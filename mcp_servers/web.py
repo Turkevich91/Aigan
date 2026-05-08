@@ -1,6 +1,6 @@
 import ipaddress
 import socket
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 import httpx
 from bs4 import BeautifulSoup
@@ -9,6 +9,7 @@ from mcp.server.fastmcp import FastMCP
 
 
 mcp = FastMCP("aigan-web")
+MAX_REDIRECTS = 5
 
 BLOCKED_RUSSIAN_HOSTS = {
     "dzen.ru",
@@ -73,6 +74,21 @@ def _clean_html(html: str, limit_chars: int) -> str:
     return compact[:limit_chars]
 
 
+def _get_with_checked_redirects(client: httpx.Client, url: str) -> httpx.Response:
+    current_url = _safe_url(url)
+    for _ in range(MAX_REDIRECTS + 1):
+        response = client.get(current_url)
+        if not response.is_redirect:
+            return response
+
+        location = response.headers.get("location")
+        if not location:
+            raise ValueError("Redirect response has no Location header")
+        current_url = _safe_url(urljoin(str(response.url), location))
+
+    raise ValueError(f"Too many redirects; limit is {MAX_REDIRECTS}")
+
+
 @mcp.tool()
 def search_web(query: str, max_results: int = 5, region: str = "ua-uk") -> str:
     """Search the public web using Ukrainian/English-oriented results; Russian domains are filtered."""
@@ -121,8 +137,8 @@ def fetch_url(url: str, limit_chars: int = 12000) -> str:
 
     headers = {"User-Agent": "aigan-mcp/1.0 (+https://modelcontextprotocol.io)"}
     try:
-        with httpx.Client(timeout=20, follow_redirects=True, headers=headers) as client:
-            response = client.get(safe_url)
+        with httpx.Client(timeout=20, follow_redirects=False, headers=headers) as client:
+            response = _get_with_checked_redirects(client, safe_url)
             response.raise_for_status()
             content_type = response.headers.get("content-type", "")
             if "text/html" in content_type:
