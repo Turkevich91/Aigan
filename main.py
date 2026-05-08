@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import html
 import logging
 import os
 import random
@@ -18,7 +19,8 @@ from agents import Agent, ModelSettings, Runner
 from agents.mcp import MCPServerStdio
 from openai import OpenAI
 from telegram import Message, MessageEntity, Update
-from telegram.constants import ChatAction, ChatType
+from telegram.constants import ChatAction, ChatType, ParseMode
+from telegram.error import BadRequest
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
 try:
@@ -189,7 +191,22 @@ Time handling:
 - Every model request includes current timezone-aware time metadata.
 - Treat that metadata as authoritative for "today", "now", "current", past/future, and date sanity checks.
 - Do not rely on model training memory to decide whether a date is current or suspicious.
+
+Telegram formatting:
+- Telegram supports native formatting through parse_mode=HTML.
+- Do not use Markdown/CommonMark markers in replies: no **bold**, __underline__, ### headings, or markdown tables.
+- If emphasis is genuinely helpful, use only sparse Telegram HTML: <b>, <i>, <u>, <s>, <code>, <pre>, or <blockquote>.
+- Prefer short plain paragraphs and simple '-' bullets over decorative formatting.
+- Never output raw '<', '>', or '&' for decoration; only use them as part of the allowed Telegram HTML tags.
 """
+
+
+TELEGRAM_HTML_TAG_RE = re.compile(
+    r"</?(?:b|strong|i|em|u|ins|s|strike|del|code|pre|blockquote)>",
+    re.IGNORECASE,
+)
+MARKDOWN_BOLD_RE = re.compile(r"\*\*(.+?)\*\*", re.DOTALL)
+MARKDOWN_HEADING_RE = re.compile(r"(?m)^\s{0,3}#{1,6}\s+(.+)$")
 
 
 @lru_cache(maxsize=4)
@@ -694,6 +711,45 @@ async def run_vision(prompt: str, image_data_urls: list[str]) -> str:
     return await asyncio.to_thread(run_vision_sync, prompt, image_data_urls)
 
 
+def normalize_outgoing_markup(text: str) -> str:
+    text = MARKDOWN_HEADING_RE.sub(lambda match: f"<b>{match.group(1).strip()}</b>", text)
+    text = MARKDOWN_BOLD_RE.sub(lambda match: f"<b>{match.group(1)}</b>", text)
+    return text.replace("**", "")
+
+
+def render_telegram_html(text: str) -> str:
+    normalized = normalize_outgoing_markup(text)
+    tags: list[str] = []
+
+    def stash_tag(match: re.Match[str]) -> str:
+        tags.append(match.group(0).lower())
+        return f"@@AIGAN_TG_HTML_{len(tags) - 1}@@"
+
+    escaped = html.escape(TELEGRAM_HTML_TAG_RE.sub(stash_tag, normalized), quote=False)
+    for index, tag in enumerate(tags):
+        escaped = escaped.replace(f"@@AIGAN_TG_HTML_{index}@@", tag)
+    return escaped
+
+
+def render_plain_fallback(text: str) -> str:
+    normalized = normalize_outgoing_markup(text)
+    without_tags = TELEGRAM_HTML_TAG_RE.sub("", normalized)
+    return html.unescape(without_tags)
+
+
+async def send_formatted_text(send_func: Any, text: str, **kwargs: Any) -> None:
+    html_text = render_telegram_html(text)
+    try:
+        await send_func(text=html_text, parse_mode=ParseMode.HTML, **kwargs)
+    except BadRequest as exc:
+        LOGGER.warning("Telegram HTML formatting rejected; retrying as plain text: %s", exc)
+        await send_func(text=render_plain_fallback(text), **kwargs)
+
+
+async def send_chat_text(bot: Any, chat_id: int, text: str) -> None:
+    await send_formatted_text(bot.send_message, text[: CONFIG.max_reply_chars], chat_id=chat_id)
+
+
 async def send_reply(message: Message, text: str) -> None:
     text = text.strip() or "Не маю корисної відповіді на це."
     if len(text) > CONFIG.max_reply_chars:
@@ -701,7 +757,7 @@ async def send_reply(message: Message, text: str) -> None:
 
     chunks = [text[i : i + 3900] for i in range(0, len(text), 3900)]
     for chunk in chunks:
-        await message.reply_text(chunk)
+        await send_formatted_text(message.reply_text, chunk)
 
 
 def allow_command(message: Message, command_name: str) -> bool:
@@ -1086,7 +1142,7 @@ If useful, write one concise professional response. Use Ukrainian by default, En
         return
 
     passive_contexts[message.chat_id].append(f"Aigan (auto): {clip_text(response, 700)}")
-    await context.bot.send_message(chat_id=message.chat_id, text=response[: CONFIG.max_reply_chars])
+    await send_chat_text(context.bot, message.chat_id, response)
 
 
 async def proactive_loop(application: Application) -> None:
@@ -1116,7 +1172,7 @@ Otherwise write one concise message. Use Ukrainian by default. Use English only 
             response = await asyncio.wait_for(run_agent(prompt), timeout=120)
             if response.strip().upper() != "SKIP":
                 passive_contexts[CONFIG.proactive_chat_id].append(f"Aigan (scheduled): {clip_text(response, 700)}")
-                await application.bot.send_message(chat_id=CONFIG.proactive_chat_id, text=response[: CONFIG.max_reply_chars])
+                await send_chat_text(application.bot, CONFIG.proactive_chat_id, response)
                 LOGGER.info("Proactive message sent chat_id=%s", CONFIG.proactive_chat_id)
             else:
                 LOGGER.info("Proactive message skipped chat_id=%s", CONFIG.proactive_chat_id)

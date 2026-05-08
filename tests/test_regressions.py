@@ -13,7 +13,8 @@ os.environ["AUTO_REACT_ENABLED"] = "false"
 os.environ["BOT_TIMEZONE"] = "America/New_York"
 
 import httpx
-from telegram.constants import ChatType
+from telegram.constants import ChatType, ParseMode
+from telegram.error import BadRequest
 
 import main
 from mcp_servers import web
@@ -38,9 +39,11 @@ class FakeMessage:
         self.document = None
         self.reply_to_message = None
         self.entities = None
+        self.reply_calls = []
 
-    async def reply_text(self, text: str) -> None:
+    async def reply_text(self, text: str, **kwargs) -> None:
         self.last_reply = text
+        self.reply_calls.append({"text": text, **kwargs})
 
 
 class PendingFlowTests(unittest.TestCase):
@@ -138,6 +141,50 @@ class TimeContextTests(unittest.TestCase):
 
         self.assertTrue(wrapped.startswith("Current time metadata:\n"))
         self.assertIn("Trusted request body", wrapped)
+
+
+class TelegramFormattingTests(unittest.TestCase):
+    def test_markdown_bold_is_rendered_as_telegram_html(self) -> None:
+        rendered = main.render_telegram_html("Коротко: **важливо**")
+
+        self.assertEqual("Коротко: <b>важливо</b>", rendered)
+        self.assertNotIn("**", rendered)
+
+    def test_plain_angle_ampersand_text_is_escaped(self) -> None:
+        rendered = main.render_telegram_html("2 < 3 & <b>ok</b>")
+
+        self.assertEqual("2 &lt; 3 &amp; <b>ok</b>", rendered)
+
+    def test_send_reply_uses_telegram_html_parse_mode(self) -> None:
+        message = FakeMessage()
+
+        asyncio.run(main.send_reply(message, "**важливо**"))
+
+        self.assertEqual("<b>важливо</b>", message.reply_calls[0]["text"])
+        self.assertEqual(ParseMode.HTML, message.reply_calls[0]["parse_mode"])
+
+    def test_bad_html_send_retries_plain_text_without_parse_mode(self) -> None:
+        calls = []
+
+        async def flaky_sender(text: str, **kwargs) -> None:
+            calls.append({"text": text, **kwargs})
+            if kwargs.get("parse_mode") == ParseMode.HTML:
+                raise BadRequest("can't parse entities")
+
+        asyncio.run(main.send_formatted_text(flaky_sender, "**важливо**"))
+
+        self.assertEqual(2, len(calls))
+        self.assertEqual("<b>важливо</b>", calls[0]["text"])
+        self.assertEqual(ParseMode.HTML, calls[0]["parse_mode"])
+        self.assertEqual("важливо", calls[1]["text"])
+        self.assertNotIn("parse_mode", calls[1])
+
+    def test_chat_sender_helper_uses_formatter(self) -> None:
+        bot = SimpleNamespace(send_message=AsyncMock())
+
+        asyncio.run(main.send_chat_text(bot, -1001, "**auto**"))
+
+        bot.send_message.assert_awaited_once_with(chat_id=-1001, text="<b>auto</b>", parse_mode=ParseMode.HTML)
 
 
 if __name__ == "__main__":
