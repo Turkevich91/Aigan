@@ -11,6 +11,7 @@ os.environ["ALLOWED_CHAT_IDS"] = "-1001"
 os.environ["ADMIN_USER_IDS"] = "407892151"
 os.environ["AUTO_REACT_ENABLED"] = "false"
 os.environ["BOT_TIMEZONE"] = "America/New_York"
+os.environ["FOLLOWUP_DEBOUNCE_SECONDS"] = "0.5"
 
 import httpx
 from telegram.constants import ChatType, ParseMode
@@ -82,6 +83,54 @@ class PendingFlowTests(unittest.TestCase):
         self.assertTrue(consumed)
         self.assertEqual({}, main.pending_requests)
         handle_prompt.assert_awaited_once_with(followup, ANY, "поясни", allow_pending_wait=False)
+
+    def test_followup_debounce_seconds_is_float(self) -> None:
+        self.assertEqual(0.5, main.CONFIG.followup_debounce_seconds)
+
+    def test_debounce_continues_original_prompt_if_no_followup_arrives(self) -> None:
+        message = FakeMessage("поясни")
+        token = main.store_pending_request(message, "поясни", "context")
+        self.assertIsNotNone(token)
+
+        with patch.object(main.asyncio, "sleep", new=AsyncMock()) as sleep:
+            with patch.object(main, "handle_prompt", new=AsyncMock()) as handle_prompt:
+                asyncio.run(main.resolve_pending_after_debounce(message, SimpleNamespace(), "поясни", token))
+
+        sleep.assert_awaited_once_with(0.5)
+        handle_prompt.assert_awaited_once_with(message, ANY, "поясни", allow_pending_wait=False)
+        self.assertTrue(main.has_pending_request(message))
+
+    def test_followup_during_debounce_suppresses_original_prompt(self) -> None:
+        message = FakeMessage("поясни")
+        followup = FakeMessage("forwarded payload")
+        token = main.store_pending_request(message, "поясни", "context")
+        self.assertIsNotNone(token)
+        main.pop_pending_request(followup)
+
+        with patch.object(main.asyncio, "sleep", new=AsyncMock()):
+            with patch.object(main, "handle_prompt", new=AsyncMock()) as handle_prompt:
+                asyncio.run(main.resolve_pending_after_debounce(message, SimpleNamespace(), "поясни", token))
+
+        handle_prompt.assert_not_awaited()
+
+    def test_passive_context_does_not_skip_debounce_for_vague_request(self) -> None:
+        message = FakeMessage("що це")
+        main.passive_contexts[message.chat_id].append("Someone: prior context")
+
+        with patch.object(main, "start_pending_debounce", new=AsyncMock()) as start_pending:
+            asyncio.run(main.handle_prompt(message, SimpleNamespace(), "що це"))
+
+        start_pending.assert_awaited_once_with(message, ANY, "що це", "followup_context")
+
+    def test_direct_image_reference_and_url_paths_do_not_debounce(self) -> None:
+        image_message = FakeMessage("що на фото")
+        image_message.photo = [object()]
+        reply_message = FakeMessage("поясни")
+        reply_message.reply_to_message = FakeMessage("referenced text")
+
+        self.assertFalse(main.should_wait_for_followup_context(image_message, "що на фото"))
+        self.assertFalse(main.should_wait_for_followup_context(reply_message, "поясни"))
+        self.assertFalse(main.should_wait_for_followup_context(FakeMessage("перекажи https://example.com"), "перекажи https://example.com"))
 
 
 class WebSafetyTests(unittest.TestCase):

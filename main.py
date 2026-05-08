@@ -11,6 +11,7 @@ from collections import defaultdict, deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from functools import lru_cache
+from itertools import count
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -86,6 +87,7 @@ class Config:
     vision_model: str
     image_max_bytes: int
     pending_request_seconds: int
+    followup_debounce_seconds: float
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -132,6 +134,7 @@ class Config:
             vision_model=os.getenv("VISION_MODEL", os.getenv("OPENAI_MODEL", "gpt-5.4-mini")).strip(),
             image_max_bytes=int(os.getenv("IMAGE_MAX_BYTES", "6000000")),
             pending_request_seconds=int(os.getenv("PENDING_REQUEST_SECONDS", "180")),
+            followup_debounce_seconds=max(0.0, float(os.getenv("FOLLOWUP_DEBOUNCE_SECONDS", "0.5"))),
         )
 
 
@@ -149,6 +152,7 @@ last_user_call: dict[int, float] = {}
 last_chat_call: dict[int, float] = {}
 last_auto_react_chat: dict[int, float] = {}
 pending_requests: dict[tuple[int, int], dict[str, Any]] = {}
+pending_token_counter = count(1)
 BOT_USERNAME = CONFIG.bot_username
 BOT_ID: int | None = None
 DEFAULT_CONTEXT_PROMPT = "Проаналізуй це повідомлення або вкладення й дай корисну відповідь українською."
@@ -335,11 +339,17 @@ def pending_key(message: Message) -> tuple[int, int] | None:
     return (message.chat_id, message.from_user.id)
 
 
-def store_pending_request(message: Message, prompt: str, kind: str) -> None:
+def pending_expired(pending: dict[str, Any]) -> bool:
+    return time.monotonic() - float(pending.get("created_at", 0)) > CONFIG.pending_request_seconds
+
+
+def store_pending_request(message: Message, prompt: str, kind: str) -> int | None:
     key = pending_key(message)
     if key is None:
-        return
-    pending_requests[key] = {"prompt": prompt, "kind": kind, "created_at": time.monotonic()}
+        return None
+    token = next(pending_token_counter)
+    pending_requests[key] = {"prompt": prompt, "kind": kind, "created_at": time.monotonic(), "token": token}
+    return token
 
 
 def pop_pending_request(message: Message) -> dict[str, Any] | None:
@@ -350,7 +360,7 @@ def pop_pending_request(message: Message) -> dict[str, Any] | None:
     pending = pending_requests.get(key)
     if not pending:
         return None
-    if time.monotonic() - float(pending.get("created_at", 0)) > CONFIG.pending_request_seconds:
+    if pending_expired(pending):
         pending_requests.pop(key, None)
         return None
     return pending_requests.pop(key, None)
@@ -363,10 +373,23 @@ def has_pending_request(message: Message) -> bool:
     pending = pending_requests.get(key)
     if not pending:
         return False
-    if time.monotonic() - float(pending.get("created_at", 0)) > CONFIG.pending_request_seconds:
+    if pending_expired(pending):
         pending_requests.pop(key, None)
         return False
     return True
+
+
+def pending_request_matches(message: Message, token: int) -> bool:
+    key = pending_key(message)
+    if key is None:
+        return False
+    pending = pending_requests.get(key)
+    if not pending:
+        return False
+    if pending_expired(pending):
+        pending_requests.pop(key, None)
+        return False
+    return pending.get("token") == token
 
 
 def is_forwarded_message(message: Message) -> bool:
@@ -971,6 +994,55 @@ async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await handle_prompt(message, context, prompt)
 
 
+def schedule_background_task(context: ContextTypes.DEFAULT_TYPE, coro: Any) -> None:
+    application = getattr(context, "application", None)
+    if application is not None and hasattr(application, "create_task"):
+        application.create_task(coro)
+        return
+    asyncio.create_task(coro)
+
+
+async def start_pending_debounce(
+    message: Message,
+    context: ContextTypes.DEFAULT_TYPE,
+    prompt: str,
+    kind: str,
+) -> None:
+    token = store_pending_request(message, prompt, kind)
+    if token is None:
+        LOGGER.info("Pending %s unavailable; continuing without debounce chat_id=%s", kind, message.chat_id)
+        await handle_prompt(message, context, prompt, allow_pending_wait=False)
+        return
+
+    LOGGER.info(
+        "Pending %s stored chat_id=%s debounce=%ss",
+        kind,
+        message.chat_id,
+        CONFIG.followup_debounce_seconds,
+    )
+    schedule_background_task(context, resolve_pending_after_debounce(message, context, prompt, token))
+
+
+async def resolve_pending_after_debounce(
+    message: Message,
+    context: ContextTypes.DEFAULT_TYPE,
+    prompt: str,
+    token: int,
+) -> None:
+    try:
+        if CONFIG.followup_debounce_seconds > 0:
+            await asyncio.sleep(CONFIG.followup_debounce_seconds)
+        if not pending_request_matches(message, token):
+            LOGGER.info("Pending request consumed during debounce chat_id=%s", message.chat_id)
+            return
+        LOGGER.info("Pending debounce elapsed chat_id=%s; continuing original prompt", message.chat_id)
+        await handle_prompt(message, context, prompt, allow_pending_wait=False)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        LOGGER.exception("Pending debounce resolution failed chat_id=%s", message.chat_id)
+
+
 async def handle_prompt(
     message: Message,
     context: ContextTypes.DEFAULT_TYPE,
@@ -984,8 +1056,7 @@ async def handle_prompt(
     has_current_payload = has_current_context_payload(message)
 
     if allow_pending_wait and not has_current_payload and should_wait_for_followup_context(message, prompt):
-        store_pending_request(message, prompt, "followup_context")
-        LOGGER.info("Pending follow-up context stored chat_id=%s", message.chat_id)
+        await start_pending_debounce(message, context, prompt, "followup_context")
         return
 
     if (
@@ -995,8 +1066,7 @@ async def handle_prompt(
         and build_reference_context(message) == "(none)"
         and is_image_request(prompt)
     ):
-        store_pending_request(message, prompt, "image")
-        LOGGER.info("Pending image context stored chat_id=%s", message.chat_id)
+        await start_pending_debounce(message, context, prompt, "image")
         return
 
     if (
@@ -1005,10 +1075,8 @@ async def handle_prompt(
         and build_reference_context(message) == "(none)"
         and is_context_dependent_request(prompt)
         and not has_url(prompt)
-        and format_passive_context(message.chat_id) == "(no recent observed messages)"
     ):
-        store_pending_request(message, prompt, "context")
-        LOGGER.info("Pending context stored chat_id=%s", message.chat_id)
+        await start_pending_debounce(message, context, prompt, "context")
         return
 
     if len(prompt) > CONFIG.max_input_chars:

@@ -93,7 +93,10 @@ If the user asks first and forwards content immediately after, the bot keeps a s
 
 ```env
 PENDING_REQUEST_SECONDS=180
+FOLLOWUP_DEBOUNCE_SECONDS=0.5
 ```
+
+`FOLLOWUP_DEBOUNCE_SECONDS` is a short input-lag buffer before the bot starts generating an answer for context-dependent requests. `PENDING_REQUEST_SECONDS` is the longer expiry window for a pending request that is waiting for follow-up context.
 
 Image analysis is enabled by default for photos and image documents that Telegram actually delivers to the bot:
 
