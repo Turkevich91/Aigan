@@ -1,0 +1,11 @@
+services:
+  aigan:
+    build: .
+    container_name: aigan
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      PYTHONUNBUFFERED: "1"
+    volumes:
+      - ./data:/app/data
