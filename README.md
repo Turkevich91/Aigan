@@ -10,8 +10,9 @@ Default model: `gpt-5.4-mini`. The public model catalog currently lists `gpt-5.4
 - Passive group context capture when Telegram bot privacy/chat access allows all messages.
 - Optional scheduled proactive messages and cautious auto-reactions, disabled by default.
 - OpenAI Agents SDK with local stdio MCP servers.
-- `web` MCP server: web search and URL fetching.
+- `web` MCP server: web search, image search, and URL fetching.
 - `youtube_transcript` MCP server: YouTube captions/transcripts, with optional audio transcription fallback.
+- Persistent bounded chat memory in SQLite, including cached Telegram image context.
 - Placeholder `.env` ready for secrets.
 
 ## Setup
@@ -61,10 +62,11 @@ ADMIN_USER_IDS=890218886
 
 ## Full Chat Access
 
-When privacy/chat access is disabled in BotFather, Telegram can deliver ordinary group messages to the bot. The bot uses that in three ways:
+When privacy/chat access is disabled in BotFather, Telegram can deliver ordinary group messages to the bot. The bot uses that in four ways:
 
-- it passively remembers recent text so replies to Telegram quotes have better context;
+- it saves recent delivered text/media context so replies to Telegram quotes have better context;
 - it can respond to `@bot_username ...` and `!m ...` without slash commands;
+- it can summarize recently delivered images lazily when a later question needs them;
 - optional auto-reactions can be enabled with strict cooldowns.
 
 Test passive reading:
@@ -74,7 +76,7 @@ send a normal group message
 /context
 ```
 
-`/context` is admin-only and shows the recent text the bot observed in that chat.
+`/context` is admin-only and shows the recent persistent memory the bot observed in that chat.
 
 ## Forwarding And Images
 
@@ -107,6 +109,26 @@ IMAGE_MAX_BYTES=6000000
 ```
 
 Telegram link previews are not always delivered as images. If the bot says it did not receive the image, resend the picture as a photo/file or reply directly to the forwarded photo.
+
+## Persistent Memory
+
+Aigan stores bounded chat memory in SQLite so it can use recent context after restarts:
+
+```env
+MEMORY_ENABLED=true
+MEMORY_DB_PATH=/app/data/aigan.sqlite3
+MEMORY_CONTEXT_MESSAGES=10
+MEMORY_RETENTION_DAYS=30
+MEMORY_IMAGE_SUMMARY_LIMIT=3
+MEMORY_EAGER_IMAGE_SUMMARY=false
+WEB_IMAGE_SEARCH_ENABLED=true
+```
+
+`MEMORY_CONTEXT_MESSAGES` controls how many recent delivered messages are added to each model request. `MEMORY_RETENTION_DAYS` deletes older rows and cached media. `MEMORY_IMAGE_SUMMARY_LIMIT` limits how many recent unsummarized images can be lazily sent to vision for one answer.
+
+The bot can only remember messages Telegram delivered to it after memory is enabled. It cannot fetch arbitrary older group history. If a forwarded post contains a real `photo` or image `document`, the bot can cache and analyze it. If Telegram only shows a client-side link preview and does not deliver the image file, Aigan keeps the text/link and may fetch public page images, but it cannot inspect a private preview that was never sent through Bot API.
+
+For web image requests such as `покажи картинку ...`, Aigan searches safe public image results, filters Russian/private hosts, sends a photo to the chat with its source, and can analyze the found image when the prompt asks for explanation.
 
 ## Tone
 

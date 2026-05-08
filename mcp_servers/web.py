@@ -89,6 +89,64 @@ def _get_with_checked_redirects(client: httpx.Client, url: str) -> httpx.Respons
     raise ValueError(f"Too many redirects; limit is {MAX_REDIRECTS}")
 
 
+def _safe_item_url(url: str) -> str:
+    try:
+        return _safe_url(url)
+    except ValueError:
+        return ""
+
+
+def search_image_candidates(query: str, max_results: int = 5, region: str = "ua-uk") -> list[dict[str, str]]:
+    """Return safe public image candidates without exposing private/Russian hosts."""
+    query = query.strip()
+    if not query:
+        return []
+    max_results = max(1, min(int(max_results), 8))
+    region = (region or "ua-uk").strip()
+
+    with DDGS(timeout=12) as ddgs:
+        raw_results = list(ddgs.images(query, max_results=max_results * 4, region=region))
+
+    results: list[dict[str, str]] = []
+    for item in raw_results:
+        image_url = item.get("image") or item.get("thumbnail") or ""
+        source_url = item.get("url") or item.get("source") or item.get("href") or image_url
+        safe_image = _safe_item_url(image_url)
+        safe_source = _safe_item_url(source_url) if source_url else safe_image
+        if not safe_image:
+            continue
+        results.append(
+            {
+                "title": item.get("title") or item.get("body") or "(untitled image)",
+                "image": safe_image,
+                "source": safe_source or safe_image,
+            }
+        )
+        if len(results) >= max_results:
+            break
+    return results
+
+
+def fetch_binary_url(url: str, max_bytes: int = 10_000_000, allowed_content_prefixes: tuple[str, ...] = ("image/",)) -> tuple[bytes, str, str]:
+    """Fetch a safe public binary URL with checked redirects and content-type limits."""
+    safe_url = _safe_url(url)
+    max_bytes = max(1, min(int(max_bytes), 10_000_000))
+    headers = {"User-Agent": "aigan-mcp/1.0 (+https://modelcontextprotocol.io)"}
+    with httpx.Client(timeout=20, follow_redirects=False, headers=headers) as client:
+        response = _get_with_checked_redirects(client, safe_url)
+        response.raise_for_status()
+        content_type = response.headers.get("content-type", "").split(";")[0].strip().lower()
+        if allowed_content_prefixes and not any(content_type.startswith(prefix) for prefix in allowed_content_prefixes):
+            raise ValueError(f"Unexpected content-type: {content_type or 'unknown'}")
+        content_length = response.headers.get("content-length")
+        if content_length and int(content_length) > max_bytes:
+            raise ValueError(f"Remote file too large: {content_length} bytes")
+        data = response.content
+        if len(data) > max_bytes:
+            raise ValueError(f"Remote file too large: {len(data)} bytes")
+        return data, content_type or "application/octet-stream", str(response.url)
+
+
 @mcp.tool()
 def search_web(query: str, max_results: int = 5, region: str = "ua-uk") -> str:
     """Search the public web using Ukrainian/English-oriented results; Russian domains are filtered."""
@@ -123,6 +181,31 @@ def search_web(query: str, max_results: int = 5, region: str = "ua-uk") -> str:
         href = item.get("href") or item.get("url") or ""
         body = item.get("body") or item.get("snippet") or ""
         lines.append(f"{index}. {title}\n{href}\n{body}".strip())
+    return "\n\n".join(lines)
+
+
+@mcp.tool()
+def search_images(query: str, max_results: int = 5, region: str = "ua-uk") -> str:
+    """Search public images; Russian/private hosts are filtered. Returns image URLs and source pages."""
+    try:
+        results = search_image_candidates(query, max_results=max_results, region=region)
+    except Exception as exc:
+        return f"Image search failed: {type(exc).__name__}: {exc}"
+
+    if not results:
+        return "No image results after filtering Russian/private hosts."
+
+    lines: list[str] = []
+    for index, item in enumerate(results, start=1):
+        lines.append(
+            "\n".join(
+                [
+                    f"{index}. {item['title']}",
+                    f"Image: {item['image']}",
+                    f"Source: {item['source']}",
+                ]
+            )
+        )
     return "\n\n".join(lines)
 
 
