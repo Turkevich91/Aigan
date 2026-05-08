@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import logging
 import os
 import random
@@ -8,9 +9,11 @@ import time
 from collections import defaultdict, deque
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from agents import Agent, ModelSettings, Runner
 from agents.mcp import MCPServerStdio
+from openai import OpenAI
 from telegram import Message, MessageEntity, Update
 from telegram.constants import ChatAction, ChatType
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
@@ -73,6 +76,10 @@ class Config:
     auto_react_keywords: list[str]
     auto_react_cooldown_seconds: int
     auto_react_min_chars: int
+    image_analysis_enabled: bool
+    vision_model: str
+    image_max_bytes: int
+    pending_request_seconds: int
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -114,6 +121,10 @@ class Config:
             auto_react_keywords=_csv_strings(os.getenv("AUTO_REACT_KEYWORDS", "")),
             auto_react_cooldown_seconds=int(os.getenv("AUTO_REACT_COOLDOWN_SECONDS", "1800")),
             auto_react_min_chars=int(os.getenv("AUTO_REACT_MIN_CHARS", "25")),
+            image_analysis_enabled=_env_bool("IMAGE_ANALYSIS_ENABLED", True),
+            vision_model=os.getenv("VISION_MODEL", os.getenv("OPENAI_MODEL", "gpt-5.4-mini")).strip(),
+            image_max_bytes=int(os.getenv("IMAGE_MAX_BYTES", "6000000")),
+            pending_request_seconds=int(os.getenv("PENDING_REQUEST_SECONDS", "180")),
         )
 
 
@@ -130,6 +141,7 @@ passive_contexts: dict[int, deque[str]] = defaultdict(lambda: deque(maxlen=CONFI
 last_user_call: dict[int, float] = {}
 last_chat_call: dict[int, float] = {}
 last_auto_react_chat: dict[int, float] = {}
+pending_requests: dict[tuple[int, int], dict[str, Any]] = {}
 BOT_USERNAME = CONFIG.bot_username
 BOT_ID: int | None = None
 
@@ -240,6 +252,94 @@ def message_content(message: Message, limit: int = 3000) -> str:
     if attachments:
         return f"[message has attachment(s): {', '.join(attachments)}]"
     return "[message has no text visible to the bot]"
+
+
+def message_text(message: Message) -> str:
+    return (message.text or message.caption or "").strip()
+
+
+def has_supported_image(message: Message) -> bool:
+    if message.photo:
+        return True
+    if message.document and (message.document.mime_type or "").startswith("image/"):
+        return True
+    return False
+
+
+def pending_key(message: Message) -> tuple[int, int] | None:
+    if message.from_user is None:
+        return None
+    return (message.chat_id, message.from_user.id)
+
+
+def store_pending_request(message: Message, prompt: str, kind: str) -> None:
+    key = pending_key(message)
+    if key is None:
+        return
+    pending_requests[key] = {"prompt": prompt, "kind": kind, "created_at": time.monotonic()}
+
+
+def pop_pending_request(message: Message) -> dict[str, Any] | None:
+    key = pending_key(message)
+    if key is None:
+        return None
+
+    pending = pending_requests.get(key)
+    if not pending:
+        return None
+    if time.monotonic() - float(pending.get("created_at", 0)) > CONFIG.pending_request_seconds:
+        pending_requests.pop(key, None)
+        return None
+    return pending_requests.pop(key, None)
+
+
+def is_image_request(prompt: str) -> bool:
+    lowered = prompt.lower()
+    keywords = (
+        "image",
+        "picture",
+        "photo",
+        "screenshot",
+        "meme",
+        "зображ",
+        "картин",
+        "фото",
+        "скрін",
+        "мем",
+        "на ній",
+        "на ньому",
+        "на фото",
+        "на картинці",
+        "на изображ",
+        "на картинке",
+    )
+    return any(keyword in lowered for keyword in keywords)
+
+
+def is_context_dependent_request(prompt: str) -> bool:
+    lowered = prompt.lower()
+    keywords = (
+        "це",
+        "оце",
+        "цей",
+        "цю",
+        "цього",
+        "це скільки",
+        "це що",
+        "поясни це",
+        "розтлумач",
+        "this",
+        "that",
+        "it",
+        "это",
+        "вот это",
+        "поясни это",
+    )
+    return any(keyword in lowered for keyword in keywords)
+
+
+def has_url(text: str) -> bool:
+    return bool(re.search(r"https?://\S+", text))
 
 
 def build_reference_context(message: Message) -> str:
@@ -434,8 +534,62 @@ async def run_agent(prompt: str) -> str:
         return str(result.final_output).strip()
 
 
+async def extract_image_data_urls(message: Message) -> list[str]:
+    if not CONFIG.image_analysis_enabled:
+        return []
+
+    file_ref = None
+    mime_type = "image/jpeg"
+    if message.photo:
+        file_ref = message.photo[-1]
+    elif message.document and (message.document.mime_type or "").startswith("image/"):
+        file_ref = message.document
+        mime_type = message.document.mime_type or mime_type
+
+    if file_ref is None:
+        return []
+
+    telegram_file = await file_ref.get_file()
+    data = bytes(await telegram_file.download_as_bytearray())
+    if len(data) > CONFIG.image_max_bytes:
+        raise ValueError(f"Image is too large: {len(data)} bytes")
+
+    encoded = base64.b64encode(data).decode("ascii")
+    return [f"data:{mime_type};base64,{encoded}"]
+
+
+def run_vision_sync(prompt: str, image_data_urls: list[str]) -> str:
+    content: list[dict[str, Any]] = [
+        {
+            "type": "input_text",
+            "text": f"""{SYSTEM_PROMPT}
+
+You are analyzing image(s) sent or forwarded in Telegram.
+Answer in Ukrainian by default. Use English only if the user explicitly asks. Never answer in Russian.
+
+Recent observed chat messages:
+{prompt}
+""",
+        }
+    ]
+    for data_url in image_data_urls:
+        content.append({"type": "input_image", "image_url": data_url})
+
+    client = OpenAI()
+    response = client.responses.create(
+        model=CONFIG.vision_model,
+        input=[{"role": "user", "content": content}],
+        max_output_tokens=CONFIG.max_output_tokens,
+    )
+    return response.output_text.strip()
+
+
+async def run_vision(prompt: str, image_data_urls: list[str]) -> str:
+    return await asyncio.to_thread(run_vision_sync, prompt, image_data_urls)
+
+
 async def send_reply(message: Message, text: str) -> None:
-    text = text.strip() or "I do not have a useful answer for that."
+    text = text.strip() or "Не маю корисної відповіді на це."
     if len(text) > CONFIG.max_reply_chars:
         text = text[: CONFIG.max_reply_chars - 32].rstrip() + "\n\n[trimmed]"
 
@@ -448,7 +602,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if update.effective_message is None:
         return
     await update.effective_message.reply_text(
-        f"I am alive. In a group, call me with: {CONFIG.bot_trigger} question, /ai question, mention, or reply. Use /ids, /context, or /proactive_now for diagnostics."
+        f"Я на зв'язку. У групі клич мене так: {CONFIG.bot_trigger} питання, /ai питання, згадка або reply. Для діагностики: /ids, /context, /proactive_now."
     )
 
 
@@ -498,14 +652,14 @@ async def context_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if message is None:
         return
     if not is_admin_user(message):
-        await message.reply_text("This diagnostic command is admin-only.")
+        await message.reply_text("Ця діагностична команда доступна лише адміну.")
         return
 
     items = list(passive_contexts[message.chat_id])[-10:]
     if not items:
-        await message.reply_text("No passive context observed yet.")
+        await message.reply_text("Поки що не бачу пасивного контексту.")
         return
-    await message.reply_text("Recent observed context:\n" + "\n".join(items))
+    await message.reply_text("Останній побачений контекст:\n" + "\n".join(items))
 
 
 async def proactive_now_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -513,7 +667,7 @@ async def proactive_now_command(update: Update, context: ContextTypes.DEFAULT_TY
     if message is None:
         return
     if not is_admin_user(message):
-        await message.reply_text("This diagnostic command is admin-only.")
+        await message.reply_text("Ця діагностична команда доступна лише адміну.")
         return
 
     prompt = f"""Write one Telegram group message for Aigan now.
@@ -531,7 +685,7 @@ Otherwise write one concise message. Use Ukrainian by default. Use English only 
         response = await asyncio.wait_for(run_agent(prompt), timeout=120)
     except Exception:
         LOGGER.exception("Manual proactive test failed")
-        await message.reply_text("Manual proactive test failed. Check logs.")
+        await message.reply_text("Тест proactive-повідомлення впав. Подивись логи.")
         return
 
     if response.strip().upper() == "SKIP":
@@ -553,30 +707,53 @@ async def command_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await handle_prompt(message, context, prompt)
 
 
+async def handle_pending_or_observe(message: Message, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    if not should_allow_chat(message):
+        return False
+
+    pending = pop_pending_request(message)
+    if pending is None:
+        remember_observed_message(message)
+        await maybe_auto_react(message, context)
+        return False
+
+    prompt = str(pending.get("prompt") or "Поясни це українською.")
+    LOGGER.info("Using pending request chat_id=%s kind=%s", message.chat_id, pending.get("kind"))
+    if has_supported_image(message):
+        await handle_image_prompt(message, prompt)
+    else:
+        remember_observed_message(message, label=f"{sender_label(message)} (forwarded context)")
+        await handle_prompt(message, context, prompt)
+    return True
+
+
 async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.effective_message
-    if message is None or message.text is None:
+    if message is None:
         return
     if message.from_user and message.from_user.is_bot:
         return
 
     chat_type = message.chat.type
     bot_username = await get_bot_username(context)
+    current_text = message_text(message)
 
     if chat_type == ChatType.PRIVATE:
-        prompt = message.text.strip()
+        prompt = current_text
+        if not prompt and not has_supported_image(message):
+            return
     else:
         was_mentioned = mentioned_via_entity(message, bot_username)
-        prompt = strip_trigger(message.text, bot_username, was_mentioned)
+        prompt = strip_trigger(current_text, bot_username, was_mentioned) if current_text else None
         replied_to_bot = (
             message.reply_to_message is not None
             and message.reply_to_message.from_user is not None
             and message.reply_to_message.from_user.id == (BOT_ID or context.bot.id)
         )
         if prompt is None and replied_to_bot:
-            prompt = message.text.strip()
+            prompt = current_text or "Поясни це українською."
         if prompt is None:
-            if "@" in message.text or (CONFIG.bot_trigger and message.text.strip().startswith(CONFIG.bot_trigger)):
+            if current_text and ("@" in current_text or (CONFIG.bot_trigger and current_text.strip().startswith(CONFIG.bot_trigger))):
                 user_id = message.from_user.id if message.from_user else "unknown"
                 LOGGER.info(
                     "Group text ignored chat_id=%s user_id=%s bot_username=%s was_mentioned=%s has_reply=%s has_quote=%s has_external_reply=%s",
@@ -588,9 +765,7 @@ async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                     getattr(message, "quote", None) is not None,
                     getattr(message, "external_reply", None) is not None,
                 )
-            if should_allow_chat(message):
-                remember_observed_message(message)
-                await maybe_auto_react(message, context)
+            await handle_pending_or_observe(message, context)
             return
         user_id = message.from_user.id if message.from_user else "unknown"
         LOGGER.info(
@@ -603,6 +778,10 @@ async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             getattr(message, "external_reply", None) is not None,
         )
 
+    if has_supported_image(message):
+        await handle_image_prompt(message, prompt or "Поясни це зображення українською.")
+        return
+
     await handle_prompt(message, context, prompt)
 
 
@@ -611,13 +790,32 @@ async def handle_prompt(message: Message, context: ContextTypes.DEFAULT_TYPE, pr
         LOGGER.warning("Ignoring message from non-allowed chat_id=%s", message.chat_id)
         return
 
+    if (
+        not has_supported_image(message)
+        and build_reference_context(message) == "(none)"
+        and is_image_request(prompt)
+    ):
+        store_pending_request(message, prompt, "image")
+        await message.reply_text("Надішли або перешли зображення наступним повідомленням, і я поясню його українською.")
+        return
+
+    if (
+        build_reference_context(message) == "(none)"
+        and is_context_dependent_request(prompt)
+        and not has_url(prompt)
+        and format_passive_context(message.chat_id) == "(no recent observed messages)"
+    ):
+        store_pending_request(message, prompt, "context")
+        await message.reply_text("Перешли повідомлення, фото або посилання наступним повідомленням, і я відповім по ньому.")
+        return
+
     if len(prompt) > CONFIG.max_input_chars:
-        await message.reply_text("Too long. Please send a shorter version.")
+        await message.reply_text("Занадто довго. Надішли коротшу версію.")
         return
 
     left = cooldown_left(message)
     if left > 0:
-        await message.reply_text(f"Please wait {left}s before the next request.")
+        await message.reply_text(f"Зачекай {left}s перед наступним запитом.")
         return
 
     mark_cooldown(message)
@@ -634,11 +832,59 @@ async def handle_prompt(message: Message, context: ContextTypes.DEFAULT_TYPE, pr
         response = await asyncio.wait_for(run_agent(agent_input), timeout=120)
     except Exception:
         LOGGER.exception("Agent run failed")
-        await message.reply_text("Request failed. Check container logs for details.")
+        await message.reply_text("Запит не вдався. Деталі будуть у логах контейнера.")
         return
 
     histories[message.chat_id].append(f"Aigan: {response[:500]}")
     remember_observed_message(message, label=f"{user_label(message)} (current request)")
+    passive_contexts[message.chat_id].append(f"Aigan: {clip_text(response, 700)}")
+    await send_reply(message, response)
+
+
+async def handle_image_prompt(message: Message, prompt: str) -> None:
+    if not should_allow_chat(message):
+        LOGGER.warning("Ignoring image from non-allowed chat_id=%s", message.chat_id)
+        return
+    if not CONFIG.image_analysis_enabled:
+        await message.reply_text("Аналіз зображень вимкнено в конфігурації.")
+        return
+
+    left = cooldown_left(message)
+    if left > 0:
+        await message.reply_text(f"Зачекай {left}s перед наступним запитом.")
+        return
+
+    mark_cooldown(message)
+    remember_observed_message(message, label=f"{user_label(message)} (image request)")
+    await message.get_bot().send_chat_action(chat_id=message.chat_id, action=ChatAction.TYPING)
+
+    try:
+        image_data_urls = await extract_image_data_urls(message)
+        if not image_data_urls:
+            await message.reply_text("Telegram не передав мені саме зображення. Надішли фото як файл/фото або дай посилання.")
+            return
+        vision_prompt = f"""Telegram chat: {message.chat.title or message.chat_id} ({message.chat_id})
+Current user: {user_label(message)}
+
+Referenced/replied-to context:
+{build_reference_context(message)}
+
+Recent observed chat messages:
+{format_passive_context(message.chat_id)}
+
+Current request:
+{prompt}
+
+Explain the image according to the current request. Ukrainian by default; English only if explicitly requested. Never Russian.
+"""
+        response = await asyncio.wait_for(run_vision(vision_prompt, image_data_urls), timeout=120)
+    except Exception:
+        LOGGER.exception("Image analysis failed")
+        await message.reply_text("Не зміг проаналізувати зображення. Деталі будуть у логах контейнера.")
+        return
+
+    histories[message.chat_id].append(f"{user_label(message)}: {prompt[:500]}")
+    histories[message.chat_id].append(f"Aigan: {response[:500]}")
     passive_contexts[message.chat_id].append(f"Aigan: {clip_text(response, 700)}")
     await send_reply(message, response)
 
@@ -759,7 +1005,7 @@ def main() -> None:
     application.add_handler(CommandHandler(["context"], context_command))
     application.add_handler(CommandHandler(["proactive_now"], proactive_now_command))
     application.add_handler(CommandHandler(["ai", "aigan", "monday"], command_prompt))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_message))
+    application.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, text_message))
     LOGGER.info("Starting Aigan with model=%s trigger=%s", CONFIG.openai_model, CONFIG.bot_trigger)
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 

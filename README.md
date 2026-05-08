@@ -76,6 +76,31 @@ send a normal group message
 
 `/context` is admin-only and shows the recent text the bot observed in that chat.
 
+## Forwarding And Images
+
+Most reliable pattern:
+
+```text
+forward the message/photo/link first
+reply to that forwarded item with @bot_username your question
+```
+
+If the user asks first and forwards content immediately after, the bot keeps a short pending request window:
+
+```env
+PENDING_REQUEST_SECONDS=180
+```
+
+Image analysis is enabled by default for photos and image documents that Telegram actually delivers to the bot:
+
+```env
+IMAGE_ANALYSIS_ENABLED=true
+VISION_MODEL=gpt-5.4-mini
+IMAGE_MAX_BYTES=6000000
+```
+
+Telegram link previews are not always delivered as images. If the bot says it did not receive the image, resend the picture as a photo/file or reply directly to the forwarded photo.
+
 ## Tone
 
 The default prompt is professional and concise. Dry humor, irony, and mild sarcasm are allowed only when they fit the moment. The bot should avoid clowning, forced jokes, and personal mockery.
