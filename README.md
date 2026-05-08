@@ -115,6 +115,16 @@ The bot is configured to answer in Ukrainian by default. English is allowed only
 
 Web search is also constrained: the assistant is instructed to search in Ukrainian or English, and the web MCP filters Russian domains/services such as `.ru`, `.su`, Yandex, VK, Mail.ru, RT, RIA, TASS, and similar sources.
 
+## Current Time
+
+Every model request includes timezone-aware current time metadata so the bot does not rely on stale model memory for "today", "now", or whether a date is past/future. Configure the local timezone with an IANA timezone name:
+
+```env
+BOT_TIMEZONE=America/New_York
+```
+
+Use `Europe/Kyiv` instead if the group should reason in Kyiv time.
+
 ## Proactive Messages
 
 Disabled by default. To let the bot post on its own, set:

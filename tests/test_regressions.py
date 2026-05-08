@@ -10,6 +10,7 @@ os.environ["OPENAI_API_KEY"] = "sk-test"
 os.environ["ALLOWED_CHAT_IDS"] = "-1001"
 os.environ["ADMIN_USER_IDS"] = "407892151"
 os.environ["AUTO_REACT_ENABLED"] = "false"
+os.environ["BOT_TIMEZONE"] = "America/New_York"
 
 import httpx
 from telegram.constants import ChatType
@@ -122,6 +123,21 @@ class WebSafetyTests(unittest.TestCase):
 
         self.assertIn("Fetch failed: ValueError", result)
         self.assertIn("local/private", result)
+
+
+class TimeContextTests(unittest.TestCase):
+    def test_time_metadata_includes_configured_timezone_and_utc(self) -> None:
+        context = main.current_time_context()
+
+        self.assertIn("America/New_York", context)
+        self.assertIn("Current UTC time:", context)
+        self.assertIn("authoritative", context)
+
+    def test_agent_prompt_is_wrapped_with_current_time_metadata(self) -> None:
+        wrapped = main.with_current_time_metadata("Trusted request body")
+
+        self.assertTrue(wrapped.startswith("Current time metadata:\n"))
+        self.assertIn("Trusted request body", wrapped)
 
 
 if __name__ == "__main__":
