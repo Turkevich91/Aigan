@@ -1,12 +1,14 @@
 # aigan
 
-Telegram group entertainer bot backed by OpenAI Agents SDK and local MCP tools.
+Telegram group assistant backed by OpenAI Agents SDK and local MCP tools.
 
 Default model: `gpt-5.4-mini`. The public model catalog currently lists `gpt-5.4-mini` and `gpt-5.4-nano`, not `GPT-5.4-micro`, so this project uses the mini model as the practical chat default.
 
 ## What is included
 
-- Telegram bot that replies in groups only on trigger, mention, reply, or `/ai`.
+- Telegram bot that replies in groups on trigger, mention, reply, or `/ai`.
+- Passive group context capture when Telegram bot privacy/chat access allows all messages.
+- Optional scheduled proactive messages and cautious auto-reactions, disabled by default.
 - OpenAI Agents SDK with local stdio MCP servers.
 - `web` MCP server: web search and URL fetching.
 - `youtube_transcript` MCP server: YouTube captions/transcripts, with optional audio transcription fallback.
@@ -36,7 +38,9 @@ In a group chat, use:
 ```text
  /ping
  /ids
-!m say something cursed but legal
+ /context
+ /proactive_now
+!m explain this briefly
 /ai summarize this https://www.youtube.com/watch?v=...
 ```
 
@@ -54,6 +58,59 @@ ADMIN_USER_IDS=890218886
 ```
 
 `ADMIN_USER_IDS` is also comma-separated. Admin users skip cooldowns and can DM the bot even when `ALLOWED_CHAT_IDS` is locked to group IDs.
+
+## Full Chat Access
+
+When privacy/chat access is disabled in BotFather, Telegram can deliver ordinary group messages to the bot. The bot uses that in three ways:
+
+- it passively remembers recent text so replies to Telegram quotes have better context;
+- it can respond to `@bot_username ...` and `!m ...` without slash commands;
+- optional auto-reactions can be enabled with strict cooldowns.
+
+Test passive reading:
+
+```text
+send a normal group message
+/context
+```
+
+`/context` is admin-only and shows the recent text the bot observed in that chat.
+
+## Tone
+
+The default prompt is professional and concise. Dry humor, irony, and mild sarcasm are allowed only when they fit the moment. The bot should avoid clowning, forced jokes, and personal mockery.
+
+## Proactive Messages
+
+Disabled by default. To let the bot post on its own, set:
+
+```env
+PROACTIVE_ENABLED=true
+PROACTIVE_CHAT_ID=-1002546271665
+PROACTIVE_INTERVAL_SECONDS=18000
+PROACTIVE_START_DELAY_SECONDS=300
+PROACTIVE_PROMPT=Write a brief, useful group check-in. Be professional, concise, and only lightly ironic if the context invites it.
+```
+
+Test without waiting:
+
+```text
+/proactive_now
+```
+
+## Auto-Reactions
+
+Disabled by default. A conservative keyword-based setup:
+
+```env
+AUTO_REACT_ENABLED=true
+AUTO_REACT_PROBABILITY=0
+AUTO_REACT_KEYWORDS=поясни,что это,новость,ссылка
+AUTO_REACT_COOLDOWN_SECONDS=1800
+AUTO_REACT_MIN_CHARS=25
+```
+
+For occasional random reactions, set a low probability such as `0.02`. Keep a long cooldown unless the group explicitly wants a more active bot.
 
 ## YouTube
 
