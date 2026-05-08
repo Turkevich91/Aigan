@@ -107,11 +107,11 @@ def _transcribe_audio_fallback(video_url: str, max_chars: int) -> str:
 @mcp.tool()
 def get_youtube_transcript(
     video: str,
-    languages: str = "ru,en",
+    languages: str = "uk,en,ru",
     include_timestamps: bool = True,
     max_chars: int = 16000,
 ) -> str:
-    """Get captions/transcript for a YouTube URL or video id; optionally fall back to audio transcription."""
+    """Get captions/transcript for YouTube; prefer Ukrainian/English captions, with Russian only as source material."""
     max_chars = max(1000, min(int(max_chars), 40000))
     try:
         video_id = _video_id(video)
@@ -120,13 +120,17 @@ def get_youtube_transcript(
 
     lang_list = [item.strip() for item in languages.split(",") if item.strip()]
     if not lang_list:
-        lang_list = ["ru", "en"]
+        lang_list = ["uk", "en", "ru"]
 
     try:
         entries = _fetch_caption_transcript(video_id, lang_list)
         transcript = _format_entries(entries, include_timestamps, max_chars)
         if transcript:
-            return f"YouTube video id: {video_id}\nTranscript/captions:\n\n{transcript}"
+            return (
+                f"YouTube video id: {video_id}\n"
+                "Transcript/captions. If the transcript is Russian, summarize or explain it in Ukrainian, not Russian:\n\n"
+                f"{transcript}"
+            )
         return "Transcript was fetched but contained no text."
     except Exception as exc:
         if not _audio_fallback_enabled():
@@ -138,7 +142,11 @@ def get_youtube_transcript(
     video_url = video if video.startswith("http") else f"https://www.youtube.com/watch?v={video_id}"
     try:
         transcript = _transcribe_audio_fallback(video_url, max_chars)
-        return f"YouTube video id: {video_id}\nAudio transcription:\n\n{transcript}"
+        return (
+            f"YouTube video id: {video_id}\n"
+            "Audio transcription. If the transcription is Russian, summarize or explain it in Ukrainian, not Russian:\n\n"
+            f"{transcript}"
+        )
     except Exception as exc:
         return f"Audio transcription failed for {video_id}: {type(exc).__name__}: {exc}"
 

@@ -10,6 +10,31 @@ from mcp.server.fastmcp import FastMCP
 
 mcp = FastMCP("aigan-web")
 
+BLOCKED_RUSSIAN_HOSTS = {
+    "dzen.ru",
+    "gazeta.ru",
+    "kommersant.ru",
+    "lenta.ru",
+    "mail.ru",
+    "rambler.ru",
+    "ria.ru",
+    "rt.com",
+    "sputnikglobe.com",
+    "tass.ru",
+    "vk.com",
+    "yandex.ru",
+}
+
+
+def _is_blocked_russian_host(host: str | None) -> bool:
+    if not host:
+        return False
+
+    host = host.lower().strip(".")
+    if host.endswith(".ru") or host.endswith(".su"):
+        return True
+    return any(host == blocked or host.endswith(f".{blocked}") for blocked in BLOCKED_RUSSIAN_HOSTS)
+
 
 def _safe_url(url: str) -> str:
     parsed = urlparse(url.strip())
@@ -19,6 +44,8 @@ def _safe_url(url: str) -> str:
     host = parsed.hostname.lower()
     if host in {"localhost", "metadata.google.internal"}:
         raise ValueError("Refusing local/private host")
+    if _is_blocked_russian_host(host):
+        raise ValueError("Russian domains and Russian search/media services are disabled for this bot")
 
     try:
         infos = socket.getaddrinfo(host, None)
@@ -47,21 +74,32 @@ def _clean_html(html: str, limit_chars: int) -> str:
 
 
 @mcp.tool()
-def search_web(query: str, max_results: int = 5) -> str:
-    """Search the public web and return titles, URLs, and snippets."""
+def search_web(query: str, max_results: int = 5, region: str = "ua-uk") -> str:
+    """Search the public web using Ukrainian/English-oriented results; Russian domains are filtered."""
     query = query.strip()
     if not query:
         return "Search query is empty."
     max_results = max(1, min(int(max_results), 8))
+    region = (region or "ua-uk").strip()
 
     try:
         with DDGS(timeout=12) as ddgs:
-            results = list(ddgs.text(query, max_results=max_results))
+            raw_results = list(ddgs.text(query, max_results=max_results * 3, region=region))
     except Exception as exc:
         return f"Search failed: {type(exc).__name__}: {exc}"
 
+    results = []
+    for item in raw_results:
+        href = item.get("href") or item.get("url") or ""
+        host = urlparse(href).hostname
+        if _is_blocked_russian_host(host):
+            continue
+        results.append(item)
+        if len(results) >= max_results:
+            break
+
     if not results:
-        return "No search results."
+        return "No search results after filtering Russian domains/services."
 
     lines: list[str] = []
     for index, item in enumerate(results, start=1):
@@ -74,7 +112,7 @@ def search_web(query: str, max_results: int = 5) -> str:
 
 @mcp.tool()
 def fetch_url(url: str, limit_chars: int = 12000) -> str:
-    """Fetch and extract readable text from a public URL."""
+    """Fetch and extract readable text from a public non-Russian URL."""
     limit_chars = max(1000, min(int(limit_chars), 30000))
     try:
         safe_url = _safe_url(url)
