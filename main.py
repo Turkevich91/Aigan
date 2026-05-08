@@ -345,8 +345,6 @@ def is_context_dependent_request(prompt: str) -> bool:
 
 
 def should_wait_for_followup_context(message: Message, prompt: str) -> bool:
-    if message.chat.type == ChatType.PRIVATE:
-        return False
     if build_reference_context(message) != "(none)":
         return False
     if has_supported_image(message) or has_url(prompt):
@@ -738,6 +736,11 @@ async def handle_pending_or_observe(message: Message, context: ContextTypes.DEFA
 
     pending = pop_pending_request(message)
     if pending is None:
+        text = message_text(message)
+        if text and should_wait_for_followup_context(message, text):
+            store_pending_request(message, text, "followup_context")
+            LOGGER.info("Pending follow-up context stored from passive text chat_id=%s", message.chat_id)
+            return True
         remember_observed_message(message)
         await maybe_auto_react(message, context)
         return False
@@ -826,7 +829,7 @@ async def handle_prompt(message: Message, context: ContextTypes.DEFAULT_TYPE, pr
         and is_image_request(prompt)
     ):
         store_pending_request(message, prompt, "image")
-        await message.reply_text("Надішли або перешли зображення наступним повідомленням, і я поясню його українською.")
+        LOGGER.info("Pending image context stored chat_id=%s", message.chat_id)
         return
 
     if (
@@ -836,7 +839,7 @@ async def handle_prompt(message: Message, context: ContextTypes.DEFAULT_TYPE, pr
         and format_passive_context(message.chat_id) == "(no recent observed messages)"
     ):
         store_pending_request(message, prompt, "context")
-        await message.reply_text("Перешли повідомлення, фото або посилання наступним повідомленням, і я відповім по ньому.")
+        LOGGER.info("Pending context stored chat_id=%s", message.chat_id)
         return
 
     if len(prompt) > CONFIG.max_input_chars:
