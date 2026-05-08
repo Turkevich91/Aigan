@@ -144,6 +144,7 @@ last_auto_react_chat: dict[int, float] = {}
 pending_requests: dict[tuple[int, int], dict[str, Any]] = {}
 BOT_USERNAME = CONFIG.bot_username
 BOT_ID: int | None = None
+DEFAULT_CONTEXT_PROMPT = "Проаналізуй це повідомлення або вкладення й дай корисну відповідь українською."
 
 
 SYSTEM_PROMPT = """You are Aigan, a professional AI assistant for a closed Telegram group.
@@ -293,6 +294,37 @@ def pop_pending_request(message: Message) -> dict[str, Any] | None:
     return pending_requests.pop(key, None)
 
 
+def has_pending_request(message: Message) -> bool:
+    key = pending_key(message)
+    if key is None:
+        return False
+    pending = pending_requests.get(key)
+    if not pending:
+        return False
+    if time.monotonic() - float(pending.get("created_at", 0)) > CONFIG.pending_request_seconds:
+        pending_requests.pop(key, None)
+        return False
+    return True
+
+
+def is_forwarded_message(message: Message) -> bool:
+    return any(
+        getattr(message, attr, None)
+        for attr in (
+            "forward_origin",
+            "forward_from",
+            "forward_from_chat",
+            "forward_sender_name",
+            "forward_date",
+            "external_reply",
+        )
+    )
+
+
+def has_current_context_payload(message: Message) -> bool:
+    return is_forwarded_message(message) or has_supported_image(message)
+
+
 def is_image_request(prompt: str) -> bool:
     lowered = prompt.lower()
     keywords = (
@@ -439,10 +471,10 @@ async def get_bot_username(context: ContextTypes.DEFAULT_TYPE) -> str | None:
 def strip_trigger(text: str, bot_username: str | None, was_mentioned: bool = False) -> str | None:
     stripped = text.strip()
     if CONFIG.bot_trigger and stripped.lower().startswith(CONFIG.bot_trigger.lower()):
-        return stripped[len(CONFIG.bot_trigger) :].strip() or "Say something useful in Ukrainian."
+        return stripped[len(CONFIG.bot_trigger) :].strip() or DEFAULT_CONTEXT_PROMPT
 
     if bot_username and (was_mentioned or f"@{bot_username}".lower() in stripped.lower()):
-        return strip_bot_mention(stripped, bot_username) or "Say something useful in Ukrainian."
+        return strip_bot_mention(stripped, bot_username) or DEFAULT_CONTEXT_PROMPT
 
     return None
 
@@ -517,6 +549,9 @@ def build_agent_input(message: Message, prompt: str) -> str:
     reference_context = build_reference_context(message)
     return f"""Telegram chat: {chat_title} ({message.chat_id})
 Current user: {user_label(message)}
+
+Current Telegram message content or attachment marker:
+{message_content(message)}
 
 Referenced/replied-to context. This is the primary object when the user says "this", "quote", "message", "it", "explain", "translate", or similar:
 {reference_context}
@@ -726,7 +761,7 @@ async def command_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     user_id = message.from_user.id if message.from_user else "unknown"
     LOGGER.info("AI command received chat_id=%s chat_type=%s user_id=%s", message.chat_id, message.chat.type, user_id)
     parts = message.text.split(maxsplit=1)
-    prompt = parts[1].strip() if len(parts) > 1 else "Say something useful in Ukrainian."
+    prompt = parts[1].strip() if len(parts) > 1 else DEFAULT_CONTEXT_PROMPT
     await handle_prompt(message, context, prompt)
 
 
@@ -745,13 +780,13 @@ async def handle_pending_or_observe(message: Message, context: ContextTypes.DEFA
         await maybe_auto_react(message, context)
         return False
 
-    prompt = str(pending.get("prompt") or "Поясни це українською.")
+    prompt = str(pending.get("prompt") or DEFAULT_CONTEXT_PROMPT)
     LOGGER.info("Using pending request chat_id=%s kind=%s", message.chat_id, pending.get("kind"))
     if has_supported_image(message):
         await handle_image_prompt(message, prompt)
     else:
         remember_observed_message(message, label=f"{sender_label(message)} (forwarded context)")
-        await handle_prompt(message, context, prompt)
+        await handle_prompt(message, context, prompt, allow_pending_wait=False)
     return True
 
 
@@ -766,9 +801,15 @@ async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     bot_username = await get_bot_username(context)
     current_text = message_text(message)
 
+    if has_pending_request(message):
+        if await handle_pending_or_observe(message, context):
+            return
+
     if chat_type == ChatType.PRIVATE:
-        prompt = current_text
-        if not prompt and not has_supported_image(message):
+        prompt = DEFAULT_CONTEXT_PROMPT if is_forwarded_message(message) else current_text
+        if not prompt and has_supported_image(message):
+            prompt = DEFAULT_CONTEXT_PROMPT
+        if not prompt:
             return
     else:
         was_mentioned = mentioned_via_entity(message, bot_username)
@@ -779,7 +820,7 @@ async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             and message.reply_to_message.from_user.id == (BOT_ID or context.bot.id)
         )
         if prompt is None and replied_to_bot:
-            prompt = current_text or "Поясни це українською."
+            prompt = current_text or DEFAULT_CONTEXT_PROMPT
         if prompt is None:
             if current_text and ("@" in current_text or (CONFIG.bot_trigger and current_text.strip().startswith(CONFIG.bot_trigger))):
                 user_id = message.from_user.id if message.from_user else "unknown"
@@ -807,24 +848,33 @@ async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         )
 
     if has_supported_image(message):
-        await handle_image_prompt(message, prompt or "Поясни це зображення українською.")
+        await handle_image_prompt(message, prompt or DEFAULT_CONTEXT_PROMPT)
         return
 
     await handle_prompt(message, context, prompt)
 
 
-async def handle_prompt(message: Message, context: ContextTypes.DEFAULT_TYPE, prompt: str) -> None:
+async def handle_prompt(
+    message: Message,
+    context: ContextTypes.DEFAULT_TYPE,
+    prompt: str,
+    allow_pending_wait: bool = True,
+) -> None:
     if not should_allow_chat(message):
         LOGGER.warning("Ignoring message from non-allowed chat_id=%s", message.chat_id)
         return
 
-    if should_wait_for_followup_context(message, prompt):
+    has_current_payload = has_current_context_payload(message)
+
+    if allow_pending_wait and not has_current_payload and should_wait_for_followup_context(message, prompt):
         store_pending_request(message, prompt, "followup_context")
         LOGGER.info("Pending follow-up context stored chat_id=%s", message.chat_id)
         return
 
     if (
-        not has_supported_image(message)
+        allow_pending_wait
+        and not has_current_payload
+        and not has_supported_image(message)
         and build_reference_context(message) == "(none)"
         and is_image_request(prompt)
     ):
@@ -833,7 +883,9 @@ async def handle_prompt(message: Message, context: ContextTypes.DEFAULT_TYPE, pr
         return
 
     if (
-        build_reference_context(message) == "(none)"
+        allow_pending_wait
+        and not has_current_payload
+        and build_reference_context(message) == "(none)"
         and is_context_dependent_request(prompt)
         and not has_url(prompt)
         and format_passive_context(message.chat_id) == "(no recent observed messages)"

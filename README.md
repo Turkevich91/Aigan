@@ -85,6 +85,10 @@ forward the message/photo/link first
 reply to that forwarded item with @bot_username your question
 ```
 
+In a private chat with the bot, simply forwarding a message/photo/link is treated as an implicit request to analyze it. No `поясни` prefix is required.
+
+In a group chat, replying to or quoting a message with only `@bot_username` is also treated as an implicit request. The bot should use the replied-to/quoted/forwarded item as the main context even when you do not add words like `поясни`.
+
 If the user asks first and forwards content immediately after, the bot keeps a short pending request window:
 
 ```env
