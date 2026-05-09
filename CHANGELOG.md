@@ -1,5 +1,11 @@
 # Aigan Changelog
 
+## 2026-05-09 - User profile and stats commands
+
+- Added `/character`, `/profile`, `/характер`, `/портрет`, and `/профіль` for cautious communication-style portraits from the last 100 saved user messages.
+- Added `/stat`, `/stats`, `/стат`, `/стата`, and `/статистика` for saved-message counts, sentence/word counts, and top words.
+- Limited other-user profile/stat requests to admins; users can still inspect their own saved data.
+
 ## 2026-05-09 - Short Ukrainian ask aliases
 
 - Added `/п` and `/а` as short Ukrainian aliases for `/питай`.

@@ -13,6 +13,7 @@ Default model: `gpt-5.4-mini`. The public model catalog currently lists `gpt-5.4
 - `web` MCP server: web search, image search, and URL fetching.
 - `youtube_transcript` MCP server: YouTube captions/transcripts, with optional audio transcription fallback.
 - Persistent bounded chat memory in SQLite, including cached Telegram image context.
+- User profile and stats commands based on messages the bot has actually seen.
 - Placeholder `.env` ready for secrets.
 
 ## Setup
@@ -41,6 +42,8 @@ In a group chat, use:
  /ids
  /version
  /context
+ /stat @username
+ /character me
  /proactive_now
 !m explain this briefly
 /ai summarize this https://www.youtube.com/watch?v=...
@@ -53,11 +56,15 @@ Ukrainian aliases are also available so users do not need to switch keyboard lay
 /айді
 /версія
 /контекст
+/стат @username
+/характер мій
 /проактив
 /питай підсумуй це відео https://www.youtube.com/watch?v=...
 /п коротко поясни попереднє
 /а що тут важливо?
 ```
+
+User commands use only retained SQLite memory for the current chat. `/stat` and `/стат` count saved messages, sentences, words, and top words. `/character`, `/profile`, `/характер`, `/портрет`, and `/профіль` build a cautious non-clinical communication portrait from the last 100 saved text messages. Users can request their own data; admins can request another user by `@username`.
 
 If Telegram privacy mode is on and the bot is not an admin, it may only receive commands, mentions, and replies. That is usually good for cost control.
 

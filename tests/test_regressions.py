@@ -43,11 +43,11 @@ VALID_JPEG = b"\xff\xd8\xff\xe0" + b"valid-jpeg"
 
 
 class FakeUser:
-    def __init__(self, user_id: int = 407892151) -> None:
+    def __init__(self, user_id: int = 407892151, username: str = "tester") -> None:
         self.id = user_id
         self.is_bot = False
         self.full_name = "Test User"
-        self.username = "tester"
+        self.username = username
 
 
 class FakeMessage:
@@ -391,6 +391,37 @@ class PersistentMemoryTests(unittest.TestCase):
         context = main.format_memory_context(-1001, 10)
 
         self.assertIn("persistent hello", context)
+
+    def test_user_messages_filter_by_user_and_limit(self) -> None:
+        base = datetime.now(timezone.utc)
+        for index in range(105):
+            main.MEMORY.save_message(
+                chat_id=-1001,
+                message_id=1000 + index,
+                sender_label="Alpha",
+                user_id=111,
+                username="alpha",
+                text=f"sample-{index:03d}",
+                created_at=base + timedelta(seconds=index),
+            )
+        main.MEMORY.save_message(
+            chat_id=-1001,
+            message_id=2000,
+            sender_label="Beta",
+            user_id=222,
+            username="beta",
+            text="other user text",
+            created_at=base + timedelta(seconds=200),
+        )
+
+        limited = main.MEMORY.user_messages(-1001, user_id=111, limit=100)
+        all_items = main.MEMORY.user_stats(-1001, username="alpha")
+
+        self.assertEqual(100, len(limited))
+        self.assertEqual(105, len(all_items))
+        self.assertNotIn("sample-000", [item.text for item in limited])
+        self.assertEqual("sample-005", limited[0].text)
+        self.assertEqual("sample-104", limited[-1].text)
 
     def test_agent_input_marks_persistent_memory_untrusted(self) -> None:
         main.MEMORY.save_message(
@@ -870,6 +901,8 @@ class PersistentMemoryTests(unittest.TestCase):
         self.assertIn("/питай", message.reply_calls[0]["text"])
         self.assertIn("/п", message.reply_calls[0]["text"])
         self.assertIn("/а", message.reply_calls[0]["text"])
+        self.assertIn("/характер", message.reply_calls[0]["text"])
+        self.assertIn("/стат", message.reply_calls[0]["text"])
 
     def test_localized_ai_alias_invokes_prompt_handler(self) -> None:
         message = FakeMessage("/питай яка погода зараз?")
@@ -900,6 +933,129 @@ class PersistentMemoryTests(unittest.TestCase):
     def test_short_localized_ai_aliases_require_slash(self) -> None:
         self.assertIsNone(main.localized_command_match("п тест", "thrd_ua_bot"))
         self.assertIsNone(main.localized_command_match("а тест", "thrd_ua_bot"))
+
+    def test_stats_command_counts_saved_self_messages(self) -> None:
+        now = datetime.now(timezone.utc)
+        main.MEMORY.save_message(
+            chat_id=-1001,
+            message_id=3000,
+            sender_label="Test User (@tester, id=407892151)",
+            user_id=407892151,
+            username="tester",
+            text="Альфа тест. Альфа ще раз!",
+            created_at=now,
+        )
+        main.MEMORY.save_message(
+            chat_id=-1001,
+            message_id=3001,
+            sender_label="Test User (@tester, id=407892151)",
+            user_id=407892151,
+            username="tester",
+            text="Бета тест про альфа.",
+            created_at=now + timedelta(seconds=1),
+        )
+        message = FakeMessage("/stat")
+
+        asyncio.run(main.stats_command(SimpleNamespace(effective_message=message), SimpleNamespace()))
+
+        reply = message.reply_calls[0]["text"]
+        self.assertIn("повідомлень: 2", reply)
+        self.assertIn("речень: 3", reply)
+        self.assertIn("альфа - 3", reply)
+
+    def test_localized_stats_alias_supports_admin_username_target(self) -> None:
+        main.MEMORY.save_message(
+            chat_id=-1001,
+            message_id=3010,
+            sender_label="Target (@target, id=222)",
+            user_id=222,
+            username="target",
+            text="ціль пише багато слів",
+            created_at=datetime.now(timezone.utc),
+        )
+        message = FakeMessage("/стат @target")
+        context = SimpleNamespace(bot=SimpleNamespace(username="thrd_ua_bot", id=8712856238))
+
+        asyncio.run(main.localized_command_alias(SimpleNamespace(effective_message=message), context))
+
+        self.assertIn("Target (@target, id=222)", message.reply_calls[0]["text"])
+        self.assertIn("повідомлень: 1", message.reply_calls[0]["text"])
+
+    def test_non_admin_cannot_request_other_user_stats_or_profile(self) -> None:
+        context = SimpleNamespace(bot=SimpleNamespace(username="thrd_ua_bot", id=8712856238))
+        for text in ("/стат @tester", "/характер @tester"):
+            with self.subTest(text=text):
+                message = FakeMessage(text)
+                message.from_user = FakeUser(user_id=999, username="other")
+
+                asyncio.run(main.localized_command_alias(SimpleNamespace(effective_message=message), context))
+
+                self.assertIn("лише адмін", message.reply_calls[0]["text"])
+
+    def test_unknown_username_returns_clear_stats_message(self) -> None:
+        message = FakeMessage("/stat @missing")
+
+        asyncio.run(main.stats_command(SimpleNamespace(effective_message=message), SimpleNamespace()))
+
+        self.assertIn("Не знайшов", message.reply_calls[0]["text"])
+        self.assertIn("@missing", message.reply_calls[0]["text"])
+
+    def test_character_command_uses_last_100_user_messages_only(self) -> None:
+        base = datetime.now(timezone.utc)
+        for index in range(105):
+            main.MEMORY.save_message(
+                chat_id=-1001,
+                message_id=3100 + index,
+                sender_label="Test User (@tester, id=407892151)",
+                user_id=407892151,
+                username="tester",
+                text=f"profile-sample-{index:03d}",
+                created_at=base + timedelta(seconds=index),
+            )
+        main.MEMORY.save_message(
+            chat_id=-1001,
+            message_id=3300,
+            sender_label="Other",
+            user_id=222,
+            username="other",
+            text="other-user-secret",
+            created_at=base + timedelta(seconds=300),
+        )
+        message = FakeMessage("/характер мій")
+        context = SimpleNamespace(bot=SimpleNamespace(username="thrd_ua_bot", id=8712856238, send_chat_action=AsyncMock()))
+        captured = {}
+
+        async def fake_run_plain_model(prompt: str) -> str:
+            captured["prompt"] = prompt
+            return "портрет готовий"
+
+        with patch.object(main, "run_plain_model", new=fake_run_plain_model):
+            asyncio.run(main.localized_command_alias(SimpleNamespace(effective_message=message), context))
+
+        self.assertIn("портрет готовий", message.reply_calls[0]["text"])
+        self.assertNotIn("profile-sample-000", captured["prompt"])
+        self.assertIn("profile-sample-005", captured["prompt"])
+        self.assertIn("profile-sample-104", captured["prompt"])
+        self.assertNotIn("other-user-secret", captured["prompt"])
+        self.assertIn("Do not infer or mention mental health", captured["prompt"])
+
+    def test_character_command_requires_minimum_messages(self) -> None:
+        main.MEMORY.save_message(
+            chat_id=-1001,
+            message_id=3400,
+            sender_label="Test User (@tester, id=407892151)",
+            user_id=407892151,
+            username="tester",
+            text="замало",
+            created_at=datetime.now(timezone.utc),
+        )
+        message = FakeMessage("/profile me")
+
+        with patch.object(main, "run_plain_model", new=AsyncMock()) as run_plain_model:
+            asyncio.run(main.character_command(SimpleNamespace(effective_message=message), SimpleNamespace(bot=SimpleNamespace())))
+
+        run_plain_model.assert_not_awaited()
+        self.assertIn("щонайменше 10", message.reply_calls[0]["text"])
 
     def test_localized_ping_alias_uses_allowlisted_command(self) -> None:
         message = FakeMessage("/пінг")

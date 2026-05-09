@@ -77,6 +77,10 @@ class MemoryStore:
             );
             CREATE INDEX IF NOT EXISTS idx_messages_chat_order
                 ON messages(chat_id, created_at, id);
+            CREATE INDEX IF NOT EXISTS idx_messages_chat_user_order
+                ON messages(chat_id, user_id, created_at, id);
+            CREATE INDEX IF NOT EXISTS idx_messages_chat_username_order
+                ON messages(chat_id, username COLLATE NOCASE, created_at, id);
             CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_chat_message
                 ON messages(chat_id, message_id)
                 WHERE message_id IS NOT NULL;
@@ -254,6 +258,70 @@ class MemoryStore:
                 """,
                 (chat_id, limit),
             ).fetchall()
+        return [self._row_to_item(row) for row in rows]
+
+    def user_messages(
+        self,
+        chat_id: int,
+        *,
+        user_id: int | None = None,
+        username: str = "",
+        limit: int = 100,
+    ) -> list[MemoryItem]:
+        return self._user_text_messages(chat_id, user_id=user_id, username=username, limit=max(1, int(limit)))
+
+    def user_stats(
+        self,
+        chat_id: int,
+        *,
+        user_id: int | None = None,
+        username: str = "",
+    ) -> list[MemoryItem]:
+        return self._user_text_messages(chat_id, user_id=user_id, username=username, limit=None)
+
+    def _user_text_messages(
+        self,
+        chat_id: int,
+        *,
+        user_id: int | None,
+        username: str = "",
+        limit: int | None,
+    ) -> list[MemoryItem]:
+        username = username.strip().lstrip("@")
+        if user_id is None and not username:
+            return []
+
+        conditions = ["chat_id = ?", "is_bot = 0", "text != ''"]
+        params: list[object] = [chat_id]
+        if user_id is not None:
+            conditions.append("user_id = ?")
+            params.append(user_id)
+        else:
+            conditions.append("username != ''")
+            conditions.append("lower(username) = lower(?)")
+            params.append(username)
+
+        where = " AND ".join(conditions)
+        if limit is None:
+            sql = f"""
+                SELECT * FROM messages
+                WHERE {where}
+                ORDER BY created_at ASC, id ASC
+                """
+        else:
+            sql = f"""
+                SELECT * FROM (
+                    SELECT * FROM messages
+                    WHERE {where}
+                    ORDER BY created_at DESC, id DESC
+                    LIMIT ?
+                )
+                ORDER BY created_at ASC, id ASC
+                """
+            params.append(limit)
+
+        with self._lock:
+            rows = self._conn.execute(sql, tuple(params)).fetchall()
         return [self._row_to_item(row) for row in rows]
 
     def unsummarized_recent_images(self, chat_id: int, limit: int = 3) -> list[MemoryItem]:
