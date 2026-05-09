@@ -35,6 +35,8 @@ import main
 from memory import MemoryStore
 from mcp_servers import web
 
+VALID_JPEG = b"\xff\xd8\xff\xe0" + b"valid-jpeg"
+
 
 class FakeUser:
     def __init__(self, user_id: int = 407892151) -> None:
@@ -67,6 +69,7 @@ class FakeMessage:
         self.entities = None
         self.reply_calls = []
         self.photo_calls = []
+        self.photo_failures = 0
         self.bot = SimpleNamespace(send_chat_action=AsyncMock())
 
     async def reply_text(self, text: str, **kwargs) -> None:
@@ -74,6 +77,9 @@ class FakeMessage:
         self.reply_calls.append({"text": text, **kwargs})
 
     async def reply_photo(self, photo, **kwargs) -> None:
+        if self.photo_failures > 0:
+            self.photo_failures -= 1
+            raise BadRequest("failed to send photo")
         self.photo_calls.append({"photo": photo, **kwargs})
 
     def get_bot(self):
@@ -468,13 +474,173 @@ class PersistentMemoryTests(unittest.TestCase):
             with patch.object(
                 main,
                 "fetch_binary_url",
-                return_value=(b"fake-image", "image/jpeg", "https://example.com/cat.jpg"),
+                return_value=(VALID_JPEG, "image/jpeg", "https://example.com/cat.jpg"),
             ):
                 handled = asyncio.run(main.maybe_send_internet_image(message, message.text))
 
         self.assertTrue(handled)
         self.assertEqual(1, len(message.photo_calls))
         self.assertIn("Cat", message.photo_calls[0]["caption"])
+
+    def test_translation_reply_route_excludes_memory_and_image_search(self) -> None:
+        main.MEMORY.save_message(
+            chat_id=-1001,
+            message_id=60,
+            sender_label="Aigan",
+            text="old answer about AI-generated image",
+            created_at=datetime.now(timezone.utc),
+        )
+        replied = FakeMessage("Structure and Details: The object looks handmade.", message_id=61)
+        message = FakeMessage("@thrd_ua_bot переведи українською", message_id=62)
+        message.reply_to_message = replied
+        context = SimpleNamespace(bot=SimpleNamespace(send_chat_action=AsyncMock()))
+
+        with patch.object(main, "run_agent", new=AsyncMock(return_value="переклад")) as run_agent:
+            with patch.object(main, "maybe_send_internet_image", new=AsyncMock()) as image_send:
+                asyncio.run(main.handle_prompt(message, context, "переведи українською"))
+
+        self.assertEqual("translate_reference", main.classify_request(message, "переведи українською"))
+        image_send.assert_not_awaited()
+        agent_input = run_agent.await_args.args[0]
+        self.assertIn("Request route: translate_reference", agent_input)
+        self.assertIn("Structure and Details", agent_input)
+        self.assertNotIn("old answer about AI-generated image", agent_input)
+        self.assertNotIn("Untrusted persistent recent chat memory", agent_input)
+
+    def test_long_source_text_with_image_show_does_not_trigger_image_send(self) -> None:
+        prompt = (
+            "Structure and Details The structure in the image has a handmade appearance "
+            "and the materials show wear from outdoor exposure. " * 3
+        )
+
+        self.assertFalse(main.is_internet_image_request(prompt))
+        self.assertNotEqual("internet_image_send", main.classify_request(FakeMessage(prompt), prompt))
+
+    def test_explicit_image_prompt_routes_to_image_send(self) -> None:
+        prompt = "покажи картинку кота"
+
+        self.assertTrue(main.is_internet_image_request(prompt))
+        self.assertEqual("internet_image_send", main.classify_request(FakeMessage(prompt), prompt))
+
+    def test_invalid_image_candidate_is_skipped_before_valid_photo(self) -> None:
+        message = FakeMessage("покажи картинку кота", message_id=70)
+
+        with patch.object(
+            main,
+            "search_image_candidates",
+            return_value=[
+                {"title": "Bad", "image": "https://example.com/bad.jpg", "source": "https://example.com/bad"},
+                {"title": "Good", "image": "https://example.com/good.jpg", "source": "https://example.com/good"},
+            ],
+        ):
+            with patch.object(
+                main,
+                "fetch_binary_url",
+                side_effect=[
+                    (b"not-an-image", "image/jpeg", "https://example.com/bad.jpg"),
+                    (VALID_JPEG, "image/jpeg", "https://example.com/good.jpg"),
+                ],
+            ):
+                handled = asyncio.run(main.maybe_send_internet_image(message, message.text))
+
+        self.assertTrue(handled)
+        self.assertEqual(1, len(message.photo_calls))
+        self.assertIn("Good", message.photo_calls[0]["caption"])
+        self.assertIn("Good", main.MEMORY.latest(message.chat_id, 1)[0].source_title)
+
+    def test_telegram_photo_failure_tries_next_candidate_without_storing_failed_image(self) -> None:
+        message = FakeMessage("покажи картинку кота", message_id=71)
+        message.photo_failures = 2
+
+        with patch.object(
+            main,
+            "search_image_candidates",
+            return_value=[
+                {"title": "Rejected", "image": "https://example.com/rejected.jpg", "source": "https://example.com/rejected"},
+                {"title": "Accepted", "image": "https://example.com/accepted.jpg", "source": "https://example.com/accepted"},
+            ],
+        ):
+            with patch.object(
+                main,
+                "fetch_binary_url",
+                side_effect=[
+                    (VALID_JPEG, "image/jpeg", "https://example.com/rejected.jpg"),
+                    (VALID_JPEG, "image/jpeg", "https://example.com/accepted.jpg"),
+                ],
+            ):
+                handled = asyncio.run(main.maybe_send_internet_image(message, message.text))
+
+        self.assertTrue(handled)
+        self.assertEqual(1, len(message.photo_calls))
+        self.assertIn("Accepted", message.photo_calls[0]["caption"])
+        stored = main.MEMORY.latest(message.chat_id, 5)
+        self.assertEqual(1, len([item for item in stored if item.attachment_type == "web_image"]))
+        self.assertIn("Accepted", stored[-1].source_title)
+
+    def test_time_sensitive_prompt_prefetches_web_context(self) -> None:
+        prompt = "яка погода зараз в Атланті?"
+        route = main.classify_request(FakeMessage(prompt), prompt)
+
+        with patch.object(main, "search_web", return_value="fresh weather result") as search_web:
+            context = asyncio.run(main.maybe_prefetch_web_context(prompt, route))
+
+        self.assertEqual("time_sensitive", route)
+        search_web.assert_called_once()
+        self.assertIn("fresh weather result", context)
+
+    def test_stable_past_prompt_does_not_force_web_prefetch(self) -> None:
+        prompt = "коли почалась друга світова війна?"
+        route = main.classify_request(FakeMessage(prompt), prompt)
+
+        with patch.object(main, "search_web") as search_web:
+            context = asyncio.run(main.maybe_prefetch_web_context(prompt, route))
+
+        self.assertEqual("normal", route)
+        self.assertEqual("(none)", context)
+        search_web.assert_not_called()
+
+    def test_changelog_parser_returns_latest_entry(self) -> None:
+        text = """# Changelog
+
+## 2026-05-09 - Latest
+
+- One
+
+## 2026-05-08 - Older
+
+- Two
+"""
+        entries = main.parse_changelog_entries(text)
+
+        self.assertEqual(2, len(entries))
+        self.assertIn("Latest", entries[0])
+        self.assertNotIn("Older", entries[0])
+
+    def test_version_command_replies_with_latest_entry(self) -> None:
+        message = FakeMessage("/version")
+
+        with patch.object(main, "read_changelog_entries", return_value=["## 2026-05-09 - Latest\n\n- One"]):
+            asyncio.run(main.version_command(SimpleNamespace(effective_message=message), SimpleNamespace()))
+
+        self.assertIn("Latest", message.reply_calls[0]["text"])
+
+    def test_version_command_accepts_capped_count(self) -> None:
+        message = FakeMessage("/version 3")
+
+        with patch.object(main, "read_changelog_entries", return_value=["one", "two", "three"]) as read_entries:
+            asyncio.run(main.version_command(SimpleNamespace(effective_message=message), SimpleNamespace()))
+
+        read_entries.assert_called_once_with(3)
+        self.assertIn("one", message.reply_calls[0]["text"])
+        self.assertIn("three", message.reply_calls[0]["text"])
+
+    def test_missing_changelog_returns_graceful_message(self) -> None:
+        message = FakeMessage("/version")
+
+        with patch.object(main, "read_changelog_entries", return_value=[]):
+            asyncio.run(main.version_command(SimpleNamespace(effective_message=message), SimpleNamespace()))
+
+        self.assertEqual("Немає записів про версію.", message.reply_calls[0]["text"])
 
 
 if __name__ == "__main__":
