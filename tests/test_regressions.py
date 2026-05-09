@@ -846,6 +846,46 @@ class PersistentMemoryTests(unittest.TestCase):
 
         self.assertEqual("Немає записів про версію.", message.reply_calls[0]["text"])
 
+    def test_localized_version_alias_accepts_count(self) -> None:
+        message = FakeMessage("/версія 3")
+        context = SimpleNamespace(bot=SimpleNamespace(username="thrd_ua_bot", id=8712856238))
+
+        with patch.object(main, "read_changelog_entries", return_value=["one", "two", "three"]) as read_entries:
+            asyncio.run(main.localized_command_alias(SimpleNamespace(effective_message=message), context))
+
+        read_entries.assert_called_once_with(3)
+        self.assertIn("one", message.reply_calls[0]["text"])
+
+    def test_localized_alias_with_bot_suffix_matches_current_bot_only(self) -> None:
+        self.assertEqual(("version", "2"), main.localized_command_match("/версія@thrd_ua_bot 2", "thrd_ua_bot"))
+        self.assertIsNone(main.localized_command_match("/версія@other_bot 2", "thrd_ua_bot"))
+
+    def test_localized_help_alias_replies_with_ukrainian_aliases(self) -> None:
+        message = FakeMessage("/довідка")
+        context = SimpleNamespace(bot=SimpleNamespace(username="thrd_ua_bot", id=8712856238))
+
+        asyncio.run(main.localized_command_alias(SimpleNamespace(effective_message=message), context))
+
+        self.assertIn("/версія", message.reply_calls[0]["text"])
+        self.assertIn("/питай", message.reply_calls[0]["text"])
+
+    def test_localized_ai_alias_invokes_prompt_handler(self) -> None:
+        message = FakeMessage("/питай яка погода зараз?")
+        context = SimpleNamespace(bot=SimpleNamespace(username="thrd_ua_bot", id=8712856238))
+
+        with patch.object(main, "handle_prompt", new=AsyncMock()) as handle_prompt:
+            asyncio.run(main.localized_command_alias(SimpleNamespace(effective_message=message), context))
+
+        handle_prompt.assert_awaited_once_with(message, context, "яка погода зараз?")
+
+    def test_localized_ping_alias_uses_allowlisted_command(self) -> None:
+        message = FakeMessage("/пінг")
+        context = SimpleNamespace(bot=SimpleNamespace(username="thrd_ua_bot", id=8712856238))
+
+        asyncio.run(main.localized_command_alias(SimpleNamespace(effective_message=message), context))
+
+        self.assertIn("pong", message.reply_calls[0]["text"])
+
 
 if __name__ == "__main__":
     unittest.main()

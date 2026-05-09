@@ -1,5 +1,11 @@
 # Aigan Changelog
 
+## 2026-05-09 - Ukrainian command aliases
+
+- Added Ukrainian aliases for common commands: `/версія`, `/довідка`, `/айді`, `/пінг`, `/контекст`, `/проактив`, and `/питай`.
+- Kept aliases as explicit commands, so they do not make the bot respond to ordinary group messages.
+- Updated help and README so Ukrainian users can use commands without switching keyboard layout.
+
 ## 2026-05-09 - Explicit current-claim verification
 
 - Added safe web verification for current-looking forwarded claims after explicit bot invocation or private DM.

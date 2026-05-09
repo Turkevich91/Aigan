@@ -244,6 +244,26 @@ MARKDOWN_BOLD_RE = re.compile(r"\*\*(.+?)\*\*", re.DOTALL)
 MARKDOWN_HEADING_RE = re.compile(r"(?m)^\s{0,3}#{1,6}\s+(.+)$")
 CHANGELOG_PATH = APP_DIR / "CHANGELOG.md"
 MAX_VERSION_ENTRIES = 5
+LOCALIZED_COMMAND_ALIASES = {
+    "версія": "version",
+    "довідка": "help",
+    "допомога": "help",
+    "айді": "ids",
+    "ід": "ids",
+    "пінг": "ping",
+    "контекст": "context",
+    "проактив": "proactive_now",
+    "проактивно": "proactive_now",
+    "питай": "ai",
+    "запит": "ai",
+    "аі": "ai",
+}
+LOCALIZED_COMMAND_RE = re.compile(
+    r"^/(?P<command>"
+    + "|".join(re.escape(command) for command in sorted(LOCALIZED_COMMAND_ALIASES, key=len, reverse=True))
+    + r")(?:@(?P<bot>[A-Za-z0-9_]+))?(?:\s+(?P<args>.*))?$",
+    re.IGNORECASE,
+)
 
 
 @lru_cache(maxsize=4)
@@ -1889,6 +1909,20 @@ def version_count_from_text(text: str | None) -> int:
         return 1
 
 
+def localized_command_match(text: str | None, bot_username: str | None = None) -> tuple[str, str] | None:
+    if not text:
+        return None
+    match = LOCALIZED_COMMAND_RE.match(text.strip())
+    if not match:
+        return None
+
+    target_bot = match.group("bot")
+    if target_bot and bot_username and target_bot.lower() != bot_username.lower():
+        return None
+    command = LOCALIZED_COMMAND_ALIASES[match.group("command").lower()]
+    return command, (match.group("args") or "").strip()
+
+
 def allow_command(message: Message, command_name: str) -> bool:
     if should_allow_chat(message):
         return True
@@ -1903,7 +1937,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if not allow_command(message, "help"):
         return
     await message.reply_text(
-        f"Я на зв'язку. У групі клич мене так: {CONFIG.bot_trigger} питання, /ai питання, згадка або reply. Для діагностики: /ids, /context, /version, /proactive_now."
+        f"Я на зв'язку. У групі клич мене так: {CONFIG.bot_trigger} питання, /ai або /питай, згадка або reply. Для діагностики: /ids (/айді), /context (/контекст), /version (/версія), /proactive_now (/проактив)."
     )
 
 
@@ -2042,6 +2076,32 @@ async def command_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     parts = message.text.split(maxsplit=1)
     prompt = parts[1].strip() if len(parts) > 1 else DEFAULT_CONTEXT_PROMPT
     await handle_prompt(message, context, prompt)
+
+
+async def localized_command_alias(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    if message is None or message.text is None:
+        return
+    bot_username = await get_bot_username(context)
+    parsed = localized_command_match(message.text, bot_username)
+    if parsed is None:
+        return
+
+    command, args = parsed
+    if command == "help":
+        await help_command(update, context)
+    elif command == "ids":
+        await ids_command(update, context)
+    elif command == "ping":
+        await ping_command(update, context)
+    elif command == "version":
+        await version_command(update, context)
+    elif command == "context":
+        await context_command(update, context)
+    elif command == "proactive_now":
+        await proactive_now_command(update, context)
+    elif command == "ai":
+        await handle_prompt(message, context, args or DEFAULT_CONTEXT_PROMPT)
 
 
 async def handle_pending_or_observe(message: Message, context: ContextTypes.DEFAULT_TYPE) -> bool:
@@ -2466,6 +2526,7 @@ def main() -> None:
     application.add_handler(CommandHandler(["context"], context_command))
     application.add_handler(CommandHandler(["proactive_now"], proactive_now_command))
     application.add_handler(CommandHandler(["ai", "aigan", "monday"], command_prompt))
+    application.add_handler(MessageHandler(filters.TEXT & filters.Regex(LOCALIZED_COMMAND_RE), localized_command_alias))
     application.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, text_message))
     LOGGER.info("Starting Aigan with model=%s trigger=%s", CONFIG.openai_model, CONFIG.bot_trigger)
     application.run_polling(allowed_updates=Update.ALL_TYPES)

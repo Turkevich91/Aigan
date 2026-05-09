@@ -46,6 +46,17 @@ In a group chat, use:
 /ai summarize this https://www.youtube.com/watch?v=...
 ```
 
+Ukrainian aliases are also available so users do not need to switch keyboard layout:
+
+```text
+/пінг
+/айді
+/версія
+/контекст
+/проактив
+/питай підсумуй це відео https://www.youtube.com/watch?v=...
+```
+
 If Telegram privacy mode is on and the bot is not an admin, it may only receive commands, mentions, and replies. That is usually good for cost control.
 
 For first group debugging, use `/ping@your_bot_username` or `/ids@your_bot_username`.
