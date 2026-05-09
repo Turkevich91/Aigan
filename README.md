@@ -92,6 +92,8 @@ In a private chat with the bot, simply forwarding a message/photo/link is treate
 
 In a group chat, replying to or quoting a message with only `@bot_username` is also treated as an implicit request. The bot should use the replied-to/quoted/forwarded item as the main context even when you do not add words like `поясни`.
 
+For current-looking forwarded news or political claims, Aigan may run a safe web check automatically, but only after an explicit bot invocation or in private DM. Ordinary group messages without a mention, command, trigger, reply-to-bot, or pending request stay silent and are only stored as passive context.
+
 If the user asks first and forwards content immediately after, the bot keeps a short pending request window:
 
 ```env

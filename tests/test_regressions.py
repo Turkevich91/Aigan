@@ -371,6 +371,10 @@ class PersistentMemoryTests(unittest.TestCase):
             main.MEMORY.clear_all()
         main.passive_contexts.clear()
         main.histories.clear()
+        main.pending_requests.clear()
+        main.last_user_call.clear()
+        main.last_chat_call.clear()
+        main.last_auto_react_chat.clear()
 
     def test_messages_persist_after_ram_context_is_cleared(self) -> None:
         self.assertIsNotNone(main.MEMORY)
@@ -705,10 +709,11 @@ class PersistentMemoryTests(unittest.TestCase):
 
     def test_time_sensitive_prompt_prefetches_web_context(self) -> None:
         prompt = "яка погода зараз в Атланті?"
-        route = main.classify_request(FakeMessage(prompt), prompt)
+        message = FakeMessage(prompt)
+        route = main.classify_request(message, prompt)
 
         with patch.object(main, "search_web", return_value="fresh weather result") as search_web:
-            context = asyncio.run(main.maybe_prefetch_web_context(prompt, route))
+            context = asyncio.run(main.maybe_prefetch_web_context(message, prompt, route))
 
         self.assertEqual("time_sensitive", route)
         search_web.assert_called_once()
@@ -719,11 +724,84 @@ class PersistentMemoryTests(unittest.TestCase):
         route = main.classify_request(FakeMessage(prompt), prompt)
 
         with patch.object(main, "search_web") as search_web:
-            context = asyncio.run(main.maybe_prefetch_web_context(prompt, route))
+            context = asyncio.run(main.maybe_prefetch_web_context(FakeMessage(prompt), prompt, route))
 
         self.assertEqual("normal", route)
         self.assertEqual("(none)", context)
         search_web.assert_not_called()
+
+    def test_private_forwarded_current_claim_routes_to_web_prefetch(self) -> None:
+        claim = "Петер Мадяр офіційно став прем’єр-міністром Угорщини. Орбан на засідання парламенту не прийшов."
+        message = FakeMessage(claim, chat_type=ChatType.PRIVATE, chat_id=407892151, message_id=80)
+        message.forward_date = datetime.now(timezone.utc)
+        context = SimpleNamespace(bot=SimpleNamespace(send_chat_action=AsyncMock()))
+
+        with patch.object(main, "search_web", return_value="fresh political result") as search_web:
+            with patch.object(main, "run_agent", new=AsyncMock(return_value="перевірено")) as run_agent:
+                asyncio.run(main.handle_prompt(message, context, main.DEFAULT_CONTEXT_PROMPT))
+
+        search_web.assert_called_once()
+        self.assertIn("Петер Мадяр", search_web.call_args.args[0])
+        self.assertNotIn(main.DEFAULT_CONTEXT_PROMPT, search_web.call_args.args[0])
+        agent_input = run_agent.await_args.args[0]
+        self.assertIn("Request route: time_sensitive", agent_input)
+        self.assertIn("fresh political result", agent_input)
+
+    def test_group_mention_on_replied_current_claim_routes_to_web_prefetch(self) -> None:
+        claim = "Петер Мадяр офіційно став прем’єр-міністром Угорщини."
+        replied = FakeMessage(claim, message_id=81)
+        message = FakeMessage("@thrd_ua_bot що це?", message_id=82)
+        message.reply_to_message = replied
+        context = SimpleNamespace(bot=SimpleNamespace(username="thrd_ua_bot", id=8712856238, send_chat_action=AsyncMock()))
+
+        with patch.object(main, "search_web", return_value="fresh reply result") as search_web:
+            with patch.object(main, "run_agent", new=AsyncMock(return_value="відповідь")) as run_agent:
+                asyncio.run(main.text_message(SimpleNamespace(effective_message=message), context))
+
+        search_web.assert_called_once()
+        self.assertIn("Петер Мадяр", search_web.call_args.args[0])
+        self.assertIn("Request route: time_sensitive", run_agent.await_args.args[0])
+
+    def test_group_ordinary_current_claim_stays_silent_without_trigger(self) -> None:
+        message = FakeMessage("Петер Мадяр офіційно став прем’єр-міністром Угорщини.", message_id=83)
+        context = SimpleNamespace(bot=SimpleNamespace(username="thrd_ua_bot", id=8712856238, send_chat_action=AsyncMock()))
+
+        with patch.object(main, "search_web") as search_web:
+            with patch.object(main, "handle_prompt", new=AsyncMock()) as handle_prompt:
+                asyncio.run(main.text_message(SimpleNamespace(effective_message=message), context))
+
+        handle_prompt.assert_not_awaited()
+        search_web.assert_not_called()
+        self.assertIn("Петер Мадяр", main.format_passive_context(message.chat_id))
+
+    def test_group_ordinary_forwarded_current_claim_stays_silent_without_trigger(self) -> None:
+        message = FakeMessage("Петер Мадяр офіційно став прем’єр-міністром Угорщини.", message_id=84)
+        message.forward_date = datetime.now(timezone.utc)
+        context = SimpleNamespace(bot=SimpleNamespace(username="thrd_ua_bot", id=8712856238, send_chat_action=AsyncMock()))
+
+        with patch.object(main, "search_web") as search_web:
+            with patch.object(main, "handle_prompt", new=AsyncMock()) as handle_prompt:
+                asyncio.run(main.text_message(SimpleNamespace(effective_message=message), context))
+
+        handle_prompt.assert_not_awaited()
+        search_web.assert_not_called()
+        self.assertIn("Петер Мадяр", main.format_passive_context(message.chat_id))
+
+    def test_explicit_verify_news_prompt_routes_to_time_sensitive(self) -> None:
+        prompt = "перевір новину: Петер Мадяр офіційно став прем’єр-міністром Угорщини"
+        message = FakeMessage(prompt)
+
+        self.assertEqual("time_sensitive", main.classify_request(message, prompt))
+
+    def test_translation_and_image_routes_do_not_web_prefetch(self) -> None:
+        replied = FakeMessage("Петер Мадяр офіційно став прем’єр-міністром Угорщини.", message_id=85)
+        translation = FakeMessage("@thrd_ua_bot переклади українською", message_id=86)
+        translation.reply_to_message = replied
+        image_prompt = "покажи фото прем’єр-міністра Угорщини"
+        image_message = FakeMessage(image_prompt, message_id=87)
+
+        self.assertEqual("translate_reference", main.classify_request(translation, "переклади українською"))
+        self.assertEqual("internet_image_send", main.classify_request(image_message, image_prompt))
 
     def test_changelog_parser_returns_latest_entry(self) -> None:
         text = """# Changelog

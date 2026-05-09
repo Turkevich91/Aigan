@@ -1,5 +1,11 @@
 # Aigan Changelog
 
+## 2026-05-09 - Explicit current-claim verification
+
+- Added safe web verification for current-looking forwarded claims after explicit bot invocation or private DM.
+- Kept ordinary group messages silent unless the bot is mentioned, triggered, replied to, or consuming a pending request.
+- Improved time-sensitive routing for political/news claims while preserving translation and image-route precedence.
+
 ## 2026-05-09 - Albums and long replies
 
 - Grouped 2-10 found internet images into Telegram albums instead of separate photo messages.
