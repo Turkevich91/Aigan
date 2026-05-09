@@ -6,7 +6,7 @@ Default model: `gpt-5.4-mini`. The public model catalog currently lists `gpt-5.4
 
 ## What is included
 
-- Telegram bot that replies in groups on trigger, mention, reply, or `/ai`.
+- Telegram bot that replies in groups on trigger, mention, reply, `/ai`, `/питай`, `/п`, or `/а`.
 - Passive group context capture when Telegram bot privacy/chat access allows all messages.
 - Optional scheduled proactive messages and cautious auto-reactions, disabled by default.
 - OpenAI Agents SDK with local stdio MCP servers.
@@ -55,6 +55,8 @@ Ukrainian aliases are also available so users do not need to switch keyboard lay
 /контекст
 /проактив
 /питай підсумуй це відео https://www.youtube.com/watch?v=...
+/п коротко поясни попереднє
+/а що тут важливо?
 ```
 
 If Telegram privacy mode is on and the bot is not an admin, it may only receive commands, mentions, and replies. That is usually good for cost control.

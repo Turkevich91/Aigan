@@ -1,5 +1,11 @@
 # Aigan Changelog
 
+## 2026-05-09 - Short Ukrainian ask aliases
+
+- Added `/п` and `/а` as short Ukrainian aliases for `/питай`.
+- Updated help and README so users can ask the bot without switching keyboard layout.
+- Kept the aliases as explicit slash commands, so ordinary group messages still do not trigger the bot.
+
 ## 2026-05-09 - Ukrainian command aliases
 
 - Added Ukrainian aliases for common commands: `/версія`, `/довідка`, `/айді`, `/пінг`, `/контекст`, `/проактив`, and `/питай`.

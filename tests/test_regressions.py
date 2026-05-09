@@ -868,6 +868,8 @@ class PersistentMemoryTests(unittest.TestCase):
 
         self.assertIn("/версія", message.reply_calls[0]["text"])
         self.assertIn("/питай", message.reply_calls[0]["text"])
+        self.assertIn("/п", message.reply_calls[0]["text"])
+        self.assertIn("/а", message.reply_calls[0]["text"])
 
     def test_localized_ai_alias_invokes_prompt_handler(self) -> None:
         message = FakeMessage("/питай яка погода зараз?")
@@ -877,6 +879,27 @@ class PersistentMemoryTests(unittest.TestCase):
             asyncio.run(main.localized_command_alias(SimpleNamespace(effective_message=message), context))
 
         handle_prompt.assert_awaited_once_with(message, context, "яка погода зараз?")
+
+    def test_short_localized_ai_aliases_invoke_prompt_handler(self) -> None:
+        context = SimpleNamespace(bot=SimpleNamespace(username="thrd_ua_bot", id=8712856238))
+
+        for command in ("/п", "/а"):
+            with self.subTest(command=command):
+                message = FakeMessage(f"{command} тест")
+                with patch.object(main, "handle_prompt", new=AsyncMock()) as handle_prompt:
+                    asyncio.run(main.localized_command_alias(SimpleNamespace(effective_message=message), context))
+
+                handle_prompt.assert_awaited_once_with(message, context, "тест")
+
+    def test_short_localized_ai_aliases_accept_bot_suffix(self) -> None:
+        self.assertEqual(("ai", "тест"), main.localized_command_match("/п@thrd_ua_bot тест", "thrd_ua_bot"))
+        self.assertEqual(("ai", "тест"), main.localized_command_match("/а@thrd_ua_bot тест", "thrd_ua_bot"))
+        self.assertIsNone(main.localized_command_match("/п@other_bot тест", "thrd_ua_bot"))
+        self.assertIsNone(main.localized_command_match("/а@other_bot тест", "thrd_ua_bot"))
+
+    def test_short_localized_ai_aliases_require_slash(self) -> None:
+        self.assertIsNone(main.localized_command_match("п тест", "thrd_ua_bot"))
+        self.assertIsNone(main.localized_command_match("а тест", "thrd_ua_bot"))
 
     def test_localized_ping_alias_uses_allowlisted_command(self) -> None:
         message = FakeMessage("/пінг")

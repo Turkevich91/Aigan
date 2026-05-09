@@ -255,8 +255,10 @@ LOCALIZED_COMMAND_ALIASES = {
     "проактив": "proactive_now",
     "проактивно": "proactive_now",
     "питай": "ai",
+    "п": "ai",
     "запит": "ai",
     "аі": "ai",
+    "а": "ai",
 }
 LOCALIZED_COMMAND_RE = re.compile(
     r"^/(?P<command>"
@@ -1937,7 +1939,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if not allow_command(message, "help"):
         return
     await message.reply_text(
-        f"Я на зв'язку. У групі клич мене так: {CONFIG.bot_trigger} питання, /ai або /питай, згадка або reply. Для діагностики: /ids (/айді), /context (/контекст), /version (/версія), /proactive_now (/проактив)."
+        f"Я на зв'язку. У групі клич мене так: {CONFIG.bot_trigger} питання, /ai, /питай, /п, /а, згадка або reply. Для діагностики: /ids (/айді), /context (/контекст), /version (/версія), /proactive_now (/проактив)."
     )
 
 
