@@ -1,5 +1,11 @@
 # Aigan Changelog
 
+## 2026-05-09 - Albums and long replies
+
+- Grouped 2-10 found internet images into Telegram albums instead of separate photo messages.
+- Added fallback to individual photos if Telegram rejects an album.
+- Added smart splitting for long text replies so answers are chunked instead of truncated at one message.
+
 ## 2026-05-09 - Internet images as photos
 
 - Improved image-request routing for prompts like `знайди 3 фотки ... і запость сюди`.

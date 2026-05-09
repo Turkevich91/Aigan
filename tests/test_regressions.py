@@ -20,6 +20,9 @@ os.environ["ALLOWED_CHAT_IDS"] = "-1001"
 os.environ["ADMIN_USER_IDS"] = "407892151"
 os.environ["AUTO_REACT_ENABLED"] = "false"
 os.environ["BOT_TIMEZONE"] = "America/New_York"
+os.environ["MAX_REPLY_CHARS"] = "12000"
+os.environ["TELEGRAM_TEXT_CHUNK_CHARS"] = "3500"
+os.environ["MAX_REPLY_CHUNKS"] = "4"
 os.environ["FOLLOWUP_DEBOUNCE_SECONDS"] = "0.5"
 os.environ["MEMORY_ENABLED"] = "true"
 os.environ["MEMORY_DB_PATH"] = TEST_DB_PATH
@@ -28,6 +31,7 @@ os.environ["MEMORY_RETENTION_DAYS"] = "30"
 os.environ["MEMORY_IMAGE_SUMMARY_LIMIT"] = "3"
 
 import httpx
+from telegram import InputMediaPhoto
 from telegram.constants import ChatType, ParseMode
 from telegram.error import BadRequest
 
@@ -70,6 +74,9 @@ class FakeMessage:
         self.reply_calls = []
         self.photo_calls = []
         self.photo_failures = 0
+        self.media_group_calls = []
+        self.media_group_attempts = 0
+        self.media_group_failures = 0
         self.bot = SimpleNamespace(send_chat_action=AsyncMock())
 
     async def reply_text(self, text: str, **kwargs) -> None:
@@ -81,6 +88,14 @@ class FakeMessage:
             self.photo_failures -= 1
             raise BadRequest("failed to send photo")
         self.photo_calls.append({"photo": photo, **kwargs})
+
+    async def reply_media_group(self, media, **kwargs):
+        self.media_group_attempts += 1
+        if self.media_group_failures > 0:
+            self.media_group_failures -= 1
+            raise BadRequest("failed to send media group")
+        self.media_group_calls.append({"media": tuple(media), **kwargs})
+        return tuple(SimpleNamespace(message_id=self.message_id + index) for index, _ in enumerate(media, start=1))
 
     def get_bot(self):
         return self.bot
@@ -318,6 +333,37 @@ class TelegramFormattingTests(unittest.TestCase):
 
         bot.send_message.assert_awaited_once_with(chat_id=-1001, text="<b>auto</b>", parse_mode=ParseMode.HTML)
 
+    def test_send_reply_smart_splits_long_text_without_3600_truncation(self) -> None:
+        message = FakeMessage()
+        text = "A" * 4100
+
+        asyncio.run(main.send_reply(message, text))
+
+        self.assertGreater(len(message.reply_calls), 1)
+        self.assertNotIn("[trimmed]", "\n".join(call["text"] for call in message.reply_calls))
+        self.assertNotIn("[...] скорочено", "\n".join(call["text"] for call in message.reply_calls))
+        self.assertTrue(all(len(call["text"]) <= main.CONFIG.telegram_text_chunk_chars for call in message.reply_calls))
+
+    def test_split_text_prefers_paragraph_boundary(self) -> None:
+        chunks = main.split_text_chunks("intro\n\n" + "body " * 12, chunk_chars=40, max_chunks=10, max_total_chars=500)
+
+        self.assertGreaterEqual(len(chunks), 2)
+        self.assertTrue(chunks[0].endswith("intro"))
+
+    def test_single_huge_paragraph_is_hard_wrapped(self) -> None:
+        chunks = main.split_text_chunks("x" * 130, chunk_chars=50, max_chunks=10, max_total_chars=500)
+
+        self.assertGreater(len(chunks), 1)
+        self.assertTrue(all(len(chunk) <= 50 for chunk in chunks))
+
+    def test_too_many_text_chunks_are_capped_with_marker(self) -> None:
+        text = "\n\n".join(f"paragraph {index} " * 4 for index in range(10))
+
+        chunks = main.split_text_chunks(text, chunk_chars=45, max_chunks=2, max_total_chars=1000)
+
+        self.assertEqual(2, len(chunks))
+        self.assertIn("[...] скорочено", chunks[-1])
+
 
 class PersistentMemoryTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -530,7 +576,7 @@ class PersistentMemoryTests(unittest.TestCase):
         self.assertEqual("капібар", main.image_search_query(prompt))
         self.assertEqual("internet_image_send", main.classify_request(FakeMessage(prompt), prompt))
 
-    def test_multi_image_request_sends_requested_photos_as_bytes(self) -> None:
+    def test_multi_image_request_sends_requested_photos_as_album_bytes(self) -> None:
         message = FakeMessage("знайди в інеті 3 фотки капібар і запость сюди", message_id=72)
 
         with patch.object(
@@ -555,12 +601,52 @@ class PersistentMemoryTests(unittest.TestCase):
 
         self.assertTrue(handled)
         search_images.assert_called_once_with("капібар", 10)
+        self.assertEqual(1, message.media_group_attempts)
+        self.assertEqual(1, len(message.media_group_calls))
+        self.assertEqual(0, len(message.photo_calls))
+        media = message.media_group_calls[0]["media"]
+        self.assertEqual(3, len(media))
+        self.assertTrue(all(isinstance(item, InputMediaPhoto) for item in media))
+        self.assertTrue(all(not str(item.media).startswith("http") for item in media))
+        self.assertIn("Capybara 1", media[0].caption)
+        self.assertLessEqual(len(media[0].caption), 1024)
+        self.assertNotIn("<a href", media[0].caption)
+        self.assertIsNone(media[1].caption)
+        self.assertIsNone(media[2].caption)
+        stored = main.MEMORY.latest(message.chat_id, 10)
+        self.assertEqual(3, len([item for item in stored if item.attachment_type == "web_image"]))
+
+    def test_album_failure_falls_back_to_individual_photos_and_memory(self) -> None:
+        message = FakeMessage("знайди в інеті 3 фотки капібар і запость сюди", message_id=73)
+        message.media_group_failures = 1
+
+        with patch.object(
+            main,
+            "search_image_candidates",
+            return_value=[
+                {"title": "Capybara 1", "image": "https://example.com/capy1.jpg", "source": "https://example.com/capy1"},
+                {"title": "Capybara 2", "image": "https://example.com/capy2.jpg", "source": "https://example.com/capy2"},
+                {"title": "Capybara 3", "image": "https://example.com/capy3.jpg", "source": "https://example.com/capy3"},
+            ],
+        ):
+            with patch.object(
+                main,
+                "fetch_binary_url",
+                side_effect=[
+                    (VALID_JPEG, "image/jpeg", "https://example.com/capy1.jpg"),
+                    (VALID_JPEG, "image/jpeg", "https://example.com/capy2.jpg"),
+                    (VALID_JPEG, "image/jpeg", "https://example.com/capy3.jpg"),
+                ],
+            ):
+                handled = asyncio.run(main.maybe_send_internet_image(message, message.text))
+
+        self.assertTrue(handled)
+        self.assertEqual(1, message.media_group_attempts)
+        self.assertEqual(0, len(message.media_group_calls))
         self.assertEqual(3, len(message.photo_calls))
-        for call in message.photo_calls:
-            self.assertNotIn("<a href", call["caption"])
-            self.assertTrue(hasattr(call["photo"], "read"))
         self.assertIn("1/3. Capybara 1", message.photo_calls[0]["caption"])
-        self.assertIn("3/3. Capybara 3", message.photo_calls[2]["caption"])
+        stored = main.MEMORY.latest(message.chat_id, 10)
+        self.assertEqual(3, len([item for item in stored if item.attachment_type == "web_image"]))
 
     def test_invalid_image_candidate_is_skipped_before_valid_photo(self) -> None:
         message = FakeMessage("покажи картинку кота", message_id=70)
