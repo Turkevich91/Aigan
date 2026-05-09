@@ -1,5 +1,11 @@
 # Aigan Changelog
 
+## 2026-05-09 - Internet images as photos
+
+- Improved image-request routing for prompts like `знайди 3 фотки ... і запость сюди`.
+- Added multi-image sending so Aigan uploads valid image bytes as Telegram photos instead of replying with image-link lists.
+- Kept source attribution in photo captions while avoiding raw `<a href>` image-link answers.
+
 ## 2026-05-09 - Safe routing and version notes
 
 - Added `/version` so the chat can view the latest local release notes.

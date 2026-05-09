@@ -129,7 +129,7 @@ WEB_IMAGE_SEARCH_ENABLED=true
 
 The bot can only remember messages Telegram delivered to it after memory is enabled. It cannot fetch arbitrary older group history. If a forwarded post contains a real `photo` or image `document`, the bot can cache and analyze it. If Telegram only shows a client-side link preview and does not deliver the image file, Aigan keeps the text/link and may fetch public page images, but it cannot inspect a private preview that was never sent through Bot API.
 
-For web image requests such as `покажи картинку ...`, Aigan searches safe public image results, filters Russian/private hosts, sends a photo to the chat with its source, and can analyze the found image when the prompt asks for explanation.
+For web image requests such as `покажи картинку ...` or `знайди 3 фотки ...`, Aigan searches safe public image results, filters Russian/private hosts, downloads valid image bytes, and sends Telegram photo attachments with source captions instead of replying with raw image links.
 
 ## Version Notes
 

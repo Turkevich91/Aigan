@@ -522,6 +522,46 @@ class PersistentMemoryTests(unittest.TestCase):
         self.assertTrue(main.is_internet_image_request(prompt))
         self.assertEqual("internet_image_send", main.classify_request(FakeMessage(prompt), prompt))
 
+    def test_slang_multi_image_prompt_routes_to_image_send(self) -> None:
+        prompt = "знайди в інеті 3 фотки капібар і запость сюди"
+
+        self.assertTrue(main.is_internet_image_request(prompt))
+        self.assertEqual(3, main.requested_image_count(prompt))
+        self.assertEqual("капібар", main.image_search_query(prompt))
+        self.assertEqual("internet_image_send", main.classify_request(FakeMessage(prompt), prompt))
+
+    def test_multi_image_request_sends_requested_photos_as_bytes(self) -> None:
+        message = FakeMessage("знайди в інеті 3 фотки капібар і запость сюди", message_id=72)
+
+        with patch.object(
+            main,
+            "search_image_candidates",
+            return_value=[
+                {"title": "Capybara 1", "image": "https://example.com/capy1.jpg", "source": "https://example.com/capy1"},
+                {"title": "Capybara 2", "image": "https://example.com/capy2.jpg", "source": "https://example.com/capy2"},
+                {"title": "Capybara 3", "image": "https://example.com/capy3.jpg", "source": "https://example.com/capy3"},
+            ],
+        ) as search_images:
+            with patch.object(
+                main,
+                "fetch_binary_url",
+                side_effect=[
+                    (VALID_JPEG, "image/jpeg", "https://example.com/capy1.jpg"),
+                    (VALID_JPEG, "image/jpeg", "https://example.com/capy2.jpg"),
+                    (VALID_JPEG, "image/jpeg", "https://example.com/capy3.jpg"),
+                ],
+            ):
+                handled = asyncio.run(main.maybe_send_internet_image(message, message.text))
+
+        self.assertTrue(handled)
+        search_images.assert_called_once_with("капібар", 10)
+        self.assertEqual(3, len(message.photo_calls))
+        for call in message.photo_calls:
+            self.assertNotIn("<a href", call["caption"])
+            self.assertTrue(hasattr(call["photo"], "read"))
+        self.assertIn("1/3. Capybara 1", message.photo_calls[0]["caption"])
+        self.assertIn("3/3. Capybara 3", message.photo_calls[2]["caption"])
+
     def test_invalid_image_candidate_is_skipped_before_valid_photo(self) -> None:
         message = FakeMessage("покажи картинку кота", message_id=70)
 
