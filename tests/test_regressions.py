@@ -1026,6 +1026,46 @@ class PersistentMemoryTests(unittest.TestCase):
         self.assertNotIn("attachment", reply)
         self.assertNotIn("sticker", reply)
 
+    def test_stats_normalizes_mentions_commands_triggers_and_pasted_output(self) -> None:
+        now = datetime.now(timezone.utc)
+        samples = [
+            "@thrd_ua_bot дай тези",
+            "/п поясни це",
+            "!m перевір це",
+            "3. thrd - 6",
+            "2. bot - 4",
+            "@someuser подивись це",
+        ]
+        for index, text in enumerate(samples):
+            main.MEMORY.save_message(
+                chat_id=-1001,
+                message_id=3050 + index,
+                sender_label="Test User (@tester, id=407892151)",
+                user_id=407892151,
+                username="tester",
+                text=text,
+                created_at=now + timedelta(seconds=index),
+            )
+        message = FakeMessage("/stat")
+
+        asyncio.run(main.stats_command(SimpleNamespace(effective_message=message), SimpleNamespace()))
+
+        reply = message.reply_calls[0]["text"].casefold()
+        self.assertIn("повідомлень: 4", reply)
+        self.assertIn("дай - 1", reply)
+        self.assertIn("тези - 1", reply)
+        self.assertIn("поясни - 1", reply)
+        self.assertIn("перевір - 1", reply)
+        self.assertNotIn("thrd", reply)
+        self.assertNotIn("bot", reply)
+        self.assertNotIn("someuser", reply)
+
+    def test_clean_user_text_for_stats_preserves_arguments(self) -> None:
+        self.assertEqual("дай тези", main.clean_user_text_for_stats("@thrd_ua_bot дай тези"))
+        self.assertEqual("поясни це", main.clean_user_text_for_stats("/п поясни це"))
+        self.assertEqual("перевір це", main.clean_user_text_for_stats("!m перевір це"))
+        self.assertEqual("", main.clean_user_text_for_stats("3. thrd - 6"))
+
     def test_localized_stats_alias_supports_admin_username_target(self) -> None:
         main.MEMORY.save_message(
             chat_id=-1001,
@@ -1101,6 +1141,42 @@ class PersistentMemoryTests(unittest.TestCase):
         self.assertIn("profile-sample-104", captured["prompt"])
         self.assertNotIn("other-user-secret", captured["prompt"])
         self.assertIn("Do not infer or mention mental health", captured["prompt"])
+
+    def test_character_command_uses_cleaned_text(self) -> None:
+        base = datetime.now(timezone.utc)
+        samples = [
+            "1. thrd - 6",
+            "2. bot - 4",
+            *[f"@thrd_ua_bot useful content {index}" for index in range(10)],
+        ]
+        for index, text in enumerate(samples):
+            main.MEMORY.save_message(
+                chat_id=-1001,
+                message_id=3500 + index,
+                sender_label="Test User (@tester, id=407892151)",
+                user_id=407892151,
+                username="tester",
+                text=text,
+                created_at=base + timedelta(seconds=index),
+            )
+        message = FakeMessage("/характер мій")
+        context = SimpleNamespace(bot=SimpleNamespace(username="thrd_ua_bot", id=8712856238, send_chat_action=AsyncMock()))
+        captured = {}
+
+        async def fake_run_plain_model(prompt: str) -> str:
+            captured["prompt"] = prompt
+            return "портрет готовий"
+
+        with patch.object(main, "run_plain_model", new=fake_run_plain_model):
+            asyncio.run(main.localized_command_alias(SimpleNamespace(effective_message=message), context))
+
+        prompt = captured["prompt"].casefold()
+        self.assertIn("useful content 0", prompt)
+        self.assertIn("useful content 9", prompt)
+        self.assertNotIn("@thrd_ua_bot", prompt)
+        self.assertNotIn("thrd", prompt)
+        self.assertNotIn("bot", prompt)
+        self.assertNotIn("1. thrd - 6", prompt)
 
     def test_character_command_requires_minimum_messages(self) -> None:
         main.MEMORY.save_message(

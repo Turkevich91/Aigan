@@ -1,5 +1,11 @@
 # Aigan Changelog
 
+## 2026-05-09 - Cleaner stat tokenization
+
+- Removed Telegram mentions, slash commands, bot trigger tokens, and pasted top-word rows from `/stat` token counts.
+- Reused the same cleaned user text for `/характер`, so bot mentions and pasted stat snippets do not shape profiles.
+- Kept normal text and media captions countable while preserving raw messages in SQLite memory.
+
 ## 2026-05-09 - Cleaner user stats filtering
 
 - Excluded media-only memory placeholders like `[message has attachment(s): sticker]` from `/stat` and `/характер`.
