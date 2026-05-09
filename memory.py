@@ -291,7 +291,12 @@ class MemoryStore:
         if user_id is None and not username:
             return []
 
-        conditions = ["chat_id = ?", "is_bot = 0", "text != ''"]
+        conditions = [
+            "chat_id = ?",
+            "is_bot = 0",
+            "text != ''",
+            "text NOT LIKE '[message has %'",
+        ]
         params: list[object] = [chat_id]
         if user_id is not None:
             conditions.append("user_id = ?")

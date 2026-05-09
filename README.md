@@ -64,7 +64,7 @@ Ukrainian aliases are also available so users do not need to switch keyboard lay
 /а що тут важливо?
 ```
 
-User commands use only retained SQLite memory for the current chat. `/stat` and `/стат` count saved messages, sentences, words, and top words. `/character`, `/profile`, `/характер`, `/портрет`, and `/профіль` build a cautious non-clinical communication portrait from the last 100 saved text messages. Users can request their own data; admins can request another user by `@username`.
+User commands use only retained SQLite memory for the current chat. `/stat` and `/стат` count saved text/caption messages, sentences, words, and top words; media-only placeholders such as photos or stickers without text are ignored. `/character`, `/profile`, `/характер`, `/портрет`, and `/профіль` build a cautious non-clinical communication portrait from the last 100 saved text messages. Users can request their own data; admins can request another user by `@username`.
 
 If Telegram privacy mode is on and the bot is not an admin, it may only receive commands, mentions, and replies. That is usually good for cost control.
 

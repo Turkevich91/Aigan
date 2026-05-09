@@ -423,6 +423,56 @@ class PersistentMemoryTests(unittest.TestCase):
         self.assertEqual("sample-005", limited[0].text)
         self.assertEqual("sample-104", limited[-1].text)
 
+    def test_user_messages_exclude_media_only_placeholders(self) -> None:
+        now = datetime.now(timezone.utc)
+        main.MEMORY.save_message(
+            chat_id=-1001,
+            message_id=2100,
+            sender_label="Alpha",
+            user_id=111,
+            username="alpha",
+            text="[message has attachment(s): sticker]",
+            content_kind="attachment",
+            attachment_type="sticker",
+            created_at=now,
+        )
+        main.MEMORY.save_message(
+            chat_id=-1001,
+            message_id=2101,
+            sender_label="Alpha",
+            user_id=111,
+            username="alpha",
+            text="[message has attachment(s): photo]",
+            content_kind="image",
+            attachment_type="photo",
+            created_at=now + timedelta(seconds=1),
+        )
+        main.MEMORY.save_message(
+            chat_id=-1001,
+            message_id=2102,
+            sender_label="Alpha",
+            user_id=111,
+            username="alpha",
+            text="caption text should count",
+            content_kind="image",
+            attachment_type="photo",
+            created_at=now + timedelta(seconds=2),
+        )
+        main.MEMORY.save_message(
+            chat_id=-1001,
+            message_id=2103,
+            sender_label="Alpha",
+            user_id=111,
+            username="alpha",
+            text="plain text should count",
+            content_kind="text",
+            created_at=now + timedelta(seconds=3),
+        )
+
+        items = main.MEMORY.user_stats(-1001, user_id=111)
+
+        self.assertEqual(["caption text should count", "plain text should count"], [item.text for item in items])
+
     def test_agent_input_marks_persistent_memory_untrusted(self) -> None:
         main.MEMORY.save_message(
             chat_id=-1001,
@@ -954,6 +1004,17 @@ class PersistentMemoryTests(unittest.TestCase):
             text="Бета тест про альфа.",
             created_at=now + timedelta(seconds=1),
         )
+        main.MEMORY.save_message(
+            chat_id=-1001,
+            message_id=3002,
+            sender_label="Test User (@tester, id=407892151)",
+            user_id=407892151,
+            username="tester",
+            text="[message has attachment(s): sticker]",
+            content_kind="attachment",
+            attachment_type="sticker",
+            created_at=now + timedelta(seconds=2),
+        )
         message = FakeMessage("/stat")
 
         asyncio.run(main.stats_command(SimpleNamespace(effective_message=message), SimpleNamespace()))
@@ -962,6 +1023,8 @@ class PersistentMemoryTests(unittest.TestCase):
         self.assertIn("повідомлень: 2", reply)
         self.assertIn("речень: 3", reply)
         self.assertIn("альфа - 3", reply)
+        self.assertNotIn("attachment", reply)
+        self.assertNotIn("sticker", reply)
 
     def test_localized_stats_alias_supports_admin_username_target(self) -> None:
         main.MEMORY.save_message(

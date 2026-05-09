@@ -1,5 +1,10 @@
 # Aigan Changelog
 
+## 2026-05-09 - Cleaner user stats filtering
+
+- Excluded media-only memory placeholders like `[message has attachment(s): sticker]` from `/stat` and `/характер`.
+- Kept captions and real text countable while preserving media placeholders for chat memory context.
+
 ## 2026-05-09 - User profile and stats commands
 
 - Added `/character`, `/profile`, `/характер`, `/портрет`, and `/профіль` for cautious communication-style portraits from the last 100 saved user messages.
