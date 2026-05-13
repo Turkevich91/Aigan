@@ -758,7 +758,28 @@ class PersistentMemoryTests(unittest.TestCase):
             results = asyncio.run(main.semantic_memory_results_for_query(message, "subnautica", route="normal"))
 
         self.assertEqual(1, len(results))
-        self.assertEqual("fts", results[0].source)
+        self.assertIn("fts", results[0].source)
+
+    def test_exact_topic_rescue_finds_old_memory_topic(self) -> None:
+        message = FakeMessage("@thrd_ua_bot remember Pragmata", message_id=1055)
+        main.MEMORY.save_message(
+            chat_id=-1001,
+            message_id=1056,
+            sender_label="User",
+            text="Pragmata sales and release context from an older discussion",
+            created_at=datetime.now(timezone.utc) - timedelta(days=3),
+        )
+
+        context = asyncio.run(
+            main.prepare_semantic_memory_context(
+                message,
+                "remember old conversation about Pragmata",
+                "normal",
+            )
+        )
+
+        self.assertIn("Pragmata sales", context)
+        self.assertNotIn("(no semantic memory matches)", context)
 
     def test_ordinary_group_text_does_not_call_semantic_retrieval(self) -> None:
         message = FakeMessage("subnautica?", message_id=1060)
@@ -809,11 +830,44 @@ class PersistentMemoryTests(unittest.TestCase):
         context = SimpleNamespace(bot=SimpleNamespace(send_chat_action=AsyncMock()))
 
         asyncio.run(main.memory_search_command(SimpleNamespace(effective_message=non_admin), context))
-        with patch.object(main, "semantic_memory_results_for_query", new=AsyncMock(return_value=[])) as search:
+        with patch.object(
+            main,
+            "semantic_memory_search_outcome",
+            new=AsyncMock(return_value=main.MemorySearchOutcome(results=[])),
+        ) as search:
             asyncio.run(main.memory_search_command(SimpleNamespace(effective_message=admin), context))
 
         self.assertIn("тільки адмінам", non_admin.reply_calls[0]["text"])
         search.assert_awaited_once()
+
+    def test_memory_search_command_reports_fallback_diagnostics(self) -> None:
+        item_id = main.MEMORY.save_message(
+            chat_id=-1001,
+            message_id=1095,
+            sender_label="User",
+            text="Pragmata release window and sales discussion",
+            created_at=datetime.now(timezone.utc),
+        )
+        item = main.MEMORY.item_by_id(item_id)
+        main.MEMORY.upsert_embedding(
+            message_id=item_id,
+            chat_id=-1001,
+            model=main.CONFIG.memory_embedding_model,
+            dimensions=4,
+            content_hash=MemoryStore.content_hash(MemoryStore.searchable_text_for_item(item)),
+            embedding=[1.0, 0.0, 0.0, 0.0],
+        )
+        message = FakeMessage("/memory_search Pragmata", message_id=1096)
+        context = SimpleNamespace(bot=SimpleNamespace(send_chat_action=AsyncMock()))
+
+        with patch.object(main, "create_embeddings", new=AsyncMock(side_effect=RuntimeError("embedding down"))):
+            asyncio.run(main.memory_search_command(SimpleNamespace(effective_message=message), context))
+
+        reply = message.reply_calls[0]["text"]
+        self.assertIn("embeddings_used: no", reply)
+        self.assertIn("fts_fallback: yes", reply)
+        self.assertIn("embedding_error:", reply)
+        self.assertIn("Pragmata release", reply)
 
     def write_export(self, tmpdir: str, messages: list[dict]) -> Path:
         path = Path(tmpdir) / "result.json"
@@ -1641,6 +1695,14 @@ class PersistentMemoryTests(unittest.TestCase):
         self.assertIsNone(main.localized_command_match("п тест", "thrd_ua_bot"))
         self.assertIsNone(main.localized_command_match("а тест", "thrd_ua_bot"))
 
+    def test_localized_memory_search_aliases_parse(self) -> None:
+        self.assertEqual(("memory_search", "subnautica"), main.localized_command_match("/\u043f\u0430\u043c\u044f\u0442\u044c subnautica", "thrd_ua_bot"))
+        self.assertEqual(("memory_search", "subnautica"), main.localized_command_match("/\u043f\u0430\u043c\u02bc\u044f\u0442\u044c subnautica", "thrd_ua_bot"))
+        self.assertEqual(
+            ("memory_search", "subnautica"),
+            main.localized_command_match("/\u043f\u043e\u0448\u0443\u043a_\u043f\u0430\u043c\u044f\u0442\u0456 subnautica", "thrd_ua_bot"),
+        )
+
     def test_stats_command_counts_saved_self_messages(self) -> None:
         now = datetime.now(timezone.utc)
         main.MEMORY.save_message(
@@ -1741,6 +1803,71 @@ class PersistentMemoryTests(unittest.TestCase):
         self.assertIn("Target (@target, id=222)", message.reply_calls[0]["text"])
         self.assertIn("повідомлень: 1", message.reply_calls[0]["text"])
 
+    def test_stats_username_target_resolves_to_user_id_for_imported_rows(self) -> None:
+        now = datetime.now(timezone.utc)
+        main.MEMORY.save_message(
+            chat_id=-1001,
+            message_id=3020,
+            sender_label="Target (@target, id=222)",
+            user_id=222,
+            username="target",
+            text="resolver anchor",
+            created_at=now,
+        )
+        for index in range(2):
+            main.MEMORY.save_message(
+                chat_id=-1001,
+                message_id=3021 + index,
+                sender_label="Target Export",
+                user_id=222,
+                username="",
+                text=f"imported row {index} pragmata",
+                created_at=now + timedelta(seconds=index + 1),
+            )
+        message = FakeMessage("/stat @target")
+
+        asyncio.run(main.handle_stats_command(message, "@target"))
+
+        reply = message.reply_calls[0]["text"]
+        self.assertIn("повідомлень: 3", reply)
+        self.assertIn("pragmata - 2", reply)
+
+    def test_character_username_target_uses_imported_rows_by_user_id(self) -> None:
+        now = datetime.now(timezone.utc)
+        main.MEMORY.save_message(
+            chat_id=-1001,
+            message_id=3030,
+            sender_label="Target (@target, id=222)",
+            user_id=222,
+            username="target",
+            text="resolver anchor",
+            created_at=now,
+        )
+        for index in range(9):
+            main.MEMORY.save_message(
+                chat_id=-1001,
+                message_id=3031 + index,
+                sender_label="Target Export",
+                user_id=222,
+                username="",
+                text=f"imported profile memory {index}",
+                created_at=now + timedelta(seconds=index + 1),
+            )
+        message = FakeMessage("/character @target")
+        context = SimpleNamespace(bot=SimpleNamespace(username="thrd_ua_bot", id=8712856238, send_chat_action=AsyncMock()))
+        captured = {}
+
+        async def fake_run_plain_model(prompt: str) -> str:
+            captured["prompt"] = prompt
+            return "profile ready"
+
+        with patch.object(main, "run_plain_model", new=fake_run_plain_model):
+            asyncio.run(main.handle_character_command(message, context, "@target"))
+
+        self.assertIn("profile ready", message.reply_calls[0]["text"])
+        self.assertIn("Cleaned messages: 10", captured["prompt"])
+        self.assertIn("imported profile memory 8", captured["prompt"])
+
     def test_non_admin_cannot_request_other_user_stats_or_profile(self) -> None:
         context = SimpleNamespace(bot=SimpleNamespace(username="thrd_ua_bot", id=8712856238))
         for text in ("/стат @tester", "/характер @tester"):
@@ -1760,7 +1887,7 @@ class PersistentMemoryTests(unittest.TestCase):
         self.assertIn("Не знайшов", message.reply_calls[0]["text"])
         self.assertIn("@missing", message.reply_calls[0]["text"])
 
-    def test_character_command_uses_last_100_user_messages_only(self) -> None:
+    def test_character_command_uses_full_retained_memory_profile_package(self) -> None:
         base = datetime.now(timezone.utc)
         for index in range(105):
             main.MEMORY.save_message(
@@ -1793,8 +1920,9 @@ class PersistentMemoryTests(unittest.TestCase):
             asyncio.run(main.localized_command_alias(SimpleNamespace(effective_message=message), context))
 
         self.assertIn("портрет готовий", message.reply_calls[0]["text"])
-        self.assertNotIn("profile-sample-000", captured["prompt"])
-        self.assertIn("profile-sample-005", captured["prompt"])
+        self.assertIn("Cleaned messages: 105", captured["prompt"])
+        self.assertIn("Representative chronological sample from the full retained period", captured["prompt"])
+        self.assertIn("profile-sample-000", captured["prompt"])
         self.assertIn("profile-sample-104", captured["prompt"])
         self.assertNotIn("other-user-secret", captured["prompt"])
         self.assertIn("Do not infer or mention mental health", captured["prompt"])

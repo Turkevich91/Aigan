@@ -67,9 +67,12 @@ Ukrainian aliases are also available so users do not need to switch keyboard lay
 /питай підсумуй це відео https://www.youtube.com/watch?v=...
 /п коротко поясни попереднє
 /а що тут важливо?
+/память subnautica
+/памʼять subnautica
+/пошук_памяті subnautica
 ```
 
-User commands use only retained SQLite memory for the current chat. `/stat` and `/стат` count saved text/caption messages, sentences, words, and top words; media-only placeholders, mentions, slash commands, the bot trigger, and pasted stat-output lines are ignored. `/character`, `/profile`, `/характер`, `/портрет`, and `/профіль` build a cautious non-clinical communication portrait from the last 100 cleaned saved text messages. Users can request their own data; admins can request another user by `@username`.
+User commands use only retained SQLite memory for the current chat. `/stat` and `/стат` count saved text/caption messages, sentences, words, and top words across the full retained history; media-only placeholders, mentions, slash commands, the bot trigger, and pasted stat-output lines are ignored. `/character`, `/profile`, `/характер`, `/портрет`, and `/профіль` build a cautious non-clinical communication portrait from the full retained history by sending the model aggregate stats plus a representative sample, not thousands of raw messages. Users can request their own data; admins can request another user by `@username`. When a username can be resolved to a stored Telegram `user_id`, imported rows without a username are included too.
 
 If Telegram privacy mode is on and the bot is not an admin, it may only receive commands, mentions, and replies. That is usually good for cost control.
 
@@ -166,7 +169,7 @@ MEMORY_VECTOR_BACKFILL_LIMIT=1000
 
 `MEMORY_RETENTION_DAYS` deletes older rows and cached media. `MEMORY_IMAGE_SUMMARY_LIMIT` limits how many recent unsummarized images can be lazily sent to vision for one answer.
 
-Semantic memory adds a local SQLite hybrid index: FTS5 for keyword fallback plus OpenAI embeddings for meaning-based retrieval over the retained lookback window. It is only used after explicit bot invocation, never for ordinary group chatter. `/memory_search query` is admin-only and shows the retrieved snippets without asking the main model to answer.
+Semantic memory adds a local SQLite hybrid index: FTS5 for keyword fallback plus OpenAI embeddings for meaning-based retrieval over the retained lookback window. It is only used after explicit bot invocation, never for ordinary group chatter. `/memory_search query` is admin-only and shows the retrieved snippets without asking the main model to answer; aliases `/память`, `/памʼять`, and `/пошук_памяті` call the same hybrid search. The command automatically uses embeddings when indexed, always attempts FTS fallback, and reports `embeddings_used`, fallback status, and per-result sources. Topic recall prompts such as `згадай стару розмову про Pragmata` also run an exact keyword rescue so named topics are not missed when the semantic query is too broad.
 
 The bot can only remember messages Telegram delivered to it after memory is enabled. It cannot fetch arbitrary older group history. If a forwarded post contains a real `photo` or image `document`, the bot can cache and analyze it. If Telegram only shows a client-side link preview and does not deliver the image file, Aigan keeps the text/link and may fetch public page images, but it cannot inspect a private preview that was never sent through Bot API.
 

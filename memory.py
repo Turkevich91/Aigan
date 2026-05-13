@@ -359,6 +359,30 @@ class MemoryStore:
     ) -> list[MemoryItem]:
         return self._user_text_messages(chat_id, user_id=user_id, username=username, limit=None)
 
+    def user_id_for_username(self, chat_id: int, username: str) -> int | None:
+        username = username.strip().lstrip("@")
+        if not username:
+            return None
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT user_id, COUNT(*) AS count
+                FROM messages
+                WHERE chat_id = ?
+                  AND is_bot = 0
+                  AND user_id IS NOT NULL
+                  AND (
+                    lower(username) = lower(?)
+                    OR lower(sender_label) LIKE lower(?)
+                  )
+                GROUP BY user_id
+                ORDER BY count DESC
+                LIMIT 1
+                """,
+                (chat_id, username, f"%@{username}%"),
+            ).fetchone()
+        return int(row["user_id"]) if row is not None else None
+
     def _user_text_messages(
         self,
         chat_id: int,
@@ -622,6 +646,54 @@ class MemoryStore:
                     search_text=self.searchable_text_for_item(item),
                     score=-float(row["rank"] or 0.0),
                     source="fts",
+                )
+            )
+        return results
+
+    def keyword_search(self, *, chat_id: int, query: str, lookback_days: int, limit: int) -> list[SemanticMemoryResult]:
+        terms = [term.casefold() for term in re.findall(r"[^\W\d_]{2,}", query, flags=re.UNICODE)]
+        terms = [term for term in terms[:6] if term]
+        if not terms:
+            return []
+        cutoff = self._format_datetime(datetime.now(timezone.utc) - timedelta(days=max(1, int(lookback_days))))
+        text_expr = """
+            lower(
+                coalesce(text, '') || ' ' ||
+                coalesce(source_title, '') || ' ' ||
+                coalesce(source_url, '') || ' ' ||
+                coalesce(vision_summary, '')
+            )
+        """
+        conditions = [
+            "chat_id = ?",
+            "created_at >= ?",
+            "is_bot = 0",
+        ]
+        params: list[object] = [chat_id, cutoff]
+        for term in terms:
+            conditions.append(f"{text_expr} LIKE ?")
+            params.append(f"%{term}%")
+        params.append(max(1, int(limit)))
+        with self._lock:
+            rows = self._conn.execute(
+                f"""
+                SELECT *
+                FROM messages
+                WHERE {" AND ".join(conditions)}
+                ORDER BY created_at DESC, id DESC
+                LIMIT ?
+                """,
+                tuple(params),
+            ).fetchall()
+        results: list[SemanticMemoryResult] = []
+        for index, row in enumerate(rows):
+            item = self._row_to_item(row)
+            results.append(
+                SemanticMemoryResult(
+                    item=item,
+                    search_text=self.searchable_text_for_item(item),
+                    score=2.0 - (index * 0.001),
+                    source="keyword",
                 )
             )
         return results

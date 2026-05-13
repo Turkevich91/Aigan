@@ -1,5 +1,12 @@
 # Aigan Changelog
 
+## 2026-05-13 - Full-memory profiles and memory search
+
+- Changed `/character` and `/характер` to analyze the full retained SQLite history through aggregate stats and representative samples instead of only the last 100 messages.
+- Improved `/stat` and profile target resolution so `@username` can resolve to a stored `user_id` and include imported rows without usernames.
+- Added Ukrainian memory-search aliases and richer `/memory_search` diagnostics showing embeddings, FTS fallback, and exact topic rescue sources.
+- Added exact named-topic rescue for prompts like `згадай стару розмову про Pragmata`, so old indexed topics are included even when semantic retrieval is weak.
+
 ## 2026-05-13 - Native Telegram HTML export import
 
 - Added direct Telegram Desktop HTML export import from `messages.html` files or full export directories.
