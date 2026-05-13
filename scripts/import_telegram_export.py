@@ -10,7 +10,9 @@ import sys
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
+
+from bs4 import BeautifulSoup
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
@@ -26,6 +28,7 @@ IMAGE_SUFFIXES = {
     "image/webp": ".webp",
     "image/gif": ".gif",
 }
+HTML_DAY_FORMATS = ("%d %B %Y", "%B %d, %Y")
 
 
 @dataclass
@@ -42,6 +45,7 @@ class ImportOptions:
     retention_days: int = 30
     image_max_bytes: int = 6_000_000
     bot_username: str = ""
+    user_map_path: Path | None = None
     embedding_model: str = "text-embedding-3-small"
     embedding_dimensions: int = 512
     embedding_batch_size: int = 64
@@ -66,6 +70,11 @@ class ImportSummary:
     embedding_error: str = ""
 
 
+class ExportParser(Protocol):
+    def messages(self) -> list[dict[str, Any]]:
+        ...
+
+
 def load_dotenv_defaults(path: Path) -> None:
     if not path.exists():
         return
@@ -86,6 +95,15 @@ def env_int(name: str, default: int) -> int:
         return int(raw)
     except ValueError:
         return default
+
+
+def normalize_name(value: str) -> str:
+    return re.sub(r"\s+", " ", (value or "").strip()).casefold()
+
+
+def clean_text(value: str) -> str:
+    lines = [line.strip() for line in (value or "").replace("\xa0", " ").splitlines()]
+    return "\n".join(line for line in lines if line).strip()
 
 
 def telegram_text_to_plain(value: Any) -> str:
@@ -167,13 +185,13 @@ def forward_origin(message: dict[str, Any]) -> str:
 
 
 def is_bot_sender(label: str, bot_username: str) -> bool:
-    normalized = re.sub(r"\s+", " ", label.strip().lower())
+    normalized = normalize_name(label)
     username = bot_username.strip().lower().lstrip("@")
-    candidates = {"aigan", "aigan 👾"}
+    candidates = {"aigan", "aigan ðŸ‘¾", "aigan 👾"}
     if username:
         candidates.add(username)
         candidates.add("@" + username)
-    return normalized in candidates
+    return normalized in {normalize_name(candidate) for candidate in candidates}
 
 
 def detect_image_mime(data: bytes) -> str | None:
@@ -188,7 +206,274 @@ def detect_image_mime(data: bytes) -> str | None:
     return None
 
 
-def media_source_path(message: dict[str, Any], export_dir: Path) -> Path | None:
+def export_base_dir(path: Path) -> Path:
+    if path.is_dir():
+        return path
+    return path.parent
+
+
+def html_page_sort_key(path: Path) -> tuple[int, str]:
+    match = re.fullmatch(r"messages(\d*)\.html", path.name)
+    if not match:
+        return (999999, path.name)
+    suffix = match.group(1)
+    return (1 if suffix == "" else int(suffix), path.name)
+
+
+def message_numeric_id(raw: str) -> int | None:
+    match = re.search(r"(\d+)", raw or "")
+    return int(match.group(1)) if match else None
+
+
+def parse_html_message_datetime(raw: str) -> datetime | None:
+    raw = (raw or "").strip()
+    for fmt in ("%d.%m.%Y %H:%M:%S UTC%z", "%d.%m.%Y %H:%M:%S %z"):
+        try:
+            return datetime.strptime(raw, fmt).astimezone(timezone.utc)
+        except ValueError:
+            pass
+    return None
+
+
+def parse_html_day_header(raw: str) -> datetime | None:
+    raw = clean_text(raw)
+    for fmt in HTML_DAY_FORMATS:
+        try:
+            return datetime.strptime(raw, fmt).replace(tzinfo=timezone.utc)
+        except ValueError:
+            pass
+    return None
+
+
+def direct_body(message_tag: Any) -> Any | None:
+    for child in message_tag.find_all("div", recursive=False):
+        classes = child.get("class") or []
+        if "body" in classes:
+            return child
+    return None
+
+
+def direct_child_text(node: Any, class_name: str) -> str:
+    if node is None:
+        return ""
+    found = node.find("div", class_=class_name, recursive=False)
+    return clean_text(found.get_text("\n")) if found else ""
+
+
+def readable_text_from_node(node: Any) -> str:
+    clone = BeautifulSoup(str(node), "html.parser")
+    for br in clone.find_all("br"):
+        br.replace_with("\n")
+    for anchor in clone.find_all("a", href=True):
+        label = clean_text(anchor.get_text(" "))
+        href = str(anchor.get("href") or "").strip()
+        if href.startswith("http") and href not in label:
+            anchor.string = f"{label} {href}" if label else href
+    return clean_text(clone.get_text("\n"))
+
+
+def html_message_text(body: Any) -> str:
+    if body is None:
+        return ""
+    texts: list[str] = []
+    for node in body.find_all("div", class_="text"):
+        text = readable_text_from_node(node)
+        if text:
+            texts.append(text)
+    return "\n\n".join(texts).strip()
+
+
+def html_forward_origin(body: Any) -> str:
+    if body is None:
+        return ""
+    forwarded = body.find("div", class_="forwarded")
+    if not forwarded:
+        return ""
+    name = forwarded.find("div", class_="from_name")
+    if not name:
+        return ""
+    for date in name.find_all("span", class_="date"):
+        date.extract()
+    return clean_text(name.get_text(" "))
+
+
+def html_reply_to_message_id(body: Any) -> int | None:
+    if body is None:
+        return None
+    reply = body.find("div", class_="reply_to")
+    if not reply:
+        return None
+    link = reply.find("a", href=True)
+    if not link:
+        return None
+    return message_numeric_id(str(link.get("href") or ""))
+
+
+def html_media_path(body: Any) -> tuple[str, str]:
+    if body is None:
+        return "", ""
+    photo = body.find("a", class_="photo_wrap", href=True)
+    if photo and str(photo.get("href") or "").strip():
+        return str(photo["href"]).strip(), "photo"
+    file_link = body.find("a", class_="media_file", href=True) or body.find("a", class_="document_wrap", href=True)
+    if file_link and str(file_link.get("href") or "").strip():
+        return str(file_link["href"]).strip(), "file"
+    return "", ""
+
+
+def user_map_entry(value: Any) -> dict[str, Any]:
+    if isinstance(value, int):
+        return {"user_id": value, "username": ""}
+    if isinstance(value, str):
+        return {"user_id": parse_user_id(value), "username": ""}
+    if isinstance(value, dict):
+        return {
+            "user_id": parse_user_id(value.get("user_id") or value.get("id")),
+            "username": str(value.get("username") or "").lstrip("@"),
+        }
+    return {"user_id": None, "username": ""}
+
+
+def load_user_map(path: Path | None) -> dict[str, dict[str, Any]]:
+    if path is None:
+        return {}
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        raise ValueError("--user-map must be a JSON object keyed by exported display name")
+    return {normalize_name(str(key)): user_map_entry(value) for key, value in data.items()}
+
+
+def infer_existing_user_map(store: MemoryStore | None, chat_id: int) -> dict[str, dict[str, Any]]:
+    if store is None:
+        return {}
+    rows = store._conn.execute(
+        """
+        SELECT sender_label, user_id, username, COUNT(*) AS count
+        FROM messages
+        WHERE chat_id = ? AND is_bot = 0 AND (user_id IS NOT NULL OR username != '')
+        GROUP BY sender_label, user_id, username
+        ORDER BY count DESC
+        """,
+        (chat_id,),
+    ).fetchall()
+    mapping: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        label = str(row["sender_label"] or "").strip()
+        if not label:
+            continue
+        entry = {"user_id": row["user_id"], "username": str(row["username"] or "").lstrip("@")}
+        aliases = {label}
+        aliases.add(re.sub(r"\s*\(@.*$", "", label).strip())
+        aliases.add(re.sub(r"\s*\(image request\)\s*$", "", label).strip())
+        for alias in aliases:
+            if alias:
+                mapping.setdefault(normalize_name(alias), entry)
+    return mapping
+
+
+class JsonExportParser:
+    def __init__(self, path: Path) -> None:
+        self.path = path
+
+    def messages(self) -> list[dict[str, Any]]:
+        data = json.loads(self.path.read_text(encoding="utf-8"))
+        messages = data.get("messages")
+        if not isinstance(messages, list):
+            raise ValueError("Telegram export JSON must contain a top-level 'messages' list")
+        normalized: list[dict[str, Any]] = []
+        for message in messages:
+            if isinstance(message, dict):
+                item = dict(message)
+                item.setdefault("_export_dir", str(self.path.parent))
+                item.setdefault("_format", "json")
+                normalized.append(item)
+        return normalized
+
+
+class HtmlExportParser:
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        if path.is_dir():
+            self.export_dir = path
+            self.pages = sorted(path.glob("messages*.html"), key=html_page_sort_key)
+        else:
+            self.export_dir = path.parent
+            self.pages = [path]
+        if not self.pages:
+            raise ValueError(f"No messages*.html files found in {path}")
+
+    def messages(self) -> list[dict[str, Any]]:
+        messages: list[dict[str, Any]] = []
+        current_day: datetime | None = None
+        for page in self.pages:
+            soup = BeautifulSoup(page.read_text(encoding="utf-8"), "html.parser")
+            for message_tag in soup.select("div.message"):
+                item = self.parse_message(message_tag, current_day)
+                if item is None:
+                    continue
+                if item.get("_day_marker"):
+                    current_day = parse_export_datetime(item)
+                messages.append(item)
+        messages.sort(key=lambda item: int(item.get("id") or 0))
+        return messages
+
+    def parse_message(self, message_tag: Any, current_day: datetime | None) -> dict[str, Any] | None:
+        message_id = message_numeric_id(str(message_tag.get("id") or ""))
+        if message_id is None:
+            return None
+        classes = message_tag.get("class") or []
+        body = direct_body(message_tag)
+        if "service" in classes:
+            text = clean_text(body.get_text("\n")) if body else ""
+            day = parse_html_day_header(text)
+            created = day or current_day
+            return {
+                "id": message_id,
+                "type": "service",
+                "date": created.isoformat() if created else "",
+                "from": "Telegram service",
+                "text": text,
+                "_day_marker": bool(day),
+                "_export_dir": str(self.export_dir),
+                "_format": "html",
+            }
+
+        date_node = body.find("div", class_="date") if body else None
+        created = parse_html_message_datetime(str(date_node.get("title") or "")) if date_node else None
+        if created is None:
+            return None
+        sender = direct_child_text(body, "from_name") or "Telegram export"
+        media_path, media_kind = html_media_path(body)
+        item: dict[str, Any] = {
+            "id": message_id,
+            "type": "message",
+            "date": created.isoformat(),
+            "date_unixtime": str(int(created.timestamp())),
+            "from": sender,
+            "text": html_message_text(body),
+            "_export_dir": str(self.export_dir),
+            "_format": "html",
+        }
+        reply_id = html_reply_to_message_id(body)
+        if reply_id is not None:
+            item["reply_to_message_id"] = reply_id
+        origin = html_forward_origin(body)
+        if origin:
+            item["forwarded_from"] = origin
+        if media_path:
+            item[media_kind] = media_path
+            item["_attachment_type"] = "photo" if media_kind == "photo" else "document"
+        return item
+
+
+def build_parser(path: Path) -> ExportParser:
+    if path.is_dir() or path.suffix.lower() in {".html", ".htm"}:
+        return HtmlExportParser(path)
+    return JsonExportParser(path)
+
+
+def media_source_path(message: dict[str, Any], default_export_dir: Path) -> Path | None:
+    export_dir = Path(str(message.get("_export_dir") or default_export_dir))
     for key in ("photo", "file"):
         raw = message.get(key)
         if not isinstance(raw, str) or not raw.strip():
@@ -210,7 +495,7 @@ def copy_export_media(
     options: ImportOptions,
     message_id: int,
 ) -> tuple[str, str, str] | None:
-    source = media_source_path(message, options.file.parent)
+    source = media_source_path(message, export_base_dir(options.file))
     if source is None:
         return None
     try:
@@ -239,29 +524,39 @@ def should_import_message(message: dict[str, Any], options: ImportOptions, cutof
         return False, "invalid"
     if cutoff is not None and created_at < cutoff:
         return False, "old"
-    has_media_ref = media_source_path(message, options.file.parent) is not None or bool(message.get("photo"))
+    has_media_ref = media_source_path(message, export_base_dir(options.file)) is not None or bool(message.get("photo"))
     if not message_text(message) and not has_media_ref:
         return False, "empty"
     return True, ""
 
 
+def apply_user_map(message: dict[str, Any], user_map: dict[str, dict[str, Any]]) -> None:
+    label = sender_label(message)
+    entry = user_map.get(normalize_name(label))
+    if not entry:
+        return
+    if entry.get("user_id") is not None and not message.get("from_id"):
+        message["from_id"] = f"user{entry['user_id']}"
+    if entry.get("username") and not message.get("username"):
+        message["username"] = str(entry["username"]).lstrip("@")
+
+
 def import_export(options: ImportOptions) -> ImportSummary:
     summary = ImportSummary()
-    data = json.loads(options.file.read_text(encoding="utf-8"))
-    messages = data.get("messages")
-    if not isinstance(messages, list):
-        raise ValueError("Telegram export JSON must contain a top-level 'messages' list")
-
+    messages = build_parser(options.file).messages()
     cutoff = None
     if options.days is not None:
         cutoff = datetime.now(timezone.utc) - timedelta(days=max(0, options.days))
 
     store: MemoryStore | None = None if options.dry_run else MemoryStore(options.db_path, options.retention_days)
+    user_map = infer_existing_user_map(store, options.chat_id)
+    user_map.update(load_user_map(options.user_map_path))
     try:
         for message in messages:
             if not isinstance(message, dict):
                 summary.skipped_invalid += 1
                 continue
+            apply_user_map(message, user_map)
             summary.scanned += 1
             should_import, reason = should_import_message(message, options, cutoff)
             if not should_import:
@@ -293,15 +588,20 @@ def import_export(options: ImportOptions) -> ImportSummary:
 
             text = message_text(message)
             content_kind = "text"
-            attachment_type = ""
+            attachment_type = str(message.get("_attachment_type") or "")
             local_media_path = ""
             mime_type = ""
-            raw_note = "imported from Telegram Desktop export"
+            raw_note = f"imported from Telegram Desktop {message.get('_format', 'export')} export"
 
-            media_ref_present = media_source_path(message, options.file.parent) is not None or bool(message.get("photo"))
-            if media_ref_present:
+            media_ref_present = media_source_path(message, export_base_dir(options.file)) is not None or bool(message.get("photo"))
+            if message.get("photo"):
                 content_kind = "image"
-                attachment_type = "photo" if message.get("photo") else "image_document"
+                attachment_type = attachment_type or ("photo" if message.get("photo") else "image_document")
+            elif media_ref_present:
+                content_kind = "attachment"
+                attachment_type = attachment_type or "document"
+            elif attachment_type:
+                content_kind = "attachment"
 
             if store is not None and options.copy_media:
                 copied = copy_export_media(store=store, message=message, options=options, message_id=message_id)
@@ -325,7 +625,7 @@ def import_export(options: ImportOptions) -> ImportSummary:
                 created_at=created_at,
                 sender_label=label,
                 user_id=parse_user_id(message.get("from_id") or message.get("actor_id")),
-                username="",
+                username=str(message.get("username") or "").lstrip("@"),
                 is_bot=bot_message,
                 text=text,
                 content_kind=content_kind,
@@ -426,6 +726,7 @@ def build_options(args: argparse.Namespace) -> ImportOptions:
         retention_days=env_int("MEMORY_RETENTION_DAYS", 30),
         image_max_bytes=env_int("IMAGE_MAX_BYTES", 6_000_000),
         bot_username=os.getenv("BOT_USERNAME", ""),
+        user_map_path=Path(args.user_map) if args.user_map else None,
         embedding_model=os.getenv("MEMORY_EMBEDDING_MODEL", "text-embedding-3-small").strip(),
         embedding_dimensions=env_int("MEMORY_EMBEDDING_DIMENSIONS", 512),
         embedding_batch_size=env_int("MEMORY_EMBEDDING_BATCH_SIZE", 64),
@@ -455,8 +756,12 @@ def print_summary(summary: ImportSummary, *, dry_run: bool) -> None:
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Import Telegram Desktop JSON export into Aigan SQLite memory.")
-    parser.add_argument("--file", default=DEFAULT_IMPORT_FILE, help="Path to Telegram Desktop result.json")
+    parser = argparse.ArgumentParser(description="Import Telegram Desktop JSON or HTML export into Aigan SQLite memory.")
+    parser.add_argument(
+        "--file",
+        default=DEFAULT_IMPORT_FILE,
+        help="Path to result.json, messages.html, or Telegram Desktop export directory",
+    )
     parser.add_argument("--chat-id", required=True, type=int, help="Target Telegram chat id, e.g. -1002546271665")
     parser.add_argument("--db", default="", help="SQLite DB path; defaults to MEMORY_DB_PATH or /app/data/aigan.sqlite3")
     parser.add_argument("--days", type=int, default=30, help="Import only messages from the last N days; use 0 for all")
@@ -465,6 +770,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--dry-run", action="store_true", help="Parse and count without writing to SQLite or media cache")
     parser.add_argument("--embed-missing", action="store_true", help="Create embeddings for missing imported/searchable messages")
     parser.add_argument("--embedding-limit", type=int, default=10000, help="Maximum embeddings to create in this run")
+    parser.add_argument("--user-map", default="", help="Optional JSON map from HTML display names to user_id/username")
     args = parser.parse_args(argv)
     if args.days == 0:
         args.days = None

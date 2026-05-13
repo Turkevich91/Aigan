@@ -1,5 +1,11 @@
 # Aigan Changelog
 
+## 2026-05-13 - Native Telegram HTML export import
+
+- Added direct Telegram Desktop HTML export import from `messages.html` files or full export directories.
+- Preserved reply links, forwarded sources, text links, local photos, and optional user-map metadata during import.
+- Kept JSON export import compatible while removing the manual HTML-to-JSON conversion step.
+
 ## 2026-05-13 - Telegram export memory import
 
 - Added a one-off Telegram Desktop JSON importer for backfilling older chat history into SQLite memory.

@@ -172,17 +172,17 @@ The bot can only remember messages Telegram delivered to it after memory is enab
 
 For web image requests such as `покажи картинку ...` or `знайди 3 фотки ...`, Aigan searches safe public image results, filters Russian/private hosts, downloads valid image bytes, and sends Telegram photo attachments with source captions instead of replying with raw image links. When it finds 2-10 valid images for one request, it sends them as a Telegram album/media group; if Telegram rejects the album, it falls back to individual photo messages.
 
-To backfill older chat history, export the chat from Telegram Desktop as JSON and import the local `result.json` into the same SQLite memory. Keep exports in `imports/`; that folder is ignored by git.
+To backfill older chat history, export the chat from Telegram Desktop as either HTML or JSON and import it into the same SQLite memory. HTML export directories such as `ChatExport_2026-05-13` are supported directly; no manual conversion is needed. Keep exports in `imports/`; that folder is ignored by git.
 
 ```bash
 cd ~/Projects/aigan
 mkdir -p imports
-# Put Telegram Desktop result.json into imports/result.json.
+# Put Telegram Desktop export directory or result.json under imports/.
 
 docker compose run --rm \
   -v "$PWD/imports:/app/imports:ro" \
   aigan python scripts/import_telegram_export.py \
-  --file /app/imports/result.json \
+  --file /app/imports/ChatExport_2026-05-13 \
   --chat-id -1002546271665 \
   --days 30 \
   --copy-media \
@@ -190,7 +190,9 @@ docker compose run --rm \
   --embedding-limit 10000
 ```
 
-Run with `--dry-run` first to count what would be imported without writing to SQLite. Re-running the importer is safe: messages are keyed by `(chat_id, message_id)`, so repeated imports update existing rows instead of duplicating history. `--copy-media` only copies valid exported JPEG/PNG/WebP/GIF files within `IMAGE_MAX_BYTES`; text and captions are imported either way.
+`--file` may point to `result.json`, a single `messages.html`, or an export directory containing `messages.html`, `messages2.html`, and later pages. Run with `--dry-run` first to count what would be imported without writing to SQLite. Re-running the importer is safe: messages are keyed by `(chat_id, message_id)`, so repeated imports update existing rows instead of duplicating history. `--copy-media` only copies valid exported JPEG/PNG/WebP/GIF files within `IMAGE_MAX_BYTES`; text and captions are imported either way.
+
+HTML exports do not reliably contain Telegram user ids. If you need `/stat @name` and `/характер @name` to attach old HTML messages to exact users, pass `--user-map /app/imports/users.json` with entries like `{"Display Name": {"user_id": 123, "username": "handle"}}`. Without a map, Aigan keeps the exported display name and only infers ids when it can match existing memory safely.
 
 Long text replies are split by the delivery layer instead of being truncated at the first Telegram limit:
 

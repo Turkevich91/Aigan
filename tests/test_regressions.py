@@ -820,6 +820,16 @@ class PersistentMemoryTests(unittest.TestCase):
         path.write_text(json.dumps({"messages": messages}), encoding="utf-8")
         return path
 
+    def write_html_export(self, tmpdir: str, pages: dict[str, str]) -> Path:
+        export_dir = Path(tmpdir) / "ChatExport"
+        export_dir.mkdir()
+        for name, body in pages.items():
+            (export_dir / name).write_text(
+                '<!DOCTYPE html><html><body><div class="history">' + body + "</div></body></html>",
+                encoding="utf-8",
+            )
+        return export_dir
+
     def import_options(self, export_path: Path, db_path: Path, **overrides) -> ImportOptions:
         values = {
             "file": export_path,
@@ -1006,6 +1016,134 @@ class PersistentMemoryTests(unittest.TestCase):
                     lookback_days=30,
                 ),
             )
+
+    def test_html_export_directory_imports_all_pages_and_text(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            export_dir = self.write_html_export(
+                tmpdir,
+                {
+                    "messages.html": """
+                    <div class="message service" id="message1"><div class="body details">13 May 2026</div></div>
+                    <div class="message default clearfix" id="message101">
+                      <div class="body">
+                        <div class="pull_right date details" title="13.05.2026 10:00:00 UTC+00:00">10:00</div>
+                        <div class="from_name">Tester</div>
+                        <div class="text">Hello<br><strong>semantic</strong> <a href="https://example.com">link</a></div>
+                      </div>
+                    </div>
+                    """,
+                    "messages2.html": """
+                    <div class="message default clearfix" id="message102">
+                      <div class="body">
+                        <div class="pull_right date details" title="13.05.2026 10:01:00 UTC+00:00">10:01</div>
+                        <div class="from_name">Tester</div>
+                        <div class="text">second page text</div>
+                      </div>
+                    </div>
+                    """,
+                },
+            )
+            db_path = Path(tmpdir) / "memory.sqlite3"
+
+            summary = import_telegram_export.import_export(self.import_options(export_dir, db_path))
+            store = MemoryStore(db_path, retention_days=30)
+            items = store.latest(-1001, 10)
+
+            self.assertEqual(2, summary.imported)
+            self.assertEqual(1, summary.skipped_service)
+            self.assertEqual([101, 102], [item.message_id for item in items])
+            self.assertIn("semantic", items[0].text)
+            self.assertIn("https://example.com", items[0].text)
+
+    def test_html_export_preserves_reply_forward_and_copies_photo(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            export_dir = Path(tmpdir) / "ChatExport"
+            photos = export_dir / "photos"
+            photos.mkdir(parents=True)
+            (photos / "photo_1.jpg").write_bytes(VALID_JPEG)
+            (export_dir / "messages.html").write_text(
+                """
+                <html><body><div class="history">
+                <div class="message default clearfix" id="message201">
+                  <div class="body">
+                    <div class="pull_right date details" title="13.05.2026 10:02:00 UTC+00:00">10:02</div>
+                    <div class="from_name">Tester</div>
+                    <div class="reply_to details">In reply to <a href="#go_to_message199">this message</a></div>
+                    <div class="forwarded body"><div class="from_name">Source Channel <span class="date details">13.05.2026</span></div></div>
+                    <div class="media_wrap clearfix"><a class="photo_wrap clearfix pull_left" href="photos/photo_1.jpg"><img src="photos/photo_1_thumb.jpg"/></a></div>
+                    <div class="text">photo caption</div>
+                  </div>
+                </div>
+                </div></body></html>
+                """,
+                encoding="utf-8",
+            )
+            db_path = Path(tmpdir) / "memory.sqlite3"
+
+            summary = import_telegram_export.import_export(self.import_options(export_dir, db_path, copy_media=True))
+            store = MemoryStore(db_path, retention_days=30)
+            item = store.message_by_message_id(-1001, 201)
+
+            self.assertEqual(1, summary.media_copied)
+            self.assertEqual(199, item.reply_to_message_id)
+            self.assertEqual("Source Channel", item.forward_origin)
+            self.assertEqual("image", item.content_kind)
+            self.assertTrue(Path(item.local_media_path).is_file())
+
+    def test_html_export_user_map_adds_user_id_and_username(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            export_dir = self.write_html_export(
+                tmpdir,
+                {
+                    "messages.html": """
+                    <div class="message default clearfix" id="message301">
+                      <div class="body">
+                        <div class="pull_right date details" title="13.05.2026 10:03:00 UTC+00:00">10:03</div>
+                        <div class="from_name">Display Name</div>
+                        <div class="text">mapped user text</div>
+                      </div>
+                    </div>
+                    """,
+                },
+            )
+            user_map = Path(tmpdir) / "users.json"
+            user_map.write_text(json.dumps({"Display Name": {"user_id": 12345, "username": "mapped"}}), encoding="utf-8")
+            db_path = Path(tmpdir) / "memory.sqlite3"
+
+            summary = import_telegram_export.import_export(
+                self.import_options(export_dir, db_path, user_map_path=user_map)
+            )
+            store = MemoryStore(db_path, retention_days=30)
+            item = store.message_by_message_id(-1001, 301)
+
+            self.assertEqual(1, summary.imported)
+            self.assertEqual(12345, item.user_id)
+            self.assertEqual("mapped", item.username)
+
+    def test_html_export_unknown_sender_does_not_fake_user_id(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            export_dir = self.write_html_export(
+                tmpdir,
+                {
+                    "messages.html": """
+                    <div class="message default clearfix" id="message401">
+                      <div class="body">
+                        <div class="pull_right date details" title="13.05.2026 10:04:00 UTC+00:00">10:04</div>
+                        <div class="from_name">Unknown Person</div>
+                        <div class="text">unknown sender text</div>
+                      </div>
+                    </div>
+                    """,
+                },
+            )
+            db_path = Path(tmpdir) / "memory.sqlite3"
+
+            import_telegram_export.import_export(self.import_options(export_dir, db_path))
+            store = MemoryStore(db_path, retention_days=30)
+            item = store.message_by_message_id(-1001, 401)
+
+            self.assertIsNone(item.user_id)
+            self.assertEqual("", item.username)
 
     def test_image_metadata_and_summary_are_stored_and_reused(self) -> None:
         item_id = main.MEMORY.save_message(
