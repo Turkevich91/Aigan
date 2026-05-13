@@ -492,6 +492,7 @@ class UserMemorySelection:
     user_id_matches: int = 0
     username_matches: int = 0
     label_alias_matches: int = 0
+    source_items: int = 0
 
 
 @dataclass(frozen=True)
@@ -779,6 +780,25 @@ def forward_origin_label(message: Message) -> str:
     return ""
 
 
+def has_forwarded_body(message: Message) -> bool:
+    return any(
+        getattr(message, attr, None)
+        for attr in (
+            "forward_origin",
+            "forward_from",
+            "forward_from_chat",
+            "forward_sender_name",
+            "forward_date",
+        )
+    ) or bool(getattr(message, "is_automatic_forward", False))
+
+
+def is_generated_or_channel_sender(message: Message) -> bool:
+    if getattr(message, "via_bot", None) is not None:
+        return True
+    return getattr(message, "from_user", None) is None and getattr(message, "sender_chat", None) is not None
+
+
 def attachment_type_for(message: Message) -> str:
     for attr in (
         "photo",
@@ -805,13 +825,26 @@ def memory_text_for(message: Message) -> str:
     return content
 
 
+def authored_memory_text_for(message: Message) -> str:
+    if has_forwarded_body(message) or is_generated_or_channel_sender(message):
+        return ""
+    return memory_text_for(message)
+
+
+def source_memory_text_for(message: Message) -> str:
+    if has_forwarded_body(message) or is_generated_or_channel_sender(message):
+        return memory_text_for(message)
+    return ""
+
+
 def save_memory_message(message: Message, *, label: str | None = None, is_bot: bool = False, text: str | None = None) -> int | None:
     if MEMORY is None:
         return None
 
     user = getattr(message, "from_user", None)
     username = getattr(user, "username", "") or ""
-    item_text = text if text is not None else memory_text_for(message)
+    item_text = text if text is not None else authored_memory_text_for(message)
+    source_text = "" if text is not None else source_memory_text_for(message)
     attachment_type = attachment_type_for(message)
     return MEMORY.save_message(
         chat_id=message.chat_id,
@@ -823,6 +856,7 @@ def save_memory_message(message: Message, *, label: str | None = None, is_bot: b
         username=username,
         is_bot=is_bot,
         text=item_text,
+        source_text=source_text,
         content_kind="image" if has_supported_image(message) else ("attachment" if attachment_type else "text"),
         attachment_type=attachment_type,
         reply_to_message_id=getattr(getattr(message, "reply_to_message", None), "message_id", None),
@@ -1385,6 +1419,8 @@ def format_memory_items(items: list[MemoryItem]) -> str:
         parts: list[str] = []
         if item.text:
             parts.append(clip_text(item.text, 900))
+        if item.source_text:
+            parts.append("shared_source_text=" + clip_text(item.source_text, 900))
         if item.reply_to_message_id is not None:
             parts.append(f"reply_to_message_id={item.reply_to_message_id}")
         if item.forward_origin:
@@ -2973,7 +3009,7 @@ def command_target_allowed(message: Message, target: UserCommandTarget) -> bool:
 
 def target_memory_selection(message: Message, target: UserCommandTarget, limit: int | None = None) -> UserMemorySelection:
     if MEMORY is None:
-        return UserMemorySelection(target=target, items=[], resolved_user_id=target.user_id, username=target.username, label_aliases=())
+        return UserMemorySelection(target=target, items=[], resolved_user_id=target.user_id, username=target.username, label_aliases=(), source_items=0)
     kwargs: dict[str, Any] = {}
     resolved_user_id = target.user_id
     if resolved_user_id is None and target.username:
@@ -2990,6 +3026,7 @@ def target_memory_selection(message: Message, target: UserCommandTarget, limit: 
         items = MEMORY.user_stats(message.chat_id, **kwargs)
     else:
         items = MEMORY.user_messages(message.chat_id, limit=limit, **kwargs)
+    source_items = MEMORY.user_source_count(message.chat_id, **kwargs)
 
     alias_set = set(label_aliases)
     user_id_matches = 0
@@ -3012,6 +3049,7 @@ def target_memory_selection(message: Message, target: UserCommandTarget, limit: 
         user_id_matches=user_id_matches,
         username_matches=username_matches,
         label_alias_matches=label_alias_matches,
+        source_items=source_items,
     )
 
 
@@ -3074,7 +3112,7 @@ def word_tokens(text: str) -> list[str]:
     return tokens
 
 
-def build_user_stats_text(target: UserCommandTarget, items: list[MemoryItem]) -> str:
+def build_user_stats_text(target: UserCommandTarget, items: list[MemoryItem], source_items: int = 0) -> str:
     pairs = cleaned_user_text_pairs(items)
     label = target_display_label(target, items)
     texts = [text for _item, text in pairs]
@@ -3108,7 +3146,9 @@ def build_user_stats_text(target: UserCommandTarget, items: list[MemoryItem]) ->
             "Топ 10 слів:",
             *top_lines,
             "",
-            "Примітка: це очищений текст або підписи, які бот бачив і ще зберігає; mentions, команди, trigger, статистичні вставки та медіа без тексту не рахуються.",
+            f"Репостів/джерел не в особистій статистиці: {source_items}",
+            "",
+            "Примітка: це очищений власний текст або власні підписи; mentions, команди, trigger, статистичні вставки, медіа без тексту та тіла репостів не рахуються.",
         ]
     )
 
@@ -3217,6 +3257,7 @@ def build_character_profile_package(selection: UserMemorySelection) -> str:
             f"Raw word tokens: {len(words)}",
             f"Top recurring words/topics: {top_line}",
             f"Identity coverage: user_id={selection.user_id_matches}, username={selection.username_matches}, label_alias={selection.label_alias_matches}",
+            f"Source/repost items excluded from profile: {selection.source_items}",
             f"Label aliases used: {', '.join(selection.label_aliases) if selection.label_aliases else '(none)'}",
             f"Embeddings available: {embedding_candidates}/{len(pairs)}",
             "",
@@ -3314,7 +3355,7 @@ async def handle_stats_command(message: Message, args: str) -> None:
     if not cleaned_user_text_pairs(items):
         await send_reply(message, f"Не знайшов змістовного тексту для {target.label} після очищення службових токенів.")
         return
-    await send_reply(message, build_user_stats_text(target, items))
+    await send_reply(message, build_user_stats_text(target, items, selection.source_items))
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

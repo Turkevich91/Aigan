@@ -1,5 +1,11 @@
 # Aigan Changelog
 
+## 2026-05-13 - Source content separated from user stats
+
+- Added separate memory storage for forwarded/source text so repost bodies stay searchable without shaping `/stat` or `/характер`.
+- Updated Telegram export import to split HTML forwarded bodies from the user's own comment and to treat JSON forwards as source-only when the author boundary is ambiguous.
+- Added importer unresolved-author reporting and optional interactive user-map prompts for Telegram Desktop exports.
+
 ## 2026-05-13 - Full-history semantic profiles
 
 - Fixed Telegram HTML import so joined messages without repeated sender names inherit the previous sender across pages.

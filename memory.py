@@ -22,6 +22,7 @@ class MemoryItem:
     username: str
     is_bot: bool
     text: str
+    source_text: str
     content_kind: str
     attachment_type: str
     telegram_file_id: str
@@ -80,6 +81,7 @@ class MemoryStore:
                 username TEXT NOT NULL DEFAULT '',
                 is_bot INTEGER NOT NULL DEFAULT 0,
                 text TEXT NOT NULL DEFAULT '',
+                source_text TEXT NOT NULL DEFAULT '',
                 content_kind TEXT NOT NULL DEFAULT 'text',
                 attachment_type TEXT NOT NULL DEFAULT '',
                 telegram_file_id TEXT NOT NULL DEFAULT '',
@@ -117,7 +119,16 @@ class MemoryStore:
                 USING fts5(search_text, tokenize = 'unicode61');
             """
         )
+        self._ensure_column("messages", "source_text", "TEXT NOT NULL DEFAULT ''")
         self._conn.commit()
+
+    def _ensure_column(self, table: str, column: str, definition: str) -> None:
+        existing = {
+            str(row["name"])
+            for row in self._conn.execute(f"PRAGMA table_info({table})").fetchall()
+        }
+        if column not in existing:
+            self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
     def save_message(
         self,
@@ -131,6 +142,7 @@ class MemoryStore:
         username: str = "",
         is_bot: bool = False,
         text: str = "",
+        source_text: str = "",
         content_kind: str = "text",
         attachment_type: str = "",
         telegram_file_id: str = "",
@@ -155,6 +167,7 @@ class MemoryStore:
             "username": username or "",
             "is_bot": 1 if is_bot else 0,
             "text": text or "",
+            "source_text": source_text or "",
             "content_kind": content_kind or "text",
             "attachment_type": attachment_type or "",
             "telegram_file_id": telegram_file_id or "",
@@ -183,13 +196,13 @@ class MemoryStore:
                     """
                     INSERT INTO messages (
                         chat_id, message_id, chat_type, created_at, sender_label,
-                        user_id, username, is_bot, text, content_kind, attachment_type,
+                        user_id, username, is_bot, text, source_text, content_kind, attachment_type,
                         telegram_file_id, telegram_unique_id, local_media_path,
                         mime_type, vision_summary, source_url, source_title,
                         reply_to_message_id, forward_origin, raw_note
                     ) VALUES (
                         :chat_id, :message_id, :chat_type, :created_at, :sender_label,
-                        :user_id, :username, :is_bot, :text, :content_kind, :attachment_type,
+                        :user_id, :username, :is_bot, :text, :source_text, :content_kind, :attachment_type,
                         :telegram_file_id, :telegram_unique_id, :local_media_path,
                         :mime_type, :vision_summary, :source_url, :source_title,
                         :reply_to_message_id, :forward_origin, :raw_note
@@ -213,6 +226,7 @@ class MemoryStore:
                     username = :username,
                     is_bot = :is_bot,
                     text = :text,
+                    source_text = :source_text,
                     content_kind = :content_kind,
                     attachment_type = :attachment_type,
                     telegram_file_id = COALESCE(NULLIF(:telegram_file_id, ''), telegram_file_id),
@@ -366,6 +380,40 @@ class MemoryStore:
         label_aliases: tuple[str, ...] | list[str] = (),
     ) -> list[MemoryItem]:
         return self._user_text_messages(chat_id, user_id=user_id, username=username, label_aliases=label_aliases, limit=None)
+
+    def user_source_count(
+        self,
+        chat_id: int,
+        *,
+        user_id: int | None = None,
+        username: str = "",
+        label_aliases: tuple[str, ...] | list[str] = (),
+    ) -> int:
+        username = username.strip().lstrip("@")
+        aliases = tuple(dict.fromkeys(alias.strip() for alias in label_aliases if alias and alias.strip()))
+        if user_id is None and not username and not aliases:
+            return 0
+
+        conditions = ["chat_id = ?", "is_bot = 0", "source_text != ''"]
+        params: list[object] = [chat_id]
+        identity_conditions: list[str] = []
+        if user_id is not None:
+            identity_conditions.append("user_id = ?")
+            params.append(user_id)
+        if username:
+            identity_conditions.append("(username != '' AND lower(username) = lower(?))")
+            params.append(username)
+        if aliases:
+            placeholders = ",".join("?" for _alias in aliases)
+            identity_conditions.append(f"sender_label IN ({placeholders})")
+            params.extend(aliases)
+        conditions.append("(" + " OR ".join(identity_conditions) + ")")
+        with self._lock:
+            row = self._conn.execute(
+                f"SELECT COUNT(*) AS count FROM messages WHERE {' AND '.join(conditions)}",
+                tuple(params),
+            ).fetchone()
+        return int(row["count"]) if row is not None else 0
 
     def user_id_for_username(self, chat_id: int, username: str) -> int | None:
         username = username.strip().lstrip("@")
@@ -892,6 +940,7 @@ class MemoryStore:
             return ""
         parts = [
             str(values.get("text") or ""),
+            str(values.get("source_text") or ""),
             str(values.get("source_title") or ""),
             str(values.get("source_url") or ""),
             str(values.get("vision_summary") or ""),
@@ -907,6 +956,7 @@ class MemoryStore:
             {
                 "is_bot": item.is_bot,
                 "text": item.text,
+                "source_text": item.source_text,
                 "source_title": item.source_title,
                 "source_url": item.source_url,
                 "vision_summary": item.vision_summary,
@@ -949,6 +999,7 @@ class MemoryStore:
             username=row["username"],
             is_bot=bool(row["is_bot"]),
             text=row["text"],
+            source_text=row["source_text"],
             content_kind=row["content_kind"],
             attachment_type=row["attachment_type"],
             telegram_file_id=row["telegram_file_id"],

@@ -7,6 +7,7 @@ import os
 import re
 import shutil
 import sys
+from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -46,6 +47,9 @@ class ImportOptions:
     image_max_bytes: int = 6_000_000
     bot_username: str = ""
     user_map_path: Path | None = None
+    interactive_user_map: str = "auto"
+    write_user_map_path: Path | None = None
+    require_resolved_users: bool = False
     embedding_model: str = "text-embedding-3-small"
     embedding_dimensions: int = 512
     embedding_batch_size: int = 64
@@ -68,6 +72,7 @@ class ImportSummary:
     fts_indexed: int = 0
     embeddings_stored: int = 0
     embedding_error: str = ""
+    unresolved_authors: dict[str, int] | None = None
 
 
 class ExportParser(Protocol):
@@ -132,7 +137,23 @@ def message_text(message: dict[str, Any]) -> str:
         telegram_text_to_plain(message.get("text")),
         telegram_text_to_plain(message.get("caption")),
     ]
-    return "\n".join(part.strip() for part in parts if part and part.strip()).strip()
+    text = "\n".join(part.strip() for part in parts if part and part.strip()).strip()
+    if forward_origin(message) and not telegram_text_to_plain(message.get("source_text")):
+        return ""
+    return text
+
+
+def message_source_text(message: dict[str, Any]) -> str:
+    source = telegram_text_to_plain(message.get("source_text")).strip()
+    if source:
+        return source
+    if forward_origin(message):
+        parts = [
+            telegram_text_to_plain(message.get("text")),
+            telegram_text_to_plain(message.get("caption")),
+        ]
+        return "\n".join(part.strip() for part in parts if part and part.strip()).strip()
+    return ""
 
 
 def parse_user_id(value: Any) -> int | None:
@@ -276,17 +297,32 @@ def html_message_text(body: Any) -> str:
     if body is None:
         return ""
     texts: list[str] = []
-    for node in body.find_all("div", class_="text"):
+    for node in body.find_all("div", class_="text", recursive=False):
         text = readable_text_from_node(node)
         if text:
             texts.append(text)
     return "\n\n".join(texts).strip()
 
 
+def html_forwarded_body(body: Any) -> Any | None:
+    if body is None:
+        return None
+    for node in body.find_all("div", recursive=False):
+        classes = set(node.get("class") or [])
+        if "forwarded" in classes and "body" in classes:
+            return node
+    return None
+
+
+def html_forwarded_text(body: Any) -> str:
+    forwarded = html_forwarded_body(body)
+    return html_message_text(forwarded) if forwarded is not None else ""
+
+
 def html_forward_origin(body: Any) -> str:
     if body is None:
         return ""
-    forwarded = body.find("div", class_="forwarded")
+    forwarded = html_forwarded_body(body)
     if not forwarded:
         return ""
     name = forwarded.find("div", class_="from_name")
@@ -449,6 +485,7 @@ class HtmlExportParser:
             return None
         sender = direct_child_text(body, "from_name") or current_sender or "Telegram export"
         media_path, media_kind = html_media_path(body)
+        source_text = html_forwarded_text(body)
         item: dict[str, Any] = {
             "id": message_id,
             "type": "message",
@@ -456,6 +493,7 @@ class HtmlExportParser:
             "date_unixtime": str(int(created.timestamp())),
             "from": sender,
             "text": html_message_text(body),
+            "source_text": source_text,
             "_export_dir": str(self.export_dir),
             "_format": "html",
         }
@@ -530,7 +568,7 @@ def should_import_message(message: dict[str, Any], options: ImportOptions, cutof
     if cutoff is not None and created_at < cutoff:
         return False, "old"
     has_media_ref = media_source_path(message, export_base_dir(options.file)) is not None or bool(message.get("photo"))
-    if not message_text(message) and not has_media_ref:
+    if not message_text(message) and not message_source_text(message) and not has_media_ref:
         return False, "empty"
     return True, ""
 
@@ -546,6 +584,89 @@ def apply_user_map(message: dict[str, Any], user_map: dict[str, dict[str, Any]])
         message["username"] = str(entry["username"]).lstrip("@")
 
 
+def unresolved_author_counts(
+    messages: list[dict[str, Any]],
+    *,
+    options: ImportOptions,
+    cutoff: datetime | None,
+    user_map: dict[str, dict[str, Any]],
+) -> Counter[str]:
+    counts: Counter[str] = Counter()
+    for original in messages:
+        if not isinstance(original, dict):
+            continue
+        message = dict(original)
+        apply_user_map(message, user_map)
+        should_import, _reason = should_import_message(message, options, cutoff)
+        if not should_import:
+            continue
+        label = sender_label(message)
+        if not label or label in {"Telegram export", "Telegram service"}:
+            continue
+        if is_bot_sender(label, options.bot_username):
+            continue
+        if parse_user_id(message.get("from_id") or message.get("actor_id")) is not None:
+            continue
+        if str(message.get("username") or "").strip():
+            continue
+        counts[label] += 1
+    return counts
+
+
+def parse_user_map_answer(raw: str) -> dict[str, Any] | None:
+    value = raw.strip()
+    if not value:
+        return None
+    parts = [part.strip() for part in value.split(",")]
+    user_id = parse_user_id(parts[0] if parts else "")
+    if user_id is None:
+        return None
+    username = parts[1].lstrip("@") if len(parts) > 1 else ""
+    return {"user_id": user_id, "username": username}
+
+
+def maybe_prompt_for_unresolved_authors(
+    counts: Counter[str],
+    *,
+    options: ImportOptions,
+    user_map: dict[str, dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    mode = (options.interactive_user_map or "auto").strip().lower()
+    if mode not in {"auto", "always", "never"}:
+        raise ValueError("--interactive-user-map must be one of: auto, always, never")
+    if not counts:
+        return {}
+    interactive = mode == "always" or (mode == "auto" and sys.stdin.isatty() and sys.stdout.isatty())
+    if not interactive:
+        return {}
+
+    additions: dict[str, dict[str, Any]] = {}
+    print("Unresolved Telegram export authors. Enter user_id[,username] or blank to keep unresolved.", file=sys.stderr)
+    for label, count in counts.most_common():
+        try:
+            answer = input(f"{label} ({count} messages): ").strip()
+        except EOFError:
+            break
+        entry = parse_user_map_answer(answer)
+        if entry is None:
+            continue
+        key = normalize_name(label)
+        user_map[key] = entry
+        additions[label] = entry
+    return additions
+
+
+def write_user_map(path: Path, additions: dict[str, dict[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    existing: dict[str, Any] = {}
+    if path.exists():
+        existing_data = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(existing_data, dict):
+            existing = existing_data
+    existing.update(additions)
+    path.write_text(json.dumps(existing, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
 def import_export(options: ImportOptions) -> ImportSummary:
     summary = ImportSummary()
     messages = build_parser(options.file).messages()
@@ -556,6 +677,15 @@ def import_export(options: ImportOptions) -> ImportSummary:
     store: MemoryStore | None = None if options.dry_run else MemoryStore(options.db_path, options.retention_days)
     user_map = infer_existing_user_map(store, options.chat_id)
     user_map.update(load_user_map(options.user_map_path))
+    unresolved = unresolved_author_counts(messages, options=options, cutoff=cutoff, user_map=user_map)
+    additions = maybe_prompt_for_unresolved_authors(unresolved, options=options, user_map=user_map)
+    if additions and options.write_user_map_path is not None:
+        write_user_map(options.write_user_map_path, additions)
+    unresolved = unresolved_author_counts(messages, options=options, cutoff=cutoff, user_map=user_map)
+    summary.unresolved_authors = dict(unresolved)
+    if options.require_resolved_users and unresolved:
+        names = ", ".join(f"{label} ({count})" for label, count in unresolved.most_common(10))
+        raise ValueError(f"Unresolved Telegram export authors remain: {names}")
     try:
         for message in messages:
             if not isinstance(message, dict):
@@ -592,6 +722,7 @@ def import_export(options: ImportOptions) -> ImportSummary:
                 summary.bot_messages += 1
 
             text = message_text(message)
+            source_text = message_source_text(message)
             content_kind = "text"
             attachment_type = str(message.get("_attachment_type") or "")
             local_media_path = ""
@@ -633,6 +764,7 @@ def import_export(options: ImportOptions) -> ImportSummary:
                 username=str(message.get("username") or "").lstrip("@"),
                 is_bot=bot_message,
                 text=text,
+                source_text=source_text,
                 content_kind=content_kind,
                 attachment_type=attachment_type,
                 local_media_path=local_media_path,
@@ -732,6 +864,9 @@ def build_options(args: argparse.Namespace) -> ImportOptions:
         image_max_bytes=env_int("IMAGE_MAX_BYTES", 6_000_000),
         bot_username=os.getenv("BOT_USERNAME", ""),
         user_map_path=Path(args.user_map) if args.user_map else None,
+        interactive_user_map=str(args.interactive_user_map),
+        write_user_map_path=Path(args.write_user_map) if args.write_user_map else None,
+        require_resolved_users=bool(args.require_resolved_users),
         embedding_model=os.getenv("MEMORY_EMBEDDING_MODEL", "text-embedding-3-small").strip(),
         embedding_dimensions=env_int("MEMORY_EMBEDDING_DIMENSIONS", 512),
         embedding_batch_size=env_int("MEMORY_EMBEDDING_BATCH_SIZE", 64),
@@ -758,6 +893,12 @@ def print_summary(summary: ImportSummary, *, dry_run: bool) -> None:
     print(f"- skipped_invalid: {summary.skipped_invalid}")
     if summary.embedding_error:
         print(f"- embedding_error: {summary.embedding_error}")
+    unresolved = summary.unresolved_authors or {}
+    if unresolved:
+        print("- unresolved_authors:")
+        for label, count in sorted(unresolved.items(), key=lambda item: (-item[1], item[0].casefold()))[:20]:
+            print(f"  - {label}: {count}")
+        print("- user_map_hint: add entries like {\"Display Name\": {\"user_id\": 123456, \"username\": \"name\"}}")
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -776,6 +917,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--embed-missing", action="store_true", help="Create embeddings for missing imported/searchable messages")
     parser.add_argument("--embedding-limit", type=int, default=10000, help="Maximum embeddings to create in this run")
     parser.add_argument("--user-map", default="", help="Optional JSON map from HTML display names to user_id/username")
+    parser.add_argument(
+        "--interactive-user-map",
+        choices=("auto", "always", "never"),
+        default="auto",
+        help="Ask for user_id[,username] for unresolved export authors when running in an interactive TTY",
+    )
+    parser.add_argument("--write-user-map", default="", help="Write interactive user-map answers to this JSON file")
+    parser.add_argument(
+        "--require-resolved-users",
+        action="store_true",
+        help="Fail if any imported non-bot author still lacks user_id/username after mapping",
+    )
     args = parser.parse_args(argv)
     if args.days == 0:
         args.days = None

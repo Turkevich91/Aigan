@@ -991,6 +991,9 @@ class PersistentMemoryTests(unittest.TestCase):
             self.assertEqual(407892151, user_item.user_id)
             self.assertEqual(19, user_item.reply_to_message_id)
             self.assertEqual("Source Channel", user_item.forward_origin)
+            self.assertEqual("", user_item.text)
+            self.assertEqual("forwarded user text", user_item.source_text)
+            self.assertTrue(store.fts_search(chat_id=-1001, query="forwarded user text", lookback_days=30, limit=3))
             self.assertFalse(store.fts_search(chat_id=-1001, query="self feedback", lookback_days=30, limit=3))
 
     def test_telegram_export_import_copies_valid_image_media(self) -> None:
@@ -1217,6 +1220,71 @@ class PersistentMemoryTests(unittest.TestCase):
             self.assertEqual("image", item.content_kind)
             self.assertTrue(Path(item.local_media_path).is_file())
 
+    def test_html_export_splits_author_comment_from_forwarded_source_text(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            export_dir = self.write_html_export(
+                tmpdir,
+                {
+                    "messages.html": """
+                    <div class="message default clearfix" id="message251">
+                      <div class="body">
+                        <div class="pull_right date details" title="13.05.2026 10:02:00 UTC+00:00">10:02</div>
+                        <div class="from_name">Sergey</div>
+                        <div class="text">my own short comment</div>
+                        <div class="forwarded body">
+                          <div class="from_name">Ukraine Online <span class="date details">13.05.2026</span></div>
+                          <div class="text"><strong>viral repost body</strong><br><a href="https://t.me/example">Ukraine Online | Subscribe</a></div>
+                        </div>
+                      </div>
+                    </div>
+                    """,
+                },
+            )
+            db_path = Path(tmpdir) / "memory.sqlite3"
+
+            import_telegram_export.import_export(self.import_options(export_dir, db_path))
+            store = MemoryStore(db_path, retention_days=30)
+            item = store.message_by_message_id(-1001, 251)
+            stats_items = store.user_stats(-1001, label_aliases=("Sergey",))
+
+            self.assertEqual("my own short comment", item.text)
+            self.assertIn("viral repost body", item.source_text)
+            self.assertIn("Ukraine Online", item.source_text)
+            self.assertEqual("Ukraine Online", item.forward_origin)
+            self.assertEqual([251], [stat_item.message_id for stat_item in stats_items])
+            self.assertTrue(store.fts_search(chat_id=-1001, query="viral repost body", lookback_days=30, limit=3))
+
+    def test_html_forward_without_author_comment_is_source_only(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            export_dir = self.write_html_export(
+                tmpdir,
+                {
+                    "messages.html": """
+                    <div class="message default clearfix" id="message252">
+                      <div class="body">
+                        <div class="pull_right date details" title="13.05.2026 10:02:00 UTC+00:00">10:02</div>
+                        <div class="from_name">Sergey</div>
+                        <div class="forwarded body">
+                          <div class="from_name">Ukraine Online <span class="date details">13.05.2026</span></div>
+                          <div class="text">channel only text subscribe online</div>
+                        </div>
+                      </div>
+                    </div>
+                    """,
+                },
+            )
+            db_path = Path(tmpdir) / "memory.sqlite3"
+
+            import_telegram_export.import_export(self.import_options(export_dir, db_path))
+            store = MemoryStore(db_path, retention_days=30)
+            item = store.message_by_message_id(-1001, 252)
+
+            self.assertEqual("", item.text)
+            self.assertEqual("channel only text subscribe online", item.source_text)
+            self.assertEqual([], store.user_stats(-1001, label_aliases=("Sergey",)))
+            self.assertEqual(1, store.user_source_count(-1001, label_aliases=("Sergey",)))
+            self.assertTrue(store.fts_search(chat_id=-1001, query="subscribe online", lookback_days=30, limit=3))
+
     def test_html_export_user_map_adds_user_id_and_username(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             export_dir = self.write_html_export(
@@ -1271,6 +1339,96 @@ class PersistentMemoryTests(unittest.TestCase):
 
             self.assertIsNone(item.user_id)
             self.assertEqual("", item.username)
+
+    def test_import_reports_unresolved_authors_without_tty_prompt(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            export_dir = self.write_html_export(
+                tmpdir,
+                {
+                    "messages.html": """
+                    <div class="message default clearfix" id="message451">
+                      <div class="body">
+                        <div class="pull_right date details" title="13.05.2026 10:04:00 UTC+00:00">10:04</div>
+                        <div class="from_name">Unknown Person</div>
+                        <div class="text">unknown sender text</div>
+                      </div>
+                    </div>
+                    """,
+                },
+            )
+            db_path = Path(tmpdir) / "memory.sqlite3"
+
+            with patch.object(import_telegram_export.sys.stdin, "isatty", return_value=False):
+                with patch.object(import_telegram_export.sys.stdout, "isatty", return_value=False):
+                    summary = import_telegram_export.import_export(self.import_options(export_dir, db_path))
+
+            self.assertEqual({"Unknown Person": 1}, summary.unresolved_authors)
+
+    def test_import_interactive_user_map_can_write_answers(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            export_dir = self.write_html_export(
+                tmpdir,
+                {
+                    "messages.html": """
+                    <div class="message default clearfix" id="message452">
+                      <div class="body">
+                        <div class="pull_right date details" title="13.05.2026 10:04:00 UTC+00:00">10:04</div>
+                        <div class="from_name">Unknown Person</div>
+                        <div class="text">unknown sender text</div>
+                      </div>
+                    </div>
+                    """,
+                },
+            )
+            db_path = Path(tmpdir) / "memory.sqlite3"
+            user_map = Path(tmpdir) / "users.json"
+
+            with patch.object(import_telegram_export.sys.stdin, "isatty", return_value=True):
+                with patch.object(import_telegram_export.sys.stdout, "isatty", return_value=True):
+                    with patch("builtins.input", return_value="777,mapped"):
+                        summary = import_telegram_export.import_export(
+                            self.import_options(
+                                export_dir,
+                                db_path,
+                                interactive_user_map="always",
+                                write_user_map_path=user_map,
+                            )
+                        )
+
+            store = MemoryStore(db_path, retention_days=30)
+            item = store.message_by_message_id(-1001, 452)
+            written = json.loads(user_map.read_text(encoding="utf-8"))
+            self.assertEqual({}, summary.unresolved_authors)
+            self.assertEqual(777, item.user_id)
+            self.assertEqual("mapped", item.username)
+            self.assertEqual({"user_id": 777, "username": "mapped"}, written["Unknown Person"])
+
+    def test_import_require_resolved_users_fails_on_unmapped_author(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            export_dir = self.write_html_export(
+                tmpdir,
+                {
+                    "messages.html": """
+                    <div class="message default clearfix" id="message453">
+                      <div class="body">
+                        <div class="pull_right date details" title="13.05.2026 10:04:00 UTC+00:00">10:04</div>
+                        <div class="from_name">Unknown Person</div>
+                        <div class="text">unknown sender text</div>
+                      </div>
+                    </div>
+                    """,
+                },
+            )
+
+            with self.assertRaisesRegex(ValueError, "Unresolved Telegram export authors"):
+                import_telegram_export.import_export(
+                    self.import_options(
+                        export_dir,
+                        Path(tmpdir) / "memory.sqlite3",
+                        require_resolved_users=True,
+                        interactive_user_map="never",
+                    )
+                )
 
     def test_image_metadata_and_summary_are_stored_and_reused(self) -> None:
         item_id = main.MEMORY.save_message(
@@ -1818,6 +1976,54 @@ class PersistentMemoryTests(unittest.TestCase):
         self.assertNotIn("attachment", reply)
         self.assertNotIn("sticker", reply)
 
+    def test_stats_ignores_forwarded_source_text_but_reports_source_count(self) -> None:
+        now = datetime.now(timezone.utc)
+        main.MEMORY.save_message(
+            chat_id=-1001,
+            message_id=3010,
+            sender_label="Test User (@tester, id=407892151)",
+            user_id=407892151,
+            username="tester",
+            text="my own comment alpha",
+            source_text="Ukraine Online subscribe viral repost body",
+            forward_origin="Ukraine Online",
+            created_at=now,
+        )
+        main.MEMORY.save_message(
+            chat_id=-1001,
+            message_id=3011,
+            sender_label="Test User (@tester, id=407892151)",
+            user_id=407892151,
+            username="tester",
+            text="",
+            source_text="channel only subscribe online",
+            forward_origin="Ukraine Online",
+            created_at=now + timedelta(seconds=1),
+        )
+        message = FakeMessage("/stat")
+
+        asyncio.run(main.stats_command(SimpleNamespace(effective_message=message), SimpleNamespace()))
+
+        reply = message.reply_calls[0]["text"].casefold()
+        self.assertIn("репостів/джерел не в особистій статистиці: 2", reply)
+        self.assertIn("alpha - 1", reply)
+        self.assertNotIn("subscribe -", reply)
+        self.assertNotIn("online -", reply)
+        self.assertTrue(main.MEMORY.fts_search(chat_id=-1001, query="viral repost body", lookback_days=30, limit=3))
+
+    def test_live_forwarded_message_is_saved_as_source_text_not_author_text(self) -> None:
+        message = FakeMessage("forwarded channel body subscribe online", message_id=3020)
+        message.forward_date = datetime.now(timezone.utc)
+
+        item_id = main.save_memory_message(message)
+        item = main.MEMORY.item_by_id(item_id)
+
+        self.assertEqual("", item.text)
+        self.assertEqual("forwarded channel body subscribe online", item.source_text)
+        self.assertEqual("forwarded", item.forward_origin)
+        self.assertEqual([], main.MEMORY.user_stats(-1001, user_id=message.from_user.id))
+        self.assertTrue(main.MEMORY.fts_search(chat_id=-1001, query="channel body", lookback_days=30, limit=3))
+
     def test_stats_normalizes_mentions_commands_triggers_and_pasted_output(self) -> None:
         now = datetime.now(timezone.utc)
         samples = [
@@ -2137,6 +2343,37 @@ class PersistentMemoryTests(unittest.TestCase):
         self.assertNotIn("thrd", prompt)
         self.assertNotIn("bot", prompt)
         self.assertNotIn("1. thrd - 6", prompt)
+
+    def test_character_profile_ignores_repost_source_text(self) -> None:
+        base = datetime.now(timezone.utc)
+        for index in range(10):
+            main.MEMORY.save_message(
+                chat_id=-1001,
+                message_id=3520 + index,
+                sender_label="Test User (@tester, id=407892151)",
+                user_id=407892151,
+                username="tester",
+                text=f"personal style sample {index}",
+                source_text=f"channel repost body subscribe online {index}",
+                forward_origin="Source Channel",
+                created_at=base + timedelta(seconds=index),
+            )
+        message = FakeMessage("/character me")
+        context = SimpleNamespace(bot=SimpleNamespace(username="thrd_ua_bot", id=8712856238, send_chat_action=AsyncMock()))
+        captured = {}
+
+        async def fake_run_plain_model(prompt: str) -> str:
+            captured["prompt"] = prompt
+            return "profile ready"
+
+        with patch.object(main, "run_plain_model", new=fake_run_plain_model):
+            asyncio.run(main.character_command(SimpleNamespace(effective_message=message), context))
+
+        prompt = captured["prompt"].casefold()
+        self.assertIn("personal style sample 0", prompt)
+        self.assertIn("source/repost items excluded from profile: 10", prompt)
+        self.assertNotIn("channel repost body", prompt)
+        self.assertNotIn("subscribe online", prompt)
 
     def test_character_command_requires_minimum_messages(self) -> None:
         main.MEMORY.save_message(
