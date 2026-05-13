@@ -4,6 +4,7 @@
 
 data/
 logs/
+imports/
 __pycache__/
 *.py[cod]
 *$py.class

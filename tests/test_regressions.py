@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 import socket
 import tempfile
@@ -53,6 +54,8 @@ from telegram.error import BadRequest
 import main
 from memory import MemoryStore
 from mcp_servers import web
+from scripts import import_telegram_export
+from scripts.import_telegram_export import ImportOptions
 from self_analysis import SelfAnalysisService, classify_complaint
 from system_log import SystemLogStore, redact_secrets
 
@@ -811,6 +814,198 @@ class PersistentMemoryTests(unittest.TestCase):
 
         self.assertIn("тільки адмінам", non_admin.reply_calls[0]["text"])
         search.assert_awaited_once()
+
+    def write_export(self, tmpdir: str, messages: list[dict]) -> Path:
+        path = Path(tmpdir) / "result.json"
+        path.write_text(json.dumps({"messages": messages}), encoding="utf-8")
+        return path
+
+    def import_options(self, export_path: Path, db_path: Path, **overrides) -> ImportOptions:
+        values = {
+            "file": export_path,
+            "chat_id": -1001,
+            "db_path": db_path,
+            "days": None,
+            "retention_days": 30,
+            "image_max_bytes": 6_000_000,
+            "bot_username": "thrd_ua_bot",
+            "embedding_dimensions": 4,
+            "embedding_batch_size": 2,
+            "semantic_lookback_days": 30,
+        }
+        values.update(overrides)
+        return ImportOptions(**values)
+
+    def test_telegram_export_import_parses_fragments_and_skips_service(self) -> None:
+        now = datetime.now(timezone.utc)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            export_path = self.write_export(
+                tmpdir,
+                [
+                    {"id": 1, "type": "service", "date_unixtime": str(int(now.timestamp())), "actor": "Tester"},
+                    {
+                        "id": 2,
+                        "type": "message",
+                        "date_unixtime": str(int(now.timestamp())),
+                        "from": "Tester",
+                        "from_id": "user123",
+                        "text": ["Hello ", {"type": "bold", "text": "semantic"}, " world"],
+                    },
+                ],
+            )
+
+            summary = import_telegram_export.import_export(self.import_options(export_path, Path(tmpdir) / "memory.sqlite3"))
+            store = MemoryStore(Path(tmpdir) / "memory.sqlite3", retention_days=30)
+
+            self.assertEqual(1, summary.imported)
+            self.assertEqual(1, summary.skipped_service)
+            self.assertEqual("Hello semantic world", store.latest(-1001, 1)[0].text)
+            self.assertTrue(store.fts_search(chat_id=-1001, query="semantic", lookback_days=30, limit=3))
+
+    def test_telegram_export_import_days_filter_and_idempotent_update(self) -> None:
+        now = datetime.now(timezone.utc)
+        old = now - timedelta(days=40)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            export_path = self.write_export(
+                tmpdir,
+                [
+                    {"id": 10, "type": "message", "date_unixtime": str(int(old.timestamp())), "from": "Old", "text": "old"},
+                    {"id": 11, "type": "message", "date_unixtime": str(int(now.timestamp())), "from": "New", "text": "first"},
+                ],
+            )
+            db_path = Path(tmpdir) / "memory.sqlite3"
+            options = self.import_options(export_path, db_path, days=30)
+
+            first = import_telegram_export.import_export(options)
+            export_path = self.write_export(
+                tmpdir,
+                [
+                    {"id": 11, "type": "message", "date_unixtime": str(int(now.timestamp())), "from": "New", "text": "updated"}
+                ],
+            )
+            second = import_telegram_export.import_export(self.import_options(export_path, db_path, days=30))
+            store = MemoryStore(db_path, retention_days=30)
+
+            self.assertEqual(1, first.inserted)
+            self.assertEqual(1, first.skipped_old)
+            self.assertEqual(1, second.updated)
+            self.assertEqual(1, len(store.latest(-1001, 10)))
+            self.assertEqual("updated", store.latest(-1001, 1)[0].text)
+
+    def test_telegram_export_import_preserves_reply_forward_user_and_excludes_bot_search(self) -> None:
+        now = datetime.now(timezone.utc)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            export_path = self.write_export(
+                tmpdir,
+                [
+                    {
+                        "id": 20,
+                        "type": "message",
+                        "date_unixtime": str(int(now.timestamp())),
+                        "from": "Tester",
+                        "from_id": "user407892151",
+                        "reply_to_message_id": 19,
+                        "forwarded_from": "Source Channel",
+                        "text": "forwarded user text",
+                    },
+                    {
+                        "id": 21,
+                        "type": "message",
+                        "date_unixtime": str(int(now.timestamp())),
+                        "from": "Aigan",
+                        "text": "bot self feedback should not index",
+                    },
+                ],
+            )
+            db_path = Path(tmpdir) / "memory.sqlite3"
+
+            summary = import_telegram_export.import_export(self.import_options(export_path, db_path))
+            store = MemoryStore(db_path, retention_days=30)
+            user_item = store.message_by_message_id(-1001, 20)
+
+            self.assertEqual(1, summary.bot_messages)
+            self.assertEqual(407892151, user_item.user_id)
+            self.assertEqual(19, user_item.reply_to_message_id)
+            self.assertEqual("Source Channel", user_item.forward_origin)
+            self.assertFalse(store.fts_search(chat_id=-1001, query="self feedback", lookback_days=30, limit=3))
+
+    def test_telegram_export_import_copies_valid_image_media(self) -> None:
+        now = datetime.now(timezone.utc)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            photo = Path(tmpdir) / "photos" / "photo_1.png"
+            photo.parent.mkdir()
+            photo.write_bytes(b"\x89PNG\r\n\x1a\n" + b"image")
+            export_path = self.write_export(
+                tmpdir,
+                [
+                    {
+                        "id": 30,
+                        "type": "message",
+                        "date_unixtime": str(int(now.timestamp())),
+                        "from": "Tester",
+                        "text": "caption",
+                        "photo": "photos/photo_1.png",
+                    }
+                ],
+            )
+            db_path = Path(tmpdir) / "memory.sqlite3"
+
+            summary = import_telegram_export.import_export(self.import_options(export_path, db_path, copy_media=True))
+            store = MemoryStore(db_path, retention_days=30)
+            item = store.message_by_message_id(-1001, 30)
+
+            self.assertEqual(1, summary.media_copied)
+            self.assertEqual("image", item.content_kind)
+            self.assertEqual("image/png", item.mime_type)
+            self.assertTrue(Path(item.local_media_path).is_file())
+
+    def test_telegram_export_dry_run_does_not_create_database(self) -> None:
+        now = datetime.now(timezone.utc)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            export_path = self.write_export(
+                tmpdir,
+                [{"id": 40, "type": "message", "date_unixtime": str(int(now.timestamp())), "from": "Tester", "text": "dry"}],
+            )
+            db_path = Path(tmpdir) / "memory.sqlite3"
+
+            summary = import_telegram_export.import_export(self.import_options(export_path, db_path, dry_run=True))
+
+            self.assertEqual(1, summary.imported)
+            self.assertFalse(db_path.exists())
+
+    def test_telegram_export_embedding_backfill_can_be_mocked(self) -> None:
+        now = datetime.now(timezone.utc)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            export_path = self.write_export(
+                tmpdir,
+                [
+                    {
+                        "id": 50,
+                        "type": "message",
+                        "date_unixtime": str(int(now.timestamp())),
+                        "from": "Tester",
+                        "text": "embedding import text",
+                    }
+                ],
+            )
+            db_path = Path(tmpdir) / "memory.sqlite3"
+
+            with patch.object(import_telegram_export, "create_embeddings", return_value=[[1.0, 0.0, 0.0, 0.0]]):
+                summary = import_telegram_export.import_export(
+                    self.import_options(export_path, db_path, embed_missing=True, embedding_limit=10)
+                )
+            store = MemoryStore(db_path, retention_days=30)
+
+            self.assertEqual(1, summary.embeddings_stored)
+            self.assertEqual(
+                1,
+                store.embedding_index_count(
+                    chat_id=-1001,
+                    model="text-embedding-3-small",
+                    dimensions=4,
+                    lookback_days=30,
+                ),
+            )
 
     def test_image_metadata_and_summary_are_stored_and_reused(self) -> None:
         item_id = main.MEMORY.save_message(

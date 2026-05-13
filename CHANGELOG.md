@@ -1,5 +1,11 @@
 # Aigan Changelog
 
+## 2026-05-13 - Telegram export memory import
+
+- Added a one-off Telegram Desktop JSON importer for backfilling older chat history into SQLite memory.
+- Kept imports idempotent by using Telegram `(chat_id, message_id)` keys and rebuilding the local FTS index.
+- Added optional exported image copy and missing embedding backfill for imported messages.
+
 ## 2026-05-13 - Hybrid semantic memory search
 
 - Added local SQLite semantic memory search with embeddings plus FTS5 fallback over retained chat history.
