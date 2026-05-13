@@ -1,5 +1,11 @@
 # Aigan Changelog
 
+## 2026-05-13 - Hybrid semantic memory search
+
+- Added local SQLite semantic memory search with embeddings plus FTS5 fallback over retained chat history.
+- Added background embedding backfill and admin `/memory_search` diagnostics.
+- Kept ordinary group messages silent; long-term memory retrieval only runs after explicit bot invocation.
+
 ## 2026-05-13 - Short follow-up memory retrieval
 
 - Added expanded persistent memory for explicit short follow-ups such as `@bot скільки?`, without changing ordinary group silence.

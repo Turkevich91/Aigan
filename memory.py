@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import hashlib
+import re
 import sqlite3
+import struct
 import threading
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -31,6 +34,21 @@ class MemoryItem:
     reply_to_message_id: int | None
     forward_origin: str
     raw_note: str
+
+
+@dataclass(frozen=True)
+class EmbeddingCandidate:
+    item: MemoryItem
+    search_text: str
+    content_hash: str
+
+
+@dataclass(frozen=True)
+class SemanticMemoryResult:
+    item: MemoryItem
+    search_text: str
+    score: float
+    source: str
 
 
 class MemoryStore:
@@ -84,6 +102,19 @@ class MemoryStore:
             CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_chat_message
                 ON messages(chat_id, message_id)
                 WHERE message_id IS NOT NULL;
+            CREATE TABLE IF NOT EXISTS message_embeddings (
+                message_id INTEGER PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE,
+                chat_id INTEGER NOT NULL,
+                model TEXT NOT NULL,
+                dimensions INTEGER NOT NULL,
+                content_hash TEXT NOT NULL,
+                embedding_blob BLOB NOT NULL,
+                embedded_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_message_embeddings_chat
+                ON message_embeddings(chat_id, model, dimensions);
+            CREATE VIRTUAL TABLE IF NOT EXISTS message_fts
+                USING fts5(search_text, tokenize = 'unicode61');
             """
         )
         self._conn.commit()
@@ -167,7 +198,9 @@ class MemoryStore:
                     values,
                 )
                 self._conn.commit()
-                return int(cursor.lastrowid)
+                item_id = int(cursor.lastrowid)
+                self._sync_search_index_from_values(item_id, values)
+                return item_id
 
             values["id"] = existing_id
             self._conn.execute(
@@ -197,6 +230,7 @@ class MemoryStore:
                 values,
             )
             self._conn.commit()
+            self._sync_search_index_from_values(existing_id, values)
             return existing_id
 
     def update_media(
@@ -234,6 +268,7 @@ class MemoryStore:
                 ),
             )
             self._conn.commit()
+            self._sync_search_index_for_id(item_id)
 
     def update_vision_summary(self, item_id: int, summary: str) -> None:
         with self._lock:
@@ -242,6 +277,7 @@ class MemoryStore:
                 (summary or "", item_id),
             )
             self._conn.commit()
+            self._sync_search_index_for_id(item_id)
 
     def latest(self, chat_id: int, limit: int = 10) -> list[MemoryItem]:
         limit = max(1, int(limit))
@@ -259,6 +295,16 @@ class MemoryStore:
                 (chat_id, limit),
             ).fetchall()
         return [self._row_to_item(row) for row in rows]
+
+    def item_by_id(self, item_id: int | None) -> MemoryItem | None:
+        if item_id is None:
+            return None
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM messages WHERE id = ? LIMIT 1",
+                (item_id,),
+            ).fetchone()
+        return self._row_to_item(row) if row is not None else None
 
     def message_by_message_id(self, chat_id: int, message_id: int | None) -> MemoryItem | None:
         if message_id is None:
@@ -382,15 +428,241 @@ class MemoryStore:
             ).fetchall()
         return [self._row_to_item(row) for row in rows]
 
+    def embedding_candidates_by_ids(
+        self,
+        item_ids: list[int],
+        *,
+        model: str,
+        dimensions: int,
+        limit: int,
+    ) -> list[EmbeddingCandidate]:
+        unique_ids = list(dict.fromkeys(int(item_id) for item_id in item_ids if item_id))
+        if not unique_ids:
+            return []
+        placeholders = ",".join("?" for _ in unique_ids)
+        params: list[object] = [model, int(dimensions), *unique_ids]
+        with self._lock:
+            rows = self._conn.execute(
+                f"""
+                SELECT m.*, e.content_hash AS embedded_hash
+                FROM messages m
+                LEFT JOIN message_embeddings e
+                  ON e.message_id = m.id AND e.model = ? AND e.dimensions = ?
+                WHERE m.id IN ({placeholders})
+                ORDER BY m.created_at ASC, m.id ASC
+                """,
+                params,
+            ).fetchall()
+        return self._embedding_candidates_from_rows(rows, limit)
+
+    def pending_embedding_candidates(
+        self,
+        *,
+        model: str,
+        dimensions: int,
+        limit: int,
+        lookback_days: int,
+    ) -> list[EmbeddingCandidate]:
+        limit = max(1, int(limit))
+        cutoff = self._format_datetime(datetime.now(timezone.utc) - timedelta(days=max(1, int(lookback_days))))
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT m.*, e.content_hash AS embedded_hash
+                FROM messages m
+                LEFT JOIN message_embeddings e
+                  ON e.message_id = m.id AND e.model = ? AND e.dimensions = ?
+                WHERE m.created_at >= ?
+                  AND m.is_bot = 0
+                ORDER BY m.created_at ASC, m.id ASC
+                """,
+                (model, int(dimensions), cutoff),
+            ).fetchall()
+        return self._embedding_candidates_from_rows(rows, limit)
+
+    def embedding_backlog_count(self, *, model: str, dimensions: int, lookback_days: int) -> int:
+        cutoff = self._format_datetime(datetime.now(timezone.utc) - timedelta(days=max(1, int(lookback_days))))
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT m.*, e.content_hash AS embedded_hash
+                FROM messages m
+                LEFT JOIN message_embeddings e
+                  ON e.message_id = m.id AND e.model = ? AND e.dimensions = ?
+                WHERE m.created_at >= ?
+                  AND m.is_bot = 0
+                ORDER BY m.created_at ASC, m.id ASC
+                """,
+                (model, int(dimensions), cutoff),
+            ).fetchall()
+        return len(self._embedding_candidates_from_rows(rows, 1000000))
+
+    def embedding_index_count(self, *, chat_id: int, model: str, dimensions: int, lookback_days: int) -> int:
+        cutoff = self._format_datetime(datetime.now(timezone.utc) - timedelta(days=max(1, int(lookback_days))))
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT COUNT(*) AS count
+                FROM message_embeddings e
+                JOIN messages m ON m.id = e.message_id
+                WHERE e.chat_id = ?
+                  AND e.model = ?
+                  AND e.dimensions = ?
+                  AND m.created_at >= ?
+                  AND m.is_bot = 0
+                """,
+                (chat_id, model, int(dimensions), cutoff),
+            ).fetchone()
+        return int(row["count"] or 0)
+
+    def upsert_embedding(
+        self,
+        *,
+        message_id: int,
+        chat_id: int,
+        model: str,
+        dimensions: int,
+        content_hash: str,
+        embedding: list[float],
+    ) -> None:
+        blob = self._embedding_to_blob(embedding)
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT INTO message_embeddings (
+                    message_id, chat_id, model, dimensions, content_hash, embedding_blob, embedded_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(message_id) DO UPDATE SET
+                    chat_id = excluded.chat_id,
+                    model = excluded.model,
+                    dimensions = excluded.dimensions,
+                    content_hash = excluded.content_hash,
+                    embedding_blob = excluded.embedding_blob,
+                    embedded_at = excluded.embedded_at
+                """,
+                (
+                    int(message_id),
+                    int(chat_id),
+                    model,
+                    int(dimensions),
+                    content_hash,
+                    blob,
+                    self._format_datetime(None),
+                ),
+            )
+            self._conn.commit()
+
+    def semantic_search(
+        self,
+        *,
+        chat_id: int,
+        query_embedding: list[float],
+        model: str,
+        dimensions: int,
+        lookback_days: int,
+        limit: int,
+    ) -> list[SemanticMemoryResult]:
+        limit = max(1, int(limit))
+        cutoff = self._format_datetime(datetime.now(timezone.utc) - timedelta(days=max(1, int(lookback_days))))
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT m.*, e.embedding_blob
+                FROM message_embeddings e
+                JOIN messages m ON m.id = e.message_id
+                WHERE e.chat_id = ?
+                  AND e.model = ?
+                  AND e.dimensions = ?
+                  AND m.created_at >= ?
+                  AND m.is_bot = 0
+                """,
+                (chat_id, model, int(dimensions), cutoff),
+            ).fetchall()
+
+        results: list[SemanticMemoryResult] = []
+        for row in rows:
+            item = self._row_to_item(row)
+            search_text = self.searchable_text_for_item(item)
+            if not search_text:
+                continue
+            score = self._dot(query_embedding, self._embedding_from_blob(row["embedding_blob"]))
+            results.append(SemanticMemoryResult(item=item, search_text=search_text, score=score, source="semantic"))
+        return sorted(results, key=lambda result: result.score, reverse=True)[:limit]
+
+    def fts_search(self, *, chat_id: int, query: str, lookback_days: int, limit: int) -> list[SemanticMemoryResult]:
+        fts_query = self._fts_query(query)
+        if not fts_query:
+            return []
+        cutoff = self._format_datetime(datetime.now(timezone.utc) - timedelta(days=max(1, int(lookback_days))))
+        try:
+            with self._lock:
+                rows = self._conn.execute(
+                    """
+                    SELECT m.*, bm25(message_fts) AS rank
+                    FROM message_fts
+                    JOIN messages m ON m.id = message_fts.rowid
+                    WHERE message_fts MATCH ?
+                      AND m.chat_id = ?
+                      AND m.created_at >= ?
+                      AND m.is_bot = 0
+                    ORDER BY rank ASC
+                    LIMIT ?
+                    """,
+                    (fts_query, chat_id, cutoff, max(1, int(limit))),
+                ).fetchall()
+        except sqlite3.OperationalError:
+            return []
+
+        results: list[SemanticMemoryResult] = []
+        for row in rows:
+            item = self._row_to_item(row)
+            results.append(
+                SemanticMemoryResult(
+                    item=item,
+                    search_text=self.searchable_text_for_item(item),
+                    score=-float(row["rank"] or 0.0),
+                    source="fts",
+                )
+            )
+        return results
+
+    def rebuild_search_index(self) -> int:
+        with self._lock:
+            rows = self._conn.execute("SELECT * FROM messages ORDER BY created_at ASC, id ASC").fetchall()
+            self._conn.execute("DELETE FROM message_fts")
+            indexed = 0
+            for row in rows:
+                item_id = int(row["id"])
+                values = dict(row)
+                search_text = self.searchable_text_from_values(values)
+                if not search_text:
+                    self._conn.execute("DELETE FROM message_embeddings WHERE message_id = ?", (item_id,))
+                    continue
+                content_hash = self.content_hash(search_text)
+                self._conn.execute("INSERT INTO message_fts(rowid, search_text) VALUES (?, ?)", (item_id, search_text))
+                self._conn.execute(
+                    "DELETE FROM message_embeddings WHERE message_id = ? AND content_hash != ?",
+                    (item_id, content_hash),
+                )
+                indexed += 1
+            self._conn.commit()
+        return indexed
+
     def cleanup(self) -> int:
         cutoff = datetime.now(timezone.utc) - timedelta(days=self.retention_days)
         cutoff_text = self._format_datetime(cutoff)
         with self._lock:
+            deleted_ids = [
+                int(row["id"])
+                for row in self._conn.execute("SELECT id FROM messages WHERE created_at < ?", (cutoff_text,)).fetchall()
+            ]
             rows = self._conn.execute(
                 "SELECT local_media_path FROM messages WHERE created_at < ? AND local_media_path != ''",
                 (cutoff_text,),
             ).fetchall()
             cursor = self._conn.execute("DELETE FROM messages WHERE created_at < ?", (cutoff_text,))
+            for item_id in deleted_ids:
+                self._conn.execute("DELETE FROM message_fts WHERE rowid = ?", (item_id,))
             self._conn.commit()
 
         for row in rows:
@@ -404,6 +676,8 @@ class MemoryStore:
 
     def clear_all(self) -> None:
         with self._lock:
+            self._conn.execute("DELETE FROM message_embeddings")
+            self._conn.execute("DELETE FROM message_fts")
             self._conn.execute("DELETE FROM messages")
             self._conn.commit()
 
@@ -420,6 +694,99 @@ class MemoryStore:
         if value.tzinfo is None:
             value = value.replace(tzinfo=timezone.utc)
         return value.astimezone(timezone.utc).isoformat(timespec="seconds")
+
+    def _sync_search_index_for_id(self, item_id: int) -> None:
+        row = self._conn.execute("SELECT * FROM messages WHERE id = ?", (item_id,)).fetchone()
+        if row is None:
+            return
+        values = dict(row)
+        self._sync_search_index_from_values(int(item_id), values)
+
+    def _sync_search_index_from_values(self, item_id: int, values: dict[str, object]) -> None:
+        search_text = self.searchable_text_from_values(values)
+        if not search_text:
+            self._conn.execute("DELETE FROM message_fts WHERE rowid = ?", (item_id,))
+            self._conn.execute("DELETE FROM message_embeddings WHERE message_id = ?", (item_id,))
+            self._conn.commit()
+            return
+
+        content_hash = self.content_hash(search_text)
+        self._conn.execute("DELETE FROM message_fts WHERE rowid = ?", (item_id,))
+        self._conn.execute("INSERT INTO message_fts(rowid, search_text) VALUES (?, ?)", (item_id, search_text))
+        self._conn.execute(
+            "DELETE FROM message_embeddings WHERE message_id = ? AND content_hash != ?",
+            (item_id, content_hash),
+        )
+        self._conn.commit()
+
+    def _embedding_candidates_from_rows(self, rows: list[sqlite3.Row], limit: int) -> list[EmbeddingCandidate]:
+        candidates: list[EmbeddingCandidate] = []
+        for row in rows:
+            item = self._row_to_item(row)
+            search_text = self.searchable_text_for_item(item)
+            if not search_text:
+                continue
+            content_hash = self.content_hash(search_text)
+            if row["embedded_hash"] == content_hash:
+                continue
+            candidates.append(EmbeddingCandidate(item=item, search_text=search_text, content_hash=content_hash))
+            if len(candidates) >= limit:
+                break
+        return candidates
+
+    @staticmethod
+    def content_hash(text: str) -> str:
+        return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def searchable_text_from_values(values: dict[str, object]) -> str:
+        if bool(values.get("is_bot")):
+            return ""
+        parts = [
+            str(values.get("text") or ""),
+            str(values.get("source_title") or ""),
+            str(values.get("source_url") or ""),
+            str(values.get("vision_summary") or ""),
+        ]
+        text = " ".join(part for part in parts if part)
+        if not text or text.startswith("[message has "):
+            text = str(values.get("vision_summary") or "")
+        return " ".join(text.split())
+
+    @staticmethod
+    def searchable_text_for_item(item: MemoryItem) -> str:
+        return MemoryStore.searchable_text_from_values(
+            {
+                "is_bot": item.is_bot,
+                "text": item.text,
+                "source_title": item.source_title,
+                "source_url": item.source_url,
+                "vision_summary": item.vision_summary,
+            }
+        )
+
+    @staticmethod
+    def _embedding_to_blob(embedding: list[float]) -> bytes:
+        return struct.pack(f"<{len(embedding)}f", *[float(value) for value in embedding])
+
+    @staticmethod
+    def _embedding_from_blob(blob: bytes) -> list[float]:
+        if not blob:
+            return []
+        count = len(blob) // 4
+        return list(struct.unpack(f"<{count}f", blob))
+
+    @staticmethod
+    def _dot(left: list[float], right: list[float]) -> float:
+        if len(left) != len(right) or not left:
+            return -1.0
+        return float(sum(a * b for a, b in zip(left, right)))
+
+    @staticmethod
+    def _fts_query(query: str) -> str:
+        tokens = re.findall(r"[^\W\d_]{2,}", query.casefold(), flags=re.UNICODE)
+        tokens = [token.replace('"', '""') for token in tokens[:12]]
+        return " OR ".join(f'"{token}"' for token in tokens)
 
     @staticmethod
     def _row_to_item(row: sqlite3.Row) -> MemoryItem:

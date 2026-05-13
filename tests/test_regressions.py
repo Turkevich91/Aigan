@@ -31,6 +31,14 @@ os.environ["MEMORY_FOLLOWUP_CONTEXT_MESSAGES"] = "40"
 os.environ["MEMORY_THREAD_CONTEXT_DEPTH"] = "6"
 os.environ["MEMORY_RETENTION_DAYS"] = "30"
 os.environ["MEMORY_IMAGE_SUMMARY_LIMIT"] = "3"
+os.environ["MEMORY_VECTOR_ENABLED"] = "true"
+os.environ["MEMORY_EMBEDDING_MODEL"] = "text-embedding-3-small"
+os.environ["MEMORY_EMBEDDING_DIMENSIONS"] = "4"
+os.environ["MEMORY_SEMANTIC_LOOKBACK_DAYS"] = "30"
+os.environ["MEMORY_SEMANTIC_TOP_K"] = "3"
+os.environ["MEMORY_EMBEDDING_BATCH_SIZE"] = "2"
+os.environ["MEMORY_VECTOR_BACKFILL_ON_START"] = "false"
+os.environ["MEMORY_VECTOR_BACKFILL_LIMIT"] = "10"
 os.environ["SYSTEM_LOG_ENABLED"] = "true"
 os.environ["SYSTEM_LOG_RETENTION_DAYS"] = "14"
 os.environ["GITHUB_REPORTING_ENABLED"] = "false"
@@ -386,6 +394,14 @@ class PersistentMemoryTests(unittest.TestCase):
         main.last_user_call.clear()
         main.last_chat_call.clear()
         main.last_auto_react_chat.clear()
+        main.embedding_queue = None
+
+    def tearDown(self) -> None:
+        if main.MEMORY is not None:
+            main.MEMORY.clear_all()
+        if main.SYSTEM_LOG is not None:
+            main.SYSTEM_LOG.clear_all()
+        main.embedding_queue = None
 
     def test_messages_persist_after_ram_context_is_cleared(self) -> None:
         self.assertIsNotNone(main.MEMORY)
@@ -615,6 +631,186 @@ class PersistentMemoryTests(unittest.TestCase):
 
         events = main.SYSTEM_LOG.latest_events(5)
         self.assertTrue(any(event.event_type == "memory_context_expanded" for event in events))
+
+    def test_vector_schema_and_fts_are_created_without_losing_messages(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = MemoryStore(Path(tmpdir) / "memory.sqlite3", retention_days=30)
+            store.save_message(chat_id=-1001, message_id=1, sender_label="Tester", text="semantic schema test")
+
+            self.assertEqual(1, len(store.latest(-1001, 10)))
+            self.assertTrue(store.fts_search(chat_id=-1001, query="semantic", lookback_days=30, limit=3))
+
+    def test_rebuild_search_index_populates_existing_messages(self) -> None:
+        main.MEMORY.save_message(chat_id=-1001, message_id=1000, sender_label="Tester", text="legacy semantic text")
+        main.MEMORY._conn.execute("DELETE FROM message_fts")
+        main.MEMORY._conn.commit()
+
+        indexed = main.MEMORY.rebuild_search_index()
+
+        self.assertGreaterEqual(indexed, 1)
+        self.assertTrue(main.MEMORY.fts_search(chat_id=-1001, query="legacy semantic", lookback_days=30, limit=3))
+
+    def test_embedding_candidates_include_only_user_messages(self) -> None:
+        main.MEMORY.save_message(chat_id=-1001, message_id=1001, sender_label="User", text="user searchable text")
+        main.MEMORY.save_message(
+            chat_id=-1001,
+            message_id=1002,
+            sender_label="Aigan",
+            is_bot=True,
+            text="bot searchable text",
+        )
+
+        candidates = main.MEMORY.pending_embedding_candidates(
+            model=main.CONFIG.memory_embedding_model,
+            dimensions=main.CONFIG.memory_embedding_dimensions,
+            limit=10,
+            lookback_days=30,
+        )
+
+        self.assertEqual(["user searchable text"], [candidate.search_text for candidate in candidates])
+
+    def test_embedding_failure_does_not_prevent_message_persistence(self) -> None:
+        main.MEMORY.save_message(chat_id=-1001, message_id=1010, sender_label="User", text="will survive failure")
+        candidates = main.MEMORY.pending_embedding_candidates(
+            model=main.CONFIG.memory_embedding_model,
+            dimensions=main.CONFIG.memory_embedding_dimensions,
+            limit=10,
+            lookback_days=30,
+        )
+
+        with patch.object(main, "create_embeddings", new=AsyncMock(side_effect=RuntimeError("embedding down"))):
+            stored = asyncio.run(main.process_embedding_candidates(candidates, "test"))
+
+        self.assertEqual(0, stored)
+        self.assertIn("will survive failure", main.format_memory_context(-1001, 10))
+
+    def test_background_embedding_batch_stores_user_embedding(self) -> None:
+        main.MEMORY.save_message(chat_id=-1001, message_id=1020, sender_label="User", text="indexed user text")
+        candidates = main.MEMORY.pending_embedding_candidates(
+            model=main.CONFIG.memory_embedding_model,
+            dimensions=main.CONFIG.memory_embedding_dimensions,
+            limit=10,
+            lookback_days=30,
+        )
+
+        with patch.object(main, "create_embeddings", new=AsyncMock(return_value=[[1.0, 0.0, 0.0, 0.0]])):
+            stored = asyncio.run(main.process_embedding_candidates(candidates, "test"))
+
+        self.assertEqual(1, stored)
+        self.assertEqual(
+            0,
+            main.MEMORY.embedding_backlog_count(
+                model=main.CONFIG.memory_embedding_model,
+                dimensions=main.CONFIG.memory_embedding_dimensions,
+                lookback_days=30,
+            ),
+        )
+
+    def test_image_vision_summary_is_searchable(self) -> None:
+        item_id = main.MEMORY.save_message(
+            chat_id=-1001,
+            message_id=1030,
+            sender_label="User",
+            text="[message has attachment(s): photo]",
+            content_kind="image",
+        )
+        main.MEMORY.update_vision_summary(item_id, "на фото унікальна зелена ракета")
+
+        results = main.MEMORY.fts_search(chat_id=-1001, query="зелена ракета", lookback_days=30, limit=3)
+
+        self.assertEqual(1, len(results))
+        self.assertIn("зелена ракета", results[0].search_text)
+
+    def test_semantic_search_returns_relevant_old_message(self) -> None:
+        item_a = main.MEMORY.save_message(chat_id=-1001, message_id=1040, sender_label="A", text="Subnautica release context")
+        item_b = main.MEMORY.save_message(chat_id=-1001, message_id=1041, sender_label="B", text="coffee machine context")
+        for item_id, vector in ((item_a, [1.0, 0.0, 0.0, 0.0]), (item_b, [0.0, 1.0, 0.0, 0.0])):
+            item = main.MEMORY.item_by_id(item_id)
+            text = MemoryStore.searchable_text_for_item(item)
+            main.MEMORY.upsert_embedding(
+                message_id=item_id,
+                chat_id=-1001,
+                model=main.CONFIG.memory_embedding_model,
+                dimensions=4,
+                content_hash=MemoryStore.content_hash(text),
+                embedding=vector,
+            )
+
+        results = main.MEMORY.semantic_search(
+            chat_id=-1001,
+            query_embedding=[1.0, 0.0, 0.0, 0.0],
+            model=main.CONFIG.memory_embedding_model,
+            dimensions=4,
+            lookback_days=30,
+            limit=1,
+        )
+
+        self.assertEqual("Subnautica release context", results[0].item.text)
+
+    def test_fts_fallback_when_query_embedding_fails(self) -> None:
+        message = FakeMessage("/memory_search subnautica", message_id=1050)
+        main.MEMORY.save_message(chat_id=-1001, message_id=1051, sender_label="User", text="subnautica terraformer context")
+
+        with patch.object(main, "create_embeddings", new=AsyncMock(side_effect=RuntimeError("no embeddings"))):
+            results = asyncio.run(main.semantic_memory_results_for_query(message, "subnautica", route="normal"))
+
+        self.assertEqual(1, len(results))
+        self.assertEqual("fts", results[0].source)
+
+    def test_ordinary_group_text_does_not_call_semantic_retrieval(self) -> None:
+        message = FakeMessage("subnautica?", message_id=1060)
+        context = SimpleNamespace(bot=SimpleNamespace(id=999, username="thrd_ua_bot"))
+
+        with patch.object(main, "prepare_semantic_memory_context", new=AsyncMock()) as prepare:
+            asyncio.run(main.text_message(SimpleNamespace(effective_message=message), context))
+
+        prepare.assert_not_awaited()
+
+    def test_excluded_routes_do_not_use_semantic_memory(self) -> None:
+        message = FakeMessage("@thrd_ua_bot переклади українською", message_id=1070)
+
+        translation = asyncio.run(main.prepare_semantic_memory_context(message, "переклади українською", "translate_reference"))
+        image_send = asyncio.run(main.prepare_semantic_memory_context(message, "покажи фото кота", "internet_image_send"))
+
+        self.assertIsNone(translation)
+        self.assertIsNone(image_send)
+
+    def test_short_followup_gets_semantic_memory_block(self) -> None:
+        item_id = main.MEMORY.save_message(
+            chat_id=-1001,
+            message_id=1080,
+            sender_label="User",
+            text="Subnautica коштувала п'ять тисяч у старому обговоренні",
+        )
+        item = main.MEMORY.item_by_id(item_id)
+        text = MemoryStore.searchable_text_for_item(item)
+        main.MEMORY.upsert_embedding(
+            message_id=item_id,
+            chat_id=-1001,
+            model=main.CONFIG.memory_embedding_model,
+            dimensions=4,
+            content_hash=MemoryStore.content_hash(text),
+            embedding=[1.0, 0.0, 0.0, 0.0],
+        )
+        message = FakeMessage("@thrd_ua_bot скільки?", message_id=1081)
+
+        with patch.object(main, "create_embeddings", new=AsyncMock(return_value=[[1.0, 0.0, 0.0, 0.0]])):
+            context = asyncio.run(main.prepare_semantic_memory_context(message, "скільки?", "normal"))
+
+        self.assertIn("Subnautica коштувала", context)
+
+    def test_memory_search_command_is_admin_only(self) -> None:
+        non_admin = FakeMessage("/memory_search subnautica", message_id=1090)
+        non_admin.from_user = FakeUser(user_id=999, username="notadmin")
+        admin = FakeMessage("/memory_search subnautica", message_id=1091)
+        context = SimpleNamespace(bot=SimpleNamespace(send_chat_action=AsyncMock()))
+
+        asyncio.run(main.memory_search_command(SimpleNamespace(effective_message=non_admin), context))
+        with patch.object(main, "semantic_memory_results_for_query", new=AsyncMock(return_value=[])) as search:
+            asyncio.run(main.memory_search_command(SimpleNamespace(effective_message=admin), context))
+
+        self.assertIn("тільки адмінам", non_admin.reply_calls[0]["text"])
+        search.assert_awaited_once()
 
     def test_image_metadata_and_summary_are_stored_and_reused(self) -> None:
         item_id = main.MEMORY.save_message(
