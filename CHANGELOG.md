@@ -1,5 +1,12 @@
 # Aigan Changelog
 
+## 2026-05-13 - Self-analysis health reporting
+
+- Added sanitized system health logs for routing, tool, delivery, pending, and command events.
+- Added admin health commands: `/health`, `/logs`, `/selfcheck`, and `/complaints` with Ukrainian aliases.
+- Added complaint-temperature tracking and optional `[Aigan]` GitHub self-report issues.
+- Added `AGENTS.md` rules for Codex, Google Antigravity, Claude Code, and other coding agents.
+
 ## 2026-05-09 - Cleaner stat tokenization
 
 - Removed Telegram mentions, slash commands, bot trigger tokens, and pasted top-word rows from `/stat` token counts.

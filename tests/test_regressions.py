@@ -29,6 +29,11 @@ os.environ["MEMORY_DB_PATH"] = TEST_DB_PATH
 os.environ["MEMORY_CONTEXT_MESSAGES"] = "10"
 os.environ["MEMORY_RETENTION_DAYS"] = "30"
 os.environ["MEMORY_IMAGE_SUMMARY_LIMIT"] = "3"
+os.environ["SYSTEM_LOG_ENABLED"] = "true"
+os.environ["SYSTEM_LOG_RETENTION_DAYS"] = "14"
+os.environ["GITHUB_REPORTING_ENABLED"] = "false"
+os.environ["COMPLAINT_LOOKBACK_SECONDS"] = "86400"
+os.environ["COMPLAINT_REPORT_TEMPERATURE"] = "3"
 
 import httpx
 from telegram import InputMediaPhoto
@@ -38,6 +43,8 @@ from telegram.error import BadRequest
 import main
 from memory import MemoryStore
 from mcp_servers import web
+from self_analysis import SelfAnalysisService, classify_complaint
+from system_log import SystemLogStore, redact_secrets
 
 VALID_JPEG = b"\xff\xd8\xff\xe0" + b"valid-jpeg"
 
@@ -1203,6 +1210,122 @@ class PersistentMemoryTests(unittest.TestCase):
         asyncio.run(main.localized_command_alias(SimpleNamespace(effective_message=message), context))
 
         self.assertIn("pong", message.reply_calls[0]["text"])
+
+class SystemHealthTests(unittest.TestCase):
+    def setUp(self) -> None:
+        if main.SYSTEM_LOG is not None:
+            main.SYSTEM_LOG.clear_all()
+        if main.MEMORY is not None:
+            main.MEMORY.clear_all()
+        main.pending_requests.clear()
+        main.passive_contexts.clear()
+        main.last_user_call.clear()
+        main.last_chat_call.clear()
+
+    def test_redaction_hides_api_and_telegram_secrets(self) -> None:
+        text = "OPENAI_API_KEY=sk-abcdefghijklmnopqrstuvwxyz TELEGRAM_BOT_TOKEN=123456:abcdefghijklmnopqrstuvwxyz"
+
+        redacted = redact_secrets(text)
+
+        self.assertNotIn("sk-abcdefghijklmnopqrstuvwxyz", redacted)
+        self.assertNotIn("123456:abcdefghijklmnopqrstuvwxyz", redacted)
+        self.assertIn("[redacted]", redacted)
+
+    def test_system_log_writes_reads_and_sanitizes_details(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = SystemLogStore(Path(tmpdir) / "health.sqlite3", retention_days=14)
+
+            store.record_event(
+                level="error",
+                component="web",
+                event_type="prefetch_failed",
+                message="OPENAI_API_KEY=sk-abcdefghijklmnopqrstuvwxyz",
+                details={"GITHUB_TOKEN": "ghp_secretsecretsecret", "count": 2},
+            )
+
+            event = store.latest_events(1)[0]
+            self.assertEqual("error", event.level)
+            self.assertNotIn("sk-abcdefghijklmnopqrstuvwxyz", event.message)
+            self.assertEqual("[redacted]", event.details["GITHUB_TOKEN"])
+            self.assertEqual(2, event.details["count"])
+
+    def test_complaint_classifier_detects_bot_web_issue(self) -> None:
+        signal = classify_complaint("Aigan bot має problem: web search не працює", bot_username="thrd_ua_bot")
+
+        self.assertIsNotNone(signal)
+        self.assertEqual("web_search", signal.category)
+
+    def test_complaint_temperature_reports_at_threshold(self) -> None:
+        class FakeReporter:
+            is_configured = True
+
+            def __init__(self) -> None:
+                self.calls = []
+
+            def create_self_report_issue(self, **kwargs):
+                self.calls.append(kwargs)
+                return SimpleNamespace(url="https://github.com/Turkevich91/Aigan/issues/99")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = SystemLogStore(Path(tmpdir) / "health.sqlite3", retention_days=14)
+            reporter = FakeReporter()
+            service = SelfAnalysisService(
+                store=store,
+                reporter=reporter,
+                complaint_lookback_seconds=86400,
+                complaint_report_temperature=2,
+            )
+
+            first = service.record_complaint_signal(text="Aigan bot має problem: web search не працює")
+            second = service.record_complaint_signal(text="Aigan bot має problem: web search не працює")
+
+            self.assertEqual(1, first.temperature)
+            self.assertEqual(2, second.temperature)
+            self.assertEqual(1, len(reporter.calls))
+            self.assertTrue(reporter.calls[0]["title"].startswith("[Aigan] self-report: web_search"))
+            self.assertIn("not a confirmed bug", reporter.calls[0]["body"])
+            self.assertIn("issues/99", store.active_complaints(1)[0].github_issue_url)
+
+    def test_passive_group_complaint_stays_silent_but_records_temperature(self) -> None:
+        message = FakeMessage("Aigan bot problem: web search не працює", message_id=5000)
+        context = SimpleNamespace(bot=SimpleNamespace(username="thrd_ua_bot", id=8712856238))
+
+        asyncio.run(main.text_message(SimpleNamespace(effective_message=message), context))
+
+        self.assertEqual([], message.reply_calls)
+        clusters = main.SYSTEM_LOG.active_complaints(1)
+        self.assertEqual(1, len(clusters))
+        self.assertEqual("web_search", clusters[0].category)
+        self.assertEqual(1, clusters[0].temperature)
+
+    def test_health_command_is_admin_only(self) -> None:
+        admin_message = FakeMessage("/health")
+        non_admin_message = FakeMessage("/health")
+        non_admin_message.from_user = FakeUser(user_id=123, username="guest")
+
+        asyncio.run(main.health_command(SimpleNamespace(effective_message=admin_message), SimpleNamespace()))
+        asyncio.run(main.health_command(SimpleNamespace(effective_message=non_admin_message), SimpleNamespace()))
+
+        self.assertIn("Status:", admin_message.reply_calls[0]["text"])
+        self.assertTrue(non_admin_message.reply_calls)
+        self.assertNotIn("Status:", non_admin_message.reply_calls[0]["text"])
+
+    def test_selfcheck_uses_sanitized_context(self) -> None:
+        main.SYSTEM_LOG.record_event(
+            level="error",
+            component="agent",
+            event_type="run_error",
+            message="OPENAI_API_KEY=sk-abcdefghijklmnopqrstuvwxyz",
+        )
+        message = FakeMessage("/selfcheck")
+
+        with patch.object(main, "run_plain_model", new=AsyncMock(return_value="health degraded")) as run_plain_model:
+            asyncio.run(main.selfcheck_command(SimpleNamespace(effective_message=message), SimpleNamespace()))
+
+        prompt = run_plain_model.await_args.args[0]
+        self.assertNotIn("sk-abcdefghijklmnopqrstuvwxyz", prompt)
+        self.assertIn("[redacted]", prompt)
+        self.assertIn("health degraded", message.reply_calls[0]["text"])
 
 
 if __name__ == "__main__":

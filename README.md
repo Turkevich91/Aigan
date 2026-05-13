@@ -14,6 +14,7 @@ Default model: `gpt-5.4-mini`. The public model catalog currently lists `gpt-5.4
 - `youtube_transcript` MCP server: YouTube captions/transcripts, with optional audio transcription fallback.
 - Persistent bounded chat memory in SQLite, including cached Telegram image context.
 - User profile and stats commands based on messages the bot has actually seen.
+- Sanitized system health logs, admin self-check commands, and optional GitHub self-reporting.
 - Placeholder `.env` ready for secrets.
 
 ## Setup
@@ -44,6 +45,10 @@ In a group chat, use:
  /context
  /stat @username
  /character me
+ /health
+ /logs 20
+ /selfcheck
+ /complaints
  /proactive_now
 !m explain this briefly
 /ai summarize this https://www.youtube.com/watch?v=...
@@ -159,6 +164,57 @@ Long text replies are split by the delivery layer instead of being truncated at 
 MAX_REPLY_CHARS=12000
 TELEGRAM_TEXT_CHUNK_CHARS=3500
 MAX_REPLY_CHUNKS=4
+```
+
+## System Health And Self-Analysis
+
+Aigan keeps a separate sanitized operational journal in SQLite. These records are not normal chat memory and are not used by `/stat`, `/character`, or ordinary answers.
+
+Admin-only commands:
+
+```text
+/health
+/logs 20
+/selfcheck
+/complaints
+```
+
+Ukrainian aliases:
+
+```text
+/самопочуття
+/здоровя
+/логи 20
+/самоаналіз
+/скарги
+/температура
+```
+
+The system log stores metadata such as route decisions, tool failures, Telegram delivery fallbacks, image-search failures, pending/debounce events, and command usage. It must not store secrets, raw prompts, `.env`, private chat dumps, or full user messages.
+
+User complaints about the bot are treated as temperature signals, not confirmed bugs. A first similar complaint starts at `temperature=1`; repeated similar complaints inside `COMPLAINT_LOOKBACK_SECONDS` raise the temperature. When `COMPLAINT_REPORT_TEMPERATURE` is reached and GitHub reporting is enabled, Aigan creates a sanitized `[Aigan] self-report: ...` issue and adds it to the configured GitHub Project.
+
+```env
+SYSTEM_LOG_ENABLED=true
+SYSTEM_LOG_RETENTION_DAYS=14
+GITHUB_REPORTING_ENABLED=false
+GITHUB_TOKEN=
+GITHUB_REPOSITORY=Turkevich91/Aigan
+GITHUB_PROJECT_OWNER=Turkevich91
+GITHUB_PROJECT_NUMBER=4
+COMPLAINT_LOOKBACK_SECONDS=86400
+COMPLAINT_REPORT_TEMPERATURE=3
+```
+
+Health reports to an admin/private chat are opt-in:
+
+```env
+HEALTH_REPORT_ENABLED=false
+HEALTH_REPORT_ADMIN_CHAT_ID=
+HEALTH_REPORT_INTERVAL_SECONDS=21600
+HEALTH_REPORT_LOOKBACK_SECONDS=21600
+HEALTH_REPORT_MIN_LEVEL=warning
+HEALTH_REPORT_COOLDOWN_SECONDS=3600
 ```
 
 ## Version Notes

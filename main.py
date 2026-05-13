@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from agents import Agent, ModelSettings, Runner
+from agents import Agent, ModelSettings, RunHooks, Runner
 from agents.mcp import MCPServerStdio
 from openai import OpenAI
 from telegram import InputMediaPhoto, Message, MessageEntity, Update
@@ -27,6 +27,9 @@ from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandl
 
 from mcp_servers.web import fetch_binary_url, search_image_candidates, search_web
 from memory import MemoryItem, MemoryStore
+from github_reporting import GitHubReporter
+from self_analysis import SelfAnalysisService
+from system_log import SystemLogStore, sanitize_text
 
 try:
     from openai.types.shared import Reasoning
@@ -56,6 +59,11 @@ def _env_bool(name: str, default: bool = False) -> bool:
 
 def _csv_strings(value: str) -> list[str]:
     return [item.strip().lower() for item in value.split(",") if item.strip()]
+
+
+def optional_int(value: str | None) -> int | None:
+    stripped = (value or "").strip()
+    return int(stripped) if stripped else None
 
 
 @dataclass(frozen=True)
@@ -101,6 +109,21 @@ class Config:
     memory_image_summary_limit: int
     memory_eager_image_summary: bool
     web_image_search_enabled: bool
+    system_log_enabled: bool
+    system_log_retention_days: int
+    health_report_enabled: bool
+    health_report_admin_chat_id: int | None
+    health_report_interval_seconds: int
+    health_report_lookback_seconds: int
+    health_report_min_level: str
+    health_report_cooldown_seconds: int
+    github_reporting_enabled: bool
+    github_token: str
+    github_repository: str
+    github_project_owner: str
+    github_project_number: int
+    complaint_lookback_seconds: int
+    complaint_report_temperature: int
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -157,6 +180,21 @@ class Config:
             memory_image_summary_limit=int(os.getenv("MEMORY_IMAGE_SUMMARY_LIMIT", "3")),
             memory_eager_image_summary=_env_bool("MEMORY_EAGER_IMAGE_SUMMARY", False),
             web_image_search_enabled=_env_bool("WEB_IMAGE_SEARCH_ENABLED", True),
+            system_log_enabled=_env_bool("SYSTEM_LOG_ENABLED", True),
+            system_log_retention_days=int(os.getenv("SYSTEM_LOG_RETENTION_DAYS", "14")),
+            health_report_enabled=_env_bool("HEALTH_REPORT_ENABLED", False),
+            health_report_admin_chat_id=optional_int(os.getenv("HEALTH_REPORT_ADMIN_CHAT_ID", "")),
+            health_report_interval_seconds=int(os.getenv("HEALTH_REPORT_INTERVAL_SECONDS", "21600")),
+            health_report_lookback_seconds=int(os.getenv("HEALTH_REPORT_LOOKBACK_SECONDS", "21600")),
+            health_report_min_level=os.getenv("HEALTH_REPORT_MIN_LEVEL", "warning").strip().lower(),
+            health_report_cooldown_seconds=int(os.getenv("HEALTH_REPORT_COOLDOWN_SECONDS", "3600")),
+            github_reporting_enabled=_env_bool("GITHUB_REPORTING_ENABLED", False),
+            github_token=os.getenv("GITHUB_TOKEN", "").strip(),
+            github_repository=os.getenv("GITHUB_REPOSITORY", "Turkevich91/Aigan").strip(),
+            github_project_owner=os.getenv("GITHUB_PROJECT_OWNER", "Turkevich91").strip(),
+            github_project_number=int(os.getenv("GITHUB_PROJECT_NUMBER", "4")),
+            complaint_lookback_seconds=int(os.getenv("COMPLAINT_LOOKBACK_SECONDS", "86400")),
+            complaint_report_temperature=int(os.getenv("COMPLAINT_REPORT_TEMPERATURE", "3")),
         )
 
 
@@ -169,6 +207,22 @@ LOGGER = logging.getLogger("aigan")
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
 MEMORY = MemoryStore(CONFIG.memory_db_path, CONFIG.memory_retention_days) if CONFIG.memory_enabled else None
+SYSTEM_LOG = (
+    SystemLogStore(CONFIG.memory_db_path, CONFIG.system_log_retention_days) if CONFIG.system_log_enabled else None
+)
+GITHUB_REPORTER = GitHubReporter(
+    enabled=CONFIG.github_reporting_enabled,
+    token=CONFIG.github_token,
+    repository=CONFIG.github_repository,
+    project_owner=CONFIG.github_project_owner,
+    project_number=CONFIG.github_project_number,
+)
+SELF_ANALYSIS = SelfAnalysisService(
+    store=SYSTEM_LOG,
+    reporter=GITHUB_REPORTER,
+    complaint_lookback_seconds=CONFIG.complaint_lookback_seconds,
+    complaint_report_temperature=CONFIG.complaint_report_temperature,
+)
 histories: dict[int, deque[str]] = defaultdict(lambda: deque(maxlen=CONFIG.max_history_messages))
 passive_contexts: dict[int, deque[str]] = defaultdict(lambda: deque(maxlen=CONFIG.passive_context_messages))
 last_user_call: dict[int, float] = {}
@@ -177,6 +231,7 @@ last_auto_react_chat: dict[int, float] = {}
 pending_requests: dict[tuple[int, int], dict[str, Any]] = {}
 pending_token_counter = count(1)
 last_memory_cleanup = 0.0
+last_health_report_sent = 0.0
 BOT_USERNAME = CONFIG.bot_username
 BOT_ID: int | None = None
 DEFAULT_CONTEXT_PROMPT = "Проаналізуй це повідомлення або вкладення й дай корисну відповідь українською."
@@ -341,6 +396,12 @@ LOCALIZED_COMMAND_ALIASES = {
     "стат": "stats",
     "стата": "stats",
     "статистика": "stats",
+    "самопочуття": "health",
+    "здоровя": "health",
+    "логи": "logs",
+    "самоаналіз": "selfcheck",
+    "скарги": "complaints",
+    "температура": "complaints",
 }
 LOCALIZED_COMMAND_RE = re.compile(
     r"^/(?P<command>"
@@ -386,6 +447,70 @@ def with_current_time_metadata(prompt: str) -> str:
 {current_time_context()}
 
 {prompt}"""
+
+
+def message_user_id(message: Message | None) -> int | None:
+    user = getattr(message, "from_user", None)
+    return getattr(user, "id", None)
+
+
+def system_event(
+    *,
+    level: str = "info",
+    component: str,
+    event_type: str,
+    message: str = "",
+    telegram_message: Message | None = None,
+    route: str = "",
+    duration_ms: int | None = None,
+    details: dict[str, Any] | None = None,
+) -> None:
+    if SYSTEM_LOG is None:
+        return
+    try:
+        SYSTEM_LOG.record_event(
+            level=level,
+            component=component,
+            event_type=event_type,
+            chat_id=getattr(telegram_message, "chat_id", None),
+            user_id=message_user_id(telegram_message),
+            route=route,
+            duration_ms=duration_ms,
+            message=message,
+            details=details,
+        )
+    except Exception:
+        LOGGER.debug("Failed to write system event", exc_info=True)
+
+
+class AiganRunHooks(RunHooks[Any]):
+    async def on_agent_start(self, context: Any, agent: Agent) -> None:
+        system_event(component="agent", event_type="agent_start", message=agent.name)
+
+    async def on_agent_end(self, context: Any, agent: Agent, output: Any) -> None:
+        system_event(component="agent", event_type="agent_end", message=agent.name)
+
+    async def on_llm_start(self, context: Any, agent: Agent, system_prompt: str | None, input_items: list[Any]) -> None:
+        system_event(
+            component="agent",
+            event_type="llm_start",
+            message=agent.name,
+            details={"input_items": len(input_items), "has_system_prompt": bool(system_prompt)},
+        )
+
+    async def on_llm_end(self, context: Any, agent: Agent, response: Any) -> None:
+        system_event(component="agent", event_type="llm_end", message=agent.name)
+
+    async def on_tool_start(self, context: Any, agent: Agent, tool: Any) -> None:
+        system_event(component="agent_tool", event_type="tool_start", message=getattr(tool, "name", repr(tool)))
+
+    async def on_tool_end(self, context: Any, agent: Agent, tool: Any, result: str) -> None:
+        system_event(
+            component="agent_tool",
+            event_type="tool_end",
+            message=getattr(tool, "name", repr(tool)),
+            details={"result_preview": sanitize_text(str(result), 200)},
+        )
 
 
 def build_model_settings() -> ModelSettings:
@@ -468,6 +593,33 @@ def message_content(message: Message, limit: int = 3000) -> str:
 
 def message_text(message: Message) -> str:
     return (message.text or message.caption or "").strip()
+
+
+def remember_self_complaint_signal(
+    message: Message,
+    *,
+    bot_username: str | None = None,
+    reply_to_bot: bool = False,
+) -> None:
+    if SYSTEM_LOG is None or not should_allow_chat(message):
+        return
+    text = message_text(message)
+    if not text:
+        return
+    cluster = SELF_ANALYSIS.record_complaint_signal(
+        text=text,
+        bot_username=bot_username or BOT_USERNAME,
+        reply_to_bot=reply_to_bot,
+        chat_id=message.chat_id,
+        user_id=message_user_id(message),
+    )
+    if cluster is not None:
+        LOGGER.info(
+            "Complaint signal category=%s temperature=%s chat_id=%s",
+            cluster.category,
+            cluster.temperature,
+            message.chat_id,
+        )
 
 
 def image_file_ref_from(value: Any) -> tuple[Any, str, str] | None:
@@ -1239,6 +1391,13 @@ Task:
 
 
 async def run_agent(prompt: str) -> str:
+    started = time.monotonic()
+    system_event(
+        component="agent",
+        event_type="run_start",
+        message=CONFIG.openai_model,
+        details={"prompt_chars": len(prompt), "model": CONFIG.openai_model},
+    )
     web_server = MCPServerStdio(
         name="web",
         params={"command": sys.executable, "args": [str(APP_DIR / "mcp_servers" / "web.py")]},
@@ -1255,8 +1414,26 @@ async def run_agent(prompt: str) -> str:
 
     async with web_server as web, youtube_server as youtube:
         agent = make_agent([web, youtube])
-        result = await Runner.run(agent, with_current_time_metadata(prompt), max_turns=6)
-        return str(result.final_output).strip()
+        try:
+            result = await Runner.run(agent, with_current_time_metadata(prompt), max_turns=6, hooks=AiganRunHooks())
+        except Exception as exc:
+            system_event(
+                level="error",
+                component="agent",
+                event_type="run_error",
+                duration_ms=int((time.monotonic() - started) * 1000),
+                message=type(exc).__name__,
+            )
+            raise
+        output = str(result.final_output).strip()
+        system_event(
+            component="agent",
+            event_type="run_end",
+            duration_ms=int((time.monotonic() - started) * 1000),
+            message=CONFIG.openai_model,
+            details={"output_chars": len(output)},
+        )
+        return output
 
 
 def run_plain_model_sync(prompt: str) -> str:
@@ -1412,10 +1589,31 @@ async def maybe_prefetch_web_context(message: Message, prompt: str, route: str) 
     query = web_prefetch_query(message, prompt)
     if not query:
         return "(none)"
+    started = time.monotonic()
     try:
-        return await asyncio.to_thread(search_web, query, 5)
+        result = await asyncio.to_thread(search_web, query, 5)
+        system_event(
+            component="web",
+            event_type="prefetch_success",
+            telegram_message=message,
+            route=route,
+            duration_ms=int((time.monotonic() - started) * 1000),
+            message="time_sensitive",
+            details={"query_preview": query, "result_chars": len(result)},
+        )
+        return result
     except Exception as exc:
         LOGGER.exception("Current web prefetch failed")
+        system_event(
+            level="error",
+            component="web",
+            event_type="prefetch_failed",
+            telegram_message=message,
+            route=route,
+            duration_ms=int((time.monotonic() - started) * 1000),
+            message=type(exc).__name__,
+            details={"query_preview": query},
+        )
         return f"Web prefetch failed: {type(exc).__name__}: {exc}"
 
 
@@ -1792,8 +1990,23 @@ async def maybe_send_internet_image(message: Message, prompt: str) -> bool:
         candidates = await asyncio.to_thread(search_image_candidates, query, search_count)
     except Exception:
         LOGGER.exception("Image search failed")
+        system_event(
+            level="error",
+            component="image_search",
+            event_type="search_failed",
+            telegram_message=message,
+            message="image search failed",
+            details={"query_preview": query, "target_count": target_count},
+        )
         await send_reply(message, "Не зміг знайти безпечне зображення за цим запитом.")
         return True
+    system_event(
+        component="image_search",
+        event_type="search_success",
+        telegram_message=message,
+        message="image candidates",
+        details={"query_preview": query, "candidate_count": len(candidates), "target_count": target_count},
+    )
 
     if target_count == 1:
         for candidate in candidates:
@@ -1822,6 +2035,13 @@ async def maybe_send_internet_image(message: Message, prompt: str) -> bool:
             return True
 
     await send_reply(message, "Не знайшов валідне безпечне зображення, яке можна надіслати в чат.")
+    system_event(
+        level="warning",
+        component="image_search",
+        event_type="no_valid_image",
+        telegram_message=message,
+        details={"query_preview": query, "candidate_count": len(candidates), "target_count": target_count},
+    )
     return True
 
 
@@ -1968,6 +2188,13 @@ async def send_formatted_text(send_func: Any, text: str, **kwargs: Any) -> None:
         await send_func(text=html_text, parse_mode=ParseMode.HTML, **kwargs)
     except BadRequest as exc:
         LOGGER.warning("Telegram HTML formatting rejected; retrying as plain text: %s", exc)
+        system_event(
+            level="warning",
+            component="telegram_delivery",
+            event_type="html_fallback",
+            message=str(exc),
+            details={"text_chars": len(text)},
+        )
         await send_func(text=render_plain_fallback(text), **kwargs)
 
 
@@ -2036,9 +2263,40 @@ def localized_command_match(text: str | None, bot_username: str | None = None) -
 
 def allow_command(message: Message, command_name: str) -> bool:
     if should_allow_chat(message):
+        system_event(
+            component="command",
+            event_type="command_used",
+            telegram_message=message,
+            message=command_name,
+            details={"admin": is_admin_user(message), "chat_type": getattr(message.chat, "type", "")},
+        )
         return True
     LOGGER.warning("Ignoring %s command from non-allowed chat_id=%s", command_name, message.chat_id)
+    system_event(
+        level="warning",
+        component="command",
+        event_type="command_denied_chat",
+        telegram_message=message,
+        message=command_name,
+    )
     return False
+
+
+async def deny_admin_command(message: Message, command_name: str) -> None:
+    if not should_allow_chat(message):
+        return
+    system_event(
+        level="warning",
+        component="command",
+        event_type="command_denied_admin",
+        telegram_message=message,
+        message=command_name,
+    )
+    await send_reply(message, "Ця команда доступна тільки адмінам.")
+
+
+def allow_admin_command(message: Message, command_name: str) -> bool:
+    return allow_command(message, command_name) and is_admin_user(message)
 
 
 def command_args_from_text(text: str | None) -> str:
@@ -2286,7 +2544,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if not allow_command(message, "help"):
         return
     await message.reply_text(
-        f"Я на зв'язку. У групі клич мене так: {CONFIG.bot_trigger} питання, /ai, /питай, /п, /а, згадка або reply. Сервісні: /ids (/айді), /context (/контекст), /version (/версія), /stat (/стат), /character (/характер), /proactive_now (/проактив)."
+        f"Я на зв'язку. У групі клич мене так: {CONFIG.bot_trigger} питання, /ai, /питай, /п, /а, згадка або reply. Сервісні: /ids (/айді), /context (/контекст), /version (/версія), /stat (/стат), /character (/характер), /health (/самопочуття), /logs (/логи), /selfcheck (/самоаналіз), /complaints (/скарги), /proactive_now (/проактив)."
     )
 
 
@@ -2434,6 +2692,75 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     await handle_stats_command(message, command_args_from_text(message.text))
 
 
+def count_from_args(args: str | None, default: int = 20, limit: int = 50) -> int:
+    if not args:
+        return default
+    first = args.split()[0]
+    try:
+        return max(1, min(int(first), limit))
+    except ValueError:
+        return default
+
+
+async def health_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    if message is None:
+        return
+    if not allow_admin_command(message, "health"):
+        await deny_admin_command(message, "health")
+        return
+    await send_reply(message, SELF_ANALYSIS.health_text(CONFIG.health_report_lookback_seconds))
+
+
+async def handle_logs_command(message: Message, args: str | None = None) -> None:
+    if not allow_admin_command(message, "logs"):
+        await deny_admin_command(message, "logs")
+        return
+    await send_reply(message, SELF_ANALYSIS.logs_text(count_from_args(args, 20, 50)))
+
+
+async def logs_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    if message is None:
+        return
+    await handle_logs_command(message, command_args_from_text(message.text))
+
+
+async def selfcheck_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    if message is None:
+        return
+    if not allow_admin_command(message, "selfcheck"):
+        await deny_admin_command(message, "selfcheck")
+        return
+    policy_path = APP_DIR / "prompts" / "self_analysis.md"
+    policy = policy_path.read_text(encoding="utf-8") if policy_path.exists() else "Write a concise self-analysis."
+    prompt = f"""{policy}
+
+Sanitized input:
+{SELF_ANALYSIS.selfcheck_context(CONFIG.health_report_lookback_seconds)}
+"""
+    try:
+        response = await asyncio.wait_for(run_plain_model(prompt), timeout=60)
+    except Exception:
+        LOGGER.exception("Selfcheck failed")
+        system_event(level="error", component="self_analysis", event_type="selfcheck_failed", telegram_message=message)
+        await send_reply(message, "Самоаналіз не вдався. Подивись system logs.")
+        return
+    system_event(component="self_analysis", event_type="selfcheck_completed", telegram_message=message)
+    await send_reply(message, response)
+
+
+async def complaints_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    if message is None:
+        return
+    if not allow_admin_command(message, "complaints"):
+        await deny_admin_command(message, "complaints")
+        return
+    await send_reply(message, SELF_ANALYSIS.complaints_text(10))
+
+
 async def command_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.effective_message
     if message is None or message.text is None:
@@ -2475,6 +2802,14 @@ async def localized_command_alias(update: Update, context: ContextTypes.DEFAULT_
         if not allow_command(message, "stats"):
             return
         await handle_stats_command(message, args)
+    elif command == "health":
+        await health_command(update, context)
+    elif command == "logs":
+        await handle_logs_command(message, args)
+    elif command == "selfcheck":
+        await selfcheck_command(update, context)
+    elif command == "complaints":
+        await complaints_command(update, context)
     elif command == "ai":
         await handle_prompt(message, context, args or DEFAULT_CONTEXT_PROMPT)
 
@@ -2491,6 +2826,13 @@ async def handle_pending_or_observe(message: Message, context: ContextTypes.DEFA
 
     prompt = str(pending.get("prompt") or DEFAULT_CONTEXT_PROMPT)
     LOGGER.info("Using pending request chat_id=%s kind=%s", message.chat_id, pending.get("kind"))
+    system_event(
+        component="pending",
+        event_type="pending_consumed",
+        telegram_message=message,
+        message=str(pending.get("kind") or ""),
+        details={"prompt_chars": len(prompt)},
+    )
     if has_supported_image(message):
         await handle_image_prompt(message, prompt)
     else:
@@ -2512,6 +2854,12 @@ async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     chat_type = message.chat.type
     bot_username = await get_bot_username(context)
     current_text = message_text(message)
+    complaint_reply_to_bot = (
+        message.reply_to_message is not None
+        and message.reply_to_message.from_user is not None
+        and message.reply_to_message.from_user.id == (BOT_ID or context.bot.id)
+    )
+    remember_self_complaint_signal(message, bot_username=bot_username, reply_to_bot=complaint_reply_to_bot)
 
     if has_pending_request(message):
         if await handle_pending_or_observe(message, context):
@@ -2592,6 +2940,13 @@ async def start_pending_debounce(
         message.chat_id,
         CONFIG.followup_debounce_seconds,
     )
+    system_event(
+        component="pending",
+        event_type="pending_created",
+        telegram_message=message,
+        message=kind,
+        details={"debounce_seconds": CONFIG.followup_debounce_seconds, "prompt_chars": len(prompt)},
+    )
     schedule_background_task(context, resolve_pending_after_debounce(message, context, prompt, token))
 
 
@@ -2606,13 +2961,16 @@ async def resolve_pending_after_debounce(
             await asyncio.sleep(CONFIG.followup_debounce_seconds)
         if not pending_request_matches(message, token):
             LOGGER.info("Pending request consumed during debounce chat_id=%s", message.chat_id)
+            system_event(component="pending", event_type="pending_consumed_during_debounce", telegram_message=message)
             return
         LOGGER.info("Pending debounce elapsed chat_id=%s; continuing original prompt", message.chat_id)
+        system_event(component="pending", event_type="pending_debounce_elapsed", telegram_message=message)
         await handle_prompt(message, context, prompt, allow_pending_wait=False)
     except asyncio.CancelledError:
         raise
     except Exception:
         LOGGER.exception("Pending debounce resolution failed chat_id=%s", message.chat_id)
+        system_event(level="error", component="pending", event_type="pending_debounce_failed", telegram_message=message)
 
 
 async def handle_prompt(
@@ -2666,6 +3024,20 @@ async def handle_prompt(
     await context.bot.send_chat_action(chat_id=message.chat_id, action=ChatAction.TYPING)
     route = classify_request(message, prompt)
     LOGGER.info("Prompt route=%s chat_id=%s", route, message.chat_id)
+    system_event(
+        component="routing",
+        event_type="route_decision",
+        telegram_message=message,
+        route=route,
+        message=route,
+        details={
+            "prompt_chars": len(prompt),
+            "has_reference": build_reference_context(message) != "(none)",
+            "has_image": has_supported_image(message),
+            "has_url": has_url(prompt),
+            "allow_pending_wait": allow_pending_wait,
+        },
+    )
 
     if route == "internet_image_send" and await maybe_send_internet_image(message, prompt):
         return
@@ -2866,6 +3238,33 @@ Otherwise write one concise message. Use Ukrainian by default. Use English only 
         await asyncio.sleep(interval)
 
 
+async def health_report_loop(application: Application) -> None:
+    global last_health_report_sent
+
+    if not CONFIG.health_report_enabled or CONFIG.health_report_admin_chat_id is None or SYSTEM_LOG is None:
+        return
+
+    interval = max(CONFIG.health_report_interval_seconds, 60)
+    await asyncio.sleep(min(60, interval))
+    while True:
+        try:
+            events = SYSTEM_LOG.events_since(CONFIG.health_report_lookback_seconds, CONFIG.health_report_min_level, 50)
+            now = time.monotonic()
+            if events and now - last_health_report_sent >= CONFIG.health_report_cooldown_seconds:
+                summary = SELF_ANALYSIS.health_text(CONFIG.health_report_lookback_seconds)
+                await send_chat_text(
+                    application.bot,
+                    CONFIG.health_report_admin_chat_id,
+                    "Aigan health report:\n" + summary,
+                )
+                last_health_report_sent = now
+                system_event(component="self_analysis", event_type="health_report_sent")
+        except Exception:
+            LOGGER.exception("Health report loop failed")
+            system_event(level="error", component="self_analysis", event_type="health_report_failed")
+        await asyncio.sleep(interval)
+
+
 async def post_init(application: Application) -> None:
     global BOT_ID, BOT_USERNAME
 
@@ -2879,6 +3278,12 @@ async def post_init(application: Application) -> None:
         BOT_USERNAME,
         getattr(me, "can_read_all_group_messages", None),
     )
+    system_event(
+        component="startup",
+        event_type="telegram_identity",
+        message=f"@{BOT_USERNAME}",
+        details={"bot_id": BOT_ID, "can_read_all_group_messages": getattr(me, "can_read_all_group_messages", None)},
+    )
     if MEMORY is not None:
         deleted = MEMORY.cleanup()
         LOGGER.info(
@@ -2888,8 +3293,25 @@ async def post_init(application: Application) -> None:
             CONFIG.memory_retention_days,
             deleted,
         )
+    if SYSTEM_LOG is not None:
+        deleted = SYSTEM_LOG.cleanup()
+        LOGGER.info(
+            "System health logs enabled db=%s retention_days=%s cleanup_deleted=%s github_reporting=%s",
+            CONFIG.memory_db_path,
+            CONFIG.system_log_retention_days,
+            deleted,
+            GITHUB_REPORTER.is_configured,
+        )
+        system_event(
+            component="startup",
+            event_type="system_log_enabled",
+            message="system logs enabled",
+            details={"cleanup_deleted": deleted, "github_reporting_configured": GITHUB_REPORTER.is_configured},
+        )
     if CONFIG.proactive_enabled:
         application.create_task(proactive_loop(application))
+    if CONFIG.health_report_enabled:
+        application.create_task(health_report_loop(application))
 
 
 def main() -> None:
@@ -2902,6 +3324,10 @@ def main() -> None:
     application.add_handler(CommandHandler(["proactive_now"], proactive_now_command))
     application.add_handler(CommandHandler(["character", "profile"], character_command))
     application.add_handler(CommandHandler(["stat", "stats"], stats_command))
+    application.add_handler(CommandHandler(["health"], health_command))
+    application.add_handler(CommandHandler(["logs"], logs_command))
+    application.add_handler(CommandHandler(["selfcheck"], selfcheck_command))
+    application.add_handler(CommandHandler(["complaints"], complaints_command))
     application.add_handler(CommandHandler(["ai", "aigan", "monday"], command_prompt))
     application.add_handler(MessageHandler(filters.TEXT & filters.Regex(LOCALIZED_COMMAND_RE), localized_command_alias))
     application.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, text_message))
