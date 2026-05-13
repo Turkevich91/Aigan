@@ -1,5 +1,11 @@
 # Aigan Changelog
 
+## 2026-05-13 - Short follow-up memory retrieval
+
+- Added expanded persistent memory for explicit short follow-ups such as `@bot скільки?`, without changing ordinary group silence.
+- Added reply-chain expansion so stored parent/grandparent messages can be used even when they are outside the normal recent window.
+- Logged `memory_context_expanded` events for observability through health/log commands.
+
 ## 2026-05-13 - Self-analysis health reporting
 
 - Added sanitized system health logs for routing, tool, delivery, pending, and command events.

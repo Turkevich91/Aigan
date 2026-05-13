@@ -260,6 +260,40 @@ class MemoryStore:
             ).fetchall()
         return [self._row_to_item(row) for row in rows]
 
+    def message_by_message_id(self, chat_id: int, message_id: int | None) -> MemoryItem | None:
+        if message_id is None:
+            return None
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT * FROM messages
+                WHERE chat_id = ? AND message_id = ?
+                LIMIT 1
+                """,
+                (chat_id, message_id),
+            ).fetchone()
+        return self._row_to_item(row) if row is not None else None
+
+    def reply_chain(self, chat_id: int, message_id: int | None, depth: int = 6) -> list[MemoryItem]:
+        depth = max(0, int(depth))
+        if message_id is None or depth == 0:
+            return []
+
+        chain: list[MemoryItem] = []
+        seen: set[int] = set()
+        current_id: int | None = message_id
+        for _ in range(depth):
+            item = self.message_by_message_id(chat_id, current_id)
+            if item is None or item.id in seen:
+                break
+            chain.append(item)
+            seen.add(item.id)
+            current_id = item.reply_to_message_id
+            if current_id is None:
+                break
+
+        return list(reversed(chain))
+
     def user_messages(
         self,
         chat_id: int,

@@ -27,6 +27,8 @@ os.environ["FOLLOWUP_DEBOUNCE_SECONDS"] = "0.5"
 os.environ["MEMORY_ENABLED"] = "true"
 os.environ["MEMORY_DB_PATH"] = TEST_DB_PATH
 os.environ["MEMORY_CONTEXT_MESSAGES"] = "10"
+os.environ["MEMORY_FOLLOWUP_CONTEXT_MESSAGES"] = "40"
+os.environ["MEMORY_THREAD_CONTEXT_DEPTH"] = "6"
 os.environ["MEMORY_RETENTION_DAYS"] = "30"
 os.environ["MEMORY_IMAGE_SUMMARY_LIMIT"] = "3"
 os.environ["SYSTEM_LOG_ENABLED"] = "true"
@@ -376,6 +378,8 @@ class PersistentMemoryTests(unittest.TestCase):
     def setUp(self) -> None:
         if main.MEMORY is not None:
             main.MEMORY.clear_all()
+        if main.SYSTEM_LOG is not None:
+            main.SYSTEM_LOG.clear_all()
         main.passive_contexts.clear()
         main.histories.clear()
         main.pending_requests.clear()
@@ -494,6 +498,123 @@ class PersistentMemoryTests(unittest.TestCase):
 
         self.assertIn("Untrusted persistent recent chat memory", agent_input)
         self.assertIn("quoted source text", agent_input)
+
+    def test_normal_prompt_uses_normal_memory_window_only(self) -> None:
+        base = datetime.now(timezone.utc)
+        for index in range(12):
+            main.MEMORY.save_message(
+                chat_id=-1001,
+                message_id=index + 1,
+                sender_label="Tester",
+                text="old topic anchor" if index == 0 else f"recent filler {index}",
+                created_at=base + timedelta(seconds=index),
+            )
+        message = FakeMessage("@thrd_ua_bot дай огляд", message_id=100)
+
+        memory_context, expanded_context = asyncio.run(main.prepare_agent_memory_context(message, "дай огляд", "normal"))
+
+        self.assertNotIn("old topic anchor", memory_context)
+        self.assertIsNone(expanded_context)
+
+    def test_short_followup_uses_expanded_memory_window(self) -> None:
+        base = datetime.now(timezone.utc)
+        main.MEMORY.save_message(
+            chat_id=-1001,
+            message_id=1,
+            sender_label="Vladimir",
+            text="Subnautica topic anchor: перша частина була дуже давно",
+            created_at=base,
+        )
+        for index in range(14):
+            main.MEMORY.save_message(
+                chat_id=-1001,
+                message_id=2 + index,
+                sender_label="Tester",
+                text=f"short filler {index}",
+                created_at=base + timedelta(seconds=index + 1),
+            )
+        message = FakeMessage("@thrd_ua_bot скільки?", message_id=100)
+
+        memory_context, expanded_context = asyncio.run(main.prepare_agent_memory_context(message, "скільки?", "normal"))
+        agent_input = main.build_agent_input(
+            message,
+            "скільки?",
+            memory_context=memory_context,
+            expanded_memory_context=expanded_context,
+        )
+
+        self.assertNotIn("Subnautica topic anchor", memory_context)
+        self.assertIsNotNone(expanded_context)
+        self.assertIn("Subnautica topic anchor", expanded_context)
+        self.assertIn("Untrusted expanded recent chat memory for short follow-up", agent_input)
+        self.assertIn("ask one concise clarifying question", agent_input)
+
+    def test_reply_chain_expansion_includes_parent_outside_normal_window(self) -> None:
+        base = datetime.now(timezone.utc)
+        main.MEMORY.save_message(
+            chat_id=-1001,
+            message_id=1,
+            sender_label="Alpha",
+            text="reply-chain parent says the amount is five thousand",
+            created_at=base,
+        )
+        main.MEMORY.save_message(
+            chat_id=-1001,
+            message_id=2,
+            sender_label="Beta",
+            text="reply-chain child asks how much",
+            reply_to_message_id=1,
+            created_at=base + timedelta(seconds=1),
+        )
+        for index in range(50):
+            main.MEMORY.save_message(
+                chat_id=-1001,
+                message_id=3 + index,
+                sender_label="Filler",
+                text=f"filler {index}",
+                created_at=base + timedelta(seconds=index + 2),
+            )
+        message = FakeMessage("@thrd_ua_bot скільки?", message_id=200)
+        message.reply_to_message = FakeMessage("reply-chain child asks how much", message_id=2)
+
+        memory_context, expanded_context = asyncio.run(main.prepare_agent_memory_context(message, "скільки?", "normal"))
+
+        self.assertNotIn("reply-chain parent says the amount", memory_context)
+        self.assertIn("reply-chain parent says the amount", expanded_context)
+
+    def test_translation_route_does_not_use_expanded_followup_memory(self) -> None:
+        message = FakeMessage("@thrd_ua_bot переклади українською", message_id=300)
+
+        _, expanded_context = asyncio.run(
+            main.prepare_agent_memory_context(message, "переклади українською", "translate_reference")
+        )
+
+        self.assertIsNone(expanded_context)
+
+    def test_ordinary_group_short_followup_stays_silent(self) -> None:
+        message = FakeMessage("скільки?", message_id=400)
+        context = SimpleNamespace(bot=SimpleNamespace(id=999, username="thrd_ua_bot"))
+
+        asyncio.run(main.text_message(SimpleNamespace(effective_message=message), context))
+
+        self.assertEqual([], message.reply_calls)
+        self.assertEqual({}, main.pending_requests)
+        self.assertIn("скільки?", main.format_passive_context(message.chat_id))
+
+    def test_short_followup_expansion_records_system_event(self) -> None:
+        main.MEMORY.save_message(
+            chat_id=-1001,
+            message_id=1,
+            sender_label="Tester",
+            text="topic anchor",
+            created_at=datetime.now(timezone.utc),
+        )
+        message = FakeMessage("@thrd_ua_bot що?", message_id=500)
+
+        asyncio.run(main.prepare_agent_memory_context(message, "що?", "normal"))
+
+        events = main.SYSTEM_LOG.latest_events(5)
+        self.assertTrue(any(event.event_type == "memory_context_expanded" for event in events))
 
     def test_image_metadata_and_summary_are_stored_and_reused(self) -> None:
         item_id = main.MEMORY.save_message(

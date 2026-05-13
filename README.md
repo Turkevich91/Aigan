@@ -146,13 +146,17 @@ Aigan stores bounded chat memory in SQLite so it can use recent context after re
 MEMORY_ENABLED=true
 MEMORY_DB_PATH=/app/data/aigan.sqlite3
 MEMORY_CONTEXT_MESSAGES=10
+MEMORY_FOLLOWUP_CONTEXT_MESSAGES=40
+MEMORY_THREAD_CONTEXT_DEPTH=6
 MEMORY_RETENTION_DAYS=30
 MEMORY_IMAGE_SUMMARY_LIMIT=3
 MEMORY_EAGER_IMAGE_SUMMARY=false
 WEB_IMAGE_SEARCH_ENABLED=true
 ```
 
-`MEMORY_CONTEXT_MESSAGES` controls how many recent delivered messages are added to each model request. `MEMORY_RETENTION_DAYS` deletes older rows and cached media. `MEMORY_IMAGE_SUMMARY_LIMIT` limits how many recent unsummarized images can be lazily sent to vision for one answer.
+`MEMORY_CONTEXT_MESSAGES` controls how many recent delivered messages are added to normal model requests. For explicit short follow-ups such as `@bot скільки?`, `що?`, or `how many?`, Aigan also injects up to `MEMORY_FOLLOWUP_CONTEXT_MESSAGES` recent messages plus reply-chain parents up to `MEMORY_THREAD_CONTEXT_DEPTH`. If the referent is still unclear, it should ask one concise clarification instead of guessing. This expanded retrieval only runs after an explicit bot invocation, private DM, reply-to-bot, or pending consume; ordinary group chatter stays passive memory only.
+
+`MEMORY_RETENTION_DAYS` deletes older rows and cached media. `MEMORY_IMAGE_SUMMARY_LIMIT` limits how many recent unsummarized images can be lazily sent to vision for one answer.
 
 The bot can only remember messages Telegram delivered to it after memory is enabled. It cannot fetch arbitrary older group history. If a forwarded post contains a real `photo` or image `document`, the bot can cache and analyze it. If Telegram only shows a client-side link preview and does not deliver the image file, Aigan keeps the text/link and may fetch public page images, but it cannot inspect a private preview that was never sent through Bot API.
 
