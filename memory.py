@@ -775,7 +775,7 @@ class MemoryStore:
         return results
 
     def keyword_search(self, *, chat_id: int, query: str, lookback_days: int, limit: int) -> list[SemanticMemoryResult]:
-        terms = [term.casefold() for term in re.findall(r"[^\W\d_]{2,}", query, flags=re.UNICODE)]
+        terms = [term.casefold() for term in re.findall(r"[^\W_]{2,}", query, flags=re.UNICODE)]
         terms = [term for term in terms[:6] if term]
         if not terms:
             return []
@@ -783,6 +783,7 @@ class MemoryStore:
         text_expr = """
             lower(
                 coalesce(text, '') || ' ' ||
+                coalesce(source_text, '') || ' ' ||
                 coalesce(source_title, '') || ' ' ||
                 coalesce(source_url, '') || ' ' ||
                 coalesce(vision_summary, '')
@@ -816,7 +817,7 @@ class MemoryStore:
                 SemanticMemoryResult(
                     item=item,
                     search_text=self.searchable_text_for_item(item),
-                    score=2.0 - (index * 0.001),
+                    score=100.0 - (index * 0.001),
                     source="keyword",
                 )
             )
@@ -982,7 +983,7 @@ class MemoryStore:
 
     @staticmethod
     def _fts_query(query: str) -> str:
-        tokens = re.findall(r"[^\W\d_]{2,}", query.casefold(), flags=re.UNICODE)
+        tokens = re.findall(r"[^\W_]{2,}", query.casefold(), flags=re.UNICODE)
         tokens = [token.replace('"', '""') for token in tokens[:12]]
         return " OR ".join(f'"{token}"' for token in tokens)
 

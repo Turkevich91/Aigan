@@ -40,6 +40,8 @@ os.environ["MEMORY_SEMANTIC_TOP_K"] = "3"
 os.environ["MEMORY_EMBEDDING_BATCH_SIZE"] = "2"
 os.environ["MEMORY_VECTOR_BACKFILL_ON_START"] = "false"
 os.environ["MEMORY_VECTOR_BACKFILL_LIMIT"] = "10"
+os.environ["MEMORY_RECALL_INTENT_THRESHOLD"] = "0.62"
+os.environ["MEMORY_RECALL_INTENT_AMBIGUOUS_THRESHOLD"] = "0.48"
 os.environ["SYSTEM_LOG_ENABLED"] = "true"
 os.environ["SYSTEM_LOG_RETENTION_DAYS"] = "14"
 os.environ["GITHUB_REPORTING_ENABLED"] = "false"
@@ -780,6 +782,99 @@ class PersistentMemoryTests(unittest.TestCase):
 
         self.assertIn("Pragmata sales", context)
         self.assertNotIn("(no semantic memory matches)", context)
+
+    def test_semantic_recall_route_for_periphrased_memory_request(self) -> None:
+        message = FakeMessage("@thrd_ua_bot а про 170 тис в казино ми щось обговорювали?", message_id=1057)
+
+        with patch.object(main, "memory_recall_embedding_confidence", new=AsyncMock(return_value=0.75)):
+            route, intent = asyncio.run(
+                main.classify_request_with_intent(
+                    message,
+                    "а про 170 тис в казино ми щось обговорювали?",
+                )
+            )
+
+        self.assertEqual("memory_recall", route)
+        self.assertTrue(intent.is_recall)
+        self.assertIn("170", intent.query)
+        self.assertIn("казино", intent.query)
+
+    def test_direct_recall_uses_old_memory_and_excludes_current_request(self) -> None:
+        old_text = (
+            "На Закарпатті поштарка проїбала в казино 170 тис. грн чужих пенсій. "
+            "Їй дали пробаційний нагляд і штраф."
+        )
+        main.MEMORY.save_message(
+            chat_id=-1001,
+            message_id=1058,
+            sender_label="Denis",
+            text=old_text,
+            created_at=datetime.now(timezone.utc) - timedelta(days=2),
+        )
+        main.MEMORY.save_message(
+            chat_id=-1001,
+            message_id=1057,
+            sender_label="Vitaliy",
+            text='@thrd_ua_bot нагадай що там було з "в казино 170 тис" з чату',
+            created_at=datetime.now(timezone.utc) - timedelta(minutes=5),
+        )
+        current = FakeMessage('@thrd_ua_bot нагадай що там було з "в казино 170 тис" з чату', message_id=1059)
+        main.MEMORY.save_message(
+            chat_id=-1001,
+            message_id=current.message_id,
+            sender_label="Vitaliy",
+            text=current.text,
+            created_at=datetime.now(timezone.utc),
+        )
+        context = SimpleNamespace(bot=SimpleNamespace(send_chat_action=AsyncMock()))
+
+        with patch.object(main, "memory_recall_embedding_confidence", new=AsyncMock(return_value=0.9)):
+            with patch.object(main, "create_embeddings", new=AsyncMock(side_effect=RuntimeError("embedding down"))):
+                with patch.object(main, "run_agent", new=AsyncMock(return_value="знайшов")) as run_agent:
+                    asyncio.run(
+                        main.handle_prompt(
+                            current,
+                            context,
+                            'нагадай що там було з "в казино 170 тис" з чату',
+                        )
+                    )
+
+        agent_input = run_agent.await_args.args[0]
+        self.assertIn("Request route: memory_recall", agent_input)
+        recalled_block = agent_input.split("Untrusted recalled long-term memory.", 1)[1].split(
+            "Untrusted current web search results.",
+            1,
+        )[0]
+        self.assertIn("поштарка проїбала в казино 170 тис", recalled_block)
+        self.assertNotIn("@thrd_ua_bot нагадай", recalled_block)
+
+    def test_recall_exact_rescue_searches_source_text_and_numbers(self) -> None:
+        main.MEMORY.save_message(
+            chat_id=-1001,
+            message_id=1060,
+            sender_label="Sergey",
+            text="дивись це",
+            source_text="Репост: відеокарта 4070 коштувала $250 у старій новині",
+            created_at=datetime.now(timezone.utc) - timedelta(days=1),
+        )
+        message = FakeMessage("@thrd_ua_bot що там було про 4070 за $250?", message_id=1061)
+        intent = main.MemoryRecallIntent(True, confidence=0.9, query="4070 250", reason="test")
+
+        context = asyncio.run(main.prepare_recalled_memory_context(message, "що там було про 4070 за $250?", intent))
+
+        self.assertIn("4070", context)
+        self.assertIn("$250", context)
+
+    def test_recall_intent_embedding_failure_uses_conservative_fallback(self) -> None:
+        message = FakeMessage('@thrd_ua_bot нагадай що там було з "Pragmata"', message_id=1062)
+
+        with patch.object(main, "memory_recall_embedding_confidence", new=AsyncMock(side_effect=RuntimeError("down"))):
+            route, intent = asyncio.run(
+                main.classify_request_with_intent(message, 'нагадай що там було з "Pragmata"')
+            )
+
+        self.assertEqual("memory_recall", route)
+        self.assertTrue(intent.degraded)
 
     def test_ordinary_group_text_does_not_call_semantic_retrieval(self) -> None:
         message = FakeMessage("subnautica?", message_id=1060)

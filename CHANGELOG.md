@@ -1,5 +1,11 @@
 # Aigan Changelog
 
+## 2026-05-13 - Semantic direct memory recall
+
+- Added semantic routing for natural prompts that ask Aigan to recall old chat context, without requiring `/memory_search`.
+- Reused hybrid memory retrieval for direct recall prompts while excluding the current prompt from search results.
+- Improved exact rescue for numeric phrases such as `170 тис`, `4070`, or `$250`, including matches stored as source/repost text.
+
 ## 2026-05-13 - Source content separated from user stats
 
 - Added separate memory storage for forwarded/source text so repost bodies stay searchable without shaping `/stat` or `/характер`.

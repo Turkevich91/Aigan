@@ -165,13 +165,15 @@ MEMORY_SEMANTIC_TOP_K=6
 MEMORY_EMBEDDING_BATCH_SIZE=64
 MEMORY_VECTOR_BACKFILL_ON_START=true
 MEMORY_VECTOR_BACKFILL_LIMIT=1000
+MEMORY_RECALL_INTENT_THRESHOLD=0.62
+MEMORY_RECALL_INTENT_AMBIGUOUS_THRESHOLD=0.48
 ```
 
 `MEMORY_CONTEXT_MESSAGES` controls how many recent delivered messages are added to normal model requests. For explicit short follow-ups such as `@bot скільки?`, `що?`, or `how many?`, Aigan also injects up to `MEMORY_FOLLOWUP_CONTEXT_MESSAGES` recent messages plus reply-chain parents up to `MEMORY_THREAD_CONTEXT_DEPTH`. If the referent is still unclear, it should ask one concise clarification instead of guessing. This expanded retrieval only runs after an explicit bot invocation, private DM, reply-to-bot, or pending consume; ordinary group chatter stays passive memory only.
 
 `MEMORY_RETENTION_DAYS` deletes older rows and cached media. `MEMORY_IMAGE_SUMMARY_LIMIT` limits how many recent unsummarized images can be lazily sent to vision for one answer.
 
-Semantic memory adds a local SQLite hybrid index: FTS5 for keyword fallback plus OpenAI embeddings for meaning-based retrieval over the retained lookback window. It is only used after explicit bot invocation, never for ordinary group chatter. `/memory_search query` is admin-only and shows the retrieved snippets without asking the main model to answer; aliases `/память`, `/памʼять`, and `/пошук_памяті` call the same hybrid search. The command automatically uses embeddings when indexed, always attempts FTS fallback, and reports `embeddings_used`, fallback status, and per-result sources. Topic recall prompts such as `згадай стару розмову про Pragmata` also run an exact keyword rescue so named topics are not missed when the semantic query is too broad.
+Semantic memory adds a local SQLite hybrid index: FTS5 for keyword fallback plus OpenAI embeddings for meaning-based retrieval over the retained lookback window. It is only used after explicit bot invocation, never for ordinary group chatter. `/memory_search query` is admin-only and shows the retrieved snippets without asking the main model to answer; aliases `/память`, `/памʼять`, and `/пошук_памяті` call the same hybrid search. The command automatically uses embeddings when indexed, always attempts FTS fallback, and reports `embeddings_used`, fallback status, and per-result sources. Natural prompts that semantically ask for old chat context, such as `@bot що ми казали про Pragmata?` or `@bot а про 170 тис в казино ми щось обговорювали?`, route to the same recall backend automatically. `MEMORY_RECALL_INTENT_THRESHOLD` and `MEMORY_RECALL_INTENT_AMBIGUOUS_THRESHOLD` control that intent detector. Recall search also runs exact rescue with numeric terms such as `170`, `5к`, `4070`, or `$250`, and excludes the current prompt so it does not become its own top memory result.
 
 The bot can only remember messages Telegram delivered to it after memory is enabled. It cannot fetch arbitrary older group history. If a forwarded post contains a real `photo` or image `document`, the bot can cache and analyze it. If Telegram only shows a client-side link preview and does not deliver the image file, Aigan keeps the text/link and may fetch public page images, but it cannot inspect a private preview that was never sent through Bot API.
 
