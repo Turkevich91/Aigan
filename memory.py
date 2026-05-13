@@ -346,9 +346,16 @@ class MemoryStore:
         *,
         user_id: int | None = None,
         username: str = "",
+        label_aliases: tuple[str, ...] | list[str] = (),
         limit: int = 100,
     ) -> list[MemoryItem]:
-        return self._user_text_messages(chat_id, user_id=user_id, username=username, limit=max(1, int(limit)))
+        return self._user_text_messages(
+            chat_id,
+            user_id=user_id,
+            username=username,
+            label_aliases=label_aliases,
+            limit=max(1, int(limit)),
+        )
 
     def user_stats(
         self,
@@ -356,8 +363,9 @@ class MemoryStore:
         *,
         user_id: int | None = None,
         username: str = "",
+        label_aliases: tuple[str, ...] | list[str] = (),
     ) -> list[MemoryItem]:
-        return self._user_text_messages(chat_id, user_id=user_id, username=username, limit=None)
+        return self._user_text_messages(chat_id, user_id=user_id, username=username, label_aliases=label_aliases, limit=None)
 
     def user_id_for_username(self, chat_id: int, username: str) -> int | None:
         username = username.strip().lstrip("@")
@@ -383,16 +391,61 @@ class MemoryStore:
             ).fetchone()
         return int(row["user_id"]) if row is not None else None
 
+    @staticmethod
+    def base_sender_label(label: str) -> str:
+        value = (label or "").strip()
+        value = re.sub(r"\s*\(@[^)]*\)\s*$", "", value)
+        value = re.sub(r"\s*\((?:current request|translation request|image request)\)\s*$", "", value)
+        return value.strip()
+
+    def identity_label_aliases(self, chat_id: int, *, user_id: int | None = None, username: str = "") -> tuple[str, ...]:
+        username = username.strip().lstrip("@")
+        if user_id is None and not username:
+            return ()
+        conditions = ["chat_id = ?", "is_bot = 0", "sender_label != ''", "sender_label != 'Telegram export'"]
+        params: list[object] = [chat_id]
+        identity_conditions: list[str] = []
+        if user_id is not None:
+            identity_conditions.append("user_id = ?")
+            params.append(user_id)
+        if username:
+            identity_conditions.append("lower(username) = lower(?)")
+            params.append(username)
+            identity_conditions.append("lower(sender_label) LIKE lower(?)")
+            params.append(f"%@{username}%")
+        if not identity_conditions:
+            return ()
+        with self._lock:
+            rows = self._conn.execute(
+                f"""
+                SELECT DISTINCT sender_label
+                FROM messages
+                WHERE {" AND ".join(conditions)}
+                  AND ({" OR ".join(identity_conditions)})
+                """,
+                tuple(params),
+            ).fetchall()
+
+        aliases: set[str] = set()
+        for row in rows:
+            label = str(row["sender_label"] or "").strip()
+            for alias in (label, self.base_sender_label(label)):
+                if alias and alias != "Telegram export":
+                    aliases.add(alias)
+        return tuple(sorted(aliases, key=str.casefold))
+
     def _user_text_messages(
         self,
         chat_id: int,
         *,
         user_id: int | None,
         username: str = "",
-        limit: int | None,
+        label_aliases: tuple[str, ...] | list[str] = (),
+        limit: int | None = None,
     ) -> list[MemoryItem]:
         username = username.strip().lstrip("@")
-        if user_id is None and not username:
+        aliases = tuple(dict.fromkeys(alias.strip() for alias in label_aliases if alias and alias.strip()))
+        if user_id is None and not username and not aliases:
             return []
 
         conditions = [
@@ -402,13 +455,18 @@ class MemoryStore:
             "text NOT LIKE '[message has %'",
         ]
         params: list[object] = [chat_id]
+        identity_conditions: list[str] = []
         if user_id is not None:
-            conditions.append("user_id = ?")
+            identity_conditions.append("user_id = ?")
             params.append(user_id)
-        else:
-            conditions.append("username != ''")
-            conditions.append("lower(username) = lower(?)")
+        if username:
+            identity_conditions.append("(username != '' AND lower(username) = lower(?))")
             params.append(username)
+        if aliases:
+            placeholders = ",".join("?" for _alias in aliases)
+            identity_conditions.append(f"sender_label IN ({placeholders})")
+            params.extend(aliases)
+        conditions.append("(" + " OR ".join(identity_conditions) + ")")
 
         where = " AND ".join(conditions)
         if limit is None:
@@ -451,6 +509,24 @@ class MemoryStore:
                 (chat_id, limit),
             ).fetchall()
         return [self._row_to_item(row) for row in rows]
+
+    def embeddings_for_items(self, item_ids: list[int], *, model: str, dimensions: int) -> dict[int, list[float]]:
+        ids = [int(item_id) for item_id in item_ids if item_id is not None]
+        if not ids:
+            return {}
+        placeholders = ",".join("?" for _item_id in ids)
+        with self._lock:
+            rows = self._conn.execute(
+                f"""
+                SELECT message_id, embedding_blob
+                FROM message_embeddings
+                WHERE model = ?
+                  AND dimensions = ?
+                  AND message_id IN ({placeholders})
+                """,
+                (model, int(dimensions), *ids),
+            ).fetchall()
+        return {int(row["message_id"]): self._embedding_from_blob(row["embedding_blob"]) for row in rows}
 
     def embedding_candidates_by_ids(
         self,

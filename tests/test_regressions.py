@@ -1109,6 +1109,79 @@ class PersistentMemoryTests(unittest.TestCase):
             self.assertIn("semantic", items[0].text)
             self.assertIn("https://example.com", items[0].text)
 
+    def test_html_export_inherits_sender_for_joined_messages_across_pages(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            export_dir = self.write_html_export(
+                tmpdir,
+                {
+                    "messages.html": """
+                    <div class="message default clearfix" id="message111">
+                      <div class="body">
+                        <div class="pull_right date details" title="13.05.2026 10:00:00 UTC+00:00">10:00</div>
+                        <div class="from_name">Alice</div>
+                        <div class="text">first text</div>
+                      </div>
+                    </div>
+                    """,
+                    "messages2.html": """
+                    <div class="message default clearfix" id="message112">
+                      <div class="body">
+                        <div class="pull_right date details" title="13.05.2026 10:01:00 UTC+00:00">10:01</div>
+                        <div class="text">joined text without author</div>
+                      </div>
+                    </div>
+                    """,
+                },
+            )
+            db_path = Path(tmpdir) / "memory.sqlite3"
+
+            import_telegram_export.import_export(self.import_options(export_dir, db_path))
+            store = MemoryStore(db_path, retention_days=30)
+
+            self.assertEqual("Alice", store.message_by_message_id(-1001, 111).sender_label)
+            self.assertEqual("Alice", store.message_by_message_id(-1001, 112).sender_label)
+
+    def test_html_export_inherited_sender_uses_inferred_user_map(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "memory.sqlite3"
+            seeded = MemoryStore(db_path, retention_days=30)
+            seeded.save_message(
+                chat_id=-1001,
+                message_id=90,
+                sender_label="Display Name (@mapped, id=12345)",
+                user_id=12345,
+                username="mapped",
+                text="live anchor",
+                created_at=datetime.now(timezone.utc),
+            )
+            export_dir = self.write_html_export(
+                tmpdir,
+                {
+                    "messages.html": """
+                    <div class="message default clearfix" id="message301">
+                      <div class="body">
+                        <div class="pull_right date details" title="13.05.2026 10:03:00 UTC+00:00">10:03</div>
+                        <div class="from_name">Display Name</div>
+                        <div class="text">mapped user text</div>
+                      </div>
+                    </div>
+                    <div class="message default clearfix" id="message302">
+                      <div class="body">
+                        <div class="pull_right date details" title="13.05.2026 10:04:00 UTC+00:00">10:04</div>
+                        <div class="text">joined mapped text</div>
+                      </div>
+                    </div>
+                    """,
+                },
+            )
+
+            import_telegram_export.import_export(self.import_options(export_dir, db_path))
+            store = MemoryStore(db_path, retention_days=30)
+
+            self.assertEqual(12345, store.message_by_message_id(-1001, 301).user_id)
+            self.assertEqual(12345, store.message_by_message_id(-1001, 302).user_id)
+            self.assertEqual("mapped", store.message_by_message_id(-1001, 302).username)
+
     def test_html_export_preserves_reply_forward_and_copies_photo(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             export_dir = Path(tmpdir) / "ChatExport"
@@ -1868,6 +1941,72 @@ class PersistentMemoryTests(unittest.TestCase):
         self.assertIn("Cleaned messages: 10", captured["prompt"])
         self.assertIn("imported profile memory 8", captured["prompt"])
 
+    def test_self_target_includes_imported_rows_by_base_sender_label(self) -> None:
+        now = datetime.now(timezone.utc)
+        main.MEMORY.save_message(
+            chat_id=-1001,
+            message_id=3040,
+            sender_label="Test User (@tester, id=407892151)",
+            user_id=407892151,
+            username="tester",
+            text="live anchor",
+            created_at=now,
+        )
+        for index in range(9):
+            main.MEMORY.save_message(
+                chat_id=-1001,
+                message_id=3041 + index,
+                sender_label="Test User",
+                user_id=None,
+                username="",
+                text=f"imported alias memory {index}",
+                created_at=now + timedelta(seconds=index + 1),
+            )
+        message = FakeMessage("/character me")
+        context = SimpleNamespace(bot=SimpleNamespace(username="thrd_ua_bot", id=8712856238, send_chat_action=AsyncMock()))
+        captured = {}
+
+        async def fake_run_plain_model(prompt: str) -> str:
+            captured["prompt"] = prompt
+            return "profile ready"
+
+        with patch.object(main, "run_plain_model", new=fake_run_plain_model):
+            asyncio.run(main.handle_character_command(message, context, "me"))
+
+        reply = message.reply_calls[0]["text"]
+        self.assertIn("profile ready", reply)
+        self.assertIn("label_alias=9", reply)
+        self.assertIn("Cleaned messages: 10", captured["prompt"])
+        self.assertIn("imported alias memory 8", captured["prompt"])
+
+    def test_username_target_includes_imported_rows_by_base_sender_label(self) -> None:
+        now = datetime.now(timezone.utc)
+        main.MEMORY.save_message(
+            chat_id=-1001,
+            message_id=3060,
+            sender_label="Target (@target, id=222)",
+            user_id=222,
+            username="target",
+            text="resolver anchor",
+            created_at=now,
+        )
+        for index in range(2):
+            main.MEMORY.save_message(
+                chat_id=-1001,
+                message_id=3061 + index,
+                sender_label="Target",
+                user_id=None,
+                username="",
+                text=f"alias stat row {index}",
+                created_at=now + timedelta(seconds=index + 1),
+            )
+        message = FakeMessage("/stat @target")
+
+        asyncio.run(main.handle_stats_command(message, "@target"))
+
+        self.assertIn("повідомлень: 3", message.reply_calls[0]["text"])
+        self.assertIn("alias - 2", message.reply_calls[0]["text"])
+
     def test_non_admin_cannot_request_other_user_stats_or_profile(self) -> None:
         context = SimpleNamespace(bot=SimpleNamespace(username="thrd_ua_bot", id=8712856238))
         for text in ("/стат @tester", "/характер @tester"):
@@ -1921,11 +2060,47 @@ class PersistentMemoryTests(unittest.TestCase):
 
         self.assertIn("портрет готовий", message.reply_calls[0]["text"])
         self.assertIn("Cleaned messages: 105", captured["prompt"])
-        self.assertIn("Representative chronological sample from the full retained period", captured["prompt"])
+        self.assertIn("Fallback representative sample", captured["prompt"])
+        self.assertIn("Chronological anchors from full retained period", captured["prompt"])
         self.assertIn("profile-sample-000", captured["prompt"])
         self.assertIn("profile-sample-104", captured["prompt"])
+        self.assertLess(captured["prompt"].count("profile-sample-"), 105)
         self.assertNotIn("other-user-secret", captured["prompt"])
         self.assertIn("Do not infer or mention mental health", captured["prompt"])
+
+    def test_character_profile_package_uses_embedding_diverse_sample(self) -> None:
+        base = datetime.now(timezone.utc)
+        item_ids: list[int] = []
+        for index in range(12):
+            item_id = main.MEMORY.save_message(
+                chat_id=-1001,
+                message_id=3600 + index,
+                sender_label="Test User (@tester, id=407892151)",
+                user_id=407892151,
+                username="tester",
+                text=f"embedded profile topic {index}",
+                created_at=base + timedelta(seconds=index),
+            )
+            item = main.MEMORY.item_by_id(item_id)
+            item_ids.append(item_id)
+            vector = [0.0, 0.0, 0.0, 0.0]
+            vector[index % 4] = 1.0
+            main.MEMORY.upsert_embedding(
+                message_id=item_id,
+                chat_id=-1001,
+                model=main.CONFIG.memory_embedding_model,
+                dimensions=4,
+                content_hash=MemoryStore.content_hash(MemoryStore.searchable_text_for_item(item)),
+                embedding=vector,
+            )
+        target = main.UserCommandTarget(user_id=407892151, username="tester", label="Test User", is_self=True)
+        selection = main.target_memory_selection(FakeMessage("/character me"), target)
+
+        prompt = main.build_character_profile_prompt(selection)
+
+        self.assertIn("Embeddings available: 12/12", prompt)
+        self.assertIn("Embedding-diverse sample", prompt)
+        self.assertIn("embedded profile topic", prompt)
 
     def test_character_command_uses_cleaned_text(self) -> None:
         base = datetime.now(timezone.utc)

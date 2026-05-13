@@ -1,5 +1,11 @@
 # Aigan Changelog
 
+## 2026-05-13 - Full-history semantic profiles
+
+- Fixed Telegram HTML import so joined messages without repeated sender names inherit the previous sender across pages.
+- Expanded `/stat` and `/характер` identity matching to include `user_id`, username, and imported display-name aliases.
+- Changed `/характер` to send aggregate stats, coverage, chronological anchors, recent tail, and embedding-diverse samples instead of raw full history.
+
 ## 2026-05-13 - Full-memory profiles and memory search
 
 - Changed `/character` and `/характер` to analyze the full retained SQLite history through aggregate stats and representative samples instead of only the last 100 messages.

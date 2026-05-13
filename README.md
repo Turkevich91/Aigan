@@ -72,7 +72,7 @@ Ukrainian aliases are also available so users do not need to switch keyboard lay
 /пошук_памяті subnautica
 ```
 
-User commands use only retained SQLite memory for the current chat. `/stat` and `/стат` count saved text/caption messages, sentences, words, and top words across the full retained history; media-only placeholders, mentions, slash commands, the bot trigger, and pasted stat-output lines are ignored. `/character`, `/profile`, `/характер`, `/портрет`, and `/профіль` build a cautious non-clinical communication portrait from the full retained history by sending the model aggregate stats plus a representative sample, not thousands of raw messages. Users can request their own data; admins can request another user by `@username`. When a username can be resolved to a stored Telegram `user_id`, imported rows without a username are included too.
+User commands use only retained SQLite memory for the current chat. `/stat` and `/стат` count saved text/caption messages, sentences, words, and top words across the full retained history; media-only placeholders, mentions, slash commands, the bot trigger, and pasted stat-output lines are ignored. `/character`, `/profile`, `/характер`, `/портрет`, and `/профіль` build a cautious non-clinical communication portrait from the full retained history by sending the model aggregate stats plus chronological anchors, recent tail, and an embedding-diverse sample, not thousands of raw messages. Users can request their own data; admins can request another user by `@username`. When a username can be resolved to a stored Telegram `user_id`, imported rows matched by base display-name aliases are included too.
 
 If Telegram privacy mode is on and the bot is not an admin, it may only receive commands, mentions, and replies. That is usually good for cost control.
 
@@ -193,7 +193,7 @@ docker compose run --rm \
   --embedding-limit 10000
 ```
 
-`--file` may point to `result.json`, a single `messages.html`, or an export directory containing `messages.html`, `messages2.html`, and later pages. Run with `--dry-run` first to count what would be imported without writing to SQLite. Re-running the importer is safe: messages are keyed by `(chat_id, message_id)`, so repeated imports update existing rows instead of duplicating history. `--copy-media` only copies valid exported JPEG/PNG/WebP/GIF files within `IMAGE_MAX_BYTES`; text and captions are imported either way.
+`--file` may point to `result.json`, a single `messages.html`, or an export directory containing `messages.html`, `messages2.html`, and later pages. Run with `--dry-run` first to count what would be imported without writing to SQLite. Re-running the importer is safe: messages are keyed by `(chat_id, message_id)`, so repeated imports update existing rows instead of duplicating history. HTML joined messages that omit `from_name` inherit the previous sender across export pages. `--copy-media` only copies valid exported JPEG/PNG/WebP/GIF files within `IMAGE_MAX_BYTES`; text and captions are imported either way.
 
 HTML exports do not reliably contain Telegram user ids. If you need `/stat @name` and `/характер @name` to attach old HTML messages to exact users, pass `--user-map /app/imports/users.json` with entries like `{"Display Name": {"user_id": 123, "username": "handle"}}`. Without a map, Aigan keeps the exported display name and only infers ids when it can match existing memory safely.
 

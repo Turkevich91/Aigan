@@ -405,19 +405,24 @@ class HtmlExportParser:
     def messages(self) -> list[dict[str, Any]]:
         messages: list[dict[str, Any]] = []
         current_day: datetime | None = None
+        current_sender = ""
         for page in self.pages:
             soup = BeautifulSoup(page.read_text(encoding="utf-8"), "html.parser")
             for message_tag in soup.select("div.message"):
-                item = self.parse_message(message_tag, current_day)
+                item = self.parse_message(message_tag, current_day, current_sender)
                 if item is None:
                     continue
                 if item.get("_day_marker"):
                     current_day = parse_export_datetime(item)
+                elif item.get("type") == "message":
+                    sender = sender_label(item)
+                    if sender and sender != "Telegram export":
+                        current_sender = sender
                 messages.append(item)
         messages.sort(key=lambda item: int(item.get("id") or 0))
         return messages
 
-    def parse_message(self, message_tag: Any, current_day: datetime | None) -> dict[str, Any] | None:
+    def parse_message(self, message_tag: Any, current_day: datetime | None, current_sender: str = "") -> dict[str, Any] | None:
         message_id = message_numeric_id(str(message_tag.get("id") or ""))
         if message_id is None:
             return None
@@ -442,7 +447,7 @@ class HtmlExportParser:
         created = parse_html_message_datetime(str(date_node.get("title") or "")) if date_node else None
         if created is None:
             return None
-        sender = direct_child_text(body, "from_name") or "Telegram export"
+        sender = direct_child_text(body, "from_name") or current_sender or "Telegram export"
         media_path, media_kind = html_media_path(body)
         item: dict[str, Any] = {
             "id": message_id,
