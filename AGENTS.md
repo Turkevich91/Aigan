@@ -22,6 +22,13 @@ This repository is maintained by humans and coding agents such as Codex, Google 
 - Use sanitized summaries and short redacted previews only.
 - Prefer behavior-level descriptions and reproduction notes over private payloads.
 
+## Runtime Environment
+
+- Local development can happen from this clone, but live deployment details and durable runtime data are operator-specific and must stay outside the repository.
+- Treat the configured deployment environment as the source of truth for SQLite memory, cached media, Telegram imports, logs, Docker volumes, and other generated artifacts.
+- Do not commit hostnames, SSH aliases, private absolute paths, runtime artifacts, imports, cached media, local databases, `.env`, or deployment-only secrets into the repository.
+- Before debugging behavior that depends on memory, imports, embeddings, media cache, or Docker state, inspect the configured deployment environment from private operator context rather than assuming the local clone has the same data.
+
 ## Implementation Rules
 
 - Keep business logic in tested Python modules.
