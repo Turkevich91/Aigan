@@ -1,5 +1,11 @@
 # Aigan Changelog
 
+## 2026-05-15 - Transcription backend adapter research
+
+- Added a research/design note for a future shared STT backend adapter.
+- Documented OpenAI default behavior, local STT candidate boundaries, backend modes, health fields, failure categories, and migration from the direct YouTube fallback.
+- Kept the task planning-only: no OpenAI/local Whisper implementation, Docker dependency change, routing change, or memory integration.
+
 ## 2026-05-15 - Telegram native transcription research
 
 - Added a research/design note for future Telegram voice, audio, video, and video-note transcription.

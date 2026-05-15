@@ -270,6 +270,7 @@ Future tool research notes:
 
 - [`docs/tool-research/universal-media-transcript-mcp.md`](docs/tool-research/universal-media-transcript-mcp.md)
 - [`docs/tool-research/telegram-native-transcription.md`](docs/tool-research/telegram-native-transcription.md)
+- [`docs/tool-research/transcription-backend-adapter.md`](docs/tool-research/transcription-backend-adapter.md)
 
 Long text replies are split by the delivery layer instead of being truncated at the first Telegram limit:
 
