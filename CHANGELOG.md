@@ -1,5 +1,11 @@
 # Aigan Changelog
 
+## 2026-05-15 - Universal media transcript research
+
+- Added a research/design note for a future universal media transcript MCP.
+- Documented the caption-first extraction ladder, audio fallback boundaries, failure categories, health contract, and source-memory rules.
+- Kept the task planning-only: no TikTok/Instagram/STT implementation or routing expansion.
+
 ## 2026-05-15 - Tool adapter runtime boundary
 
 - Added a shared tool runtime boundary for optional adapters, including health summaries, safe failure handling, and cleanup hooks.
