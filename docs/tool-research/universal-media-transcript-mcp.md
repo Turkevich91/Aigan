@@ -20,7 +20,7 @@ This note does not implement the tool. It does not add STT backends, cookies, pr
 
 - `yt-dlp` is the right first extraction layer, but its own supported-sites page says support is best-effort and the only reliable test is to try the URL. Future UI must report degraded failures honestly rather than promising universal support.
 - Captions/subtitles should be preferred over audio transcription. They avoid downloads, cost less, and reduce temp-file risk.
-- OpenAI speech-to-text currently supports `gpt-4o-transcribe`, `gpt-4o-mini-transcribe`, `gpt-4o-transcribe-diarize`, and `whisper-1`; file uploads are limited to 25 MB and supported audio formats include `mp3`, `mp4`, `mpeg`, `mpga`, `m4a`, `wav`, and `webm`.
+- OpenAI speech-to-text model names and accepted audio formats should be read from the current API reference during implementation; the current docs include `gpt-4o` transcription variants and `whisper-1`, and file uploads are limited to 25 MB.
 - Long audio needs chunking below the file limit. Chunk boundaries should avoid cutting mid-sentence when possible.
 - `whisper.cpp` is a plausible local-STT candidate because it supports quantized models and CPU/OpenVINO paths, but local STT should stay behind the separate benchmark/backend tasks before production use.
 - TikTok and Instagram should be treated as unreliable in v1 because extractor breakage, auth gates, rate limits, cookies, or bot protection can fail independently of Aigan.
@@ -56,19 +56,20 @@ Recommended internal layers:
 
 ## Extraction Ladder
 
-1. Validate that the URL is public `http` or `https`; reject local, private, file, and non-network targets.
+1. Validate that the URL is public `http` or `https`; reject local, private, file, credentialed, and non-network targets before passing anything to `yt-dlp`.
 2. Use a `yt_dlp.YoutubeDL({"noplaylist": True, "quiet": True})` instance and call `ydl.extract_info(url, download=False)` for metadata and extractor capability.
-3. Prefer manually provided captions in configured languages.
-4. Fall back to automatic captions when available and marked as such.
-5. If captions are missing and audio fallback is enabled, enforce duration and byte limits before downloading.
-6. Download audio into a temporary directory, transcode to a supported compact format, transcribe through the configured STT adapter, and delete temp files.
-7. Return a structured failure if any layer cannot proceed.
+3. Re-check the resolved/canonical URL and any redirects for private IP ranges, URL credentials, unsupported schemes, and token-like query parameters.
+4. Prefer manually provided captions in configured languages.
+5. Fall back to automatic captions when available and marked as such.
+6. If captions are missing and audio fallback is enabled, enforce duration and byte limits before downloading.
+7. Download audio into a temporary directory, transcode to a supported compact format, transcribe through the configured STT adapter, and delete temp files.
+8. Return a structured failure if any layer cannot proceed.
 
 ## Output Contract
 
 A successful result should include:
 
-- original URL and canonical URL when available;
+- sanitized source URL and canonical URL when available;
 - platform or extractor name;
 - sanitized title/uploader metadata when available;
 - duration in seconds when available;
@@ -118,6 +119,7 @@ Cookie or proxy support should not be part of v1. If ever added, it must live in
 ## Safety And Memory Rules
 
 - Do not keep downloaded media after the request completes.
+- Strip credentials, tracking parameters, and token-like query values before storing or returning source URLs.
 - Do not log raw URLs when they may contain private tokens or tracking parameters; log host/extractor/failure category instead.
 - Do not put raw transcripts in system logs or GitHub issues.
 - If transcripts become memory in a later issue, store them as source context with provenance, not as the forwarding user's authored text.
