@@ -161,6 +161,8 @@ Use stable sanitized categories rather than raw exceptions:
 
 Failures must go through `ToolRuntime.safe_call` or an equivalent sanitized system-event path and must not block Telegram routing, memory ingestion, embeddings, recall, `/stat`, `/character`, or normal replies.
 
+Structured backend failures must also carry a safe user-facing unavailable message or message key. Callers such as Telegram native transcription, universal media transcript, or YouTube audio fallback should show that short sanitized copy to the user instead of raw provider errors or internal exception text.
+
 ## Configuration Defaults
 
 Recommended future defaults:
@@ -233,5 +235,5 @@ TRANSCRIPTION_LOCAL_MODEL=
 
 - Env-selectable backend is covered by backend modes and configuration defaults.
 - OpenAI remains default through `TRANSCRIPTION_BACKEND=openai` and `TRANSCRIPTION_MODEL=gpt-4o-mini-transcribe`.
-- Disabled or missing backend returns structured unavailable failures.
+- Disabled or missing backend returns structured unavailable failures plus safe user-facing unavailable copy.
 - Backend errors become sanitized system events and do not block memory ingestion or normal bot replies.
