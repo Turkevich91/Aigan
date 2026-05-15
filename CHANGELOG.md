@@ -1,5 +1,11 @@
 # Aigan Changelog
 
+## 2026-05-15 - Tool adapter runtime boundary
+
+- Added a shared tool runtime boundary for optional adapters, including health summaries, safe failure handling, and cleanup hooks.
+- Registered outbound reactions through the tool runtime while preserving the existing null-adapter fallback and behavior.
+- Documented the adapter contract for future media, transcription, OCR, document, and fact-check tools.
+
 ## 2026-05-15 - Modular outbound reactions
 
 - Added an optional outbound reaction adapter that can set real Telegram reactions on selected strong live group messages.

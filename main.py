@@ -14,7 +14,7 @@ from datetime import datetime, timezone
 from functools import lru_cache
 from itertools import count
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Sequence, cast
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from agents import Agent, ModelSettings, RunHooks, Runner
@@ -33,6 +33,7 @@ from github_reporting import GitHubReporter
 from self_analysis import SelfAnalysisService
 from social_memory import SocialMemoryStore, SocialObservation
 from system_log import SystemLogStore, sanitize_text
+from tool_runtime import ToolRuntime
 
 try:
     from openai.types.shared import Reasoning
@@ -408,6 +409,24 @@ def build_reaction_adapter() -> ReactionAdapter:
 
 
 REACTION_ADAPTER: ReactionAdapter = build_reaction_adapter()
+TOOL_RUNTIME = ToolRuntime()
+
+
+def set_reaction_adapter(adapter: ReactionAdapter) -> ReactionAdapter:
+    global REACTION_ADAPTER
+    REACTION_ADAPTER = adapter
+    TOOL_RUNTIME.register("outbound_reactions", adapter)
+    return adapter
+
+
+def runtime_reaction_adapter() -> ReactionAdapter:
+    adapter = TOOL_RUNTIME.get("outbound_reactions")
+    if adapter is None:
+        return set_reaction_adapter(REACTION_ADAPTER)
+    return cast(ReactionAdapter, adapter)
+
+
+set_reaction_adapter(REACTION_ADAPTER)
 GITHUB_REPORTER = GitHubReporter(
     enabled=CONFIG.github_reporting_enabled,
     token=CONFIG.github_token,
@@ -952,6 +971,9 @@ def system_event(
         )
     except Exception:
         LOGGER.debug("Failed to write system event", exc_info=True)
+
+
+TOOL_RUNTIME.set_event_callback(system_event)
 
 
 def system_event_for_chat(
@@ -1606,17 +1628,13 @@ async def remember_message_persistently(message: Message, label: str | None = No
 
 
 async def run_reaction_ingestion_hook(message: Message, item: MemoryItem | None, *, phase: str) -> None:
-    try:
-        await REACTION_ADAPTER.on_message_ingested(message, item, phase)
-    except Exception as exc:
-        LOGGER.warning("Outbound reaction hook failed", exc_info=True)
-        system_event(
-            level="warning",
-            component="outbound_reactions",
-            event_type="outbound_reaction_hook_failed",
-            telegram_message=message,
-            message=f"{type(exc).__name__}: {exc}",
-        )
+    await TOOL_RUNTIME.safe_call(
+        "outbound_reactions",
+        "on_message_ingested",
+        lambda: runtime_reaction_adapter().on_message_ingested(message, item, phase),
+        event_context={"telegram_message": message},
+        details={"phase": phase},
+    )
 
 
 def remember_social_observations(item_id: int | None) -> int:
@@ -3448,6 +3466,23 @@ def memory_vector_health_text() -> str:
     )
 
 
+def tool_runtime_health_text() -> str:
+    summary = TOOL_RUNTIME.health_summary()
+    lines = [
+        "Tool runtime:",
+        f"- status: {summary.get('status', 'unknown')}",
+        f"- adapters: {summary.get('adapter_count', 0)}",
+        f"- errors: {summary.get('error_count', 0)}",
+    ]
+    for item in summary.get("adapters", []):
+        enabled = "enabled" if item.get("enabled") else "disabled"
+        lines.append(
+            f"- {item.get('name', 'unknown')}: {item.get('status', 'unknown')} "
+            f"({enabled}, adapter={item.get('adapter', 'unknown')}, errors={item.get('error_count', 0)})"
+        )
+    return "\n".join(lines)
+
+
 def clean_web_prefetch_query(text: str) -> str:
     text = re.sub(r"@\w+", " ", text)
     text = text.replace(DEFAULT_CONTEXT_PROMPT, " ")
@@ -5070,7 +5105,11 @@ async def health_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
     await send_reply(
         message,
-        SELF_ANALYSIS.health_text(CONFIG.health_report_lookback_seconds) + "\n\n" + memory_vector_health_text(),
+        SELF_ANALYSIS.health_text(CONFIG.health_report_lookback_seconds)
+        + "\n\n"
+        + memory_vector_health_text()
+        + "\n\n"
+        + tool_runtime_health_text(),
     )
 
 
@@ -6321,7 +6360,7 @@ async def post_init(application: Application) -> None:
                 "prompt_version": CONFIG.reaction_analysis_prompt_version,
             },
         )
-    reaction_adapter_health = REACTION_ADAPTER.health_summary()
+    reaction_adapter_health = runtime_reaction_adapter().health_summary()
     LOGGER.info("Outbound reaction adapter=%s enabled=%s", reaction_adapter_health.get("adapter"), reaction_adapter_health.get("enabled"))
     system_event(
         component="startup",
@@ -6329,14 +6368,44 @@ async def post_init(application: Application) -> None:
         message=str(reaction_adapter_health.get("adapter")),
         details=reaction_adapter_health,
     )
+    tool_runtime_health = TOOL_RUNTIME.health_summary()
+    LOGGER.info(
+        "Tool runtime status=%s adapters=%s errors=%s",
+        tool_runtime_health.get("status"),
+        tool_runtime_health.get("adapter_count"),
+        tool_runtime_health.get("error_count"),
+    )
+    system_event(
+        component="startup",
+        event_type="tool_runtime_ready",
+        message=str(tool_runtime_health.get("status")),
+        details=tool_runtime_health,
+    )
     if CONFIG.proactive_enabled:
         asyncio.create_task(proactive_loop(application))
     if CONFIG.health_report_enabled:
         asyncio.create_task(health_report_loop(application))
 
 
+async def post_shutdown(application: Application) -> None:
+    await TOOL_RUNTIME.cleanup()
+    tool_runtime_health = TOOL_RUNTIME.health_summary()
+    LOGGER.info(
+        "Tool runtime cleanup finished status=%s adapters=%s errors=%s",
+        tool_runtime_health.get("status"),
+        tool_runtime_health.get("adapter_count"),
+        tool_runtime_health.get("error_count"),
+    )
+    system_event(
+        component="shutdown",
+        event_type="tool_runtime_cleanup_finished",
+        message=str(tool_runtime_health.get("status")),
+        details=tool_runtime_health,
+    )
+
+
 def main() -> None:
-    application = Application.builder().token(CONFIG.telegram_token).post_init(post_init).build()
+    application = Application.builder().token(CONFIG.telegram_token).post_init(post_init).post_shutdown(post_shutdown).build()
     application.add_handler(CommandHandler(["start", "help"], help_command))
     application.add_handler(CommandHandler(["ids"], ids_command))
     application.add_handler(CommandHandler(["ping"], ping_command))
