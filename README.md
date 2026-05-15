@@ -266,7 +266,10 @@ Each tool family should provide a small adapter with:
 
 Tool failures must not block message persistence, embeddings, memory recall, `/stat`, `/character`, Telegram routing, or normal replies. Tool outputs that are later saved to memory must be stored as source context, not as user-authored text.
 
-Future universal media transcript MCP research lives in [`docs/tool-research/universal-media-transcript-mcp.md`](docs/tool-research/universal-media-transcript-mcp.md).
+Future tool research notes:
+
+- [`docs/tool-research/universal-media-transcript-mcp.md`](docs/tool-research/universal-media-transcript-mcp.md)
+- [`docs/tool-research/telegram-native-transcription.md`](docs/tool-research/telegram-native-transcription.md)
 
 Long text replies are split by the delivery layer instead of being truncated at the first Telegram limit:
 

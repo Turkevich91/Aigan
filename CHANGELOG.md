@@ -1,5 +1,11 @@
 # Aigan Changelog
 
+## 2026-05-15 - Telegram native transcription research
+
+- Added a research/design note for future Telegram voice, audio, video, and video-note transcription.
+- Documented Bot API download limits, activation rules, failure categories, temp cleanup, health fields, and source-memory boundaries.
+- Kept the task planning-only: no STT backend, runtime routing, memory integration, or media download implementation.
+
 ## 2026-05-15 - Universal media transcript research
 
 - Added a research/design note for a future universal media transcript MCP.
