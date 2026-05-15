@@ -688,6 +688,46 @@ class ToolRuntimeTests(unittest.TestCase):
         self.assertIn("message", event["details"]["ignored_event_context_keys"])
         self.assertIn("details", event["details"]["ignored_event_context_keys"])
 
+    def test_tool_details_cannot_override_runtime_failure_fields(self) -> None:
+        events = []
+
+        def record_event(**kwargs):
+            events.append(kwargs)
+
+        class BrokenTool:
+            def health_summary(self):
+                return {"enabled": True, "adapter": "broken"}
+
+        runtime = ToolRuntime(event_callback=record_event)
+        runtime.register("broken", BrokenTool())
+
+        asyncio.run(
+            runtime.safe_call(
+                "broken",
+                "explode",
+                lambda: (_ for _ in ()).throw(RuntimeError(f"OPENAI_API_KEY={fake_openai_secret()}")),
+                details={
+                    "tool": "wrong",
+                    "operation": "wrong",
+                    "exception_type": "WrongError",
+                    "exception_message": f"raw {fake_openai_secret()}",
+                    "ignored_detail_keys": ["wrong"],
+                    "token": fake_telegram_secret(),
+                },
+            )
+        )
+
+        self.assertEqual(1, len(events))
+        details = events[0]["details"]
+        self.assertEqual("broken", details["tool"])
+        self.assertEqual("explode", details["operation"])
+        self.assertEqual("RuntimeError", details["exception_type"])
+        self.assertNotIn(fake_openai_secret(), details["exception_message"])
+        self.assertEqual("[redacted]", details["token"])
+        self.assertNotIn(fake_telegram_secret(), json.dumps(events[0], ensure_ascii=False))
+        self.assertIn("tool", details["ignored_detail_keys"])
+        self.assertIn("exception_message", details["ignored_detail_keys"])
+
     def test_tool_runtime_cleanup_calls_optional_adapter_hook_safely(self) -> None:
         class CleaningTool:
             def __init__(self) -> None:
