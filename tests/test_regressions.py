@@ -644,6 +644,21 @@ class ToolRuntimeTests(unittest.TestCase):
         self.assertNotIn(fake_telegram_secret(), event_text)
         self.assertIn("[redacted]", event_text)
 
+    def test_adapter_reported_errors_mark_runtime_degraded(self) -> None:
+        class ErroringAdapter:
+            def health_summary(self):
+                return {"enabled": True, "adapter": "erroring", "status": "ok", "error_count": 2}
+
+        runtime = ToolRuntime()
+        runtime.register("erroring", ErroringAdapter())
+
+        health = runtime.health_summary()
+
+        self.assertEqual("degraded", health["status"])
+        self.assertEqual("degraded", health["adapters"][0]["status"])
+        self.assertEqual(2, health["adapters"][0]["error_count"])
+        self.assertEqual(0, health["adapters"][0]["runtime_error_count"])
+
     def test_tool_event_context_cannot_override_sanitized_failure_fields(self) -> None:
         events = []
 

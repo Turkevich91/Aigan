@@ -147,7 +147,7 @@ class ToolRuntime:
         enabled = bool(raw.get("enabled", False))
         if not status:
             status = "ok" if enabled else "disabled"
-        if runtime_errors and status == "ok":
+        if (runtime_errors or adapter_errors) and status == "ok":
             status = "degraded"
 
         raw["name"] = str(raw.get("name") or name)
