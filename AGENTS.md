@@ -29,6 +29,13 @@ This repository is maintained by humans and coding agents such as Codex, Google 
 - Do not commit hostnames, SSH aliases, private absolute paths, runtime artifacts, imports, cached media, local databases, `.env`, or deployment-only secrets into the repository.
 - Before debugging behavior that depends on memory, imports, embeddings, media cache, or Docker state, inspect the configured deployment environment from private operator context rather than assuming the local clone has the same data.
 
+## Optional Local Operator Notes
+
+- Maintainers may keep private machine-specific notes in `AGENTS.local.md`.
+- `AGENTS.local.md` is optional, local-only, and must never be committed.
+- It may contain deployment aliases, private paths, runtime data locations, or operator workflow notes.
+- If the file exists, coding agents may read it for local context, but must never copy its contents into commits, GitHub issues, logs, or public documentation.
+
 ## Implementation Rules
 
 - Keep business logic in tested Python modules.
