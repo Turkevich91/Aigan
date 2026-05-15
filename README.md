@@ -81,6 +81,8 @@ User commands use only retained SQLite memory for the current chat. `/stat` and 
 
 `/interests`, `/likes`, `/інтереси`, and `/смаки` show a public sanitized summary of the room's recurring interests and reactions. With `@username`, they show the selected participant's high-level topic/reaction signals. This is not a private dossier or diagnosis: social memory stores condensed observations such as interest, dislike, irritation, amusement, recurring questions, and avoided topics. It uses only the user's own text, not repost bodies, quotes, previews, or bot replies. Admin-only maintenance commands are `/interest_evidence`, `/rebuild_social_memory`, and `/forget_interest`; users can remove one of their own stored interest topics with `/forget_interest topic`.
 
+Telegram emoji reactions are stored as a separate relation layer, not as words in `/stat`. Custom emoji are cached by `custom_emoji_id`: Aigan fetches Telegram sticker metadata once, optionally downloads a safe thumbnail/static sticker, and lazily stores a vision summary after the emoji is used enough times. The global asset summary says what the emoji looks like; chat-local semantics track how this room tends to use it.
+
 Forwarded/reposted bodies are stored as source context, not as the forwarding user's personal text. That means `/stat` and `/character` do not treat channel repost text, previews, quotes, external replies, or generated/via-bot content as the user's own writing, while `/memory_search` can still find that source material.
 
 If Telegram privacy mode is on and the bot is not an admin, it may only receive commands, mentions, and replies. That is usually good for cost control.
@@ -230,6 +232,11 @@ Forwarded/source bodies from Telegram exports are stored separately from the sen
 Social taste memory is also separate from raw chat memory. It keeps compact sanitized observations for topic selection, `/interests`, and proactive messages. Proactive messages choose a weighted direction from group taste, personal ping, current hook, or an unanswered thread:
 
 ```env
+REACTIONS_ENABLED=true
+REACTION_ASSET_ANALYSIS_ENABLED=true
+REACTION_ASSET_MIN_USES_FOR_VISION=3
+REACTION_ANALYSIS_PROMPT_VERSION=1
+REACTION_ASSET_MAX_BYTES=2000000
 PROACTIVE_DIRECTION_WEIGHTS=group_taste:0.25,personal_ping:0.25,current_hook:0.25,unanswered_thread:0.25
 PROACTIVE_SELF_REFERENCE_GUARD=true
 PROACTIVE_RECENT_SEED_COOLDOWN_DAYS=14

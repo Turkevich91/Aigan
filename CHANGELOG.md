@@ -1,5 +1,11 @@
 # Aigan Changelog
 
+## 2026-05-15 - Cached reaction emoji analysis
+
+- Added Telegram reaction memory as a separate relation layer, linked to stored messages when available.
+- Added cached custom emoji assets with Telegram metadata, optional safe media caching, and lazy one-time vision summaries.
+- Added chat-local reaction semantics so `/interests` and `/character` can use emoji reactions as lightweight taste signals without polluting `/stat`.
+
 ## 2026-05-15 - In-flight reply coalescing
 
 - Added a per-chat in-flight generation guard so overlapping explicit prompts do not produce duplicate answers.

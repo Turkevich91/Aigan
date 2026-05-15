@@ -73,15 +73,21 @@ os.environ["SOCIAL_MEMORY_ENABLED"] = "true"
 os.environ["SOCIAL_MEMORY_EXTRACT_EVERY_MESSAGES"] = "20"
 os.environ["SOCIAL_MEMORY_CONFIDENCE_THRESHOLD"] = "0.65"
 os.environ["SOCIAL_PROFILE_RETENTION_DAYS"] = "180"
+os.environ["REACTIONS_ENABLED"] = "true"
+os.environ["REACTION_ASSET_ANALYSIS_ENABLED"] = "true"
+os.environ["REACTION_ASSET_MIN_USES_FOR_VISION"] = "3"
+os.environ["REACTION_ANALYSIS_PROMPT_VERSION"] = "1"
+os.environ["REACTION_ASSET_MAX_BYTES"] = "2000000"
 
 import httpx
-from telegram import InputMediaPhoto
+from telegram import InputMediaPhoto, ReactionTypeCustomEmoji, ReactionTypeEmoji
 from telegram.constants import ChatType, ParseMode
 from telegram.error import BadRequest
 
 import main
 from memory import MemoryStore
 from mcp_servers import web
+from reaction_memory import ReactionSpec
 from scripts import import_telegram_export
 from scripts.import_telegram_export import ImportOptions
 from self_analysis import SelfAnalysisService, classify_complaint
@@ -167,6 +173,47 @@ class FakePhoto:
         return self._file
 
 
+class FakeSticker:
+    def __init__(
+        self,
+        *,
+        custom_emoji_id: str = "custom-1",
+        file_id: str = "sticker-file",
+        file_unique_id: str = "sticker-unique",
+        emoji: str = ":)",
+        is_animated: bool = False,
+        is_video: bool = False,
+        thumbnail=None,
+        data: bytes = VALID_JPEG,
+    ) -> None:
+        self.custom_emoji_id = custom_emoji_id
+        self.file_id = file_id
+        self.file_unique_id = file_unique_id
+        self.set_name = "test_set"
+        self.type = "custom_emoji"
+        self.emoji = emoji
+        self.is_animated = is_animated
+        self.is_video = is_video
+        self.file_size = len(data)
+        self.thumbnail = thumbnail
+        self._file = FakeTelegramFile(data)
+
+    async def get_file(self) -> FakeTelegramFile:
+        return self._file
+
+    def to_dict(self) -> dict:
+        return {
+            "custom_emoji_id": self.custom_emoji_id,
+            "file_id": self.file_id,
+            "file_unique_id": self.file_unique_id,
+            "set_name": self.set_name,
+            "emoji": self.emoji,
+            "type": self.type,
+            "is_animated": self.is_animated,
+            "is_video": self.is_video,
+        }
+
+
 class PendingFlowTests(unittest.TestCase):
     def setUp(self) -> None:
         main.pending_requests.clear()
@@ -183,6 +230,10 @@ class PendingFlowTests(unittest.TestCase):
             main.MEMORY.clear_all()
         if main.SOCIAL_MEMORY is not None:
             main.SOCIAL_MEMORY.clear_all()
+        if main.REACTION_MEMORY is not None:
+            main.REACTION_MEMORY.clear_all()
+        if main.REACTION_MEMORY is not None:
+            main.REACTION_MEMORY.clear_all()
 
     def test_passive_group_context_text_does_not_create_pending(self) -> None:
         message = FakeMessage("це що")
@@ -528,6 +579,8 @@ class PersistentMemoryTests(unittest.TestCase):
             main.SYSTEM_LOG.clear_all()
         if main.SOCIAL_MEMORY is not None:
             main.SOCIAL_MEMORY.clear_all()
+        if main.REACTION_MEMORY is not None:
+            main.REACTION_MEMORY.clear_all()
         main.passive_contexts.clear()
         main.histories.clear()
         main.pending_requests.clear()
@@ -566,6 +619,117 @@ class PersistentMemoryTests(unittest.TestCase):
         context = main.format_memory_context(-1001, 10)
 
         self.assertIn("persistent hello", context)
+
+    def test_custom_emoji_asset_metadata_is_cached_once(self) -> None:
+        self.assertIsNotNone(main.REACTION_MEMORY)
+        spec = ReactionSpec("custom_emoji", "custom:custom-1", custom_emoji_id="custom-1")
+        sticker = FakeSticker(custom_emoji_id="custom-1", thumbnail=FakePhoto(data=VALID_JPEG))
+        context = SimpleNamespace(bot=SimpleNamespace(get_custom_emoji_stickers=AsyncMock(return_value=(sticker,))))
+
+        asyncio.run(main.ensure_reaction_assets_hydrated([spec], context))
+        asyncio.run(main.ensure_reaction_assets_hydrated([spec], context))
+
+        self.assertEqual(1, context.bot.get_custom_emoji_stickers.await_count)
+        asset = main.REACTION_MEMORY.asset_by_key("custom:custom-1")
+        self.assertIsNotNone(asset)
+        self.assertEqual("sticker-file", asset.file_id)
+        self.assertIn("test_set", asset.raw_metadata_json)
+        self.assertTrue(asset.thumbnail_path)
+
+    def test_reused_custom_emoji_analysis_is_cached(self) -> None:
+        self.assertIsNotNone(main.REACTION_MEMORY)
+        spec = ReactionSpec("custom_emoji", "custom:custom-2", custom_emoji_id="custom-2")
+        sticker = FakeSticker(custom_emoji_id="custom-2", thumbnail=FakePhoto(data=VALID_JPEG))
+        context = SimpleNamespace(bot=SimpleNamespace(get_custom_emoji_stickers=AsyncMock(return_value=(sticker,))))
+        asyncio.run(main.ensure_reaction_assets_hydrated([spec], context))
+        item_id = main.MEMORY.save_message(
+            chat_id=-1001,
+            message_id=900,
+            sender_label="Tester",
+            user_id=111,
+            text="Pragmata trailer joke",
+            created_at=datetime.now(timezone.utc),
+        )
+        item = main.MEMORY.item_by_id(item_id)
+        for _ in range(main.CONFIG.reaction_asset_min_uses_for_vision):
+            main.REACTION_MEMORY.upsert_chat_semantics(chat_id=-1001, reaction_key=spec.reaction_key, target_item=item)
+
+        with patch.object(main, "run_vision", new=AsyncMock(return_value="видно жартівливий custom emoji")) as run_vision:
+            asyncio.run(main.maybe_analyze_reaction_asset(spec, -1001))
+            asyncio.run(main.maybe_analyze_reaction_asset(spec, -1001))
+
+        self.assertEqual(1, run_vision.await_count)
+        asset = main.REACTION_MEMORY.asset_by_key(spec.reaction_key)
+        self.assertEqual("analyzed", asset.analysis_status)
+        self.assertIn("custom emoji", asset.visual_summary_uk)
+
+    def test_unsupported_custom_emoji_stays_metadata_only(self) -> None:
+        self.assertIsNotNone(main.REACTION_MEMORY)
+        spec = ReactionSpec("custom_emoji", "custom:animated-1", custom_emoji_id="animated-1")
+        sticker = FakeSticker(custom_emoji_id="animated-1", is_animated=True, thumbnail=None)
+        context = SimpleNamespace(bot=SimpleNamespace(get_custom_emoji_stickers=AsyncMock(return_value=(sticker,))))
+        asyncio.run(main.ensure_reaction_assets_hydrated([spec], context))
+        for _ in range(main.CONFIG.reaction_asset_min_uses_for_vision):
+            main.REACTION_MEMORY.upsert_chat_semantics(chat_id=-1001, reaction_key=spec.reaction_key, target_item=None)
+
+        with patch.object(main, "run_vision", new=AsyncMock()) as run_vision:
+            asyncio.run(main.maybe_analyze_reaction_asset(spec, -1001))
+
+        run_vision.assert_not_awaited()
+        asset = main.REACTION_MEMORY.asset_by_key(spec.reaction_key)
+        self.assertEqual("metadata_only", asset.analysis_status)
+
+    def test_message_reaction_update_creates_user_preference_not_stat_text(self) -> None:
+        self.assertIsNotNone(main.REACTION_MEMORY)
+        main.MEMORY.save_message(
+            chat_id=-1001,
+            message_id=909,
+            sender_label="Author",
+            user_id=111,
+            text="Pragmata tech joke",
+            created_at=datetime.now(timezone.utc),
+        )
+        reaction_update = SimpleNamespace(
+            chat=SimpleNamespace(id=-1001),
+            message_id=909,
+            date=datetime.now(timezone.utc),
+            old_reaction=[],
+            new_reaction=[ReactionTypeEmoji("\N{FIRE}")],
+            user=FakeUser(user_id=222, username="reactor"),
+        )
+        update = SimpleNamespace(update_id=770, message_reaction=reaction_update, to_json=lambda: "{}")
+
+        asyncio.run(main.handle_message_reaction_update(update, SimpleNamespace(bot=SimpleNamespace())))
+
+        preferences = main.REACTION_MEMORY.user_preferences(-1001, user_id=222)
+        self.assertEqual(1, len(preferences))
+        self.assertEqual(1, preferences[0].count)
+        self.assertIn("Pragmata", " ".join(preferences[0].topics))
+        self.assertEqual([], main.MEMORY.user_stats(-1001, user_id=222))
+
+    def test_reaction_count_update_stores_aggregate_count(self) -> None:
+        self.assertIsNotNone(main.REACTION_MEMORY)
+        main.MEMORY.save_message(
+            chat_id=-1001,
+            message_id=910,
+            sender_label="Author",
+            user_id=111,
+            text="Another topic",
+            created_at=datetime.now(timezone.utc),
+        )
+        count_update = SimpleNamespace(
+            chat=SimpleNamespace(id=-1001),
+            message_id=910,
+            date=datetime.now(timezone.utc),
+            reactions=[SimpleNamespace(type=ReactionTypeEmoji("\N{THUMBS UP SIGN}"), total_count=4)],
+        )
+        update = SimpleNamespace(update_id=771, message_reaction_count=count_update, to_json=lambda: "{}")
+
+        asyncio.run(main.handle_message_reaction_count_update(update, SimpleNamespace(bot=SimpleNamespace())))
+
+        preferences = main.REACTION_MEMORY.group_preferences(-1001)
+        self.assertEqual(1, len(preferences))
+        self.assertEqual(4, preferences[0].count)
 
     def test_user_messages_filter_by_user_and_limit(self) -> None:
         base = datetime.now(timezone.utc)
