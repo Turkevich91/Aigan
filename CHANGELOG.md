@@ -1,5 +1,11 @@
 # Aigan Changelog
 
+## 2026-05-15 - Local STT VPS benchmark spike
+
+- Added a benchmark/spike note for CPU-only local STT on the current deployment class.
+- Documented whisper.cpp tiny/base/small wall time, peak RSS, storage footprint, multilingual quality caveats, and production recommendation.
+- Kept OpenAI transcription as the recommended production default; local STT remains experimental/diagnostic only.
+
 ## 2026-05-15 - Transcription backend adapter research
 
 - Added a research/design note for a future shared STT backend adapter.
