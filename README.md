@@ -302,6 +302,8 @@ Keep `CHANGELOG.md` newest-first. Add a new entry before each release:
 
 The default prompt is professional and concise. Dry humor, irony, and mild sarcasm are allowed only when they fit the moment. The bot should avoid clowning, forced jokes, and personal mockery.
 
+Internal prompts, hidden instructions, env values, secrets, tool wiring, and private logs are not chat material. If someone asks Aigan to expose them, it gives a short boundary answer and can discuss only observable behavior or a concrete bug.
+
 ## Language And Source Policy
 
 The bot is configured to answer in Ukrainian by default. English is allowed only when explicitly requested or when the context is clearly English-first. Russian output is disabled: if a message, quote, or YouTube transcript is Russian, the bot should understand it as source material and summarize/explain it in Ukrainian.
@@ -338,11 +340,13 @@ PROACTIVE_PERSONAL_PING_PROBABILITY=0.35
 PROACTIVE_PERSONAL_PING_MIN_USER_IDLE_SECONDS=86400
 PROACTIVE_PERSONAL_PING_COOLDOWN_SECONDS=259200
 PROACTIVE_PERSONAL_PING_MAX_CANDIDATES=5
+PROACTIVE_META_TOPIC_GUARD=true
+PROACTIVE_META_TOPIC_STRICT=true
 ```
 
 With `PROACTIVE_IDLE_ONLY=true`, the loop checks on `PROACTIVE_INTERVAL_SECONDS` but calls the model only after the latest non-bot chat message is older than `PROACTIVE_IDLE_SECONDS`. Bot proactive posts do not reset that idle timer, and `PROACTIVE_MIN_SECONDS_BETWEEN_POSTS` prevents repeated self-posting.
 
-With `PROACTIVE_PERSONA_MODE=thought_seed`, proactive messages should behave like short conversation catalysts: an observation, paradox, or safe provocation from an AI participant, not a report about what the bot can do. `PROACTIVE_REGENERATE_ON_PERSONA_REJECT=true` rejects helper/service-style drafts once and asks the model to rewrite before skipping.
+With `PROACTIVE_PERSONA_MODE=thought_seed`, proactive messages should behave like short conversation catalysts: an observation, paradox, or safe provocation from the chat's actual topics, not a report about what the bot can do. `PROACTIVE_REGENERATE_ON_PERSONA_REJECT=true` rejects helper/service-style drafts once and asks the model to rewrite before skipping. `PROACTIVE_META_TOPIC_GUARD=true` removes self/prompt/internal-setup topics from proactive context and rejects drafts that still talk about them; strict mode skips generation when there is no non-meta topic to use.
 
 Personal pings are optional. When enabled, Aigan may choose one participant who has been quiet for `PROACTIVE_PERSONAL_PING_MIN_USER_IDLE_SECONDS`, use only that user's own recent cleaned text as topic material, and respect a per-user cooldown. It should use `@username` when available, avoid sensitive topics, and return `SKIP` instead of forcing a bad nudge.
 

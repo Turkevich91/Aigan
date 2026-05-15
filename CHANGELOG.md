@@ -1,5 +1,11 @@
 # Aigan Changelog
 
+## 2026-05-15 - Prompt privacy and no-meta proactive
+
+- Added a deterministic privacy boundary for direct requests to reveal system prompts, hidden instructions, env/secrets, tool wiring, or private logs.
+- Added a minimal public identity response for “хто ти?” without exposing internal setup.
+- Hardened proactive messages so bot/AI/prompt/internal-setup topics are filtered from context and rejected in drafts.
+
 ## 2026-05-15 - Social taste memory
 
 - Added sanitized social taste memory for group/user interests, dislikes, irritation, amusement, recurring questions, and avoided topics.
