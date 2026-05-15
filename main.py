@@ -85,6 +85,10 @@ class Config:
     admin_user_ids: set[int]
     user_cooldown_seconds: int
     chat_cooldown_seconds: int
+    chat_inflight_guard_enabled: bool
+    chat_duplicate_suppress_seconds: int
+    chat_duplicate_similarity_threshold: float
+    chat_inflight_suppress_ordinary_auto_react: bool
     max_input_chars: int
     max_reply_chars: int
     max_history_messages: int
@@ -183,6 +187,13 @@ class Config:
             admin_user_ids=_csv_ints(os.getenv("ADMIN_USER_IDS", "")),
             user_cooldown_seconds=int(os.getenv("USER_COOLDOWN_SECONDS", "20")),
             chat_cooldown_seconds=int(os.getenv("CHAT_COOLDOWN_SECONDS", "5")),
+            chat_inflight_guard_enabled=_env_bool("CHAT_INFLIGHT_GUARD_ENABLED", True),
+            chat_duplicate_suppress_seconds=int(os.getenv("CHAT_DUPLICATE_SUPPRESS_SECONDS", "45")),
+            chat_duplicate_similarity_threshold=float(os.getenv("CHAT_DUPLICATE_SIMILARITY_THRESHOLD", "0.72")),
+            chat_inflight_suppress_ordinary_auto_react=_env_bool(
+                "CHAT_INFLIGHT_SUPPRESS_ORDINARY_AUTO_REACT",
+                True,
+            ),
             max_input_chars=int(os.getenv("MAX_INPUT_CHARS", "2500")),
             max_reply_chars=int(os.getenv("MAX_REPLY_CHARS", "12000")),
             telegram_text_chunk_chars=int(os.getenv("TELEGRAM_TEXT_CHUNK_CHARS", "3500")),
@@ -311,6 +322,8 @@ last_proactive_sent_chat: dict[int, float] = {}
 last_proactive_personal_ping: dict[str, float] = {}
 pending_requests: dict[tuple[int, int], dict[str, Any]] = {}
 pending_token_counter = count(1)
+chat_generation_locks: dict[int, asyncio.Lock] = {}
+recent_chat_answers: dict[int, deque[Any]] = defaultdict(lambda: deque(maxlen=12))
 embedding_queue: asyncio.Queue[int] | None = None
 last_embedding_error = ""
 last_embedding_at = ""
@@ -406,6 +419,7 @@ MENTION_TOKEN_RE = re.compile(r"@[A-Za-z0-9_]{1,64}")
 SLASH_COMMAND_TOKEN_RE = re.compile(r"/(?:[A-Za-z0-9_]+|[^\W\d_]+)(?:@[A-Za-z0-9_]+)?", re.UNICODE)
 STAT_OUTPUT_LINE_RE = re.compile(r"^\s*\d+[.)]\s+\S+\s+-\s+\d+\s*$")
 WORD_RE = re.compile(r"[^\W\d_]+(?:[’'-][^\W\d_]+)?", re.UNICODE)
+DEDUPE_TOKEN_RE = re.compile(r"[^\W_]{2,}", re.UNICODE)
 MEMORY_RECALL_TOKEN_RE = re.compile(r"[^\W_]{2,}", re.UNICODE)
 QUOTED_PHRASE_RE = re.compile(r'"([^"]{2,160})"|“([^”]{2,160})”|«([^»]{2,160})»|`([^`]{2,160})`')
 USERNAME_RE = re.compile(r"@?(?P<username>[A-Za-z0-9_]{1,64})$")
@@ -744,6 +758,17 @@ class MemoryRecallIntent:
     query: str = ""
     reason: str = ""
     degraded: bool = False
+
+
+@dataclass(frozen=True)
+class ChatAnswerRecord:
+    prompt: str
+    normalized_prompt: str
+    tokens: frozenset[str]
+    route: str
+    context_signature: str
+    context_dependent: bool
+    created_at: float
 
 
 @dataclass(frozen=True)
@@ -1876,6 +1901,129 @@ def mark_cooldown(message: Message) -> None:
     if message.from_user:
         last_user_call[message.from_user.id] = now
     last_chat_call[message.chat_id] = now
+
+
+def chat_generation_lock(chat_id: int) -> asyncio.Lock:
+    lock = chat_generation_locks.get(chat_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        chat_generation_locks[chat_id] = lock
+    return lock
+
+
+def chat_generation_active(chat_id: int) -> bool:
+    lock = chat_generation_locks.get(chat_id)
+    return bool(lock and lock.locked())
+
+
+def normalize_prompt_for_dedupe(prompt: str) -> str:
+    prompt = URL_TOKEN_RE.sub(" ", prompt or "")
+    tokens = DEDUPE_TOKEN_RE.findall(prompt.casefold())
+    return " ".join(tokens)
+
+
+def prompt_dedupe_tokens(prompt: str) -> frozenset[str]:
+    return frozenset(normalize_prompt_for_dedupe(prompt).split())
+
+
+def token_jaccard(left: frozenset[str], right: frozenset[str]) -> float:
+    if not left or not right:
+        return 0.0
+    return len(left & right) / len(left | right)
+
+
+def context_signature_for_dedupe(message: Message) -> str:
+    parts: list[str] = []
+    replied = getattr(message, "reply_to_message", None)
+    replied_id = getattr(replied, "message_id", None)
+    if replied_id is not None:
+        parts.append(f"reply:{replied_id}")
+
+    quote = getattr(message, "quote", None)
+    quote_text = getattr(quote, "text", "") if quote is not None else ""
+    if quote_text:
+        parts.append("quote:" + clip_text(quote_text, 240))
+
+    external_reply = getattr(message, "external_reply", None)
+    external_text = getattr(external_reply, "text", "") or getattr(external_reply, "caption", "")
+    if external_text:
+        parts.append("external:" + clip_text(str(external_text), 240))
+
+    reference = build_reference_context(message)
+    if reference != "(none)":
+        parts.append("ref:" + clip_text(reference, 360))
+
+    if has_current_context_payload(message):
+        parts.append("payload:" + clip_text(message_content(message, 500), 360))
+
+    return " || ".join(parts) if parts else "none"
+
+
+def prune_recent_chat_answers(chat_id: int, now: float | None = None) -> None:
+    records = recent_chat_answers[chat_id]
+    if not records:
+        return
+    now = time.monotonic() if now is None else now
+    ttl = max(0, CONFIG.chat_duplicate_suppress_seconds)
+    while records and now - records[0].created_at > ttl:
+        records.popleft()
+
+
+def duplicate_prompt_reason(message: Message, prompt: str) -> str:
+    if not CONFIG.chat_inflight_guard_enabled or CONFIG.chat_duplicate_suppress_seconds <= 0:
+        return ""
+    now = time.monotonic()
+    prune_recent_chat_answers(message.chat_id, now)
+    records = recent_chat_answers.get(message.chat_id)
+    if not records:
+        return ""
+
+    normalized = normalize_prompt_for_dedupe(prompt)
+    tokens = prompt_dedupe_tokens(prompt)
+    context_signature = context_signature_for_dedupe(message)
+    context_dependent = is_context_dependent_request(prompt)
+    threshold = max(0.0, min(CONFIG.chat_duplicate_similarity_threshold, 1.0))
+    for record in reversed(records):
+        if normalized and normalized == record.normalized_prompt:
+            return "exact_prompt"
+        similarity = token_jaccard(tokens, record.tokens)
+        if similarity >= threshold:
+            return f"similar_prompt:{similarity:.2f}"
+        if context_dependent and record.context_dependent and context_signature == record.context_signature:
+            return "same_context_dependent_prompt"
+    return ""
+
+
+def should_suppress_duplicate_prompt(message: Message, prompt: str, stage: str) -> bool:
+    reason = duplicate_prompt_reason(message, prompt)
+    if not reason:
+        return False
+    LOGGER.info("Suppressing duplicate prompt chat_id=%s reason=%s stage=%s", message.chat_id, reason, stage)
+    system_event(
+        component="inflight",
+        event_type="duplicate_prompt_suppressed",
+        telegram_message=message,
+        message=reason,
+        details={"stage": stage, "prompt_chars": len(prompt)},
+    )
+    return True
+
+
+def record_chat_answer(message: Message, prompt: str, route: str) -> None:
+    if not CONFIG.chat_inflight_guard_enabled or CONFIG.chat_duplicate_suppress_seconds <= 0:
+        return
+    prune_recent_chat_answers(message.chat_id)
+    recent_chat_answers[message.chat_id].append(
+        ChatAnswerRecord(
+            prompt=clip_text(prompt, 500),
+            normalized_prompt=normalize_prompt_for_dedupe(prompt),
+            tokens=prompt_dedupe_tokens(prompt),
+            route=route,
+            context_signature=context_signature_for_dedupe(message),
+            context_dependent=is_context_dependent_request(prompt),
+            created_at=time.monotonic(),
+        )
+    )
 
 
 def format_history(chat_id: int) -> str:
@@ -4516,6 +4664,14 @@ async def handle_pending_or_observe(message: Message, context: ContextTypes.DEFA
     pending = pop_pending_request(message)
     if pending is None:
         remember_observed_message(message)
+        if CONFIG.chat_inflight_suppress_ordinary_auto_react and chat_generation_active(message.chat_id):
+            system_event(
+                component="inflight",
+                event_type="ordinary_auto_react_suppressed",
+                telegram_message=message,
+                message="chat_generation_active",
+            )
+            return False
         await maybe_auto_react(message, context)
         return False
 
@@ -4726,8 +4882,29 @@ async def handle_prompt(
         await message.reply_text("Занадто довго. Надішли коротшу версію.")
         return
 
+    if CONFIG.chat_inflight_guard_enabled:
+        if should_suppress_duplicate_prompt(message, prompt, "before_lock"):
+            return
+        lock = chat_generation_lock(message.chat_id)
+        waited_for_generation = lock.locked()
+        async with lock:
+            if should_suppress_duplicate_prompt(message, prompt, "after_lock"):
+                return
+            await handle_prompt_generation(message, context, prompt, allow_pending_wait, waited_for_generation)
+        return
+
+    await handle_prompt_generation(message, context, prompt, allow_pending_wait, skip_cooldown=False)
+
+
+async def handle_prompt_generation(
+    message: Message,
+    context: ContextTypes.DEFAULT_TYPE,
+    prompt: str,
+    allow_pending_wait: bool,
+    skip_cooldown: bool = False,
+) -> None:
     left = cooldown_left(message)
-    if left > 0:
+    if left > 0 and not skip_cooldown:
         await message.reply_text(f"Зачекай {left}s перед наступним запитом.")
         return
 
@@ -4755,6 +4932,7 @@ async def handle_prompt(
     )
 
     if route == "internet_image_send" and await maybe_send_internet_image(message, prompt):
+        record_chat_answer(message, prompt, route)
         return
 
     if route == "translate_reference":
@@ -4771,6 +4949,7 @@ async def handle_prompt(
         passive_contexts[message.chat_id].append(f"Aigan: {clip_text(response, 700)}")
         remember_bot_message(message.chat_id, response)
         await send_reply(message, response)
+        record_chat_answer(message, prompt, route)
         return
 
     has_reference = build_reference_context(message) != "(none)"
@@ -4808,6 +4987,7 @@ async def handle_prompt(
     passive_contexts[message.chat_id].append(f"Aigan: {clip_text(response, 700)}")
     remember_bot_message(message.chat_id, response)
     await send_reply(message, response)
+    record_chat_answer(message, prompt, route)
 
 
 async def handle_image_prompt(message: Message, prompt: str) -> None:

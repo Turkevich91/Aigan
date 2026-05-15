@@ -1,5 +1,11 @@
 # Aigan Changelog
 
+## 2026-05-15 - In-flight reply coalescing
+
+- Added a per-chat in-flight generation guard so overlapping explicit prompts do not produce duplicate answers.
+- Added short-lived duplicate suppression for near-identical prompts, including admin requests that bypass normal cooldowns.
+- Suppressed ordinary auto-reactions while a chat answer is already being generated.
+
 ## 2026-05-15 - Prompt privacy and no-meta proactive
 
 - Added a deterministic privacy boundary for direct requests to reveal system prompts, hidden instructions, env/secrets, tool wiring, or private logs.

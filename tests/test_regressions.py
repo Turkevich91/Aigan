@@ -25,6 +25,10 @@ os.environ["BOT_TIMEZONE"] = "America/New_York"
 os.environ["MAX_REPLY_CHARS"] = "12000"
 os.environ["TELEGRAM_TEXT_CHUNK_CHARS"] = "3500"
 os.environ["MAX_REPLY_CHUNKS"] = "4"
+os.environ["CHAT_INFLIGHT_GUARD_ENABLED"] = "true"
+os.environ["CHAT_DUPLICATE_SUPPRESS_SECONDS"] = "45"
+os.environ["CHAT_DUPLICATE_SIMILARITY_THRESHOLD"] = "0.72"
+os.environ["CHAT_INFLIGHT_SUPPRESS_ORDINARY_AUTO_REACT"] = "true"
 os.environ["FOLLOWUP_DEBOUNCE_SECONDS"] = "0.5"
 os.environ["PROACTIVE_ENABLED"] = "false"
 os.environ["PROACTIVE_IDLE_ONLY"] = "true"
@@ -173,6 +177,8 @@ class PendingFlowTests(unittest.TestCase):
         main.last_auto_react_chat.clear()
         main.last_proactive_sent_chat.clear()
         main.last_proactive_personal_ping.clear()
+        main.chat_generation_locks.clear()
+        main.recent_chat_answers.clear()
         if main.MEMORY is not None:
             main.MEMORY.clear_all()
         if main.SOCIAL_MEMORY is not None:
@@ -253,6 +259,107 @@ class PendingFlowTests(unittest.TestCase):
         self.assertFalse(main.should_wait_for_followup_context(image_message, "що на фото"))
         self.assertFalse(main.should_wait_for_followup_context(reply_message, "поясни"))
         self.assertFalse(main.should_wait_for_followup_context(FakeMessage("перекажи https://example.com"), "перекажи https://example.com"))
+
+    @staticmethod
+    def prompt_context():
+        return SimpleNamespace(bot=SimpleNamespace(send_chat_action=AsyncMock()))
+
+    @staticmethod
+    def prompt_patches(run_agent):
+        return (
+            patch.object(main, "classify_request_with_intent", new=AsyncMock(return_value=("normal", None))),
+            patch.object(main, "maybe_prefetch_web_context", new=AsyncMock(return_value=None)),
+            patch.object(main, "prepare_agent_memory_context", new=AsyncMock(return_value=("(memory)", "(not active)"))),
+            patch.object(main, "prepare_semantic_memory_context", new=AsyncMock(return_value=None)),
+            patch.object(main, "run_agent", new=run_agent),
+        )
+
+    def test_concurrent_duplicate_prompts_generate_one_answer(self) -> None:
+        first = FakeMessage("@thrd_ua_bot склади короткий список плюсів Pragmata", message_id=301)
+        second = FakeMessage("@thrd_ua_bot склади короткий список плюсів Pragmata", message_id=302)
+        context = self.prompt_context()
+
+        async def slow_agent(_prompt: str) -> str:
+            await asyncio.sleep(0.01)
+            return "одна відповідь"
+
+        run_agent = AsyncMock(side_effect=slow_agent)
+        patches = self.prompt_patches(run_agent)
+
+        async def run_both() -> None:
+            await asyncio.gather(
+                main.handle_prompt(first, context, "склади короткий список плюсів Pragmata"),
+                main.handle_prompt(second, context, "склади короткий список плюсів Pragmata"),
+            )
+
+        with patches[0], patches[1], patches[2], patches[3], patches[4]:
+            asyncio.run(run_both())
+
+        self.assertEqual(1, run_agent.await_count)
+        self.assertEqual(1, len(first.reply_calls))
+        self.assertEqual(0, len(second.reply_calls))
+        self.assertTrue(any(event.event_type == "duplicate_prompt_suppressed" for event in main.SYSTEM_LOG.latest_events(10)))
+
+    def test_recent_duplicate_prompt_is_suppressed_for_admin_too(self) -> None:
+        first = FakeMessage("@thrd_ua_bot що було з Pragmata", message_id=303)
+        second = FakeMessage("@thrd_ua_bot що було з Pragmata?", message_id=304)
+        context = self.prompt_context()
+        run_agent = AsyncMock(return_value="відповідь про Pragmata")
+        patches = self.prompt_patches(run_agent)
+
+        with patches[0], patches[1], patches[2], patches[3], patches[4]:
+            asyncio.run(main.handle_prompt(first, context, "що було з Pragmata"))
+            asyncio.run(main.handle_prompt(second, context, "що було з Pragmata?"))
+
+        self.assertEqual(1, run_agent.await_count)
+        self.assertEqual(1, len(first.reply_calls))
+        self.assertEqual(0, len(second.reply_calls))
+
+    def test_distinct_prompt_after_inflight_waits_and_answers(self) -> None:
+        first = FakeMessage("@thrd_ua_bot склади короткий список плюсів Pragmata", message_id=305)
+        second = FakeMessage("@thrd_ua_bot яка погода зараз?", message_id=306)
+        context = self.prompt_context()
+
+        async def slow_agent(_prompt: str) -> str:
+            await asyncio.sleep(0.01)
+            return "окрема відповідь"
+
+        run_agent = AsyncMock(side_effect=slow_agent)
+        patches = self.prompt_patches(run_agent)
+
+        async def run_both() -> None:
+            await asyncio.gather(
+                main.handle_prompt(first, context, "склади короткий список плюсів Pragmata"),
+                main.handle_prompt(second, context, "яка погода зараз?"),
+            )
+
+        with patches[0], patches[1], patches[2], patches[3], patches[4]:
+            asyncio.run(run_both())
+
+        self.assertEqual(2, run_agent.await_count)
+        self.assertEqual(1, len(first.reply_calls))
+        self.assertEqual(1, len(second.reply_calls))
+
+    def test_ordinary_message_during_generation_does_not_auto_react(self) -> None:
+        message = FakeMessage("звичайне повідомлення")
+        context = self.prompt_context()
+
+        async def scenario() -> bool:
+            lock = main.chat_generation_lock(message.chat_id)
+            await lock.acquire()
+            try:
+                with patch.object(main, "maybe_auto_react", new=AsyncMock()) as maybe_auto_react:
+                    consumed = await main.handle_pending_or_observe(message, context)
+                    maybe_auto_react.assert_not_awaited()
+                    return consumed
+            finally:
+                lock.release()
+
+        consumed = asyncio.run(scenario())
+
+        self.assertFalse(consumed)
+        self.assertIn("звичайне повідомлення", main.format_passive_context(message.chat_id))
+        self.assertTrue(any(event.event_type == "ordinary_auto_react_suppressed" for event in main.SYSTEM_LOG.latest_events(10)))
 
 
 class WebSafetyTests(unittest.TestCase):
@@ -429,6 +536,8 @@ class PersistentMemoryTests(unittest.TestCase):
         main.last_auto_react_chat.clear()
         main.last_proactive_sent_chat.clear()
         main.last_proactive_personal_ping.clear()
+        main.chat_generation_locks.clear()
+        main.recent_chat_answers.clear()
         main.embedding_queue = None
 
     def tearDown(self) -> None:
@@ -438,6 +547,8 @@ class PersistentMemoryTests(unittest.TestCase):
             main.SYSTEM_LOG.clear_all()
         if main.SOCIAL_MEMORY is not None:
             main.SOCIAL_MEMORY.clear_all()
+        main.chat_generation_locks.clear()
+        main.recent_chat_answers.clear()
         main.embedding_queue = None
 
     def test_messages_persist_after_ram_context_is_cleared(self) -> None:
@@ -3129,6 +3240,8 @@ class SystemHealthTests(unittest.TestCase):
         main.last_chat_call.clear()
         main.last_proactive_sent_chat.clear()
         main.last_proactive_personal_ping.clear()
+        main.chat_generation_locks.clear()
+        main.recent_chat_answers.clear()
 
     def test_redaction_hides_api_and_telegram_secrets(self) -> None:
         text = "OPENAI_API_KEY=sk-abcdefghijklmnopqrstuvwxyz TELEGRAM_BOT_TOKEN=123456:abcdefghijklmnopqrstuvwxyz"

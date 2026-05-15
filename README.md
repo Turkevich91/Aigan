@@ -98,6 +98,17 @@ ADMIN_USER_IDS=890218886
 
 `ADMIN_USER_IDS` is also comma-separated. Admin users skip cooldowns and can DM the bot even when `ALLOWED_CHAT_IDS` is locked to group IDs.
 
+To avoid duplicate answers while a long model call is running, Aigan keeps one in-flight generation per chat and suppresses near-duplicate explicit prompts shortly after an answer:
+
+```env
+CHAT_INFLIGHT_GUARD_ENABLED=true
+CHAT_DUPLICATE_SUPPRESS_SECONDS=45
+CHAT_DUPLICATE_SIMILARITY_THRESHOLD=0.72
+CHAT_INFLIGHT_SUPPRESS_ORDINARY_AUTO_REACT=true
+```
+
+This guard is separate from cooldowns: admins can still skip cooldowns, but they cannot accidentally cause two near-identical answers from concurrent updates.
+
 ## Full Chat Access
 
 When privacy/chat access is disabled in BotFather, Telegram can deliver ordinary group messages to the bot. The bot uses that in four ways:
