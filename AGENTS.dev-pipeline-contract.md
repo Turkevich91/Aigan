@@ -12,15 +12,13 @@ Private runtime details, host aliases, local paths, MCP endpoints, logs, databas
 - Work on a task branch, commit intentional changes, push, and open a PR.
 - Request Copilot review on the PR. Treat Copilot as a dry code reviewer: useful for code-level risk, not a context owner and not an approval authority.
 - Before ending a ReAct session while waiting on Copilot, CI, deploy validation, another agent, or an external reviewer, create and verify a Heartbeat follow-up for the current thread.
-- Every wait state must name the owner, target URL or issue/PR number, branch, latest commit, wait reason, next wake time, maximum checks, expiry action, and current fallback.
-- The current thread context is the normal continuity layer, but external waits still need a minimal suspend/resume breadcrumb. Do not rely on process memory, global variables, environment variables, or local files as the only record of what to do after wake-up.
-- A per-run pipeline live file is allowed only as an untracked private cache. It must never contain secrets or private runtime details and must not be required for recovery.
-- The Heartbeat prompt must point to this contract and include enough issue/PR metadata for the next session to identify the current step. Vague wake-up prompts such as "check later" are not valid handoffs.
+- Every wait state must name the owner, issue or PR, branch, latest commit, `NEXT_STEP`, maximum checks, expiry action, and fallback.
+- Use a compact suspend/resume breadcrumb only at wait or handoff boundaries.
 - If Copilot comments, evaluate each point with full project context. Fix relevant issues; briefly document intentionally rejected or non-actionable suggestions when useful.
 - Re-request Copilot review after pushing review fixes and create another Heartbeat before sleeping again.
 - When Copilot has no relevant new comments, spawn or ask a reviewer sub-agent for a final blocker-focused pass, then run the final tests.
 - Mark the PR ready only after the final gates pass. Squash merge, delete the branch, close/update the task issue, and update the parent epic checklist when applicable.
-- No loop may return to the same state without new evidence. Repeated comments, repeated test failures, stale CI, missing reviewer response, or mergeability that stays blocked must hit a cap and escalate instead of spinning forever.
+- Each loop needs new evidence. Repeated comments, repeated test failures, stale CI, missing reviewer response, or unchanged merge blockers must hit a cap and escalate.
 
 ## Epic Task State Machine
 
@@ -36,7 +34,7 @@ stateDiagram-v2
     VerifyLocal --> CommitPush: tests and safety checks pass
     CommitPush --> OpenPR: commit and push
     OpenPR --> RequestCopilot: create or update PR
-    RequestCopilot --> SleepWithHeartbeat: create verified Heartbeat and handoff capsule
+    RequestCopilot --> SleepWithHeartbeat: create verified Heartbeat and wait breadcrumb
     SleepWithHeartbeat --> EscalateBlocked: Heartbeat cannot be verified
     SleepWithHeartbeat --> CheckCopilot: Heartbeat wakes thread
     CheckCopilot --> EvaluateCopilot: comments found
@@ -109,9 +107,9 @@ flowchart TD
     D --> B
     C -- "Yes" --> E["Commit, push, open PR"]
     E --> F["Request Copilot review"]
-    F --> G["Create Heartbeat and handoff capsule"]
+    F --> G["Create Heartbeat and wait breadcrumb"]
     G --> G2{"Heartbeat verified?"}
-    G2 -- "No" --> X["Do not sleep; record blocked handoff"]
+    G2 -- "No" --> X["Record blocked handoff"]
     G2 -- "Yes" --> H{"Copilot signal before expiry?"}
     H -- "Relevant" --> I["Fix or consciously reject with sanitized note"]
     I --> J{"Loop cap or duplicate signal?"}
@@ -140,8 +138,8 @@ flowchart TD
 
 ## Liveness And Loop Guards
 
-- A Heartbeat is valid only after the agent has the automation id, target thread, next wake time, and self-contained prompt. If this cannot be verified, the agent must not end the ReAct session as if the wait is covered.
-- A handoff capsule must be durable and sanitized. Put it in the PR or task issue when useful, and include issue number, PR number, branch, latest commit, check results, reviewer state, wait owner, and next expected action.
+- A Heartbeat is valid only after the agent has the automation id, target thread, next wake time, and self-contained prompt.
+- A wait breadcrumb must be sanitized and include issue or PR, branch, latest commit, check state, reviewer state, wait owner, and next expected action.
 - Each wait loop needs a maximum check count and an expiry action. Suggested defaults: Copilot review `3` checks, CI `6` checks, deploy validation `3` checks, reviewer sub-agent `2` checks.
 - Each fix loop needs a maximum attempt count. Suggested defaults: Copilot fix loop `3` relevant iterations, focused test loop `3` attempts, mergeability loop `2` attempts.
 - Duplicate or stale signals must be detected by a stable key such as review comment URL, file path and line, check name, failure signature, or sanitized error class.
@@ -152,43 +150,15 @@ flowchart TD
 
 ## Suspend/Resume Breadcrumbs
 
-Do not build a second workflow engine in project comments. Codex Heartbeats normally wake the same thread, so the chat context remains the primary continuity layer. The breadcrumb is a small insurance policy for suspend points, context compaction, stale waits, or another agent picking up the PR.
-
 - Write a breadcrumb only before a real wait or handoff: Copilot, CI, deploy validation, reviewer sub-agent, external reviewer, human approval, or a blocked state.
-- The Heartbeat prompt is the first breadcrumb. It must include the automation id, issue or PR number, branch, latest commit, current state, `NEXT_STEP`, wait owner, wait cap, and fallback.
+- The Heartbeat prompt is the first breadcrumb. Include the automation id, issue or PR number, branch, latest commit, current state, `NEXT_STEP`, wait owner, wait cap, and fallback.
 - Add a PR or issue breadcrumb comment only when the wait is long, risky, already stale, crosses agents, changes reviewer ownership, or follows a new commit that materially changes the next action.
-- Do not update breadcrumbs after every normal side effect. The next session should verify GitHub state first and treat repeated actions as idempotent.
-- Do not advance `NEXT_STEP` before the side effect that justifies the advance has actually succeeded.
+- On wake, verify GitHub state before acting and treat repeated actions as idempotent.
+- Advance `NEXT_STEP` only after the side effect that justifies the advance has succeeded.
 - A local live file is optional private scratch. It can speed up same-machine recovery, but the Heartbeat and PR or issue context must be enough when the file is missing.
-- Never store raw prompts, private chat text, secrets, local hostnames, private paths, database or media paths, token-like strings, or raw logs in breadcrumbs.
+- Keep breadcrumbs free of raw prompts, private chat text, secrets, local hostnames, private paths, database or media paths, token-like strings, and raw logs.
 
-Example public-safe breadcrumb:
-
-```yaml
-schema: agent-suspend-breadcrumb/v1
-run_id: issue-31-pr-32
-contract: AGENTS.dev-pipeline-contract.md
-issue: 31
-pr: 32
-branch: VIT/codex/example-task
-head_sha: abc1234
-state: waiting_for_copilot
-NEXT_STEP: check_copilot_review
-heartbeat_id: check-copilot-review-for-pr-32
-wait_owner: copilot
-wait_reason: review requested after latest push
-attempts:
-  copilot_checks: 1
-limits:
-  copilot_checks: 3
-expires_utc: 2026-05-15T22:00:00Z
-fallback: run_reviewer_subagent_or_escalate
-evidence:
-  latest_commit: abc1234
-  last_checks: docs_safety_green
-  copilot_status: requested
-safety: sanitized_no_private_runtime_details
-```
+Minimum breadcrumb fields: `automation_id`, `issue` or `pr`, `branch`, `head_sha`, `state`, `NEXT_STEP`, `wait_owner`, `wait_count`, `wait_limit`, `fallback`, and latest check or reviewer status.
 
 Wake-up recovery algorithm:
 
@@ -235,12 +205,6 @@ Wake-up recovery algorithm:
 - Copilot code review: https://docs.github.com/en/copilot/how-tos/use-copilot-agents/request-a-code-review/use-code-review?tool=visualstudio
 - Mermaid state diagrams: https://mermaid.js.org/syntax/stateDiagram
 - AWS timeout guidance for agentic workflows: https://docs.aws.amazon.com/wellarchitected/latest/generative-ai-lens/genrel03-bp02.html
-- AWS Durable Execution determinism guidance: https://docs.aws.amazon.com/durable-execution/patterns/best-practices/determinism/
 - LangGraph interrupt and resume patterns: https://docs.langchain.com/oss/python/langgraph/interrupts
 - LangGraph persistence and checkpointing: https://docs.langchain.com/oss/javascript/langgraph/persistence
-- Microsoft Agent Framework checkpoints: https://learn.microsoft.com/en-us/agent-framework/workflows/checkpoints
-- Azure Durable Task replay constraints: https://learn.microsoft.com/en-us/azure/azure-functions/durable/durable-functions-code-constraints
-- Temporal durable execution: https://docs.temporal.io/
 - AutoGen termination and handoff patterns: https://microsoft.github.io/autogen/stable/user-guide/agentchat-user-guide/tutorial/human-in-the-loop.html
-- Community loop-closure discussion: https://www.reddit.com/r/LLMDevs/comments/1su80un/closing_the_loop/
-- Community autonomous-agent failure discussion: https://www.reddit.com/r/AI_Agents/comments/1sqi8r3/what_actually_breaks_when_you_move_from/
