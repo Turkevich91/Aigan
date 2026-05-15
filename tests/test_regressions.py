@@ -30,6 +30,8 @@ os.environ["PROACTIVE_ENABLED"] = "false"
 os.environ["PROACTIVE_IDLE_ONLY"] = "true"
 os.environ["PROACTIVE_IDLE_SECONDS"] = "21600"
 os.environ["PROACTIVE_MIN_SECONDS_BETWEEN_POSTS"] = "21600"
+os.environ["PROACTIVE_PERSONA_MODE"] = "thought_seed"
+os.environ["PROACTIVE_REGENERATE_ON_PERSONA_REJECT"] = "true"
 os.environ["PROACTIVE_PERSONAL_PING_ENABLED"] = "true"
 os.environ["PROACTIVE_PERSONAL_PING_PROBABILITY"] = "0.35"
 os.environ["PROACTIVE_PERSONAL_PING_MIN_USER_IDLE_SECONDS"] = "86400"
@@ -939,6 +941,121 @@ class PersistentMemoryTests(unittest.TestCase):
             self.assertTrue(any(event.event_type == "proactive_personal_model_skip" for event in main.SYSTEM_LOG.latest_events(10)))
         finally:
             main.CONFIG = original
+
+    def test_proactive_prompts_use_thought_seed_contract_without_helper_framing(self) -> None:
+        idle_prompt = main.build_idle_proactive_prompt(-1001, 21600)
+        personal_prompt = main.build_personal_ping_prompt(
+            -1001,
+            main.ProactivePingCandidate(
+                key="id:222",
+                user_id=222,
+                username="target",
+                label="Target",
+                mention="@target",
+                idle_seconds=86400,
+                topic_lines=("Subnautica база знову просить ресурсів",),
+            ),
+            21600,
+        )
+        combined = f"{idle_prompt}\n{personal_prompt}".casefold()
+
+        self.assertIn("thought seed", combined)
+        self.assertIn("equal ai participant", combined)
+        self.assertIn("no servant framing", combined)
+        self.assertNotIn("helpful assistant", combined)
+        self.assertNotIn("i can help", combined)
+        self.assertNotIn("можу допомогти", combined)
+        self.assertNotIn("давно тебе не було чути", combined)
+
+    def test_proactive_persona_guard_rejects_servant_output_and_regenerates_once(self) -> None:
+        original = main.CONFIG
+        main.CONFIG = replace(
+            original,
+            proactive_enabled=True,
+            proactive_chat_id=-1001,
+            proactive_idle_only=True,
+            proactive_idle_seconds=3600,
+            proactive_min_seconds_between_posts=0,
+            proactive_personal_ping_enabled=False,
+            proactive_regenerate_on_persona_reject=True,
+        )
+        try:
+            main.MEMORY.save_message(
+                chat_id=-1001,
+                message_id=619,
+                sender_label="Tester",
+                user_id=111,
+                username="tester",
+                text="old message",
+                created_at=datetime.now(timezone.utc) - timedelta(hours=7),
+            )
+            app = SimpleNamespace(bot=SimpleNamespace(send_message=AsyncMock()))
+            run_agent = AsyncMock(
+                side_effect=[
+                    "Я можу допомогти перевірити факти, резюмувати відео і знайти посилання.",
+                    "Новина без дати - це не новина, а косплей тривоги. Я б почав із джерела, а не з адреналіну.",
+                ]
+            )
+            with patch.object(main, "run_agent", new=run_agent):
+                sent = asyncio.run(main.run_proactive_once(app))
+
+            self.assertTrue(sent)
+            self.assertEqual(2, run_agent.await_count)
+            sent_text = app.bot.send_message.await_args.kwargs["text"]
+            self.assertIn("Новина без дати", sent_text)
+            self.assertNotIn("можу допомогти", sent_text.casefold())
+            self.assertTrue(any(event.event_type == "proactive_persona_rejected" for event in main.SYSTEM_LOG.latest_events(10)))
+        finally:
+            main.CONFIG = original
+
+    def test_proactive_persona_guard_skips_after_second_servant_output(self) -> None:
+        original = main.CONFIG
+        main.CONFIG = replace(
+            original,
+            proactive_enabled=True,
+            proactive_chat_id=-1001,
+            proactive_idle_only=True,
+            proactive_idle_seconds=3600,
+            proactive_min_seconds_between_posts=0,
+            proactive_personal_ping_enabled=False,
+            proactive_regenerate_on_persona_reject=True,
+        )
+        try:
+            main.MEMORY.save_message(
+                chat_id=-1001,
+                message_id=620,
+                sender_label="Tester",
+                user_id=111,
+                username="tester",
+                text="old message",
+                created_at=datetime.now(timezone.utc) - timedelta(hours=7),
+            )
+            app = SimpleNamespace(bot=SimpleNamespace(send_message=AsyncMock()))
+            run_agent = AsyncMock(
+                side_effect=[
+                    "Я на зв'язку, тегайте якщо треба.",
+                    "Якщо треба, пишіть прямо - я можу допомогти.",
+                ]
+            )
+            with patch.object(main, "run_agent", new=run_agent):
+                sent = asyncio.run(main.run_proactive_once(app))
+
+            self.assertFalse(sent)
+            self.assertEqual(2, run_agent.await_count)
+            app.bot.send_message.assert_not_awaited()
+            events = main.SYSTEM_LOG.latest_events(10)
+            self.assertGreaterEqual(sum(1 for event in events if event.event_type == "proactive_persona_rejected"), 2)
+            self.assertTrue(any(event.event_type == "proactive_idle_model_skip" for event in events))
+        finally:
+            main.CONFIG = original
+
+    def test_direct_reply_is_not_blocked_by_proactive_persona_guard(self) -> None:
+        message = FakeMessage("/ai тест")
+
+        asyncio.run(main.send_reply(message, "Я можу допомогти з цим прямим запитом."))
+
+        self.assertEqual(1, len(message.reply_calls))
+        self.assertIn("можу допомогти", message.reply_calls[0]["text"].casefold())
 
     def test_vector_schema_and_fts_are_created_without_losing_messages(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

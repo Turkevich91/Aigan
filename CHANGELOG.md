@@ -1,5 +1,11 @@
 # Aigan Changelog
 
+## 2026-05-14 - Proactive thought-seed persona
+
+- Changed proactive messages from service-style check-ins to short thought seeds from an equal AI participant.
+- Added a proactive persona contract with few-shot examples for observations, paradoxes, safe provocations, and `SKIP`.
+- Added a deterministic guard that rejects helper/capability-report phrasing and regenerates once before skipping.
+
 ## 2026-05-14 - Idle proactive personal pings
 
 - Added idle-only proactive posting so Aigan only wakes the group after real user silence, not just on a fixed timer.
