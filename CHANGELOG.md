@@ -1,5 +1,11 @@
 # Aigan Changelog
 
+## 2026-05-14 - Idle proactive personal pings
+
+- Added idle-only proactive posting so Aigan only wakes the group after real user silence, not just on a fixed timer.
+- Added optional soft personal pings that use a quiet participant's own recent topics, avoid sensitive subjects, and respect per-user cooldowns.
+- Added proactive observability events for idle skips, cooldown skips, candidate selection, model skips, and sent pings.
+
 ## 2026-05-13 - Semantic direct memory recall
 
 - Added semantic routing for natural prompts that ask Aigan to recall old chat context, without requiring `/memory_search`.

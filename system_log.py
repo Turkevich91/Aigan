@@ -204,6 +204,39 @@ class SystemLogStore:
             ).fetchall()
         return [row_to_event(row) for row in rows]
 
+    def latest_event(
+        self,
+        *,
+        component: str,
+        event_type: str,
+        chat_id: int | None = None,
+        user_id: int | None = None,
+        message: str = "",
+    ) -> SystemEvent | None:
+        conditions = ["component = ?", "event_type = ?"]
+        params: list[Any] = [sanitize_text(component, 80), sanitize_text(event_type, 120)]
+        if chat_id is not None:
+            conditions.append("chat_id = ?")
+            params.append(chat_id)
+        if user_id is not None:
+            conditions.append("user_id = ?")
+            params.append(user_id)
+        if message:
+            conditions.append("message = ?")
+            params.append(sanitize_text(message, 300))
+        with self._lock:
+            row = self._conn.execute(
+                f"""
+                SELECT *
+                FROM system_events
+                WHERE {" AND ".join(conditions)}
+                ORDER BY datetime(created_at) DESC, id DESC
+                LIMIT 1
+                """,
+                tuple(params),
+            ).fetchone()
+        return row_to_event(row) if row is not None else None
+
     def events_since(self, seconds: int, min_level: str = "info", limit: int = 200) -> list[SystemEvent]:
         cutoff = format_datetime(utc_now() - timedelta(seconds=max(1, int(seconds))))
         allowed = allowed_levels(min_level)

@@ -4,6 +4,7 @@ import os
 import socket
 import tempfile
 import unittest
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -25,6 +26,15 @@ os.environ["MAX_REPLY_CHARS"] = "12000"
 os.environ["TELEGRAM_TEXT_CHUNK_CHARS"] = "3500"
 os.environ["MAX_REPLY_CHUNKS"] = "4"
 os.environ["FOLLOWUP_DEBOUNCE_SECONDS"] = "0.5"
+os.environ["PROACTIVE_ENABLED"] = "false"
+os.environ["PROACTIVE_IDLE_ONLY"] = "true"
+os.environ["PROACTIVE_IDLE_SECONDS"] = "21600"
+os.environ["PROACTIVE_MIN_SECONDS_BETWEEN_POSTS"] = "21600"
+os.environ["PROACTIVE_PERSONAL_PING_ENABLED"] = "true"
+os.environ["PROACTIVE_PERSONAL_PING_PROBABILITY"] = "0.35"
+os.environ["PROACTIVE_PERSONAL_PING_MIN_USER_IDLE_SECONDS"] = "86400"
+os.environ["PROACTIVE_PERSONAL_PING_COOLDOWN_SECONDS"] = "259200"
+os.environ["PROACTIVE_PERSONAL_PING_MAX_CANDIDATES"] = "5"
 os.environ["MEMORY_ENABLED"] = "true"
 os.environ["MEMORY_DB_PATH"] = TEST_DB_PATH
 os.environ["MEMORY_CONTEXT_MESSAGES"] = "10"
@@ -149,6 +159,8 @@ class PendingFlowTests(unittest.TestCase):
         main.last_user_call.clear()
         main.last_chat_call.clear()
         main.last_auto_react_chat.clear()
+        main.last_proactive_sent_chat.clear()
+        main.last_proactive_personal_ping.clear()
         if main.MEMORY is not None:
             main.MEMORY.clear_all()
 
@@ -399,6 +411,8 @@ class PersistentMemoryTests(unittest.TestCase):
         main.last_user_call.clear()
         main.last_chat_call.clear()
         main.last_auto_react_chat.clear()
+        main.last_proactive_sent_chat.clear()
+        main.last_proactive_personal_ping.clear()
         main.embedding_queue = None
 
     def tearDown(self) -> None:
@@ -636,6 +650,295 @@ class PersistentMemoryTests(unittest.TestCase):
 
         events = main.SYSTEM_LOG.latest_events(5)
         self.assertTrue(any(event.event_type == "memory_context_expanded" for event in events))
+
+    def test_idle_proactive_skips_recent_user_activity_without_model_call(self) -> None:
+        original = main.CONFIG
+        main.CONFIG = replace(
+            original,
+            proactive_enabled=True,
+            proactive_chat_id=-1001,
+            proactive_idle_only=True,
+            proactive_idle_seconds=21600,
+            proactive_min_seconds_between_posts=0,
+        )
+        try:
+            main.MEMORY.save_message(
+                chat_id=-1001,
+                message_id=610,
+                sender_label="Tester",
+                user_id=111,
+                username="tester",
+                text="fresh message",
+                created_at=datetime.now(timezone.utc),
+            )
+            app = SimpleNamespace(bot=SimpleNamespace(send_message=AsyncMock()))
+            with patch.object(main, "run_agent", new=AsyncMock()) as run_agent:
+                sent = asyncio.run(main.run_proactive_once(app))
+
+            self.assertFalse(sent)
+            run_agent.assert_not_awaited()
+            self.assertTrue(
+                any(event.event_type == "proactive_idle_skipped_recent_user_activity" for event in main.SYSTEM_LOG.latest_events(5))
+            )
+        finally:
+            main.CONFIG = original
+
+    def test_idle_proactive_sends_after_chat_idle(self) -> None:
+        original = main.CONFIG
+        main.CONFIG = replace(
+            original,
+            proactive_enabled=True,
+            proactive_chat_id=-1001,
+            proactive_idle_only=True,
+            proactive_idle_seconds=3600,
+            proactive_min_seconds_between_posts=0,
+            proactive_personal_ping_enabled=False,
+        )
+        try:
+            main.MEMORY.save_message(
+                chat_id=-1001,
+                message_id=611,
+                sender_label="Tester",
+                user_id=111,
+                username="tester",
+                text="old message",
+                created_at=datetime.now(timezone.utc) - timedelta(hours=7),
+            )
+            app = SimpleNamespace(bot=SimpleNamespace(send_message=AsyncMock()))
+            with patch.object(main, "run_agent", new=AsyncMock(return_value="Тиша в чаті вже проходить техогляд.")) as run_agent:
+                sent = asyncio.run(main.run_proactive_once(app))
+
+            self.assertTrue(sent)
+            run_agent.assert_awaited_once()
+            app.bot.send_message.assert_awaited_once()
+            self.assertTrue(any(item.sender_label == "Aigan (scheduled)" for item in main.MEMORY.latest(-1001, 5)))
+        finally:
+            main.CONFIG = original
+
+    def test_idle_proactive_cooldown_prevents_repeated_self_posts(self) -> None:
+        original = main.CONFIG
+        main.CONFIG = replace(
+            original,
+            proactive_enabled=True,
+            proactive_chat_id=-1001,
+            proactive_idle_only=True,
+            proactive_idle_seconds=3600,
+            proactive_min_seconds_between_posts=21600,
+        )
+        try:
+            main.MEMORY.save_message(
+                chat_id=-1001,
+                message_id=612,
+                sender_label="Tester",
+                user_id=111,
+                username="tester",
+                text="old message",
+                created_at=datetime.now(timezone.utc) - timedelta(hours=7),
+            )
+            main.MEMORY.save_message(
+                chat_id=-1001,
+                message_id=None,
+                sender_label="Aigan (scheduled)",
+                is_bot=True,
+                text="recent proactive",
+                created_at=datetime.now(timezone.utc),
+            )
+            app = SimpleNamespace(bot=SimpleNamespace(send_message=AsyncMock()))
+            with patch.object(main, "run_agent", new=AsyncMock()) as run_agent:
+                sent = asyncio.run(main.run_proactive_once(app))
+
+            self.assertFalse(sent)
+            run_agent.assert_not_awaited()
+            self.assertTrue(any(event.event_type == "proactive_idle_skipped_cooldown" for event in main.SYSTEM_LOG.latest_events(5)))
+        finally:
+            main.CONFIG = original
+
+    def test_idle_proactive_bot_messages_do_not_reset_user_idle_timer(self) -> None:
+        original = main.CONFIG
+        main.CONFIG = replace(
+            original,
+            proactive_enabled=True,
+            proactive_chat_id=-1001,
+            proactive_idle_only=True,
+            proactive_idle_seconds=3600,
+            proactive_min_seconds_between_posts=0,
+            proactive_personal_ping_enabled=False,
+        )
+        try:
+            main.MEMORY.save_message(
+                chat_id=-1001,
+                message_id=617,
+                sender_label="Tester",
+                user_id=111,
+                username="tester",
+                text="old user message",
+                created_at=datetime.now(timezone.utc) - timedelta(hours=7),
+            )
+            main.MEMORY.save_message(
+                chat_id=-1001,
+                message_id=None,
+                sender_label="Aigan (scheduled)",
+                is_bot=True,
+                text="recent bot message",
+                created_at=datetime.now(timezone.utc),
+            )
+            app = SimpleNamespace(bot=SimpleNamespace(send_message=AsyncMock()))
+            with patch.object(main, "run_agent", new=AsyncMock(return_value="Тихий техогляд чату завершено.")) as run_agent:
+                sent = asyncio.run(main.run_proactive_once(app))
+
+            self.assertTrue(sent)
+            run_agent.assert_awaited_once()
+        finally:
+            main.CONFIG = original
+
+    def test_personal_ping_uses_username_and_own_topics_only(self) -> None:
+        original = main.CONFIG
+        main.CONFIG = replace(
+            original,
+            proactive_enabled=True,
+            proactive_chat_id=-1001,
+            proactive_idle_only=True,
+            proactive_idle_seconds=3600,
+            proactive_min_seconds_between_posts=0,
+            proactive_personal_ping_enabled=True,
+            proactive_personal_ping_probability=1.0,
+            proactive_personal_ping_min_user_idle_seconds=3600,
+            proactive_personal_ping_cooldown_seconds=259200,
+        )
+        try:
+            main.MEMORY.save_message(
+                chat_id=-1001,
+                message_id=613,
+                sender_label="Target (@target, id=222)",
+                user_id=222,
+                username="target",
+                text="Subnautica база знову просить ресурсів",
+                source_text="Репост: це не особиста тема користувача",
+                created_at=datetime.now(timezone.utc) - timedelta(hours=25),
+            )
+            app = SimpleNamespace(bot=SimpleNamespace(send_message=AsyncMock()))
+            with patch.object(main, "run_agent", new=AsyncMock(return_value="@target як там Subnautica, база вже перестала їсти ресурси чи тільки розігрілась?")) as run_agent:
+                sent = asyncio.run(main.run_proactive_once(app))
+
+            self.assertTrue(sent)
+            prompt = run_agent.await_args.args[0]
+            self.assertIn("Target participant: @target", prompt)
+            self.assertIn("Subnautica база", prompt)
+            self.assertNotIn("Репост", prompt)
+            self.assertIn("@target", app.bot.send_message.await_args.kwargs["text"])
+            self.assertTrue(any(event.event_type == "proactive_personal_sent" for event in main.SYSTEM_LOG.latest_events(10)))
+        finally:
+            main.CONFIG = original
+
+    def test_personal_ping_candidate_without_username_uses_display_label(self) -> None:
+        original = main.CONFIG
+        main.CONFIG = replace(
+            original,
+            proactive_personal_ping_enabled=True,
+            proactive_personal_ping_min_user_idle_seconds=3600,
+            proactive_personal_ping_cooldown_seconds=259200,
+        )
+        try:
+            main.MEMORY.save_message(
+                chat_id=-1001,
+                message_id=614,
+                sender_label="Display Name",
+                user_id=333,
+                username="",
+                text="Pragmata трейлер виглядає підозріло красиво",
+                created_at=datetime.now(timezone.utc) - timedelta(hours=24),
+            )
+
+            candidates = main.proactive_personal_ping_candidates(-1001)
+
+            self.assertEqual("Display Name", candidates[0].mention)
+        finally:
+            main.CONFIG = original
+
+    def test_personal_ping_cooldown_excludes_recent_target(self) -> None:
+        original = main.CONFIG
+        main.CONFIG = replace(
+            original,
+            proactive_personal_ping_enabled=True,
+            proactive_personal_ping_min_user_idle_seconds=3600,
+            proactive_personal_ping_cooldown_seconds=259200,
+        )
+        try:
+            main.MEMORY.save_message(
+                chat_id=-1001,
+                message_id=618,
+                sender_label="Target (@target, id=222)",
+                user_id=222,
+                username="target",
+                text="Pragmata трейлер виглядає підозріло красиво",
+                created_at=datetime.now(timezone.utc) - timedelta(hours=24),
+            )
+            main.SYSTEM_LOG.record_event(
+                component="proactive",
+                event_type="proactive_personal_sent",
+                chat_id=-1001,
+                user_id=222,
+                message="id:222",
+            )
+
+            self.assertEqual([], main.proactive_personal_ping_candidates(-1001))
+        finally:
+            main.CONFIG = original
+
+    def test_sensitive_personal_topics_are_not_ping_candidates(self) -> None:
+        original = main.CONFIG
+        main.CONFIG = replace(
+            original,
+            proactive_personal_ping_enabled=True,
+            proactive_personal_ping_min_user_idle_seconds=3600,
+        )
+        try:
+            main.MEMORY.save_message(
+                chat_id=-1001,
+                message_id=615,
+                sender_label="Target (@target, id=222)",
+                user_id=222,
+                username="target",
+                text="обстріл і війна сьогодні виглядають дуже важко",
+                created_at=datetime.now(timezone.utc) - timedelta(hours=24),
+            )
+
+            self.assertEqual([], main.proactive_personal_ping_candidates(-1001))
+        finally:
+            main.CONFIG = original
+
+    def test_personal_ping_model_skip_sends_nothing_and_logs(self) -> None:
+        original = main.CONFIG
+        main.CONFIG = replace(
+            original,
+            proactive_enabled=True,
+            proactive_chat_id=-1001,
+            proactive_idle_only=True,
+            proactive_idle_seconds=3600,
+            proactive_min_seconds_between_posts=0,
+            proactive_personal_ping_enabled=True,
+            proactive_personal_ping_probability=1.0,
+            proactive_personal_ping_min_user_idle_seconds=3600,
+        )
+        try:
+            main.MEMORY.save_message(
+                chat_id=-1001,
+                message_id=616,
+                sender_label="Target (@target, id=222)",
+                user_id=222,
+                username="target",
+                text="Satisfactory завод знову влаштував логістичний ребус",
+                created_at=datetime.now(timezone.utc) - timedelta(hours=24),
+            )
+            app = SimpleNamespace(bot=SimpleNamespace(send_message=AsyncMock()))
+            with patch.object(main, "run_agent", new=AsyncMock(return_value="SKIP")):
+                sent = asyncio.run(main.run_proactive_once(app))
+
+            self.assertFalse(sent)
+            app.bot.send_message.assert_not_awaited()
+            self.assertTrue(any(event.event_type == "proactive_personal_model_skip" for event in main.SYSTEM_LOG.latest_events(10)))
+        finally:
+            main.CONFIG = original
 
     def test_vector_schema_and_fts_are_created_without_losing_messages(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -2506,6 +2809,8 @@ class SystemHealthTests(unittest.TestCase):
         main.passive_contexts.clear()
         main.last_user_call.clear()
         main.last_chat_call.clear()
+        main.last_proactive_sent_chat.clear()
+        main.last_proactive_personal_ping.clear()
 
     def test_redaction_hides_api_and_telegram_secrets(self) -> None:
         text = "OPENAI_API_KEY=sk-abcdefghijklmnopqrstuvwxyz TELEGRAM_BOT_TOKEN=123456:abcdefghijklmnopqrstuvwxyz"

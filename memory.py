@@ -310,6 +310,64 @@ class MemoryStore:
             ).fetchall()
         return [self._row_to_item(row) for row in rows]
 
+    def latest_user_message(self, chat_id: int) -> MemoryItem | None:
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT *
+                FROM messages
+                WHERE chat_id = ?
+                  AND is_bot = 0
+                ORDER BY datetime(created_at) DESC, id DESC
+                LIMIT 1
+                """,
+                (chat_id,),
+            ).fetchone()
+        return self._row_to_item(row) if row is not None else None
+
+    def latest_bot_message(self, chat_id: int, label_prefixes: tuple[str, ...] = ("Aigan",)) -> MemoryItem | None:
+        prefixes = tuple(prefix for prefix in label_prefixes if prefix)
+        if not prefixes:
+            return None
+        conditions = ["chat_id = ?", "is_bot = 1"]
+        params: list[object] = [chat_id]
+        label_conditions = []
+        for prefix in prefixes:
+            label_conditions.append("sender_label LIKE ?")
+            params.append(f"{prefix}%")
+        conditions.append("(" + " OR ".join(label_conditions) + ")")
+        with self._lock:
+            row = self._conn.execute(
+                f"""
+                SELECT *
+                FROM messages
+                WHERE {" AND ".join(conditions)}
+                ORDER BY datetime(created_at) DESC, id DESC
+                LIMIT 1
+                """,
+                tuple(params),
+            ).fetchone()
+        return self._row_to_item(row) if row is not None else None
+
+    def recent_user_text_activity(self, chat_id: int, *, lookback_days: int, limit: int = 500) -> list[MemoryItem]:
+        cutoff = self._format_datetime(datetime.now(timezone.utc) - timedelta(days=max(1, int(lookback_days))))
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT *
+                FROM messages
+                WHERE chat_id = ?
+                  AND is_bot = 0
+                  AND created_at >= ?
+                  AND text != ''
+                  AND text NOT LIKE '[message has %'
+                ORDER BY datetime(created_at) DESC, id DESC
+                LIMIT ?
+                """,
+                (chat_id, cutoff, max(1, int(limit))),
+            ).fetchall()
+        return [self._row_to_item(row) for row in rows]
+
     def item_by_id(self, item_id: int | None) -> MemoryItem | None:
         if item_id is None:
             return None

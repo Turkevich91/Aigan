@@ -307,7 +307,19 @@ PROACTIVE_CHAT_ID=-1002546271665
 PROACTIVE_INTERVAL_SECONDS=18000
 PROACTIVE_START_DELAY_SECONDS=300
 PROACTIVE_PROMPT=Write a brief, useful group check-in. Be professional, concise, and only lightly ironic if the context invites it.
+PROACTIVE_IDLE_ONLY=true
+PROACTIVE_IDLE_SECONDS=21600
+PROACTIVE_MIN_SECONDS_BETWEEN_POSTS=21600
+PROACTIVE_PERSONAL_PING_ENABLED=true
+PROACTIVE_PERSONAL_PING_PROBABILITY=0.35
+PROACTIVE_PERSONAL_PING_MIN_USER_IDLE_SECONDS=86400
+PROACTIVE_PERSONAL_PING_COOLDOWN_SECONDS=259200
+PROACTIVE_PERSONAL_PING_MAX_CANDIDATES=5
 ```
+
+With `PROACTIVE_IDLE_ONLY=true`, the loop checks on `PROACTIVE_INTERVAL_SECONDS` but calls the model only after the latest non-bot chat message is older than `PROACTIVE_IDLE_SECONDS`. Bot proactive posts do not reset that idle timer, and `PROACTIVE_MIN_SECONDS_BETWEEN_POSTS` prevents repeated self-posting.
+
+Personal pings are optional. When enabled, Aigan may choose one participant who has been quiet for `PROACTIVE_PERSONAL_PING_MIN_USER_IDLE_SECONDS`, use only that user's own recent cleaned text as topic material, and respect a per-user cooldown. It should use `@username` when available, avoid sensitive topics, and return `SKIP` instead of forcing a bad nudge.
 
 Test without waiting:
 
