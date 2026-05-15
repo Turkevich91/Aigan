@@ -18,6 +18,7 @@ Private runtime details, host aliases, local paths, MCP endpoints, logs, databas
 - Re-request Copilot review after pushing review fixes and create another Heartbeat before sleeping again.
 - When Copilot has no relevant new comments, spawn or ask a reviewer sub-agent for a final blocker-focused pass, then run the final tests.
 - Mark the PR ready only after the final gates pass. Squash merge, delete the branch, close/update the task issue, and update the parent epic checklist when applicable.
+- After a task is closed, if the parent epic still has `Todo` child issues, either continue to the next task immediately or create a 1-minute Heartbeat with `NEXT_STEP=start_next_task` before ending the ReAct session.
 - Each loop needs new evidence. Repeated comments, repeated test failures, stale CI, missing reviewer response, or unchanged merge blockers must hit a cap and escalate.
 
 ## Epic Task State Machine
@@ -52,7 +53,9 @@ stateDiagram-v2
     MergePR --> CloseTask: squash merge and delete branch
     CloseTask --> UpdateEpic: task summary and Project status Done
     CloseTask --> EscalateBlocked: cleanup failed after retry
-    UpdateEpic --> SelectTask: epic still has Todo tasks
+    UpdateEpic --> NextTaskHeartbeat: epic still has Todo tasks and session is ending
+    UpdateEpic --> SelectTask: epic still has Todo tasks and agent continues now
+    NextTaskHeartbeat --> SelectTask: Heartbeat wakes after 1 minute
     UpdateEpic --> [*]: epic complete
     EscalateBlocked --> [*]: sanitized blocked handoff recorded
 ```
@@ -133,7 +136,10 @@ flowchart TD
     O2 -- "Yes" --> X
     N -- "Yes" --> P["Squash merge and delete branch"]
     P --> Q["Update task issue and epic checklist"]
-    Q --> R["Select next epic task or finish"]
+    Q --> R{"Epic still has Todo tasks?"}
+    R -- "Yes, continuing now" --> S["Select next epic task"]
+    R -- "Yes, session ending" --> T["Create 1-minute Heartbeat: NEXT_STEP=start_next_task"]
+    R -- "No" --> U["Finish epic loop"]
     X --> Y["Escalate to human or create follow-up issue"]
 ```
 
@@ -148,6 +154,7 @@ flowchart TD
 - If a loop expires, record a sanitized blocked handoff and either escalate to a human, create a follow-up issue, or continue with an explicitly named fallback path.
 - Reviewer sub-agents are also external wait states. Before sleeping on them, create a Heartbeat or keep the current ReAct session open until they return.
 - Cleanup after merge is bounded. If branch deletion, issue update, or epic checklist update fails after one retry, record the failure and move to a follow-up instead of blocking the next task forever.
+- The next-task Heartbeat is required only when the agent is about to stop while the parent epic still has `Todo` tasks. Use a 1-minute interval and `NEXT_STEP=start_next_task`.
 
 ## Suspend/Resume Breadcrumbs
 
@@ -178,6 +185,7 @@ Wake-up recovery algorithm:
 - Heartbeat wakes with no readable PR/issue breadcrumb: agent uses the Heartbeat and GitHub evidence, then escalates only if the next step is still ambiguous.
 - Heartbeat prompt and PR/issue evidence disagree on `NEXT_STEP`: agent reconciles from GitHub evidence or escalates.
 - A side effect succeeds but the wait breadcrumb cannot be refreshed before sleeping: agent records a blocked handoff or keeps working instead of creating an ambiguous wait.
+- A task closes while its parent epic still has Todo tasks: agent either starts the next task immediately or schedules a 1-minute `NEXT_STEP=start_next_task` Heartbeat.
 - Copilot is requested but silent past the max checks: agent runs the fallback reviewer path or escalates.
 - Copilot repeats the same irrelevant comment: agent classifies it as duplicate or not relevant and exits the Copilot loop.
 - Copilot repeats a relevant finding after repeated fixes: agent escalates with the latest failure signature instead of editing forever.
@@ -198,6 +206,7 @@ Wake-up recovery algorithm:
 - Final reviewer sub-agent verdict is recorded before merge.
 - Task issue gets a concise completion note with important pitfalls, decisions, and verification.
 - Parent epic checklist is updated after task completion when a parent epic exists.
+- If the parent epic still has Todo tasks and the session is ending, a 1-minute next-task Heartbeat is scheduled with `NEXT_STEP=start_next_task`.
 
 ## References
 
