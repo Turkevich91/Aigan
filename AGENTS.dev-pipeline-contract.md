@@ -13,9 +13,9 @@ Private runtime details, host aliases, local paths, MCP endpoints, logs, databas
 - Request Copilot review on the PR. Treat Copilot as a dry code reviewer: useful for code-level risk, not a context owner and not an approval authority.
 - Before ending a ReAct session while waiting on Copilot, CI, deploy validation, another agent, or an external reviewer, create and verify a Heartbeat follow-up for the current thread.
 - Every wait state must name the owner, target URL or issue/PR number, branch, latest commit, wait reason, next wake time, maximum checks, expiry action, and current fallback.
-- Do not rely on process memory, global variables, environment variables, or local files as the source of truth for pipeline progress. A future session must be able to recover the current step from durable, sanitized GitHub state plus the Heartbeat prompt.
-- A per-run pipeline live file is allowed only as an untracked private cache. It must mirror the durable state capsule, must never contain secrets or private runtime details, and must not be required for recovery.
-- The Heartbeat prompt must point to this contract and to the latest state capsule or enough issue/PR metadata to find it. Vague wake-up prompts such as "check later" are not valid handoffs.
+- The current thread context is the normal continuity layer, but external waits still need a minimal suspend/resume breadcrumb. Do not rely on process memory, global variables, environment variables, or local files as the only record of what to do after wake-up.
+- A per-run pipeline live file is allowed only as an untracked private cache. It must never contain secrets or private runtime details and must not be required for recovery.
+- The Heartbeat prompt must point to this contract and include enough issue/PR metadata for the next session to identify the current step. Vague wake-up prompts such as "check later" are not valid handoffs.
 - If Copilot comments, evaluate each point with full project context. Fix relevant issues; briefly document intentionally rejected or non-actionable suggestions when useful.
 - Re-request Copilot review after pushing review fixes and create another Heartbeat before sleeping again.
 - When Copilot has no relevant new comments, spawn or ask a reviewer sub-agent for a final blocker-focused pass, then run the final tests.
@@ -65,7 +65,7 @@ stateDiagram-v2
 sequenceDiagram
     participant CA as Codex Agent
     participant GH as GitHub Project and PR
-    participant PS as Pipeline State Capsule
+    participant BR as Suspend Breadcrumb
     participant CP as Copilot Reviewer
     participant HB as Heartbeat
     participant RA as Reviewer Sub-Agent
@@ -74,22 +74,22 @@ sequenceDiagram
     CA->>GH: set task In Progress
     CA->>GH: push branch and open PR
     CA->>CP: request PR review
-    CA->>PS: write sanitized state capsule
+    CA->>BR: write minimal wait breadcrumb
     CA->>HB: schedule wake-up before ending ReAct session
     HB-->>CA: return automation id and next wake time
-    CA->>PS: verify capsule includes Heartbeat id and next step
+    CA->>BR: verify breadcrumb includes Heartbeat id and next step
     CA->>GH: verify Copilot request and PR state
     HB-->>CA: wake and check PR review
-    CA->>PS: load latest state capsule
+    CA->>BR: recover current step from Heartbeat or PR breadcrumb
     CA->>GH: read Copilot comments and PR state
     alt Copilot has relevant findings
         CA->>CA: decide with full project context
         CA->>GH: push fix or document rejection
         CA->>CP: request re-review
-        CA->>PS: update state, attempt count, and next step
+        CA->>BR: refresh breadcrumb only before the next wait
         CA->>HB: schedule next wake-up with attempt count
     else Copilot is stale or repeating
-        CA->>PS: record sanitized blocked or fallback decision
+        CA->>BR: record sanitized blocked or fallback decision
         CA->>RA: request blocker-focused final review or human escalation
     else Copilot has no relevant comments
         CA->>RA: request blocker-focused final review
@@ -150,23 +150,22 @@ flowchart TD
 - Reviewer sub-agents are also external wait states. Before sleeping on them, create a Heartbeat or keep the current ReAct session open until they return.
 - Cleanup after merge is bounded. If branch deletion, issue update, or epic checklist update fails after one retry, record the failure and move to a follow-up instead of blocking the next task forever.
 
-## Persisted State Protocol
+## Suspend/Resume Breadcrumbs
 
-Pipeline state is a small, sanitized checkpoint. It answers "where am I, what did I already do, and what exact step should the next session run?"
+Do not build a second workflow engine in project comments. Codex Heartbeats normally wake the same thread, so the chat context remains the primary continuity layer. The breadcrumb is a small insurance policy for suspend points, context compaction, stale waits, or another agent picking up the PR.
 
-- The source of truth is the latest state capsule in the task issue or PR. It should be public-safe, compact, and machine-readable enough for a future agent to parse.
-- The Heartbeat prompt must include the automation id, issue or PR number, current branch, latest commit, current state, `NEXT_STEP`, and a pointer to the state capsule when available.
-- Update the state capsule immediately after each successful side effect: commit, push, PR creation, Copilot request, review response, test run, merge, branch deletion, issue update, or Heartbeat change.
-- Do not update `NEXT_STEP` before the side effect has actually succeeded. If a side effect succeeds but the state update fails, record the run as blocked before sleeping.
-- State writes are idempotent. Re-running a wake step should first check whether the target side effect already happened, then either advance the state or no-op with evidence.
-- Use stable state names such as `implementing`, `waiting_for_copilot`, `evaluating_review`, `waiting_for_reviewer_subagent`, `running_final_checks`, `ready_to_merge`, `closing_task`, and `blocked`.
-- Keep private operator facts in `AGENTS.local.md` or another untracked private note only. A local live file can speed up recovery on the same machine, but GitHub state must remain sufficient if that file is missing.
-- Never store raw prompts, private chat text, secrets, local hostnames, private paths, database or media paths, token-like strings, or raw logs in the capsule.
+- Write a breadcrumb only before a real wait or handoff: Copilot, CI, deploy validation, reviewer sub-agent, external reviewer, human approval, or a blocked state.
+- The Heartbeat prompt is the first breadcrumb. It must include the automation id, issue or PR number, branch, latest commit, current state, `NEXT_STEP`, wait owner, wait cap, and fallback.
+- Add a PR or issue breadcrumb comment only when the wait is long, risky, already stale, crosses agents, changes reviewer ownership, or follows a new commit that materially changes the next action.
+- Do not update breadcrumbs after every normal side effect. The next session should verify GitHub state first and treat repeated actions as idempotent.
+- Do not advance `NEXT_STEP` before the side effect that justifies the advance has actually succeeded.
+- A local live file is optional private scratch. It can speed up same-machine recovery, but the Heartbeat and PR or issue context must be enough when the file is missing.
+- Never store raw prompts, private chat text, secrets, local hostnames, private paths, database or media paths, token-like strings, or raw logs in breadcrumbs.
 
-Example public-safe capsule:
+Example public-safe breadcrumb:
 
 ```yaml
-schema: agent-pipeline-state/v1
+schema: agent-suspend-breadcrumb/v1
 run_id: issue-31-pr-32
 contract: AGENTS.dev-pipeline-contract.md
 issue: 31
@@ -180,10 +179,8 @@ wait_owner: copilot
 wait_reason: review requested after latest push
 attempts:
   copilot_checks: 1
-  fix_iterations: 0
 limits:
   copilot_checks: 3
-  fix_iterations: 3
 expires_utc: 2026-05-15T22:00:00Z
 fallback: run_reviewer_subagent_or_escalate
 evidence:
@@ -195,21 +192,21 @@ safety: sanitized_no_private_runtime_details
 
 Wake-up recovery algorithm:
 
-1. Read the Heartbeat instructions and extract the automation id, issue or PR number, branch, latest commit, and `NEXT_STEP`.
-2. Load the latest state capsule from the issue or PR. If it is missing, stale, or conflicts with GitHub state, stop and record a sanitized blocked handoff instead of going back to sleep.
-3. Fetch or inspect GitHub state, then verify branch, head commit, PR status, review status, checks, and project item status against the capsule.
+1. Read the Heartbeat instructions and recover the automation id, issue or PR number, branch, latest commit, and `NEXT_STEP`.
+2. Use the current thread context first. If context is compressed or ambiguous, read the latest PR or issue breadcrumb comment.
+3. Fetch GitHub state, then verify branch, head commit, PR status, review status, checks, and project item status before acting.
 4. Execute only the named `NEXT_STEP`, and make it idempotent by checking whether the intended side effect already happened.
-5. After a successful side effect, update the capsule with the new state, evidence, attempt counters, fallback, and next wake target.
-6. Before any new wait, update or create the Heartbeat with the new capsule pointer and verify the automation id and next wake time.
+5. If another wait is needed, refresh the Heartbeat breadcrumb and add or update a PR/issue breadcrumb only when the handoff is risky enough to deserve durable notes.
+6. If the Heartbeat and GitHub evidence disagree and the agent cannot reconcile them, record a sanitized blocked handoff instead of sleeping again.
 7. If the task is complete, delete obsolete Heartbeats, mark Project status and issue state, and write a concise sanitized completion note.
 
 ## Pipeline Test Matrix
 
 - Heartbeat creation fails: agent records a blocked handoff and does not sleep silently.
-- Heartbeat wakes without local context: handoff capsule is sufficient to recover issue, PR, branch, commit, and next action.
-- Heartbeat wakes with no readable state capsule: agent reports a blocked handoff instead of sleeping again.
-- Heartbeat prompt and state capsule disagree on `NEXT_STEP`: agent reconciles from GitHub evidence or escalates.
-- A side effect succeeds but capsule update fails: agent does not advance to the next wait until recovery state is recorded.
+- Heartbeat wakes after context compaction: the Heartbeat breadcrumb plus GitHub PR/issue state is sufficient to recover issue, PR, branch, commit, and next action.
+- Heartbeat wakes with no readable PR/issue breadcrumb: agent uses the Heartbeat and GitHub evidence, then escalates only if the next step is still ambiguous.
+- Heartbeat prompt and PR/issue evidence disagree on `NEXT_STEP`: agent reconciles from GitHub evidence or escalates.
+- A side effect succeeds but the wait breadcrumb cannot be refreshed before sleeping: agent records a blocked handoff or keeps working instead of creating an ambiguous wait.
 - Copilot is requested but silent past the max checks: agent runs the fallback reviewer path or escalates.
 - Copilot repeats the same irrelevant comment: agent classifies it as duplicate or not relevant and exits the Copilot loop.
 - Copilot repeats a relevant finding after repeated fixes: agent escalates with the latest failure signature instead of editing forever.
@@ -223,7 +220,7 @@ Wake-up recovery algorithm:
 
 - Current task issue and Project status are named.
 - Branch, PR number, latest commit, and test status are named.
-- Current state capsule location and `NEXT_STEP` are named.
+- Current suspend breadcrumb and `NEXT_STEP` are named for any wait handoff.
 - Heartbeat is scheduled and verified for any wait state before the agent stops.
 - Wait owner, max checks, expiry action, and fallback are named.
 - Copilot comments are classified as relevant, not relevant, duplicate, or already fixed.
