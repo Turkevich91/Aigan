@@ -15,6 +15,13 @@ This repository is maintained by humans and coding agents such as Codex, Google 
 - `[codex]` means a planning or development issue created by a coding agent or developer workflow.
 - `[Aigan]` means an issue created by Aigan itself through self-analysis or complaint-temperature reporting.
 - Aigan self-reports are triage signals, not confirmed bugs.
+- `[DEV]` means a developer-workflow, automation, or agent-process contract issue.
+
+## Agent Development Pipeline
+
+- Follow the public agent handoff and PR-review contract in [`AGENTS.dev-pipeline-contract.md`](AGENTS.dev-pipeline-contract.md).
+- Keep this repository-level entry concise; detailed workflow diagrams and gates live in that contract.
+- Keep private environment details in `AGENTS.local.md` only.
 
 ## Safety Rules
 
