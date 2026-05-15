@@ -703,6 +703,52 @@ class ToolRuntimeTests(unittest.TestCase):
         self.assertIn("message", event["details"]["ignored_event_context_keys"])
         self.assertIn("details", event["details"]["ignored_event_context_keys"])
 
+    def test_tool_event_context_unknown_keys_are_sanitized_details(self) -> None:
+        events = []
+
+        def record_event(*, level, component, event_type, duration_ms=None, message="", details=None, telegram_message=None, route=""):
+            events.append(
+                {
+                    "level": level,
+                    "component": component,
+                    "event_type": event_type,
+                    "duration_ms": duration_ms,
+                    "message": message,
+                    "details": details,
+                    "telegram_message": telegram_message,
+                    "route": route,
+                }
+            )
+
+        class BrokenTool:
+            def health_summary(self):
+                return {"enabled": True, "adapter": "broken"}
+
+        runtime = ToolRuntime(event_callback=record_event)
+        runtime.register("broken", BrokenTool())
+
+        asyncio.run(
+            runtime.safe_call(
+                "broken",
+                "explode",
+                lambda: (_ for _ in ()).throw(RuntimeError("boom")),
+                event_context={
+                    "telegram_message": "safe context",
+                    "route": f"OPENAI_API_KEY={fake_openai_secret()}",
+                    "unexpected": f"OPENAI_API_KEY={fake_openai_secret()}",
+                },
+            )
+        )
+
+        self.assertEqual(1, len(events))
+        event = events[0]
+        event_text = json.dumps(event, ensure_ascii=False)
+        self.assertEqual("safe context", event["telegram_message"])
+        self.assertNotIn("unexpected", event)
+        self.assertNotIn(fake_openai_secret(), event_text)
+        self.assertIn("[redacted]", event_text)
+        self.assertEqual("OPENAI_API_KEY=[redacted]", event["details"]["extra_event_context"]["unexpected"])
+
     def test_tool_details_cannot_override_runtime_failure_fields(self) -> None:
         events = []
 

@@ -17,6 +17,7 @@ ToolEventCallback = Callable[..., None]
 ToolOperation = Callable[[], Any | Awaitable[Any]]
 RESERVED_EVENT_CONTEXT_KEYS = {"level", "component", "event_type", "duration_ms", "message", "details"}
 RESERVED_DETAIL_KEYS = {"tool", "operation", "exception_type", "exception_message", "ignored_detail_keys"}
+TOP_LEVEL_EVENT_CONTEXT_KEYS = {"telegram_message", "route"}
 
 
 @dataclass(frozen=True)
@@ -187,6 +188,7 @@ class ToolRuntime:
             if ignored_detail_keys:
                 clean_details["ignored_detail_keys"] = sorted(ignored_detail_keys)
         context_kwargs: dict[str, Any] = {}
+        extra_context: dict[str, Any] = {}
         ignored_context_keys: list[str] = []
         if event_context:
             for key, value in event_context.items():
@@ -194,9 +196,14 @@ class ToolRuntime:
                 if clean_key in RESERVED_EVENT_CONTEXT_KEYS:
                     ignored_context_keys.append(clean_key)
                     continue
-                context_kwargs[clean_key] = value
+                if clean_key in TOP_LEVEL_EVENT_CONTEXT_KEYS and self._event_callback_accepts(clean_key):
+                    context_kwargs[clean_key] = sanitize_text(str(value), 80) if clean_key == "route" else value
+                    continue
+                extra_context[clean_key] = sanitize_details(value)
         if ignored_context_keys:
             clean_details["ignored_event_context_keys"] = sorted(ignored_context_keys)
+        if extra_context:
+            clean_details["extra_event_context"] = extra_context
         kwargs = {
             "level": "warning",
             "component": "tool_runtime",
@@ -211,6 +218,21 @@ class ToolRuntime:
             self._event_callback(**kwargs)
         except Exception:
             return
+
+    def _event_callback_accepts(self, key: str) -> bool:
+        if self._event_callback is None:
+            return False
+        try:
+            signature = inspect.signature(self._event_callback)
+        except (TypeError, ValueError):
+            return False
+        parameter = signature.parameters.get(key)
+        if parameter is not None and parameter.kind in {
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            inspect.Parameter.KEYWORD_ONLY,
+        }:
+            return True
+        return any(param.kind == inspect.Parameter.VAR_KEYWORD for param in signature.parameters.values())
 
     def _clean_name(self, name: str) -> str:
         clean = str(name or "").strip()
