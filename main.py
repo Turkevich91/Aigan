@@ -27,6 +27,7 @@ from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandl
 
 from mcp_servers.web import fetch_binary_url, search_image_candidates, search_web
 from memory import EmbeddingCandidate, MemoryItem, MemoryStore, SemanticMemoryResult
+from outbound_reactions import NullReactionAdapter, OutboundReactionAdapter, OutboundReactionConfig, ReactionAdapter
 from reaction_memory import ReactionAsset, ReactionMemoryStore, ReactionPreference, ReactionSpec
 from github_reporting import GitHubReporter
 from self_analysis import SelfAnalysisService
@@ -61,6 +62,10 @@ def _env_bool(name: str, default: bool = False) -> bool:
 
 def _csv_strings(value: str) -> list[str]:
     return [item.strip().lower() for item in value.split(",") if item.strip()]
+
+
+def _csv_values(value: str) -> list[str]:
+    return [item.strip() for item in value.split(",") if item.strip()]
 
 
 def optional_int(value: str | None) -> int | None:
@@ -167,6 +172,13 @@ class Config:
     reaction_asset_min_uses_for_vision: int
     reaction_analysis_prompt_version: str
     reaction_asset_max_bytes: int
+    outbound_reactions_enabled: bool
+    outbound_reaction_every_n_messages: int
+    outbound_reaction_cooldown_seconds: int
+    outbound_reaction_min_score: float
+    outbound_reaction_allowed_emoji: list[str]
+    outbound_reaction_use_custom_emoji: bool
+    outbound_reaction_big: bool
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -291,6 +303,15 @@ class Config:
             reaction_asset_min_uses_for_vision=int(os.getenv("REACTION_ASSET_MIN_USES_FOR_VISION", "3")),
             reaction_analysis_prompt_version=os.getenv("REACTION_ANALYSIS_PROMPT_VERSION", "1").strip() or "1",
             reaction_asset_max_bytes=int(os.getenv("REACTION_ASSET_MAX_BYTES", "2000000")),
+            outbound_reactions_enabled=_env_bool("OUTBOUND_REACTIONS_ENABLED", False),
+            outbound_reaction_every_n_messages=max(1, int(os.getenv("OUTBOUND_REACTION_EVERY_N_MESSAGES", "10"))),
+            outbound_reaction_cooldown_seconds=max(0, int(os.getenv("OUTBOUND_REACTION_COOLDOWN_SECONDS", "1800"))),
+            outbound_reaction_min_score=float(os.getenv("OUTBOUND_REACTION_MIN_SCORE", "0.72")),
+            outbound_reaction_allowed_emoji=_csv_values(
+                os.getenv("OUTBOUND_REACTION_ALLOWED_EMOJI", "🔥,👀,👍,🤔,😂")
+            ),
+            outbound_reaction_use_custom_emoji=_env_bool("OUTBOUND_REACTION_USE_CUSTOM_EMOJI", True),
+            outbound_reaction_big=_env_bool("OUTBOUND_REACTION_BIG", False),
         )
 
 
@@ -316,6 +337,55 @@ REACTION_MEMORY = (
     if CONFIG.memory_enabled and CONFIG.reactions_enabled
     else None
 )
+
+
+def outbound_reaction_event(
+    *,
+    level: str = "info",
+    event_type: str,
+    chat_id: int,
+    user_id: int | None = None,
+    message: str = "",
+    details: dict[str, Any] | None = None,
+) -> None:
+    system_event_for_chat(
+        level=level,
+        component="outbound_reactions",
+        event_type=event_type,
+        chat_id=chat_id,
+        user_id=user_id,
+        message=message,
+        details=details,
+    )
+
+
+def build_reaction_adapter() -> ReactionAdapter:
+    if not CONFIG.outbound_reactions_enabled:
+        return NullReactionAdapter()
+    try:
+        config = OutboundReactionConfig(
+            enabled=True,
+            every_n_messages=CONFIG.outbound_reaction_every_n_messages,
+            cooldown_seconds=CONFIG.outbound_reaction_cooldown_seconds,
+            min_score=CONFIG.outbound_reaction_min_score,
+            allowed_emoji=tuple(CONFIG.outbound_reaction_allowed_emoji or ["👍"]),
+            use_custom_emoji=CONFIG.outbound_reaction_use_custom_emoji,
+            is_big=CONFIG.outbound_reaction_big,
+            bot_trigger=CONFIG.bot_trigger,
+        )
+        return OutboundReactionAdapter(
+            config=config,
+            reaction_memory=REACTION_MEMORY,
+            event_callback=outbound_reaction_event,
+            bot_id_provider=lambda: BOT_ID,
+            bot_username_provider=lambda: BOT_USERNAME or CONFIG.bot_username,
+        )
+    except Exception:
+        LOGGER.warning("Failed to initialize outbound reaction adapter; using null adapter", exc_info=True)
+        return NullReactionAdapter()
+
+
+REACTION_ADAPTER: ReactionAdapter = build_reaction_adapter()
 GITHUB_REPORTER = GitHubReporter(
     enabled=CONFIG.github_reporting_enabled,
     token=CONFIG.github_token,
@@ -1505,10 +1575,26 @@ async def remember_message_persistently(message: Message, label: str | None = No
 
     if CONFIG.memory_eager_image_summary:
         await ensure_recent_image_summaries(message.chat_id, force=True)
-    enqueue_memory_embedding(item_id)
     remember_social_observations(item_id)
+    item = MEMORY.item_by_id(item_id)
+    await run_reaction_ingestion_hook(message, item, phase="pre_embedding")
+    enqueue_memory_embedding(item_id)
     cleanup_memory_if_due()
     return item_id
+
+
+async def run_reaction_ingestion_hook(message: Message, item: MemoryItem | None, *, phase: str) -> None:
+    try:
+        await REACTION_ADAPTER.on_message_ingested(message, item, phase)
+    except Exception as exc:
+        LOGGER.warning("Outbound reaction hook failed", exc_info=True)
+        system_event(
+            level="warning",
+            component="outbound_reactions",
+            event_type="outbound_reaction_hook_failed",
+            telegram_message=message,
+            message=f"{type(exc).__name__}: {exc}",
+        )
 
 
 def remember_social_observations(item_id: int | None) -> int:
@@ -6213,6 +6299,14 @@ async def post_init(application: Application) -> None:
                 "prompt_version": CONFIG.reaction_analysis_prompt_version,
             },
         )
+    reaction_adapter_health = REACTION_ADAPTER.health_summary()
+    LOGGER.info("Outbound reaction adapter=%s enabled=%s", reaction_adapter_health.get("adapter"), reaction_adapter_health.get("enabled"))
+    system_event(
+        component="startup",
+        event_type="outbound_reaction_adapter_ready",
+        message=str(reaction_adapter_health.get("adapter")),
+        details=reaction_adapter_health,
+    )
     if CONFIG.proactive_enabled:
         asyncio.create_task(proactive_loop(application))
     if CONFIG.health_report_enabled:

@@ -78,6 +78,13 @@ os.environ["REACTION_ASSET_ANALYSIS_ENABLED"] = "true"
 os.environ["REACTION_ASSET_MIN_USES_FOR_VISION"] = "3"
 os.environ["REACTION_ANALYSIS_PROMPT_VERSION"] = "1"
 os.environ["REACTION_ASSET_MAX_BYTES"] = "2000000"
+os.environ["OUTBOUND_REACTIONS_ENABLED"] = "false"
+os.environ["OUTBOUND_REACTION_EVERY_N_MESSAGES"] = "10"
+os.environ["OUTBOUND_REACTION_COOLDOWN_SECONDS"] = "1800"
+os.environ["OUTBOUND_REACTION_MIN_SCORE"] = "0.72"
+os.environ["OUTBOUND_REACTION_ALLOWED_EMOJI"] = "\N{FIRE},\N{EYES},\N{THUMBS UP SIGN},\N{THINKING FACE},\N{FACE WITH TEARS OF JOY}"
+os.environ["OUTBOUND_REACTION_USE_CUSTOM_EMOJI"] = "true"
+os.environ["OUTBOUND_REACTION_BIG"] = "false"
 
 import httpx
 from telegram import InputMediaPhoto, ReactionTypeCustomEmoji, ReactionTypeEmoji
@@ -131,7 +138,7 @@ class FakeMessage:
         self.media_group_calls = []
         self.media_group_attempts = 0
         self.media_group_failures = 0
-        self.bot = SimpleNamespace(send_chat_action=AsyncMock())
+        self.bot = SimpleNamespace(send_chat_action=AsyncMock(), set_message_reaction=AsyncMock(return_value=True))
 
     async def reply_text(self, text: str, **kwargs) -> None:
         self.last_reply = text
@@ -592,6 +599,7 @@ class PersistentMemoryTests(unittest.TestCase):
         main.chat_generation_locks.clear()
         main.recent_chat_answers.clear()
         main.embedding_queue = None
+        main.REACTION_ADAPTER = main.NullReactionAdapter()
 
     def tearDown(self) -> None:
         if main.MEMORY is not None:
@@ -600,9 +608,12 @@ class PersistentMemoryTests(unittest.TestCase):
             main.SYSTEM_LOG.clear_all()
         if main.SOCIAL_MEMORY is not None:
             main.SOCIAL_MEMORY.clear_all()
+        if main.REACTION_MEMORY is not None:
+            main.REACTION_MEMORY.clear_all()
         main.chat_generation_locks.clear()
         main.recent_chat_answers.clear()
         main.embedding_queue = None
+        main.REACTION_ADAPTER = main.NullReactionAdapter()
 
     def test_messages_persist_after_ram_context_is_cleared(self) -> None:
         self.assertIsNotNone(main.MEMORY)
@@ -730,6 +741,236 @@ class PersistentMemoryTests(unittest.TestCase):
         preferences = main.REACTION_MEMORY.group_preferences(-1001)
         self.assertEqual(1, len(preferences))
         self.assertEqual(4, preferences[0].count)
+
+    def test_null_reaction_adapter_noops_without_env(self) -> None:
+        message = FakeMessage("сильне повідомлення про реліз і ціну 170 тис", message_id=920)
+        item_id = main.MEMORY.save_message(
+            chat_id=-1001,
+            message_id=920,
+            sender_label="Tester",
+            user_id=111,
+            text=message.text,
+            created_at=datetime.now(timezone.utc),
+        )
+
+        asyncio.run(main.NullReactionAdapter().on_message_ingested(message, main.MEMORY.item_by_id(item_id), "pre_embedding"))
+
+        message.bot.set_message_reaction.assert_not_awaited()
+
+    def test_reaction_hook_failure_does_not_block_memory_or_embedding(self) -> None:
+        class BrokenAdapter:
+            async def on_message_ingested(self, message, memory_item, phase):
+                raise RuntimeError("boom")
+
+            async def on_reaction_update(self, update, context):
+                return None
+
+            def health_summary(self):
+                return {}
+
+        main.REACTION_ADAPTER = BrokenAdapter()
+        message = FakeMessage("повідомлення для пам'яті", message_id=921)
+        calls = []
+
+        with patch.object(main, "enqueue_memory_embedding", side_effect=lambda item_id: calls.append(item_id)):
+            item_id = asyncio.run(main.remember_message_persistently(message))
+
+        self.assertIsNotNone(item_id)
+        self.assertEqual([item_id], calls)
+        self.assertIsNotNone(main.MEMORY.item_by_id(item_id))
+
+    def test_reaction_hook_runs_before_embedding_enqueue(self) -> None:
+        class RecordingAdapter:
+            async def on_message_ingested(self, message, memory_item, phase):
+                events.append((phase, memory_item.id if memory_item else None))
+
+            async def on_reaction_update(self, update, context):
+                return None
+
+            def health_summary(self):
+                return {}
+
+        events = []
+        main.REACTION_ADAPTER = RecordingAdapter()
+        message = FakeMessage("змістовний текст перед індексацією", message_id=922)
+
+        with patch.object(main, "enqueue_memory_embedding", side_effect=lambda item_id: events.append(("enqueue", item_id))):
+            item_id = asyncio.run(main.remember_message_persistently(message))
+
+        self.assertEqual([("pre_embedding", item_id), ("enqueue", item_id)], events)
+
+    def test_outbound_reaction_sends_every_tenth_strong_group_message(self) -> None:
+        config = main.OutboundReactionConfig(
+            enabled=True,
+            every_n_messages=10,
+            cooldown_seconds=0,
+            min_score=0.2,
+            allowed_emoji=("\N{FIRE}",),
+            use_custom_emoji=False,
+        )
+        adapter = main.OutboundReactionAdapter(config=config, reaction_memory=main.REACTION_MEMORY)
+
+        for index in range(9):
+            message = FakeMessage(f"звичайне сильне повідомлення {index} про реліз і ціну 170 тис", message_id=930 + index)
+            item_id = main.MEMORY.save_message(
+                chat_id=-1001,
+                message_id=message.message_id,
+                sender_label="Tester",
+                user_id=111,
+                text=message.text,
+                created_at=datetime.now(timezone.utc),
+            )
+            asyncio.run(adapter.on_message_ingested(message, main.MEMORY.item_by_id(item_id), "pre_embedding"))
+            message.bot.set_message_reaction.assert_not_awaited()
+
+        strong = FakeMessage(
+            "Оце вже сильна новина: реліз, ціна 170 тис, питання ринку і купа деталей.",
+            message_id=939,
+        )
+        item_id = main.MEMORY.save_message(
+            chat_id=-1001,
+            message_id=939,
+            sender_label="Tester",
+            user_id=111,
+            text=strong.text,
+            created_at=datetime.now(timezone.utc),
+        )
+
+        asyncio.run(adapter.on_message_ingested(strong, main.MEMORY.item_by_id(item_id), "pre_embedding"))
+
+        strong.bot.set_message_reaction.assert_awaited_once()
+
+    def test_outbound_reaction_skips_private_commands_bots_and_noise(self) -> None:
+        config = main.OutboundReactionConfig(
+            enabled=True,
+            every_n_messages=1,
+            cooldown_seconds=0,
+            min_score=0.0,
+            allowed_emoji=("\N{THUMBS UP SIGN}",),
+            use_custom_emoji=False,
+        )
+        adapter = main.OutboundReactionAdapter(
+            config=config,
+            reaction_memory=main.REACTION_MEMORY,
+            bot_id_provider=lambda: 999,
+            bot_username_provider=lambda: "thrd_ua_bot",
+        )
+        messages = [
+            FakeMessage("приватний текст", chat_type=ChatType.PRIVATE, chat_id=111, message_id=940),
+            FakeMessage("/stat", message_id=941),
+            FakeMessage("@thrd_ua_bot поясни", message_id=942),
+            FakeMessage("ок", message_id=943),
+        ]
+        bot_message = FakeMessage("бот", message_id=944)
+        bot_message.from_user.is_bot = True
+        messages.append(bot_message)
+
+        for message in messages:
+            item_id = main.MEMORY.save_message(
+                chat_id=message.chat_id,
+                message_id=message.message_id,
+                chat_type=str(message.chat.type),
+                sender_label="Tester",
+                user_id=111,
+                is_bot=message.from_user.is_bot,
+                text=message.text,
+                created_at=datetime.now(timezone.utc),
+            )
+            asyncio.run(adapter.on_message_ingested(message, main.MEMORY.item_by_id(item_id), "pre_embedding"))
+            message.bot.set_message_reaction.assert_not_awaited()
+
+    def test_outbound_reaction_cooldown_prevents_spam(self) -> None:
+        config = main.OutboundReactionConfig(
+            enabled=True,
+            every_n_messages=1,
+            cooldown_seconds=1800,
+            min_score=0.0,
+            allowed_emoji=("\N{FIRE}",),
+            use_custom_emoji=False,
+        )
+        adapter = main.OutboundReactionAdapter(config=config, reaction_memory=main.REACTION_MEMORY)
+        first = FakeMessage("сильний пост про реліз 170 тис і ціну", message_id=950)
+        second = FakeMessage("ще один сильний пост про реліз 170 тис і ціну", message_id=951)
+        for message in (first, second):
+            item_id = main.MEMORY.save_message(
+                chat_id=-1001,
+                message_id=message.message_id,
+                sender_label="Tester",
+                user_id=111,
+                text=message.text,
+                created_at=datetime.now(timezone.utc),
+            )
+            asyncio.run(adapter.on_message_ingested(message, main.MEMORY.item_by_id(item_id), "pre_embedding"))
+
+        first.bot.set_message_reaction.assert_awaited_once()
+        second.bot.set_message_reaction.assert_not_awaited()
+
+    def test_custom_reaction_reject_falls_back_to_standard(self) -> None:
+        self.assertIsNotNone(main.REACTION_MEMORY)
+        custom = ReactionSpec("custom_emoji", "custom:custom-777", custom_emoji_id="custom-777")
+        main.REACTION_MEMORY.get_or_create_asset(custom)
+        main.REACTION_MEMORY.upsert_chat_semantics(chat_id=-1001, reaction_key=custom.reaction_key, target_item=None)
+        config = main.OutboundReactionConfig(
+            enabled=True,
+            every_n_messages=1,
+            cooldown_seconds=0,
+            min_score=0.0,
+            allowed_emoji=("\N{FIRE}",),
+            use_custom_emoji=True,
+        )
+        adapter = main.OutboundReactionAdapter(config=config, reaction_memory=main.REACTION_MEMORY)
+        message = FakeMessage("сильний пост про реліз 170 тис і ціну", message_id=960)
+        message.bot.set_message_reaction = AsyncMock(side_effect=[BadRequest("bad custom"), True])
+        item_id = main.MEMORY.save_message(
+            chat_id=-1001,
+            message_id=960,
+            sender_label="Tester",
+            user_id=111,
+            text=message.text,
+            created_at=datetime.now(timezone.utc),
+        )
+
+        asyncio.run(adapter.on_message_ingested(message, main.MEMORY.item_by_id(item_id), "pre_embedding"))
+
+        self.assertEqual(2, message.bot.set_message_reaction.await_count)
+        second_reaction = message.bot.set_message_reaction.await_args_list[1].kwargs["reaction"][0]
+        self.assertIsInstance(second_reaction, ReactionTypeEmoji)
+
+    def test_outbound_reaction_is_stored_locally(self) -> None:
+        self.assertIsNotNone(main.REACTION_MEMORY)
+        config = main.OutboundReactionConfig(
+            enabled=True,
+            every_n_messages=1,
+            cooldown_seconds=0,
+            min_score=0.0,
+            allowed_emoji=("\N{FIRE}",),
+            use_custom_emoji=False,
+        )
+        adapter = main.OutboundReactionAdapter(
+            config=config,
+            reaction_memory=main.REACTION_MEMORY,
+            bot_id_provider=lambda: 123456,
+            bot_username_provider=lambda: "thrd_ua_bot",
+        )
+        message = FakeMessage("сильний пост про реліз 170 тис і ціну", message_id=970)
+        item_id = main.MEMORY.save_message(
+            chat_id=-1001,
+            message_id=970,
+            sender_label="Tester",
+            user_id=111,
+            text=message.text,
+            created_at=datetime.now(timezone.utc),
+        )
+
+        asyncio.run(adapter.on_message_ingested(message, main.MEMORY.item_by_id(item_id), "pre_embedding"))
+
+        rows = main.REACTION_MEMORY._conn.execute(
+            "SELECT actor_kind, actor_username FROM message_reactions WHERE chat_id = ? AND target_message_id = ?",
+            (-1001, 970),
+        ).fetchall()
+        self.assertEqual(1, len(rows))
+        self.assertEqual("bot", rows[0]["actor_kind"])
+        self.assertEqual("thrd_ua_bot", rows[0]["actor_username"])
 
     def test_user_messages_filter_by_user_and_limit(self) -> None:
         base = datetime.now(timezone.utc)

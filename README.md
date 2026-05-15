@@ -237,10 +237,19 @@ REACTION_ASSET_ANALYSIS_ENABLED=true
 REACTION_ASSET_MIN_USES_FOR_VISION=3
 REACTION_ANALYSIS_PROMPT_VERSION=1
 REACTION_ASSET_MAX_BYTES=2000000
+OUTBOUND_REACTIONS_ENABLED=false
+OUTBOUND_REACTION_EVERY_N_MESSAGES=10
+OUTBOUND_REACTION_COOLDOWN_SECONDS=1800
+OUTBOUND_REACTION_MIN_SCORE=0.72
+OUTBOUND_REACTION_ALLOWED_EMOJI=🔥,👀,👍,🤔,😂
+OUTBOUND_REACTION_USE_CUSTOM_EMOJI=true
+OUTBOUND_REACTION_BIG=false
 PROACTIVE_DIRECTION_WEIGHTS=group_taste:0.25,personal_ping:0.25,current_hook:0.25,unanswered_thread:0.25
 PROACTIVE_SELF_REFERENCE_GUARD=true
 PROACTIVE_RECENT_SEED_COOLDOWN_DAYS=14
 ```
+
+Inbound reaction memory and outbound reactions are separate. `REACTIONS_ENABLED=true` lets Aigan store reactions from the chat and learn lightweight taste signals. `OUTBOUND_REACTIONS_ENABLED=true` lets Aigan set real Telegram reactions on selected live group messages through an optional adapter hook. If the outbound adapter is disabled, missing, or Telegram rejects a reaction, memory saving and embeddings continue normally. The older `maybe_auto_react()` behavior is text-based; outbound reactions use Telegram's native message reaction API.
 
 The self-reference guard rejects proactive drafts that talk about being a bot/AI, announce capabilities, or ask users to tag/contact Aigan. Direct answers to explicit user requests are not blocked by this proactive-only guard.
 

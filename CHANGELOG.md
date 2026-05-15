@@ -1,5 +1,11 @@
 # Aigan Changelog
 
+## 2026-05-15 - Modular outbound reactions
+
+- Added an optional outbound reaction adapter that can set real Telegram reactions on selected strong live group messages.
+- Kept outbound reactions disabled by default and isolated from memory, social memory, digest, and embeddings through a null-adapter fallback.
+- Added rate limits, cooldowns, deterministic relevance scoring, custom-emoji fallback handling, and local storage of bot-set reactions.
+
 ## 2026-05-15 - Cached reaction emoji analysis
 
 - Added Telegram reaction memory as a separate relation layer, linked to stored messages when available.
