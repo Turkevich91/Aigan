@@ -121,6 +121,7 @@ flowchart TD
     K --> L{"Reviewer found blocker?"}
     L -- "Yes" --> I
     L -- "No" --> M["Run final test suite and safety checks"]
+    L -- "Unavailable or stale" --> X
     M --> M1{"Final checks pass?"}
     M1 -- "No" --> M2{"Repeated failure or attempt cap?"}
     M2 -- "No" --> I
@@ -158,7 +159,7 @@ flowchart TD
 - A local live file is optional private scratch. It can speed up same-machine recovery, but the Heartbeat and PR or issue context must be enough when the file is missing.
 - Keep breadcrumbs free of raw prompts, private chat text, secrets, local hostnames, private paths, database or media paths, token-like strings, and raw logs.
 
-Minimum breadcrumb fields: `automation_id`, `issue` or `pr`, `branch`, `head_sha`, `state`, `NEXT_STEP`, `wait_owner`, `wait_count`, `wait_limit`, `fallback`, and latest check or reviewer status.
+For durable PR or issue breadcrumbs, include: `automation_id`, `issue` or `pr`, `branch`, `head_sha`, `state`, `NEXT_STEP`, `wait_owner`, `wait_count`, `wait_limit`, `fallback`, and latest check or reviewer status. Short waits can rely on the Heartbeat prompt.
 
 Wake-up recovery algorithm:
 
