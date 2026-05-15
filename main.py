@@ -6387,8 +6387,25 @@ async def post_init(application: Application) -> None:
         asyncio.create_task(health_report_loop(application))
 
 
+async def post_shutdown(application: Application) -> None:
+    await TOOL_RUNTIME.cleanup()
+    tool_runtime_health = TOOL_RUNTIME.health_summary()
+    LOGGER.info(
+        "Tool runtime cleanup finished status=%s adapters=%s errors=%s",
+        tool_runtime_health.get("status"),
+        tool_runtime_health.get("adapter_count"),
+        tool_runtime_health.get("error_count"),
+    )
+    system_event(
+        component="shutdown",
+        event_type="tool_runtime_cleanup_finished",
+        message=str(tool_runtime_health.get("status")),
+        details=tool_runtime_health,
+    )
+
+
 def main() -> None:
-    application = Application.builder().token(CONFIG.telegram_token).post_init(post_init).build()
+    application = Application.builder().token(CONFIG.telegram_token).post_init(post_init).post_shutdown(post_shutdown).build()
     application.add_handler(CommandHandler(["start", "help"], help_command))
     application.add_handler(CommandHandler(["ids"], ids_command))
     application.add_handler(CommandHandler(["ping"], ping_command))

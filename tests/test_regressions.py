@@ -747,6 +747,32 @@ class ToolRuntimeTests(unittest.TestCase):
 
         self.assertTrue(adapter.cleaned)
 
+    def test_post_shutdown_invokes_tool_runtime_cleanup(self) -> None:
+        class CleaningReactionAdapter:
+            def __init__(self) -> None:
+                self.cleaned = False
+
+            def health_summary(self):
+                return {"enabled": True, "adapter": "cleaning"}
+
+            async def on_message_ingested(self, message, item, phase):
+                return None
+
+            async def cleanup(self) -> None:
+                self.cleaned = True
+
+        original_adapter = main.runtime_reaction_adapter()
+        adapter = CleaningReactionAdapter()
+        try:
+            main.set_reaction_adapter(adapter)
+
+            asyncio.run(main.post_shutdown(SimpleNamespace()))
+
+            self.assertTrue(adapter.cleaned)
+        finally:
+            main.set_reaction_adapter(original_adapter)
+            main.TOOL_RUNTIME.clear_error_counts()
+
     def test_main_tool_runtime_health_includes_outbound_reactions(self) -> None:
         health = main.TOOL_RUNTIME.health_summary()
 
