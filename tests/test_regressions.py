@@ -644,6 +644,50 @@ class ToolRuntimeTests(unittest.TestCase):
         self.assertNotIn(fake_telegram_secret(), event_text)
         self.assertIn("[redacted]", event_text)
 
+    def test_tool_event_context_cannot_override_sanitized_failure_fields(self) -> None:
+        events = []
+
+        def record_event(**kwargs):
+            events.append(kwargs)
+
+        class BrokenTool:
+            def health_summary(self):
+                return {"enabled": True, "adapter": "broken"}
+
+        runtime = ToolRuntime(event_callback=record_event)
+        runtime.register("broken", BrokenTool())
+
+        asyncio.run(
+            runtime.safe_call(
+                "broken",
+                "explode",
+                lambda: (_ for _ in ()).throw(RuntimeError(f"OPENAI_API_KEY={fake_openai_secret()}")),
+                details={"token": fake_telegram_secret()},
+                event_context={
+                    "level": "critical",
+                    "component": "unsafe_component",
+                    "event_type": "unsafe_event",
+                    "duration_ms": 999,
+                    "message": f"raw {fake_openai_secret()}",
+                    "details": {"token": fake_telegram_secret()},
+                    "telegram_message": "safe context",
+                },
+            )
+        )
+
+        self.assertEqual(1, len(events))
+        event = events[0]
+        self.assertEqual("warning", event["level"])
+        self.assertEqual("tool_runtime", event["component"])
+        self.assertEqual("tool_operation_failed", event["event_type"])
+        self.assertNotEqual(999, event["duration_ms"])
+        self.assertNotIn(fake_openai_secret(), event["message"])
+        self.assertNotIn(fake_telegram_secret(), json.dumps(event, ensure_ascii=False))
+        self.assertEqual("safe context", event["telegram_message"])
+        self.assertEqual("[redacted]", event["details"]["token"])
+        self.assertIn("message", event["details"]["ignored_event_context_keys"])
+        self.assertIn("details", event["details"]["ignored_event_context_keys"])
+
     def test_tool_runtime_cleanup_calls_optional_adapter_hook_safely(self) -> None:
         class CleaningTool:
             def __init__(self) -> None:

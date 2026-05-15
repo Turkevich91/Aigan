@@ -15,6 +15,7 @@ class ToolAdapter(Protocol):
 
 ToolEventCallback = Callable[..., None]
 ToolOperation = Callable[[], Any | Awaitable[Any]]
+RESERVED_EVENT_CONTEXT_KEYS = {"level", "component", "event_type", "duration_ms", "message", "details"}
 
 
 @dataclass(frozen=True)
@@ -176,6 +177,17 @@ class ToolRuntime:
         }
         if details:
             clean_details.update(sanitize_details(details))
+        context_kwargs: dict[str, Any] = {}
+        ignored_context_keys: list[str] = []
+        if event_context:
+            for key, value in event_context.items():
+                clean_key = str(key)
+                if clean_key in RESERVED_EVENT_CONTEXT_KEYS:
+                    ignored_context_keys.append(clean_key)
+                    continue
+                context_kwargs[clean_key] = value
+        if ignored_context_keys:
+            clean_details["ignored_event_context_keys"] = sorted(ignored_context_keys)
         kwargs = {
             "level": "warning",
             "component": "tool_runtime",
@@ -184,8 +196,8 @@ class ToolRuntime:
             "message": sanitize_text(f"{name}.{operation}: {type(exc).__name__}: {exc}", 300),
             "details": clean_details,
         }
-        if event_context:
-            kwargs.update(event_context)
+        if context_kwargs:
+            kwargs.update(context_kwargs)
         try:
             self._event_callback(**kwargs)
         except Exception:
