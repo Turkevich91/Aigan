@@ -11,11 +11,13 @@ Private runtime details, host aliases, local paths, MCP endpoints, logs, databas
 - Before implementation, move the task Project status to `In Progress`; new planning work starts as `Todo`.
 - Work on a task branch, commit intentional changes, push, and open a PR.
 - Request Copilot review on the PR. Treat Copilot as a dry code reviewer: useful for code-level risk, not a context owner and not an approval authority.
-- Before ending a ReAct session while waiting on Copilot, CI, deploy validation, another agent, or an external reviewer, create a Heartbeat follow-up for the current thread.
+- Before ending a ReAct session while waiting on Copilot, CI, deploy validation, another agent, or an external reviewer, create and verify a Heartbeat follow-up for the current thread.
+- Every wait state must name the owner, target URL or issue/PR number, branch, latest commit, wait reason, next wake time, maximum checks, expiry action, and current fallback.
 - If Copilot comments, evaluate each point with full project context. Fix relevant issues; briefly document intentionally rejected or non-actionable suggestions when useful.
 - Re-request Copilot review after pushing review fixes and create another Heartbeat before sleeping again.
 - When Copilot has no relevant new comments, spawn or ask a reviewer sub-agent for a final blocker-focused pass, then run the final tests.
 - Mark the PR ready only after the final gates pass. Squash merge, delete the branch, close/update the task issue, and update the parent epic checklist when applicable.
+- No loop may return to the same state without new evidence. Repeated comments, repeated test failures, stale CI, missing reviewer response, or mergeability that stays blocked must hit a cap and escalate instead of spinning forever.
 
 ## Epic Task State Machine
 
@@ -31,19 +33,27 @@ stateDiagram-v2
     VerifyLocal --> CommitPush: tests and safety checks pass
     CommitPush --> OpenPR: commit and push
     OpenPR --> RequestCopilot: create or update PR
-    RequestCopilot --> SleepWithHeartbeat: request Copilot review
+    RequestCopilot --> SleepWithHeartbeat: create verified Heartbeat and handoff capsule
+    SleepWithHeartbeat --> EscalateBlocked: Heartbeat cannot be verified
     SleepWithHeartbeat --> CheckCopilot: Heartbeat wakes thread
     CheckCopilot --> EvaluateCopilot: comments found
     CheckCopilot --> FinalReviewer: no relevant new comments
+    CheckCopilot --> EscalateBlocked: review stale after max checks
     EvaluateCopilot --> Implement: relevant finding
     EvaluateCopilot --> RequestCopilot: pushed fix or documented rejection
+    EvaluateCopilot --> EscalateBlocked: duplicate or max fix loop reached
     FinalReviewer --> VerifyFinal: reviewer sub-agent finds no blockers
     FinalReviewer --> Implement: reviewer finds blocker
+    FinalReviewer --> EscalateBlocked: reviewer unavailable or stale
     VerifyFinal --> MergePR: final tests pass and PR mergeable
+    VerifyFinal --> Implement: new final test failure within cap
+    VerifyFinal --> EscalateBlocked: repeated test or mergeability failure
     MergePR --> CloseTask: squash merge and delete branch
     CloseTask --> UpdateEpic: task summary and Project status Done
+    CloseTask --> EscalateBlocked: cleanup failed after retry
     UpdateEpic --> SelectTask: epic still has Todo tasks
     UpdateEpic --> [*]: epic complete
+    EscalateBlocked --> [*]: sanitized blocked handoff recorded
 ```
 
 ## Review And Heartbeat Sequence
@@ -60,14 +70,20 @@ sequenceDiagram
     CA->>GH: set task In Progress
     CA->>GH: push branch and open PR
     CA->>CP: request PR review
+    CA->>GH: write sanitized handoff capsule
     CA->>HB: schedule wake-up before ending ReAct session
+    HB-->>CA: return automation id and next wake time
+    CA->>GH: verify Copilot request and Heartbeat details
     HB-->>CA: wake and check PR review
     CA->>GH: read Copilot comments and PR state
     alt Copilot has relevant findings
         CA->>CA: decide with full project context
         CA->>GH: push fix or document rejection
         CA->>CP: request re-review
-        CA->>HB: schedule next wake-up
+        CA->>HB: schedule next wake-up with attempt count
+    else Copilot is stale or repeating
+        CA->>GH: record sanitized blocked or fallback decision
+        CA->>RA: request blocker-focused final review or human escalation
     else Copilot has no relevant comments
         CA->>RA: request blocker-focused final review
         RA-->>CA: return findings or mergeable verdict
@@ -86,28 +102,66 @@ flowchart TD
     D --> B
     C -- "Yes" --> E["Commit, push, open PR"]
     E --> F["Request Copilot review"]
-    F --> G["Create Heartbeat before sleep"]
-    G --> H{"Copilot has comments?"}
+    F --> G["Create Heartbeat and handoff capsule"]
+    G --> G2{"Heartbeat verified?"}
+    G2 -- "No" --> X["Do not sleep; record blocked handoff"]
+    G2 -- "Yes" --> H{"Copilot signal before expiry?"}
     H -- "Relevant" --> I["Fix or consciously reject with sanitized note"]
-    I --> J["Run focused tests and push"]
-    J --> F
+    I --> J{"Loop cap or duplicate signal?"}
+    J -- "No" --> J2["Run focused tests and push"]
+    J2 --> F
+    J -- "Yes" --> X
     H -- "None or not relevant" --> K["Run reviewer sub-agent"]
+    H -- "Stale" --> K
     K --> L{"Reviewer found blocker?"}
     L -- "Yes" --> I
     L -- "No" --> M["Run final test suite and safety checks"]
-    M --> N{"PR mergeable and not draft?"}
+    M --> M1{"Final checks pass?"}
+    M1 -- "No" --> M2{"Repeated failure or attempt cap?"}
+    M2 -- "No" --> I
+    M2 -- "Yes" --> X
+    M1 -- "Yes" --> N{"PR mergeable and not draft?"}
     N -- "No" --> O["Resolve merge/draft/status issue"]
-    O --> M
+    O --> O2{"Mergeability loop cap hit?"}
+    O2 -- "No" --> M
+    O2 -- "Yes" --> X
     N -- "Yes" --> P["Squash merge and delete branch"]
     P --> Q["Update task issue and epic checklist"]
     Q --> R["Select next epic task or finish"]
+    X --> Y["Escalate to human or create follow-up issue"]
 ```
+
+## Liveness And Loop Guards
+
+- A Heartbeat is valid only after the agent has the automation id, target thread, next wake time, and self-contained prompt. If this cannot be verified, the agent must not end the ReAct session as if the wait is covered.
+- A handoff capsule must be durable and sanitized. Put it in the PR or task issue when useful, and include issue number, PR number, branch, latest commit, check results, reviewer state, wait owner, and next expected action.
+- Each wait loop needs a maximum check count and an expiry action. Suggested defaults: Copilot review `3` checks, CI `6` checks, deploy validation `3` checks, reviewer sub-agent `2` checks.
+- Each fix loop needs a maximum attempt count. Suggested defaults: Copilot fix loop `3` relevant iterations, focused test loop `3` attempts, mergeability loop `2` attempts.
+- Duplicate or stale signals must be detected by a stable key such as review comment URL, file path and line, check name, failure signature, or sanitized error class.
+- A loop is stale when the same state repeats without a new commit, new reviewer signal, changed check result, changed failure signature, or changed mergeability reason.
+- If a loop expires, record a sanitized blocked handoff and either escalate to a human, create a follow-up issue, or continue with an explicitly named fallback path.
+- Reviewer sub-agents are also external wait states. Before sleeping on them, create a Heartbeat or keep the current ReAct session open until they return.
+- Cleanup after merge is bounded. If branch deletion, issue update, or epic checklist update fails after one retry, record the failure and move to a follow-up instead of blocking the next task forever.
+
+## Pipeline Test Matrix
+
+- Heartbeat creation fails: agent records a blocked handoff and does not sleep silently.
+- Heartbeat wakes without local context: handoff capsule is sufficient to recover issue, PR, branch, commit, and next action.
+- Copilot is requested but silent past the max checks: agent runs the fallback reviewer path or escalates.
+- Copilot repeats the same irrelevant comment: agent classifies it as duplicate or not relevant and exits the Copilot loop.
+- Copilot repeats a relevant finding after repeated fixes: agent escalates with the latest failure signature instead of editing forever.
+- Focused tests fail with the same signature more than the attempt cap: agent stops the loop and records the blocker.
+- CI stays pending or unavailable beyond expiry: agent records the stale check and follows the configured fallback.
+- Reviewer sub-agent is unavailable or returns no verdict: agent uses the wait cap and escalates rather than sleeping forever.
+- PR mergeability stays blocked after bounded retries: agent records the merge blocker and stops the merge loop.
+- Project item or epic checklist update fails after merge: agent records the bookkeeping follow-up and does not reopen completed code work.
 
 ## Handoff Checklist
 
 - Current task issue and Project status are named.
 - Branch, PR number, latest commit, and test status are named.
-- Heartbeat is scheduled for any wait state before the agent stops.
+- Heartbeat is scheduled and verified for any wait state before the agent stops.
+- Wait owner, max checks, expiry action, and fallback are named.
 - Copilot comments are classified as relevant, not relevant, duplicate, or already fixed.
 - Final reviewer sub-agent verdict is recorded before merge.
 - Task issue gets a concise completion note with important pitfalls, decisions, and verification.
@@ -119,3 +173,8 @@ flowchart TD
 - Custom instruction guidance: https://code.visualstudio.com/docs/copilot/customization/custom-instructions
 - Copilot code review: https://docs.github.com/en/copilot/how-tos/use-copilot-agents/request-a-code-review/use-code-review?tool=visualstudio
 - Mermaid state diagrams: https://mermaid.js.org/syntax/stateDiagram
+- AWS timeout guidance for agentic workflows: https://docs.aws.amazon.com/wellarchitected/latest/generative-ai-lens/genrel03-bp02.html
+- LangGraph interrupt and resume patterns: https://docs.langchain.com/oss/python/langgraph/interrupts
+- AutoGen termination and handoff patterns: https://microsoft.github.io/autogen/stable/user-guide/agentchat-user-guide/tutorial/human-in-the-loop.html
+- Community loop-closure discussion: https://www.reddit.com/r/LLMDevs/comments/1su80un/closing_the_loop/
+- Community autonomous-agent failure discussion: https://www.reddit.com/r/AI_Agents/comments/1sqi8r3/what_actually_breaks_when_you_move_from/
