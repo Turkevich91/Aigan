@@ -13,6 +13,9 @@ Private runtime details, host aliases, local paths, MCP endpoints, logs, databas
 - Request Copilot review on the PR. Treat Copilot as a dry code reviewer: useful for code-level risk, not a context owner and not an approval authority.
 - Before ending a ReAct session while waiting on Copilot, CI, deploy validation, another agent, or an external reviewer, create and verify a Heartbeat follow-up for the current thread.
 - Every wait state must name the owner, target URL or issue/PR number, branch, latest commit, wait reason, next wake time, maximum checks, expiry action, and current fallback.
+- Do not rely on process memory, global variables, environment variables, or local files as the source of truth for pipeline progress. A future session must be able to recover the current step from durable, sanitized GitHub state plus the Heartbeat prompt.
+- A per-run pipeline live file is allowed only as an untracked private cache. It must mirror the durable state capsule, must never contain secrets or private runtime details, and must not be required for recovery.
+- The Heartbeat prompt must point to this contract and to the latest state capsule or enough issue/PR metadata to find it. Vague wake-up prompts such as "check later" are not valid handoffs.
 - If Copilot comments, evaluate each point with full project context. Fix relevant issues; briefly document intentionally rejected or non-actionable suggestions when useful.
 - Re-request Copilot review after pushing review fixes and create another Heartbeat before sleeping again.
 - When Copilot has no relevant new comments, spawn or ask a reviewer sub-agent for a final blocker-focused pass, then run the final tests.
@@ -62,6 +65,7 @@ stateDiagram-v2
 sequenceDiagram
     participant CA as Codex Agent
     participant GH as GitHub Project and PR
+    participant PS as Pipeline State Capsule
     participant CP as Copilot Reviewer
     participant HB as Heartbeat
     participant RA as Reviewer Sub-Agent
@@ -70,19 +74,22 @@ sequenceDiagram
     CA->>GH: set task In Progress
     CA->>GH: push branch and open PR
     CA->>CP: request PR review
-    CA->>GH: write sanitized handoff capsule
+    CA->>PS: write sanitized state capsule
     CA->>HB: schedule wake-up before ending ReAct session
     HB-->>CA: return automation id and next wake time
-    CA->>GH: verify Copilot request and Heartbeat details
+    CA->>PS: verify capsule includes Heartbeat id and next step
+    CA->>GH: verify Copilot request and PR state
     HB-->>CA: wake and check PR review
+    CA->>PS: load latest state capsule
     CA->>GH: read Copilot comments and PR state
     alt Copilot has relevant findings
         CA->>CA: decide with full project context
         CA->>GH: push fix or document rejection
         CA->>CP: request re-review
+        CA->>PS: update state, attempt count, and next step
         CA->>HB: schedule next wake-up with attempt count
     else Copilot is stale or repeating
-        CA->>GH: record sanitized blocked or fallback decision
+        CA->>PS: record sanitized blocked or fallback decision
         CA->>RA: request blocker-focused final review or human escalation
     else Copilot has no relevant comments
         CA->>RA: request blocker-focused final review
@@ -143,10 +150,66 @@ flowchart TD
 - Reviewer sub-agents are also external wait states. Before sleeping on them, create a Heartbeat or keep the current ReAct session open until they return.
 - Cleanup after merge is bounded. If branch deletion, issue update, or epic checklist update fails after one retry, record the failure and move to a follow-up instead of blocking the next task forever.
 
+## Persisted State Protocol
+
+Pipeline state is a small, sanitized checkpoint. It answers "where am I, what did I already do, and what exact step should the next session run?"
+
+- The source of truth is the latest state capsule in the task issue or PR. It should be public-safe, compact, and machine-readable enough for a future agent to parse.
+- The Heartbeat prompt must include the automation id, issue or PR number, current branch, latest commit, current state, `NEXT_STEP`, and a pointer to the state capsule when available.
+- Update the state capsule immediately after each successful side effect: commit, push, PR creation, Copilot request, review response, test run, merge, branch deletion, issue update, or Heartbeat change.
+- Do not update `NEXT_STEP` before the side effect has actually succeeded. If a side effect succeeds but the state update fails, record the run as blocked before sleeping.
+- State writes are idempotent. Re-running a wake step should first check whether the target side effect already happened, then either advance the state or no-op with evidence.
+- Use stable state names such as `implementing`, `waiting_for_copilot`, `evaluating_review`, `waiting_for_reviewer_subagent`, `running_final_checks`, `ready_to_merge`, `closing_task`, and `blocked`.
+- Keep private operator facts in `AGENTS.local.md` or another untracked private note only. A local live file can speed up recovery on the same machine, but GitHub state must remain sufficient if that file is missing.
+- Never store raw prompts, private chat text, secrets, local hostnames, private paths, database or media paths, token-like strings, or raw logs in the capsule.
+
+Example public-safe capsule:
+
+```yaml
+schema: agent-pipeline-state/v1
+run_id: issue-31-pr-32
+contract: AGENTS.dev-pipeline-contract.md
+issue: 31
+pr: 32
+branch: VIT/codex/example-task
+head_sha: abc1234
+state: waiting_for_copilot
+NEXT_STEP: check_copilot_review
+heartbeat_id: check-copilot-review-for-pr-32
+wait_owner: copilot
+wait_reason: review requested after latest push
+attempts:
+  copilot_checks: 1
+  fix_iterations: 0
+limits:
+  copilot_checks: 3
+  fix_iterations: 3
+expires_utc: 2026-05-15T22:00:00Z
+fallback: run_reviewer_subagent_or_escalate
+evidence:
+  latest_commit: abc1234
+  last_checks: docs_safety_green
+  copilot_status: requested
+safety: sanitized_no_private_runtime_details
+```
+
+Wake-up recovery algorithm:
+
+1. Read the Heartbeat instructions and extract the automation id, issue or PR number, branch, latest commit, and `NEXT_STEP`.
+2. Load the latest state capsule from the issue or PR. If it is missing, stale, or conflicts with GitHub state, stop and record a sanitized blocked handoff instead of going back to sleep.
+3. Fetch or inspect GitHub state, then verify branch, head commit, PR status, review status, checks, and project item status against the capsule.
+4. Execute only the named `NEXT_STEP`, and make it idempotent by checking whether the intended side effect already happened.
+5. After a successful side effect, update the capsule with the new state, evidence, attempt counters, fallback, and next wake target.
+6. Before any new wait, update or create the Heartbeat with the new capsule pointer and verify the automation id and next wake time.
+7. If the task is complete, delete obsolete Heartbeats, mark Project status and issue state, and write a concise sanitized completion note.
+
 ## Pipeline Test Matrix
 
 - Heartbeat creation fails: agent records a blocked handoff and does not sleep silently.
 - Heartbeat wakes without local context: handoff capsule is sufficient to recover issue, PR, branch, commit, and next action.
+- Heartbeat wakes with no readable state capsule: agent reports a blocked handoff instead of sleeping again.
+- Heartbeat prompt and state capsule disagree on `NEXT_STEP`: agent reconciles from GitHub evidence or escalates.
+- A side effect succeeds but capsule update fails: agent does not advance to the next wait until recovery state is recorded.
 - Copilot is requested but silent past the max checks: agent runs the fallback reviewer path or escalates.
 - Copilot repeats the same irrelevant comment: agent classifies it as duplicate or not relevant and exits the Copilot loop.
 - Copilot repeats a relevant finding after repeated fixes: agent escalates with the latest failure signature instead of editing forever.
@@ -160,6 +223,7 @@ flowchart TD
 
 - Current task issue and Project status are named.
 - Branch, PR number, latest commit, and test status are named.
+- Current state capsule location and `NEXT_STEP` are named.
 - Heartbeat is scheduled and verified for any wait state before the agent stops.
 - Wait owner, max checks, expiry action, and fallback are named.
 - Copilot comments are classified as relevant, not relevant, duplicate, or already fixed.
@@ -174,7 +238,12 @@ flowchart TD
 - Copilot code review: https://docs.github.com/en/copilot/how-tos/use-copilot-agents/request-a-code-review/use-code-review?tool=visualstudio
 - Mermaid state diagrams: https://mermaid.js.org/syntax/stateDiagram
 - AWS timeout guidance for agentic workflows: https://docs.aws.amazon.com/wellarchitected/latest/generative-ai-lens/genrel03-bp02.html
+- AWS Durable Execution determinism guidance: https://docs.aws.amazon.com/durable-execution/patterns/best-practices/determinism/
 - LangGraph interrupt and resume patterns: https://docs.langchain.com/oss/python/langgraph/interrupts
+- LangGraph persistence and checkpointing: https://docs.langchain.com/oss/javascript/langgraph/persistence
+- Microsoft Agent Framework checkpoints: https://learn.microsoft.com/en-us/agent-framework/workflows/checkpoints
+- Azure Durable Task replay constraints: https://learn.microsoft.com/en-us/azure/azure-functions/durable/durable-functions-code-constraints
+- Temporal durable execution: https://docs.temporal.io/
 - AutoGen termination and handoff patterns: https://microsoft.github.io/autogen/stable/user-guide/agentchat-user-guide/tutorial/human-in-the-loop.html
 - Community loop-closure discussion: https://www.reddit.com/r/LLMDevs/comments/1su80un/closing_the_loop/
 - Community autonomous-agent failure discussion: https://www.reddit.com/r/AI_Agents/comments/1sqi8r3/what_actually_breaks_when_you_move_from/
