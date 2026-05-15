@@ -42,7 +42,7 @@ Suggested MCP tool:
 get_media_transcript(
     url: str,
     languages: str = "uk,en,ru",
-    include_timestamps: bool = true,
+    include_timestamps: bool = True,
     max_chars: int = 16000
 )
 ```
@@ -57,7 +57,7 @@ Recommended internal layers:
 ## Extraction Ladder
 
 1. Validate that the URL is public `http` or `https`; reject local, private, file, and non-network targets.
-2. Use `yt-dlp.extract_info(download=False, noplaylist=True)` for metadata and extractor capability.
+2. Use a `yt_dlp.YoutubeDL({"noplaylist": True, "quiet": True})` instance and call `ydl.extract_info(url, download=False)` for metadata and extractor capability.
 3. Prefer manually provided captions in configured languages.
 4. Fall back to automatic captions when available and marked as such.
 5. If captions are missing and audio fallback is enabled, enforce duration and byte limits before downloading.
