@@ -14,6 +14,7 @@ Default model: `gpt-5.4-mini`. The public model catalog currently lists `gpt-5.4
 - `youtube_transcript` MCP server: YouTube captions/transcripts, with optional audio transcription fallback.
 - Persistent bounded chat memory in SQLite, including cached Telegram image context.
 - User profile and stats commands based on messages the bot has actually seen.
+- Social taste memory for sanitized group/user interests and reactions, used by proactive thought seeds.
 - Sanitized system health logs, admin self-check commands, and optional GitHub self-reporting.
 - Placeholder `.env` ready for secrets.
 
@@ -43,9 +44,11 @@ In a group chat, use:
  /ids
  /version
  /context
- /stat @username
- /character me
- /health
+/stat @username
+/character me
+/interests
+/interests @username
+/health
  /logs 20
  /selfcheck
  /complaints
@@ -63,6 +66,8 @@ Ukrainian aliases are also available so users do not need to switch keyboard lay
 /контекст
 /стат @username
 /характер мій
+/інтереси
+/інтереси @username
 /проактив
 /питай підсумуй це відео https://www.youtube.com/watch?v=...
 /п коротко поясни попереднє
@@ -73,6 +78,8 @@ Ukrainian aliases are also available so users do not need to switch keyboard lay
 ```
 
 User commands use only retained SQLite memory for the current chat. `/stat` and `/стат` count saved text/caption messages, sentences, words, and top words across the full retained history; media-only placeholders, mentions, slash commands, the bot trigger, and pasted stat-output lines are ignored. `/character`, `/profile`, `/характер`, `/портрет`, and `/профіль` build a cautious non-clinical communication portrait from the full retained history by sending the model aggregate stats plus chronological anchors, recent tail, and an embedding-diverse sample, not thousands of raw messages. Users can request their own data; admins can request another user by `@username`. When a username can be resolved to a stored Telegram `user_id`, imported rows matched by base display-name aliases are included too.
+
+`/interests`, `/likes`, `/інтереси`, and `/смаки` show a public sanitized summary of the room's recurring interests and reactions. With `@username`, they show the selected participant's high-level topic/reaction signals. This is not a private dossier or diagnosis: social memory stores condensed observations such as interest, dislike, irritation, amusement, recurring questions, and avoided topics. It uses only the user's own text, not repost bodies, quotes, previews, or bot replies. Admin-only maintenance commands are `/interest_evidence`, `/rebuild_social_memory`, and `/forget_interest`; users can remove one of their own stored interest topics with `/forget_interest topic`.
 
 Forwarded/reposted bodies are stored as source context, not as the forwarding user's personal text. That means `/stat` and `/character` do not treat channel repost text, previews, quotes, external replies, or generated/via-bot content as the user's own writing, while `/memory_search` can still find that source material.
 
@@ -167,6 +174,10 @@ MEMORY_VECTOR_BACKFILL_ON_START=true
 MEMORY_VECTOR_BACKFILL_LIMIT=1000
 MEMORY_RECALL_INTENT_THRESHOLD=0.62
 MEMORY_RECALL_INTENT_AMBIGUOUS_THRESHOLD=0.48
+SOCIAL_MEMORY_ENABLED=true
+SOCIAL_MEMORY_EXTRACT_EVERY_MESSAGES=20
+SOCIAL_MEMORY_CONFIDENCE_THRESHOLD=0.65
+SOCIAL_PROFILE_RETENTION_DAYS=180
 ```
 
 `MEMORY_CONTEXT_MESSAGES` controls how many recent delivered messages are added to normal model requests. For explicit short follow-ups such as `@bot скільки?`, `що?`, or `how many?`, Aigan also injects up to `MEMORY_FOLLOWUP_CONTEXT_MESSAGES` recent messages plus reply-chain parents up to `MEMORY_THREAD_CONTEXT_DEPTH`. If the referent is still unclear, it should ask one concise clarification instead of guessing. This expanded retrieval only runs after an explicit bot invocation, private DM, reply-to-bot, or pending consume; ordinary group chatter stays passive memory only.
@@ -204,6 +215,16 @@ HTML exports do not reliably contain Telegram user ids. If you need `/stat @name
 When the importer sees unresolved export authors, it reports them with counts. In an interactive terminal, `--interactive-user-map auto` can ask for `user_id[,username]`; in Docker/non-TTY it will not hang. Use `--write-user-map /app/imports/users.json` to save answers, or `--require-resolved-users` to fail the import if any authors remain unmapped.
 
 Forwarded/source bodies from Telegram exports are stored separately from the sender's own text. They remain searchable through FTS/embeddings, but they do not affect `/stat` top words or `/character` profiles.
+
+Social taste memory is also separate from raw chat memory. It keeps compact sanitized observations for topic selection, `/interests`, and proactive messages. Proactive messages choose a weighted direction from group taste, personal ping, current hook, or an unanswered thread:
+
+```env
+PROACTIVE_DIRECTION_WEIGHTS=group_taste:0.25,personal_ping:0.25,current_hook:0.25,unanswered_thread:0.25
+PROACTIVE_SELF_REFERENCE_GUARD=true
+PROACTIVE_RECENT_SEED_COOLDOWN_DAYS=14
+```
+
+The self-reference guard rejects proactive drafts that talk about being a bot/AI, announce capabilities, or ask users to tag/contact Aigan. Direct answers to explicit user requests are not blocked by this proactive-only guard.
 
 Long text replies are split by the delivery layer instead of being truncated at the first Telegram limit:
 

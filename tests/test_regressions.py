@@ -37,6 +37,9 @@ os.environ["PROACTIVE_PERSONAL_PING_PROBABILITY"] = "0.35"
 os.environ["PROACTIVE_PERSONAL_PING_MIN_USER_IDLE_SECONDS"] = "86400"
 os.environ["PROACTIVE_PERSONAL_PING_COOLDOWN_SECONDS"] = "259200"
 os.environ["PROACTIVE_PERSONAL_PING_MAX_CANDIDATES"] = "5"
+os.environ["PROACTIVE_DIRECTION_WEIGHTS"] = "group_taste:0.25,personal_ping:0.25,current_hook:0.25,unanswered_thread:0.25"
+os.environ["PROACTIVE_SELF_REFERENCE_GUARD"] = "true"
+os.environ["PROACTIVE_RECENT_SEED_COOLDOWN_DAYS"] = "14"
 os.environ["MEMORY_ENABLED"] = "true"
 os.environ["MEMORY_DB_PATH"] = TEST_DB_PATH
 os.environ["MEMORY_CONTEXT_MESSAGES"] = "10"
@@ -59,6 +62,10 @@ os.environ["SYSTEM_LOG_RETENTION_DAYS"] = "14"
 os.environ["GITHUB_REPORTING_ENABLED"] = "false"
 os.environ["COMPLAINT_LOOKBACK_SECONDS"] = "86400"
 os.environ["COMPLAINT_REPORT_TEMPERATURE"] = "3"
+os.environ["SOCIAL_MEMORY_ENABLED"] = "true"
+os.environ["SOCIAL_MEMORY_EXTRACT_EVERY_MESSAGES"] = "20"
+os.environ["SOCIAL_MEMORY_CONFIDENCE_THRESHOLD"] = "0.65"
+os.environ["SOCIAL_PROFILE_RETENTION_DAYS"] = "180"
 
 import httpx
 from telegram import InputMediaPhoto
@@ -165,6 +172,8 @@ class PendingFlowTests(unittest.TestCase):
         main.last_proactive_personal_ping.clear()
         if main.MEMORY is not None:
             main.MEMORY.clear_all()
+        if main.SOCIAL_MEMORY is not None:
+            main.SOCIAL_MEMORY.clear_all()
 
     def test_passive_group_context_text_does_not_create_pending(self) -> None:
         message = FakeMessage("це що")
@@ -407,6 +416,8 @@ class PersistentMemoryTests(unittest.TestCase):
             main.MEMORY.clear_all()
         if main.SYSTEM_LOG is not None:
             main.SYSTEM_LOG.clear_all()
+        if main.SOCIAL_MEMORY is not None:
+            main.SOCIAL_MEMORY.clear_all()
         main.passive_contexts.clear()
         main.histories.clear()
         main.pending_requests.clear()
@@ -422,6 +433,8 @@ class PersistentMemoryTests(unittest.TestCase):
             main.MEMORY.clear_all()
         if main.SYSTEM_LOG is not None:
             main.SYSTEM_LOG.clear_all()
+        if main.SOCIAL_MEMORY is not None:
+            main.SOCIAL_MEMORY.clear_all()
         main.embedding_queue = None
 
     def test_messages_persist_after_ram_context_is_cleared(self) -> None:
@@ -695,6 +708,7 @@ class PersistentMemoryTests(unittest.TestCase):
             proactive_idle_seconds=3600,
             proactive_min_seconds_between_posts=0,
             proactive_personal_ping_enabled=False,
+            proactive_direction_weights="group_taste:1",
         )
         try:
             main.MEMORY.save_message(
@@ -765,6 +779,7 @@ class PersistentMemoryTests(unittest.TestCase):
             proactive_idle_seconds=3600,
             proactive_min_seconds_between_posts=0,
             proactive_personal_ping_enabled=False,
+            proactive_direction_weights="group_taste:1",
         )
         try:
             main.MEMORY.save_message(
@@ -806,6 +821,7 @@ class PersistentMemoryTests(unittest.TestCase):
             proactive_personal_ping_probability=1.0,
             proactive_personal_ping_min_user_idle_seconds=3600,
             proactive_personal_ping_cooldown_seconds=259200,
+            proactive_direction_weights="personal_ping:1",
         )
         try:
             main.MEMORY.save_message(
@@ -921,6 +937,7 @@ class PersistentMemoryTests(unittest.TestCase):
             proactive_personal_ping_enabled=True,
             proactive_personal_ping_probability=1.0,
             proactive_personal_ping_min_user_idle_seconds=3600,
+            proactive_direction_weights="personal_ping:1",
         )
         try:
             main.MEMORY.save_message(
@@ -942,7 +959,7 @@ class PersistentMemoryTests(unittest.TestCase):
         finally:
             main.CONFIG = original
 
-    def test_proactive_prompts_use_thought_seed_contract_without_helper_framing(self) -> None:
+    def test_proactive_prompts_use_voice_contract_without_self_meta(self) -> None:
         idle_prompt = main.build_idle_proactive_prompt(-1001, 21600)
         personal_prompt = main.build_personal_ping_prompt(
             -1001,
@@ -960,8 +977,9 @@ class PersistentMemoryTests(unittest.TestCase):
         combined = f"{idle_prompt}\n{personal_prompt}".casefold()
 
         self.assertIn("thought seed", combined)
-        self.assertIn("equal ai participant", combined)
-        self.assertIn("no servant framing", combined)
+        self.assertIn("speak from the situation", combined)
+        self.assertIn("known interests", combined)
+        self.assertNotIn("equal ai participant", combined)
         self.assertNotIn("helpful assistant", combined)
         self.assertNotIn("i can help", combined)
         self.assertNotIn("можу допомогти", combined)
@@ -978,6 +996,7 @@ class PersistentMemoryTests(unittest.TestCase):
             proactive_min_seconds_between_posts=0,
             proactive_personal_ping_enabled=False,
             proactive_regenerate_on_persona_reject=True,
+            proactive_direction_weights="group_taste:1",
         )
         try:
             main.MEMORY.save_message(
@@ -1019,6 +1038,7 @@ class PersistentMemoryTests(unittest.TestCase):
             proactive_min_seconds_between_posts=0,
             proactive_personal_ping_enabled=False,
             proactive_regenerate_on_persona_reject=True,
+            proactive_direction_weights="group_taste:1",
         )
         try:
             main.MEMORY.save_message(
@@ -1056,6 +1076,95 @@ class PersistentMemoryTests(unittest.TestCase):
 
         self.assertEqual(1, len(message.reply_calls))
         self.assertIn("можу допомогти", message.reply_calls[0]["text"].casefold())
+
+    def test_proactive_guard_rejects_self_reference(self) -> None:
+        self.assertTrue(main.proactive_persona_violation("Я бот, мені дали інструкцію оживити чат."))
+        self.assertTrue(main.proactive_persona_violation("As an AI participant, I can help."))
+
+    def test_proactive_direction_weights_can_select_all_routes(self) -> None:
+        original = main.CONFIG
+        main.CONFIG = replace(
+            original,
+            proactive_direction_weights="group_taste:1,personal_ping:1,current_hook:1,unanswered_thread:1",
+        )
+        try:
+            with patch.object(main.random, "random", side_effect=[0.01, 0.30, 0.60, 0.90]):
+                self.assertEqual("group_taste", main.choose_weighted_proactive_direction())
+                self.assertEqual("personal_ping", main.choose_weighted_proactive_direction())
+                self.assertEqual("current_hook", main.choose_weighted_proactive_direction())
+                self.assertEqual("unanswered_thread", main.choose_weighted_proactive_direction())
+        finally:
+            main.CONFIG = original
+
+    def test_bot_memory_is_marked_as_aigans_previous_output(self) -> None:
+        main.remember_bot_message(-1001, "previous bot answer")
+
+        context = main.format_memory_context(-1001, 5)
+
+        self.assertIn("Aigan's previous output", context)
+        self.assertIn("previous bot answer", context)
+
+    def test_social_memory_records_user_and_group_without_source_text(self) -> None:
+        item_id = main.MEMORY.save_message(
+            chat_id=-1001,
+            message_id=7000,
+            sender_label="Tester (@tester, id=407892151)",
+            user_id=407892151,
+            username="tester",
+            text="мені подобається Subnautica база і океан",
+            source_text="репост про казино 170 тис",
+            created_at=datetime.now(timezone.utc),
+        )
+
+        recorded = main.remember_social_observations(item_id)
+
+        self.assertGreater(recorded, 0)
+        user_observations = main.SOCIAL_MEMORY.user_observations(-1001, user_id=407892151, username="tester")
+        group_observations = main.SOCIAL_MEMORY.group_observations(-1001)
+        self.assertTrue(any("subnautica" in item.topic.casefold() for item in user_observations))
+        self.assertTrue(any("subnautica" in item.topic.casefold() for item in group_observations))
+        self.assertFalse(any("казино" in item.topic.casefold() for item in user_observations))
+
+    def test_social_memory_skips_sensitive_topic(self) -> None:
+        item_id = main.MEMORY.save_message(
+            chat_id=-1001,
+            message_id=7001,
+            sender_label="Tester (@tester, id=407892151)",
+            user_id=407892151,
+            username="tester",
+            text="мені подобається тема здоров'я і діагнозів",
+            created_at=datetime.now(timezone.utc),
+        )
+
+        recorded = main.remember_social_observations(item_id)
+
+        self.assertEqual(0, recorded)
+
+    def test_interests_commands_show_public_sanitized_summary(self) -> None:
+        item_id = main.MEMORY.save_message(
+            chat_id=-1001,
+            message_id=7002,
+            sender_label="Tester (@tester, id=407892151)",
+            user_id=407892151,
+            username="tester",
+            text="мене бісить шум навколо Pragmata",
+            created_at=datetime.now(timezone.utc),
+        )
+        main.remember_social_observations(item_id)
+        message = FakeMessage("/interests @tester")
+
+        asyncio.run(main.interests_command(SimpleNamespace(effective_message=message), SimpleNamespace()))
+
+        self.assertIn("pragmata", message.reply_calls[0]["text"].casefold())
+        self.assertIn("sanitized", message.reply_calls[0]["text"].casefold())
+
+    def test_interest_evidence_is_admin_only(self) -> None:
+        message = FakeMessage("/interest_evidence @tester")
+        message.from_user = FakeUser(user_id=999, username="other")
+
+        asyncio.run(main.interest_evidence_command(SimpleNamespace(effective_message=message), SimpleNamespace()))
+
+        self.assertIn("адмінам", message.reply_calls[0]["text"])
 
     def test_vector_schema_and_fts_are_created_without_losing_messages(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -2922,6 +3031,8 @@ class SystemHealthTests(unittest.TestCase):
             main.SYSTEM_LOG.clear_all()
         if main.MEMORY is not None:
             main.MEMORY.clear_all()
+        if main.SOCIAL_MEMORY is not None:
+            main.SOCIAL_MEMORY.clear_all()
         main.pending_requests.clear()
         main.passive_contexts.clear()
         main.last_user_call.clear()

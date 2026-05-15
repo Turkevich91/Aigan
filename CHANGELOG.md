@@ -1,5 +1,11 @@
 # Aigan Changelog
 
+## 2026-05-15 - Social taste memory
+
+- Added sanitized social taste memory for group/user interests, dislikes, irritation, amusement, recurring questions, and avoided topics.
+- Added `/interests`, `/likes`, `/інтереси`, and `/смаки` for public high-level taste summaries, plus admin maintenance commands.
+- Changed proactive messages to choose weighted directions from group taste, personal pings, current hooks, or unanswered threads while rejecting self-referential bot/capability framing.
+
 ## 2026-05-14 - Proactive thought-seed persona
 
 - Changed proactive messages from service-style check-ins to short thought seeds from an equal AI participant.
