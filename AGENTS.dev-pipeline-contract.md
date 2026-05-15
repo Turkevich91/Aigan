@@ -6,7 +6,7 @@ Private runtime details, host aliases, local paths, MCP endpoints, logs, databas
 
 ## Operating Rules
 
-- Start from a GitHub issue. Use `[DEV]` for developer workflow, automation, and agent-process contract work.
+- Start from a GitHub issue. Use the implementing agent's normal prefix for pipeline tasks, for example `[codex]` for Codex-owned work. Reserve `[DEV]` for this pipeline contract and closely related contract-maintenance issues only.
 - Keep `AGENTS.md` as the concise entrypoint and use this file for the detailed pipeline.
 - Before implementation, move the task Project status to `In Progress`; new planning work starts as `Todo`.
 - Work on a task branch, commit intentional changes, push, and open a PR.
