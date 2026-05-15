@@ -4899,9 +4899,9 @@ async def post_init(application: Application) -> None:
             details={"cleanup_deleted": deleted, "github_reporting_configured": GITHUB_REPORTER.is_configured},
         )
     if CONFIG.proactive_enabled:
-        application.create_task(proactive_loop(application))
+        asyncio.create_task(proactive_loop(application))
     if CONFIG.health_report_enabled:
-        application.create_task(health_report_loop(application))
+        asyncio.create_task(health_report_loop(application))
 
 
 def main() -> None:
