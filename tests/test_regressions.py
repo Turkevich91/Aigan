@@ -82,7 +82,7 @@ os.environ["OUTBOUND_REACTIONS_ENABLED"] = "false"
 os.environ["OUTBOUND_REACTION_EVERY_N_MESSAGES"] = "10"
 os.environ["OUTBOUND_REACTION_COOLDOWN_SECONDS"] = "1800"
 os.environ["OUTBOUND_REACTION_MIN_SCORE"] = "0.72"
-os.environ["OUTBOUND_REACTION_ALLOWED_EMOJI"] = "\N{FIRE},\N{EYES},\N{THUMBS UP SIGN},\N{THINKING FACE},\N{FACE WITH TEARS OF JOY}"
+os.environ["OUTBOUND_REACTION_ALLOWED_EMOJI"] = "fire,eyes,thumbs_up,thinking,laugh"
 os.environ["OUTBOUND_REACTION_USE_CUSTOM_EMOJI"] = "true"
 os.environ["OUTBOUND_REACTION_BIG"] = "false"
 
@@ -756,6 +756,12 @@ class PersistentMemoryTests(unittest.TestCase):
         asyncio.run(main.NullReactionAdapter().on_message_ingested(message, main.MEMORY.item_by_id(item_id), "pre_embedding"))
 
         message.bot.set_message_reaction.assert_not_awaited()
+
+    def test_outbound_reaction_emoji_aliases_avoid_env_unicode_breakage(self) -> None:
+        self.assertEqual(
+            ["\N{FIRE}", "\N{EYES}", "\N{THUMBS UP SIGN}", "\N{THINKING FACE}", "\N{FACE WITH TEARS OF JOY}"],
+            main._reaction_emoji_values("fire,eyes,thumbs_up,thinking,laugh,??"),
+        )
 
     def test_reaction_hook_failure_does_not_block_memory_or_embedding(self) -> None:
         class BrokenAdapter:

@@ -5,6 +5,7 @@
 - Added an optional outbound reaction adapter that can set real Telegram reactions on selected strong live group messages.
 - Kept outbound reactions disabled by default and isolated from memory, social memory, digest, and embeddings through a null-adapter fallback.
 - Added rate limits, cooldowns, deterministic relevance scoring, custom-emoji fallback handling, and local storage of bot-set reactions.
+- Allowed ASCII reaction aliases such as `fire`, `eyes`, `thumbs_up`, `thinking`, and `laugh` to avoid `.env` Unicode corruption.
 
 ## 2026-05-15 - Cached reaction emoji analysis
 

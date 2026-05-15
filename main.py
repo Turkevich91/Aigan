@@ -68,6 +68,28 @@ def _csv_values(value: str) -> list[str]:
     return [item.strip() for item in value.split(",") if item.strip()]
 
 
+REACTION_EMOJI_ALIASES = {
+    "fire": "🔥",
+    "eyes": "👀",
+    "thumbs_up": "👍",
+    "thumbsup": "👍",
+    "thinking": "🤔",
+    "thinking_face": "🤔",
+    "laugh": "😂",
+    "joy": "😂",
+}
+
+
+def _reaction_emoji_values(value: str) -> list[str]:
+    items: list[str] = []
+    for item in _csv_values(value):
+        normalized = item.strip().lower().replace("-", "_")
+        mapped = REACTION_EMOJI_ALIASES.get(normalized, item)
+        if mapped and not set(mapped) <= {"?"}:
+            items.append(mapped)
+    return items
+
+
 def optional_int(value: str | None) -> int | None:
     stripped = (value or "").strip()
     return int(stripped) if stripped else None
@@ -307,8 +329,8 @@ class Config:
             outbound_reaction_every_n_messages=max(1, int(os.getenv("OUTBOUND_REACTION_EVERY_N_MESSAGES", "10"))),
             outbound_reaction_cooldown_seconds=max(0, int(os.getenv("OUTBOUND_REACTION_COOLDOWN_SECONDS", "1800"))),
             outbound_reaction_min_score=float(os.getenv("OUTBOUND_REACTION_MIN_SCORE", "0.72")),
-            outbound_reaction_allowed_emoji=_csv_values(
-                os.getenv("OUTBOUND_REACTION_ALLOWED_EMOJI", "🔥,👀,👍,🤔,😂")
+            outbound_reaction_allowed_emoji=_reaction_emoji_values(
+                os.getenv("OUTBOUND_REACTION_ALLOWED_EMOJI", "fire,eyes,thumbs_up,thinking,laugh")
             ),
             outbound_reaction_use_custom_emoji=_env_bool("OUTBOUND_REACTION_USE_CUSTOM_EMOJI", True),
             outbound_reaction_big=_env_bool("OUTBOUND_REACTION_BIG", False),
