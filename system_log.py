@@ -372,6 +372,10 @@ class SystemLogStore:
             self._conn.execute("DELETE FROM complaint_clusters")
             self._conn.commit()
 
+    def close(self) -> None:
+        with self._lock:
+            self._conn.close()
+
 
 def normalize_level(level: str) -> str:
     normalized = (level or "info").strip().casefold()

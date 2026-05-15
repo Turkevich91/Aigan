@@ -684,6 +684,9 @@ def import_export(options: ImportOptions) -> ImportSummary:
     unresolved = unresolved_author_counts(messages, options=options, cutoff=cutoff, user_map=user_map)
     summary.unresolved_authors = dict(unresolved)
     if options.require_resolved_users and unresolved:
+        if store is not None:
+            store.close()
+            store = None
         names = ", ".join(f"{label} ({count})" for label, count in unresolved.most_common(10))
         raise ValueError(f"Unresolved Telegram export authors remain: {names}")
     try:

@@ -253,6 +253,19 @@ Inbound reaction memory and outbound reactions are separate. `REACTIONS_ENABLED=
 
 The self-reference guard rejects proactive drafts that talk about being a bot/AI, announce capabilities, or ask users to tag/contact Aigan. Direct answers to explicit user requests are not blocked by this proactive-only guard.
 
+## Tool Adapter Boundary
+
+Optional tools should plug into the shared tool runtime instead of adding one-off hooks directly to `main.py`.
+Each tool family should provide a small adapter with:
+
+- a null/no-op fallback for disabled or unavailable dependencies;
+- `health_summary()` with adapter name, enabled state, status, and error counts;
+- best-effort execution through the runtime safe-call boundary;
+- sanitized system log events for failures and degraded states;
+- a cleanup hook for temporary downloads, audio/video fragments, OCR images, or document extracts when needed.
+
+Tool failures must not block message persistence, embeddings, memory recall, `/stat`, `/character`, Telegram routing, or normal replies. Tool outputs that are later saved to memory must be stored as source context, not as user-authored text.
+
 Long text replies are split by the delivery layer instead of being truncated at the first Telegram limit:
 
 ```env

@@ -16,6 +16,19 @@ try:
 except FileNotFoundError:
     pass
 
+
+def fake_openai_secret() -> str:
+    return "sk-" + "abcdefghijklmnopqrstuvwxyz"
+
+
+def fake_telegram_secret() -> str:
+    return "123456:" + "abcdefghijklmnopqrstuvwxyz"
+
+
+def fake_github_token() -> str:
+    return "gh" + "p_" + "secretsecretsecret"
+
+
 os.environ["TELEGRAM_BOT_TOKEN"] = "123456:test-token"
 os.environ["OPENAI_API_KEY"] = "sk-test"
 os.environ["ALLOWED_CHAT_IDS"] = "-1001"
@@ -99,6 +112,7 @@ from scripts import import_telegram_export
 from scripts.import_telegram_export import ImportOptions
 from self_analysis import SelfAnalysisService, classify_complaint
 from system_log import SystemLogStore, redact_secrets
+from tool_runtime import NullToolAdapter, ToolRuntime
 
 VALID_JPEG = b"\xff\xd8\xff\xe0" + b"valid-jpeg"
 
@@ -578,6 +592,84 @@ class TelegramFormattingTests(unittest.TestCase):
         self.assertIn("[...] скорочено", chunks[-1])
 
 
+class ToolRuntimeTests(unittest.TestCase):
+    def setUp(self) -> None:
+        if main.SYSTEM_LOG is not None:
+            main.SYSTEM_LOG.clear_all()
+        main.TOOL_RUNTIME.clear_error_counts()
+
+    def test_null_tool_adapter_noops_and_reports_disabled_health(self) -> None:
+        runtime = ToolRuntime()
+        runtime.register("future_media", NullToolAdapter("future_media"))
+
+        result = asyncio.run(runtime.safe_call("future_media", "noop", lambda: "ok"))
+        health = runtime.health_summary()
+
+        self.assertEqual("ok", result)
+        self.assertEqual("ok", health["status"])
+        self.assertEqual(1, health["adapter_count"])
+        self.assertEqual("future_media", health["adapters"][0]["name"])
+        self.assertEqual("disabled", health["adapters"][0]["status"])
+
+    def test_failing_tool_operation_logs_sanitized_warning_without_raising(self) -> None:
+        events = []
+
+        def record_event(**kwargs):
+            events.append(kwargs)
+
+        class BrokenTool:
+            def health_summary(self):
+                return {"enabled": True, "adapter": "broken"}
+
+        runtime = ToolRuntime(event_callback=record_event)
+        runtime.register("broken", BrokenTool())
+
+        result = asyncio.run(
+            runtime.safe_call(
+                "broken",
+                "explode",
+                lambda: (_ for _ in ()).throw(RuntimeError(f"OPENAI_API_KEY={fake_openai_secret()}")),
+                default="fallback",
+                details={"token": fake_telegram_secret()},
+            )
+        )
+        health = runtime.health_summary()
+
+        self.assertEqual("fallback", result)
+        self.assertEqual("degraded", health["status"])
+        self.assertEqual(1, health["adapters"][0]["error_count"])
+        self.assertEqual(1, len(events))
+        event_text = json.dumps(events[0], ensure_ascii=False)
+        self.assertNotIn(fake_openai_secret(), event_text)
+        self.assertNotIn(fake_telegram_secret(), event_text)
+        self.assertIn("[redacted]", event_text)
+
+    def test_tool_runtime_cleanup_calls_optional_adapter_hook_safely(self) -> None:
+        class CleaningTool:
+            def __init__(self) -> None:
+                self.cleaned = False
+
+            def health_summary(self):
+                return {"enabled": True, "adapter": "cleaning"}
+
+            async def cleanup(self) -> None:
+                self.cleaned = True
+
+        adapter = CleaningTool()
+        runtime = ToolRuntime()
+        runtime.register("cleaning", adapter)
+
+        asyncio.run(runtime.cleanup())
+
+        self.assertTrue(adapter.cleaned)
+
+    def test_main_tool_runtime_health_includes_outbound_reactions(self) -> None:
+        health = main.TOOL_RUNTIME.health_summary()
+
+        self.assertTrue(any(item["name"] == "outbound_reactions" for item in health["adapters"]))
+        self.assertIn("outbound_reactions", main.tool_runtime_health_text())
+
+
 class PersistentMemoryTests(unittest.TestCase):
     def setUp(self) -> None:
         if main.MEMORY is not None:
@@ -600,6 +692,7 @@ class PersistentMemoryTests(unittest.TestCase):
         main.recent_chat_answers.clear()
         main.embedding_queue = None
         main.REACTION_ADAPTER = main.NullReactionAdapter()
+        main.TOOL_RUNTIME.clear_error_counts()
 
     def tearDown(self) -> None:
         if main.MEMORY is not None:
@@ -614,6 +707,7 @@ class PersistentMemoryTests(unittest.TestCase):
         main.recent_chat_answers.clear()
         main.embedding_queue = None
         main.REACTION_ADAPTER = main.NullReactionAdapter()
+        main.TOOL_RUNTIME.clear_error_counts()
 
     def test_messages_persist_after_ram_context_is_cleared(self) -> None:
         self.assertIsNotNone(main.MEMORY)
@@ -1785,6 +1879,7 @@ class PersistentMemoryTests(unittest.TestCase):
 
             self.assertEqual(1, len(store.latest(-1001, 10)))
             self.assertTrue(store.fts_search(chat_id=-1001, query="semantic", lookback_days=30, limit=3))
+            store.close()
 
     def test_rebuild_search_index_populates_existing_messages(self) -> None:
         main.MEMORY.save_message(chat_id=-1001, message_id=1000, sender_label="Tester", text="legacy semantic text")
@@ -2161,6 +2256,7 @@ class PersistentMemoryTests(unittest.TestCase):
             self.assertEqual(1, summary.skipped_service)
             self.assertEqual("Hello semantic world", store.latest(-1001, 1)[0].text)
             self.assertTrue(store.fts_search(chat_id=-1001, query="semantic", lookback_days=30, limit=3))
+            store.close()
 
     def test_telegram_export_import_days_filter_and_idempotent_update(self) -> None:
         now = datetime.now(timezone.utc)
@@ -2191,6 +2287,7 @@ class PersistentMemoryTests(unittest.TestCase):
             self.assertEqual(1, second.updated)
             self.assertEqual(1, len(store.latest(-1001, 10)))
             self.assertEqual("updated", store.latest(-1001, 1)[0].text)
+            store.close()
 
     def test_telegram_export_import_preserves_reply_forward_user_and_excludes_bot_search(self) -> None:
         now = datetime.now(timezone.utc)
@@ -2231,6 +2328,7 @@ class PersistentMemoryTests(unittest.TestCase):
             self.assertEqual("forwarded user text", user_item.source_text)
             self.assertTrue(store.fts_search(chat_id=-1001, query="forwarded user text", lookback_days=30, limit=3))
             self.assertFalse(store.fts_search(chat_id=-1001, query="self feedback", lookback_days=30, limit=3))
+            store.close()
 
     def test_telegram_export_import_copies_valid_image_media(self) -> None:
         now = datetime.now(timezone.utc)
@@ -2261,6 +2359,7 @@ class PersistentMemoryTests(unittest.TestCase):
             self.assertEqual("image", item.content_kind)
             self.assertEqual("image/png", item.mime_type)
             self.assertTrue(Path(item.local_media_path).is_file())
+            store.close()
 
     def test_telegram_export_dry_run_does_not_create_database(self) -> None:
         now = datetime.now(timezone.utc)
@@ -2309,6 +2408,7 @@ class PersistentMemoryTests(unittest.TestCase):
                     lookback_days=30,
                 ),
             )
+            store.close()
 
     def test_html_export_directory_imports_all_pages_and_text(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -2347,6 +2447,7 @@ class PersistentMemoryTests(unittest.TestCase):
             self.assertEqual([101, 102], [item.message_id for item in items])
             self.assertIn("semantic", items[0].text)
             self.assertIn("https://example.com", items[0].text)
+            store.close()
 
     def test_html_export_inherits_sender_for_joined_messages_across_pages(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -2379,6 +2480,7 @@ class PersistentMemoryTests(unittest.TestCase):
 
             self.assertEqual("Alice", store.message_by_message_id(-1001, 111).sender_label)
             self.assertEqual("Alice", store.message_by_message_id(-1001, 112).sender_label)
+            store.close()
 
     def test_html_export_inherited_sender_uses_inferred_user_map(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -2393,6 +2495,7 @@ class PersistentMemoryTests(unittest.TestCase):
                 text="live anchor",
                 created_at=datetime.now(timezone.utc),
             )
+            seeded.close()
             export_dir = self.write_html_export(
                 tmpdir,
                 {
@@ -2420,6 +2523,7 @@ class PersistentMemoryTests(unittest.TestCase):
             self.assertEqual(12345, store.message_by_message_id(-1001, 301).user_id)
             self.assertEqual(12345, store.message_by_message_id(-1001, 302).user_id)
             self.assertEqual("mapped", store.message_by_message_id(-1001, 302).username)
+            store.close()
 
     def test_html_export_preserves_reply_forward_and_copies_photo(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -2455,6 +2559,7 @@ class PersistentMemoryTests(unittest.TestCase):
             self.assertEqual("Source Channel", item.forward_origin)
             self.assertEqual("image", item.content_kind)
             self.assertTrue(Path(item.local_media_path).is_file())
+            store.close()
 
     def test_html_export_splits_author_comment_from_forwarded_source_text(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -2489,6 +2594,7 @@ class PersistentMemoryTests(unittest.TestCase):
             self.assertEqual("Ukraine Online", item.forward_origin)
             self.assertEqual([251], [stat_item.message_id for stat_item in stats_items])
             self.assertTrue(store.fts_search(chat_id=-1001, query="viral repost body", lookback_days=30, limit=3))
+            store.close()
 
     def test_html_forward_without_author_comment_is_source_only(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -2520,6 +2626,7 @@ class PersistentMemoryTests(unittest.TestCase):
             self.assertEqual([], store.user_stats(-1001, label_aliases=("Sergey",)))
             self.assertEqual(1, store.user_source_count(-1001, label_aliases=("Sergey",)))
             self.assertTrue(store.fts_search(chat_id=-1001, query="subscribe online", lookback_days=30, limit=3))
+            store.close()
 
     def test_html_export_user_map_adds_user_id_and_username(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -2550,6 +2657,7 @@ class PersistentMemoryTests(unittest.TestCase):
             self.assertEqual(1, summary.imported)
             self.assertEqual(12345, item.user_id)
             self.assertEqual("mapped", item.username)
+            store.close()
 
     def test_html_export_unknown_sender_does_not_fake_user_id(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -2575,6 +2683,7 @@ class PersistentMemoryTests(unittest.TestCase):
 
             self.assertIsNone(item.user_id)
             self.assertEqual("", item.username)
+            store.close()
 
     def test_import_reports_unresolved_authors_without_tty_prompt(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -2638,6 +2747,7 @@ class PersistentMemoryTests(unittest.TestCase):
             self.assertEqual(777, item.user_id)
             self.assertEqual("mapped", item.username)
             self.assertEqual({"user_id": 777, "username": "mapped"}, written["Unknown Person"])
+            store.close()
 
     def test_import_require_resolved_users_fails_on_unmapped_author(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -3655,12 +3765,12 @@ class SystemHealthTests(unittest.TestCase):
         main.recent_chat_answers.clear()
 
     def test_redaction_hides_api_and_telegram_secrets(self) -> None:
-        text = "OPENAI_API_KEY=sk-abcdefghijklmnopqrstuvwxyz TELEGRAM_BOT_TOKEN=123456:abcdefghijklmnopqrstuvwxyz"
+        text = f"OPENAI_API_KEY={fake_openai_secret()} TELEGRAM_BOT_TOKEN={fake_telegram_secret()}"
 
         redacted = redact_secrets(text)
 
-        self.assertNotIn("sk-abcdefghijklmnopqrstuvwxyz", redacted)
-        self.assertNotIn("123456:abcdefghijklmnopqrstuvwxyz", redacted)
+        self.assertNotIn(fake_openai_secret(), redacted)
+        self.assertNotIn(fake_telegram_secret(), redacted)
         self.assertIn("[redacted]", redacted)
 
     def test_system_log_writes_reads_and_sanitizes_details(self) -> None:
@@ -3671,15 +3781,16 @@ class SystemHealthTests(unittest.TestCase):
                 level="error",
                 component="web",
                 event_type="prefetch_failed",
-                message="OPENAI_API_KEY=sk-abcdefghijklmnopqrstuvwxyz",
-                details={"GITHUB_TOKEN": "ghp_secretsecretsecret", "count": 2},
+                message=f"OPENAI_API_KEY={fake_openai_secret()}",
+                details={"GITHUB_TOKEN": fake_github_token(), "count": 2},
             )
 
             event = store.latest_events(1)[0]
             self.assertEqual("error", event.level)
-            self.assertNotIn("sk-abcdefghijklmnopqrstuvwxyz", event.message)
+            self.assertNotIn(fake_openai_secret(), event.message)
             self.assertEqual("[redacted]", event.details["GITHUB_TOKEN"])
             self.assertEqual(2, event.details["count"])
+            store.close()
 
     def test_complaint_classifier_detects_bot_web_issue(self) -> None:
         signal = classify_complaint("Aigan bot має problem: web search не працює", bot_username="thrd_ua_bot")
@@ -3717,6 +3828,7 @@ class SystemHealthTests(unittest.TestCase):
             self.assertTrue(reporter.calls[0]["title"].startswith("[Aigan] self-report: web_search"))
             self.assertIn("not a confirmed bug", reporter.calls[0]["body"])
             self.assertIn("issues/99", store.active_complaints(1)[0].github_issue_url)
+            store.close()
 
     def test_passive_group_complaint_stays_silent_but_records_temperature(self) -> None:
         message = FakeMessage("Aigan bot problem: web search не працює", message_id=5000)
@@ -3747,7 +3859,7 @@ class SystemHealthTests(unittest.TestCase):
             level="error",
             component="agent",
             event_type="run_error",
-            message="OPENAI_API_KEY=sk-abcdefghijklmnopqrstuvwxyz",
+            message=f"OPENAI_API_KEY={fake_openai_secret()}",
         )
         message = FakeMessage("/selfcheck")
 
@@ -3755,7 +3867,7 @@ class SystemHealthTests(unittest.TestCase):
             asyncio.run(main.selfcheck_command(SimpleNamespace(effective_message=message), SimpleNamespace()))
 
         prompt = run_plain_model.await_args.args[0]
-        self.assertNotIn("sk-abcdefghijklmnopqrstuvwxyz", prompt)
+        self.assertNotIn(fake_openai_secret(), prompt)
         self.assertIn("[redacted]", prompt)
         self.assertIn("health degraded", message.reply_calls[0]["text"])
 
