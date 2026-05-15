@@ -691,7 +691,7 @@ class PersistentMemoryTests(unittest.TestCase):
         main.chat_generation_locks.clear()
         main.recent_chat_answers.clear()
         main.embedding_queue = None
-        main.REACTION_ADAPTER = main.NullReactionAdapter()
+        main.set_reaction_adapter(main.NullReactionAdapter())
         main.TOOL_RUNTIME.clear_error_counts()
 
     def tearDown(self) -> None:
@@ -706,7 +706,7 @@ class PersistentMemoryTests(unittest.TestCase):
         main.chat_generation_locks.clear()
         main.recent_chat_answers.clear()
         main.embedding_queue = None
-        main.REACTION_ADAPTER = main.NullReactionAdapter()
+        main.set_reaction_adapter(main.NullReactionAdapter())
         main.TOOL_RUNTIME.clear_error_counts()
 
     def test_messages_persist_after_ram_context_is_cleared(self) -> None:
@@ -868,7 +868,7 @@ class PersistentMemoryTests(unittest.TestCase):
             def health_summary(self):
                 return {}
 
-        main.REACTION_ADAPTER = BrokenAdapter()
+        main.set_reaction_adapter(BrokenAdapter())
         message = FakeMessage("повідомлення для пам'яті", message_id=921)
         calls = []
 
@@ -891,7 +891,7 @@ class PersistentMemoryTests(unittest.TestCase):
                 return {}
 
         events = []
-        main.REACTION_ADAPTER = RecordingAdapter()
+        main.set_reaction_adapter(RecordingAdapter())
         message = FakeMessage("змістовний текст перед індексацією", message_id=922)
 
         with patch.object(main, "enqueue_memory_embedding", side_effect=lambda item_id: events.append(("enqueue", item_id))):

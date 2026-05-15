@@ -14,7 +14,7 @@ from datetime import datetime, timezone
 from functools import lru_cache
 from itertools import count
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Sequence, cast
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from agents import Agent, ModelSettings, RunHooks, Runner
@@ -410,7 +410,23 @@ def build_reaction_adapter() -> ReactionAdapter:
 
 REACTION_ADAPTER: ReactionAdapter = build_reaction_adapter()
 TOOL_RUNTIME = ToolRuntime()
-TOOL_RUNTIME.register("outbound_reactions", REACTION_ADAPTER)
+
+
+def set_reaction_adapter(adapter: ReactionAdapter) -> ReactionAdapter:
+    global REACTION_ADAPTER
+    REACTION_ADAPTER = adapter
+    TOOL_RUNTIME.register("outbound_reactions", adapter)
+    return adapter
+
+
+def runtime_reaction_adapter() -> ReactionAdapter:
+    adapter = TOOL_RUNTIME.get("outbound_reactions")
+    if adapter is None:
+        return set_reaction_adapter(REACTION_ADAPTER)
+    return cast(ReactionAdapter, adapter)
+
+
+set_reaction_adapter(REACTION_ADAPTER)
 GITHUB_REPORTER = GitHubReporter(
     enabled=CONFIG.github_reporting_enabled,
     token=CONFIG.github_token,
@@ -1615,7 +1631,7 @@ async def run_reaction_ingestion_hook(message: Message, item: MemoryItem | None,
     await TOOL_RUNTIME.safe_call(
         "outbound_reactions",
         "on_message_ingested",
-        lambda: REACTION_ADAPTER.on_message_ingested(message, item, phase),
+        lambda: runtime_reaction_adapter().on_message_ingested(message, item, phase),
         event_context={"telegram_message": message},
         details={"phase": phase},
     )
@@ -6344,7 +6360,7 @@ async def post_init(application: Application) -> None:
                 "prompt_version": CONFIG.reaction_analysis_prompt_version,
             },
         )
-    reaction_adapter_health = REACTION_ADAPTER.health_summary()
+    reaction_adapter_health = runtime_reaction_adapter().health_summary()
     LOGGER.info("Outbound reaction adapter=%s enabled=%s", reaction_adapter_health.get("adapter"), reaction_adapter_health.get("enabled"))
     system_event(
         component="startup",
