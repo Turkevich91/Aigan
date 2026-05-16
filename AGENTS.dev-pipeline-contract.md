@@ -4,6 +4,15 @@ This contract describes the public, environment-obfuscated workflow for Codex-li
 
 Private runtime details, host aliases, local paths, MCP endpoints, logs, databases, media caches, secrets, and raw chat text must stay out of this file, GitHub issues, PRs, commits, and public handoffs.
 
+## Discovery And Shaping Gate
+
+- Use GitHub issues as the durable scratchpad for long-running discovery. Record sanitized facts, rejected paths, external references, code/runtime evidence, and goal changes as the idea matures.
+- A raw idea may stay as a draft or planning issue while the goal is unclear. Do not start implementation only because an issue exists.
+- Before promoting a draft to a task, state the goal, non-goals, evidence, one concrete next slice, acceptance checks, safety constraints, and expected value/cost. If the goal cannot be stated, shelve or keep shaping.
+- Before promoting a task to an epic, verify that the work cannot be completed safely in one PR and has independent child slices, staged research/implementation/deploy work, cross-subsystem risk, durable data or contract impact, or epic-level testing/deploy gates.
+- Do not promote when the work is mostly speculation, a grab-bag of nice-to-haves, or smaller than the process it would create. Prefer the smallest issue shape that reduces risk and preserves context.
+- A shaped task or epic should be rough enough to leave implementation freedom, solved enough to avoid blind coding, and bounded enough to name risks, rabbit holes, no-gos, and validation.
+
 ## Operating Rules
 
 - Start from a GitHub issue. Use the implementing agent's normal prefix for pipeline tasks, for example `[codex]` for Codex-owned work. Reserve `[DEV]` for this pipeline contract and closely related contract-maintenance issues only.
@@ -28,9 +37,16 @@ Private runtime details, host aliases, local paths, MCP endpoints, logs, databas
 
 ```mermaid
 stateDiagram-v2
-    [*] --> GatherContext
+    [*] --> CaptureIdea
+    CaptureIdea --> ShapeDraft: goal, evidence, and constraints unclear
+    ShapeDraft --> PromoteTask: goal and next slice are clear
+    ShapeDraft --> ShelveIdea: value or safe path is unclear
+    PromoteTask --> GatherContext
+    ShelveIdea --> [*]: shelved or closed
     GatherContext --> SelectEpic: find active epic or standalone task
     SelectEpic --> SelectTask: choose next Todo task
+    SelectTask --> PromoteEpic: task is too large for one PR
+    PromoteEpic --> SelectTask: child tasks created
     SelectTask --> AcceptTask: confirm scope and acceptance
     AcceptTask --> PrepareBranch: set Project status In Progress
     PrepareBranch --> Implement: clean git, create branch
@@ -119,6 +135,13 @@ sequenceDiagram
 
 ```mermaid
 flowchart TD
+    A0["Idea or draft issue"] --> A1{"Goal, evidence, slice, and acceptance clear?"}
+    A1 -- "No" --> A2["Keep shaping, shelve, or close"]
+    A1 -- "Yes" --> A3{"One PR can complete safely?"}
+    A3 -- "No" --> A4["Promote to epic with child tasks"]
+    A3 -- "Yes" --> A["Task implementation complete"]
+    A4 --> A5["First shaped child task complete"]
+    A5 --> B
     A["Task implementation complete"] --> B["Local focused checks"]
     B --> C{"Checks pass?"}
     C -- "No" --> D["Fix failures before PR"]
@@ -220,6 +243,10 @@ Wake-up recovery algorithm:
 
 ## Pipeline Test Matrix
 
+- Draft lacks a clear goal, evidence, or acceptance: agent keeps it in discovery instead of implementing.
+- A draft has a clear goal and one bounded slice: agent promotes it to a task, not an epic.
+- A task has multiple independent slices or epic-level deploy risk: agent promotes or splits it before implementation.
+- A task is small enough for one PR: agent does not promote it just to satisfy process.
 - Heartbeat creation fails: agent records a blocked handoff and does not sleep silently.
 - Heartbeat wakes after context compaction: the Heartbeat breadcrumb plus GitHub PR/issue state is sufficient to recover issue, PR, branch, commit, and next action.
 - Heartbeat wakes with no readable PR/issue breadcrumb: agent uses the Heartbeat and GitHub evidence, then escalates only if the next step is still ambiguous.
@@ -258,6 +285,12 @@ Wake-up recovery algorithm:
 ## References
 
 - AGENTS.md format: https://github.com/agentsmd/agents.md
+- Shape Up shaping principles: https://basecamp.com/shapeup/1.1-chapter-02
+- Shape Up betting and circuit breaker: https://basecamp.com/shapeup/2.2-chapter-08
+- Atlassian product discovery: https://www.atlassian.com/agile/product-management/discovery
+- GitHub planning with issues and projects: https://docs.github.com/en/issues/tracking-your-work-with-issues/configuring-issues/planning-and-tracking-work-for-your-team-or-project
+- Architecture decision records: https://learn.microsoft.com/en-ie/azure/well-architected/architect-role/architecture-decision-record
+- Design docs overview: https://www.designdocs.dev/
 - Custom instruction guidance: https://code.visualstudio.com/docs/copilot/customization/custom-instructions
 - Copilot code review: https://docs.github.com/en/copilot/how-tos/use-copilot-agents/request-a-code-review/use-code-review?tool=visualstudio
 - Mermaid state diagrams: https://mermaid.js.org/syntax/stateDiagram
