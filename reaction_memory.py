@@ -285,6 +285,8 @@ class ReactionMemoryStore:
             );
             CREATE INDEX IF NOT EXISTS idx_outbound_reaction_decisions_target
                 ON outbound_reaction_decisions(chat_id, target_message_id, created_at, id);
+            CREATE INDEX IF NOT EXISTS idx_outbound_reaction_decisions_chat_action
+                ON outbound_reaction_decisions(chat_id, action, created_at, id);
             CREATE INDEX IF NOT EXISTS idx_outbound_reaction_decisions_memory
                 ON outbound_reaction_decisions(target_memory_id, created_at, id);
             """

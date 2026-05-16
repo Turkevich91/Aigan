@@ -34,7 +34,7 @@ from media_frames import FfmpegMediaFrameAdapter, MediaFrameAdapter, MediaFrameL
 from outbound_reactions import NullReactionAdapter, OutboundReactionAdapter, OutboundReactionConfig, ReactionAdapter
 from reaction_memory import ReactionAsset, ReactionMemoryStore, ReactionPreference, ReactionSpec
 from github_reporting import GitHubReporter
-from self_analysis import SelfAnalysisService
+from self_analysis import SelfAnalysisService, has_reaction_complaint_hint
 from social_memory import SocialMemoryStore, SocialObservation
 from system_log import SystemEvent, SystemLogStore, sanitize_text
 from tool_diagnostics import CapabilityRow, build_capability_rows, render_capability_matrix, render_recent_failures
@@ -1284,7 +1284,12 @@ def remember_self_complaint_signal(
     text = message_text(message)
     if not text:
         return
-    reaction_record = reaction_decision_for_complaint(message)
+    has_reaction_hint = has_reaction_complaint_hint(
+        text,
+        bot_username=bot_username or BOT_USERNAME,
+        reply_to_bot=reply_to_bot,
+    )
+    reaction_record = reaction_decision_for_complaint(message) if has_reaction_hint else None
     target_hash = ""
     if reaction_record is not None:
         target_hash = reaction_complaint_target_hash(

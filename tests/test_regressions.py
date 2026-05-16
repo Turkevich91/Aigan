@@ -6441,14 +6441,24 @@ class SystemHealthTests(unittest.TestCase):
                 self.assertNotIn(text, signal.sample)
 
     def test_reaction_complaint_classifier_rejects_broad_passive_markers(self) -> None:
-        signal = classify_reaction_complaint(
+        cases = (
             "I support the plan and the tone sounds fine",
-            has_recent_reaction=True,
-            rationale_state="stored_rationale",
-            decision_action="sent",
+            "I approve",
+            "the building is on fire and this is not ok",
+            "Aigan posted inappropriate message",
+            "Aigan, the tone sounds fine",
         )
+        for text in cases:
+            with self.subTest(text=text):
+                signal = classify_reaction_complaint(
+                    text,
+                    bot_username="thrd_ua_bot",
+                    has_recent_reaction=True,
+                    rationale_state="stored_rationale",
+                    decision_action="sent",
+                )
 
-        self.assertIsNone(signal)
+                self.assertIsNone(signal)
 
     def test_reaction_complaint_classifier_does_not_match_like_inside_dislike(self) -> None:
         signal = classify_reaction_complaint(

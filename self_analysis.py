@@ -88,13 +88,15 @@ REACTION_TERMS = (
     "emote",
     "smile",
     "smiley",
-    "fire",
+    "fire emoji",
+    "fire reaction",
     "thumbs up",
     "put that",
     "put this",
     "set that",
     "set this",
-    "posted",
+    "posted reaction",
+    "posted emoji",
     "reacted",
     "реакц",
     "эмод",
@@ -120,12 +122,14 @@ REACTION_REASON_TERMS = (
 )
 REACTION_APPROVAL_TERMS = (
     "approval",
-    "approve",
-    "approved",
-    "endors",
+    "approval of harm",
     "looks like approval",
+    "looks like you approve",
     "looks like support",
     "looks like endorsement",
+    "looks approving",
+    "approving reaction",
+    "endorsing reaction",
     "supporting harm",
     "liked the idea",
     "схвал",
@@ -150,17 +154,21 @@ REACTION_FAKE_EMPATHY_TERMS = (
     "фальшив",
 )
 REACTION_TONE_TERMS = (
-    "tone",
-    "boundary",
+    "tone boundary",
+    "crossed a tone boundary",
+    "wrong tone",
+    "bad tone",
     "too cheerful",
     "too casual",
+    "tone deaf",
     "тон",
     "границ",
     "меж",
 )
 REACTION_SYCOPHANCY_TERMS = (
     "sycophancy",
-    "sycoph",
+    "sycophantic",
+    "sycophant",
     "yes-man",
     "yes man",
     "agree with everything",
@@ -179,6 +187,35 @@ def has_marker(lowered: str, marker: str) -> bool:
 
 def has_any_marker(lowered: str, markers: tuple[str, ...] | set[str]) -> bool:
     return any(has_marker(lowered, marker) for marker in markers)
+
+
+def has_reaction_complaint_hint(
+    text: str,
+    *,
+    bot_username: str | None = None,
+    reply_to_bot: bool = False,
+) -> bool:
+    clean = sanitize_text(text or "", 500)
+    if not clean:
+        return False
+    lowered = clean.casefold()
+    bot_markers = set(BOT_WORDS)
+    if bot_username:
+        bot_markers.add(bot_username.casefold().lstrip("@"))
+        bot_markers.add("@" + bot_username.casefold().lstrip("@"))
+    mentions_bot = reply_to_bot or has_any_marker(lowered, bot_markers)
+    has_reaction_marker = has_any_marker(lowered, REACTION_TERMS)
+    has_approval_marker = has_any_marker(lowered, REACTION_APPROVAL_TERMS)
+    if not mentions_bot:
+        return has_reaction_marker or has_approval_marker
+    return (
+        has_reaction_marker
+        or has_approval_marker
+        or has_any_marker(lowered, REACTION_FAKE_EMPATHY_TERMS)
+        or has_any_marker(lowered, REACTION_TONE_TERMS)
+        or has_any_marker(lowered, REACTION_SYCOPHANCY_TERMS)
+        or has_any_marker(lowered, REACTION_REASON_TERMS)
+    )
 
 
 def classify_complaint(
@@ -245,20 +282,20 @@ def classify_reaction_complaint(
 
     if not (mentions_bot or has_recent_reaction):
         return None
-    if not mentions_bot and not (has_reaction_marker or has_approval_marker or has_insensitive_marker):
+    if not mentions_bot and not (has_reaction_marker or has_approval_marker):
         return None
     if not has_reaction_context and not has_approval_marker:
         return None
 
-    if has_sycophancy_marker:
+    if has_sycophancy_marker and has_reaction_marker:
         category = "sycophancy"
-    elif has_fake_empathy_marker:
+    elif has_fake_empathy_marker and has_reaction_marker:
         category = "fake_empathy"
-    elif has_tone_marker:
+    elif has_tone_marker and has_reaction_marker:
         category = "tone_boundary"
-    elif has_approval_marker or has_insensitive_marker:
+    elif has_approval_marker or (has_insensitive_marker and has_reaction_marker):
         category = "insensitive_reaction"
-    elif has_reason_marker and rationale_state in {"missing_decision", "insufficient_rationale"}:
+    elif has_reason_marker and has_reaction_marker and rationale_state in {"missing_decision", "insufficient_rationale"}:
         category = "reaction_reasoning_gap"
     else:
         return None
