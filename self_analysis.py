@@ -148,7 +148,7 @@ REACTION_APPROVAL_TERMS = (
     "approving reaction",
     "endorsing reaction",
     "supporting harm",
-    "liked the idea",
+    "looks like you liked the idea",
     "виглядає як підтримка",
     "виглядає як схвалення",
     "похоже на одобрение",
@@ -297,8 +297,21 @@ def has_reaction_complaint_hint(
     has_specific_insensitive_reaction_marker = bool(
         has_reaction_marker and has_any_marker(lowered, REACTION_INSENSITIVE_HINT_TERMS)
     )
+    has_specific_health_reaction_marker = bool(
+        has_reaction_marker
+        and (
+            has_any_marker(lowered, REACTION_FAKE_EMPATHY_TERMS)
+            or has_any_marker(lowered, REACTION_TONE_TERMS)
+            or has_any_marker(lowered, REACTION_SYCOPHANCY_TERMS)
+        )
+    )
     if not mentions_bot:
-        return has_approval_marker or has_passive_complaint_marker or has_specific_insensitive_reaction_marker
+        return (
+            has_approval_marker
+            or has_passive_complaint_marker
+            or has_specific_insensitive_reaction_marker
+            or has_specific_health_reaction_marker
+        )
     return (
         has_reaction_marker
         or has_approval_marker
@@ -378,6 +391,9 @@ def classify_reaction_complaint(
     has_specific_insensitive_reaction_marker = bool(
         has_reaction_marker and has_any_marker(lowered, REACTION_INSENSITIVE_HINT_TERMS)
     )
+    has_specific_health_reaction_marker = bool(
+        has_reaction_marker and (has_fake_empathy_marker or has_tone_marker or has_sycophancy_marker)
+    )
     has_reaction_context = bool(has_recent_reaction or has_reaction_marker)
     has_temporal_reaction_context = bool(has_recent_reaction and mentions_bot)
     has_specific_insensitive_temporal_marker = bool(
@@ -403,7 +419,14 @@ def classify_reaction_complaint(
         return None
     if not mentions_bot and not (
         has_approval_marker
-        or (has_recent_reaction and (has_passive_complaint_marker or has_specific_insensitive_reaction_marker))
+        or (
+            has_recent_reaction
+            and (
+                has_passive_complaint_marker
+                or has_specific_insensitive_reaction_marker
+                or has_specific_health_reaction_marker
+            )
+        )
     ):
         return None
     if not has_reaction_context and not has_approval_marker:
