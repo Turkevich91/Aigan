@@ -676,13 +676,6 @@ class OutboundReactionAdapter:
             flags.append(f"attachment:{safe_code(item.attachment_type)}")
         return tuple(flags)
 
-    def _reaction_class(self, spec: ReactionSpec) -> str:
-        value = spec.base_emoji or spec.reaction_key
-        for emotion_class, candidates in REACTION_EMOJI_BY_EMOTION.items():
-            if value in candidates:
-                return emotion_class
-        return "custom_or_unknown"
-
     def _send_attempt_rationale(self, item: MemoryItem, score: float, policy: EmotionPolicyDecision) -> str:
         return policy.rationale
 
@@ -716,6 +709,15 @@ class OutboundReactionAdapter:
         own_ambiguous = self._hit_count(own_content, AMBIGUOUS_TERMS, own_tokens)
         own_positive = self._hit_count(own_content, POSITIVE_TERMS, own_tokens)
         own_policy_signal = own_grief + own_horror + own_condemnation + own_ambiguous + own_positive
+        if item.forward_origin and own_policy_signal:
+            return EmotionPolicyDecision(
+                emotion_class="ambiguous_low_confidence",
+                confidence=0.35,
+                allow_reaction=False,
+                reason_code="emotion_forwarded_context",
+                rationale="Skipped because forwarded content defaults to no reaction without additional context.",
+                severity_flags=tuple(flags + ["forwarded_context"]),
+            )
         if item.attachment_type in {"video", "animation"} and not item.vision_summary and not item.source_text and not own_policy_signal:
             return EmotionPolicyDecision(
                 emotion_class="ambiguous_sensitive",

@@ -3289,6 +3289,39 @@ class PersistentMemoryTests(unittest.TestCase):
         self.assertEqual("ambiguous_low_confidence", record.emotion_class)
         self.assertIn("forwarded", record.severity_flags)
 
+    def test_outbound_reaction_forwarded_tragedy_defaults_to_no_reaction(self) -> None:
+        self.assertIsNotNone(main.REACTION_MEMORY)
+        config = main.OutboundReactionConfig(
+            enabled=True,
+            every_n_messages=1,
+            cooldown_seconds=0,
+            min_score=0.0,
+            allowed_emoji=("\N{CRYING FACE}", "\N{BROKEN HEART}", "\N{FACE SCREAMING IN FEAR}"),
+            use_custom_emoji=False,
+        )
+        adapter = main.OutboundReactionAdapter(config=config, reaction_memory=main.REACTION_MEMORY)
+        message = FakeMessage("sad news: victims died in a shocking attack", message_id=987)
+        item_id = main.MEMORY.save_message(
+            chat_id=-1001,
+            message_id=987,
+            sender_label="Tester",
+            user_id=111,
+            text=message.text,
+            forward_origin="Source Channel",
+            created_at=datetime.now(timezone.utc),
+        )
+
+        asyncio.run(adapter.on_message_ingested(message, main.MEMORY.item_by_id(item_id), "pre_embedding"))
+
+        message.bot.set_message_reaction.assert_not_awaited()
+        record = main.REACTION_MEMORY.latest_outbound_decision(chat_id=-1001, target_message_id=987)
+        self.assertIsNotNone(record)
+        self.assertEqual("skipped", record.action)
+        self.assertEqual("ambiguous_low_confidence", record.emotion_class)
+        self.assertEqual("emotion_forwarded_context", record.reason_code)
+        self.assertIn("forwarded", record.severity_flags)
+        self.assertIn("forwarded_context", record.severity_flags)
+
     def test_outbound_reaction_laugh_alias_remains_positive_option(self) -> None:
         self.assertIsNotNone(main.REACTION_MEMORY)
         config = main.OutboundReactionConfig(
