@@ -83,6 +83,15 @@ REACTION_EMOJI_ALIASES = {
     "thinking_face": "🤔",
     "laugh": "😂",
     "joy": "😂",
+    "sad": "😢",
+    "cry": "😢",
+    "crying": "😢",
+    "broken_heart": "💔",
+    "shock": "😱",
+    "scream": "😱",
+    "fear": "😨",
+    "angry": "😡",
+    "rage": "🤬",
 }
 
 
@@ -356,7 +365,7 @@ class Config:
             outbound_reaction_cooldown_seconds=max(0, int(os.getenv("OUTBOUND_REACTION_COOLDOWN_SECONDS", "1800"))),
             outbound_reaction_min_score=float(os.getenv("OUTBOUND_REACTION_MIN_SCORE", "0.72")),
             outbound_reaction_allowed_emoji=_reaction_emoji_values(
-                os.getenv("OUTBOUND_REACTION_ALLOWED_EMOJI", "fire,eyes,thumbs_up,thinking,laugh")
+                os.getenv("OUTBOUND_REACTION_ALLOWED_EMOJI", "fire,eyes,thumbs_up,thinking,laugh,sad,broken_heart,shock,fear,angry")
             ),
             outbound_reaction_use_custom_emoji=_env_bool("OUTBOUND_REACTION_USE_CUSTOM_EMOJI", True),
             outbound_reaction_big=_env_bool("OUTBOUND_REACTION_BIG", False),

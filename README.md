@@ -241,7 +241,7 @@ OUTBOUND_REACTIONS_ENABLED=false
 OUTBOUND_REACTION_EVERY_N_MESSAGES=10
 OUTBOUND_REACTION_COOLDOWN_SECONDS=1800
 OUTBOUND_REACTION_MIN_SCORE=0.72
-OUTBOUND_REACTION_ALLOWED_EMOJI=fire,eyes,thumbs_up,thinking,laugh
+OUTBOUND_REACTION_ALLOWED_EMOJI=fire,eyes,thumbs_up,thinking,laugh,sad,broken_heart,shock,fear,angry
 OUTBOUND_REACTION_USE_CUSTOM_EMOJI=true
 OUTBOUND_REACTION_BIG=false
 PROACTIVE_DIRECTION_WEIGHTS=group_taste:0.25,personal_ping:0.25,current_hook:0.25,unanswered_thread:0.25
@@ -249,7 +249,7 @@ PROACTIVE_SELF_REFERENCE_GUARD=true
 PROACTIVE_RECENT_SEED_COOLDOWN_DAYS=14
 ```
 
-Inbound reaction memory and outbound reactions are separate. `REACTIONS_ENABLED=true` lets Aigan store reactions from the chat and learn lightweight taste signals. `OUTBOUND_REACTIONS_ENABLED=true` lets Aigan set real Telegram reactions on selected live group messages through an optional adapter hook. `OUTBOUND_REACTION_ALLOWED_EMOJI` accepts ASCII aliases (`fire`, `eyes`, `thumbs_up`, `thinking`, `laugh`) so `.env` files do not depend on editor Unicode handling; literal UTF-8 emoji also work. If the outbound adapter is disabled, missing, or Telegram rejects a reaction, memory saving and embeddings continue normally. The older `maybe_auto_react()` behavior is text-based; outbound reactions use Telegram's native message reaction API.
+Inbound reaction memory and outbound reactions are separate. `REACTIONS_ENABLED=true` lets Aigan store reactions from the chat and learn lightweight taste signals. `OUTBOUND_REACTIONS_ENABLED=true` lets Aigan set real Telegram reactions on selected live group messages through an optional adapter hook. `OUTBOUND_REACTION_ALLOWED_EMOJI` accepts ASCII aliases such as `fire`, `eyes`, `thumbs_up`, `thinking`, `laugh`, `sad`, `broken_heart`, `shock`, `fear`, and `angry` so `.env` files do not depend on editor Unicode handling; literal UTF-8 emoji also work. Outbound reaction selection is emotion-aware: positive reactions are reserved for safely positive direct content, while sensitive or ambiguous content defaults to no reaction unless a configured emotion class is high-confidence. Possible stored sent classes are `positive_celebratory`, `grief_sympathy`, `horror_shock`, `condemnation_outrage`, `despair_heavy_news`, and `uncertainty_doubt`. If the outbound adapter is disabled, missing, or Telegram rejects a reaction, memory saving and embeddings continue normally. The older `maybe_auto_react()` behavior is text-based; outbound reactions use Telegram's native message reaction API.
 
 The self-reference guard rejects proactive drafts that talk about being a bot/AI, announce capabilities, or ask users to tag/contact Aigan. Direct answers to explicit user requests are not blocked by this proactive-only guard.
 
