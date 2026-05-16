@@ -276,6 +276,7 @@ Future tool research notes:
 - [`docs/tool-research/chat-digest-commands.md`](docs/tool-research/chat-digest-commands.md)
 - [`docs/tool-research/document-pdf-ingest.md`](docs/tool-research/document-pdf-ingest.md)
 - [`docs/tool-research/ocr-screenshot-understanding.md`](docs/tool-research/ocr-screenshot-understanding.md)
+- [`docs/tool-research/fact-check-route-v2.md`](docs/tool-research/fact-check-route-v2.md)
 
 Long text replies are split by the delivery layer instead of being truncated at the first Telegram limit:
 
