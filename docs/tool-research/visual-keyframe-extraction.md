@@ -190,11 +190,61 @@ finally {
 Measurement wrapper:
 
 ```text
-Each timed command was launched from Python and sampled with psutil:
-  - wall time: time.perf_counter()
-  - CPU time: sum(user + system) for the command process tree
-  - peak RSS: max(sum(memory_info().rss) for the command process tree)
+$measureProcess = @'
+import json
+import psutil
+import subprocess
+import sys
+import time
+
+cmd = sys.argv[1:]
+if cmd and cmd[0] == "--":
+    cmd = cmd[1:]
+started = time.perf_counter()
+proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+root = psutil.Process(proc.pid)
+peak_rss = 0
+cpu_time = 0.0
+while proc.poll() is None:
+    processes = [root]
+    try:
+        processes.extend(root.children(recursive=True))
+    except psutil.Error:
+        pass
+    rss = 0
+    cpu = 0.0
+    for process in processes:
+        try:
+            memory = process.memory_info().rss
+            times = process.cpu_times()
+        except psutil.Error:
+            continue
+        rss += memory
+        cpu += float(times.user + times.system)
+    peak_rss = max(peak_rss, rss)
+    cpu_time = max(cpu_time, cpu)
+    time.sleep(0.01)
+stdout, stderr = proc.communicate()
+print(json.dumps({
+    "exit_code": proc.returncode,
+    "wall_ms": round((time.perf_counter() - started) * 1000, 1),
+    "cpu_time_s": round(cpu_time, 3),
+    "peak_rss_mb": round(peak_rss / 1024 / 1024, 1),
+    "stdout_preview": stdout[:400],
+    "stderr_preview": stderr[:400],
+}, sort_keys=True))
+'@
+
+# Example wrapping pattern:
+$measureProcess | uv run --python 3.12 --with psutil python - -- `
+  ffmpeg -hide_banner -loglevel error -y -i $video `
+  -vf "fps=1,scale=320:-1:flags=lanczos" `
+  (Join-Path $ffmpegDir "frame_%03d.jpg")
 ```
+
+Use the same wrapper around the PySceneDetect command and the inline OpenCV
+probe command from the recipe above. Frame counts were read from the generated
+output directories before the `finally` cleanup removed them.
 
 Results:
 
