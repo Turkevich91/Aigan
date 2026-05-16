@@ -8,7 +8,7 @@ from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import ANY, AsyncMock, patch
+from unittest.mock import ANY, AsyncMock, PropertyMock, patch
 
 TEST_DB_PATH = os.path.join(tempfile.gettempdir(), f"aigan-test-{os.getpid()}.sqlite3")
 try:
@@ -861,7 +861,9 @@ class ToolRuntimeTests(unittest.TestCase):
                     "name": "unsafe_adapter",
                     "enabled": True,
                     "status": "ok",
-                    "adapter": "unsafe",
+                    "adapter": "\\\\private\\adapter",
+                    "mode": "C:\\Users\\private\\mode",
+                    "backend": f"https://example.test/?token={fake_openai_secret()}",
                     "error_count": 0,
                     "source_url": f"https://example.test/?token={fake_openai_secret()}",
                     "prompt": f"raw {fake_openai_secret()}",
@@ -875,8 +877,35 @@ class ToolRuntimeTests(unittest.TestCase):
         self.assertIn("unsafe_adapter", text)
         self.assertNotIn(fake_openai_secret(), text)
         self.assertNotIn("C:\\Users", text)
+        self.assertNotIn("https://example.test", text)
+        self.assertNotIn("\\\\private", text)
         self.assertNotIn("source_url", text)
         self.assertNotIn("prompt", text)
+        self.assertIn("[redacted]", text)
+
+    def test_tool_diagnostics_preserves_adapter_configured_available_fields(self) -> None:
+        rows = build_capability_rows(
+            {
+                "status": "ok",
+                "adapter_count": 1,
+                "error_count": 0,
+                "adapters": [
+                    {
+                        "name": "future_backend",
+                        "enabled": True,
+                        "configured": False,
+                        "available": False,
+                        "status": "unconfigured",
+                        "adapter": "backend",
+                    }
+                ],
+            }
+        )
+        row = {item.name: item for item in rows}["future_backend"]
+
+        self.assertFalse(row.configured)
+        self.assertFalse(row.available)
+        self.assertEqual("unconfigured", row.status)
 
     def test_tool_diagnostics_aggregates_sanitized_tool_failure(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -904,6 +933,39 @@ class ToolRuntimeTests(unittest.TestCase):
             self.assertNotIn(fake_openai_secret(), text)
             self.assertNotIn(fake_telegram_secret(), text)
             store.close()
+
+    def test_tool_diagnostics_counts_error_event_once(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = SystemLogStore(Path(tmpdir) / "events.sqlite3", retention_days=14)
+            store.record_event(
+                level="error",
+                component="tool_runtime",
+                event_type="tool_operation_failed",
+                details={"tool": "media_transcript", "failure_category": "provider_unavailable"},
+            )
+
+            rows = build_capability_rows(
+                {"status": "ok", "adapter_count": 0, "error_count": 0, "adapters": []},
+                events=store.events_since(21600, "warning", 20),
+            )
+            text = render_recent_failures(rows)
+
+            self.assertIn("media_transcript: 1 recent", text)
+            store.close()
+
+    def test_github_reporting_row_uses_reporter_configuration(self) -> None:
+        original_config = main.CONFIG
+        try:
+            main.CONFIG = replace(main.CONFIG, github_reporting_enabled=True)
+            with patch.object(type(main.GITHUB_REPORTER), "is_configured", new_callable=PropertyMock, return_value=False):
+                row = {item.name: item for item in main.configured_capability_rows()}["github_reporting"]
+        finally:
+            main.CONFIG = original_config
+
+        self.assertTrue(row.enabled)
+        self.assertFalse(row.configured)
+        self.assertFalse(row.available)
+        self.assertEqual("unconfigured", row.status)
 
     def test_tools_command_is_admin_only(self) -> None:
         admin_message = FakeMessage("/tools")

@@ -3593,9 +3593,9 @@ def configured_capability_rows() -> list[CapabilityRow]:
             name="github_reporting",
             family="reporting",
             enabled=CONFIG.github_reporting_enabled,
-            configured=CONFIG.github_reporting_enabled,
-            available=CONFIG.github_reporting_enabled,
-            status="ok" if CONFIG.github_reporting_enabled else "disabled",
+            configured=GITHUB_REPORTER.is_configured,
+            available=GITHUB_REPORTER.is_configured,
+            status="ok" if GITHUB_REPORTER.is_configured else ("unconfigured" if CONFIG.github_reporting_enabled else "disabled"),
             adapter="GitHubReporter",
         )
     )

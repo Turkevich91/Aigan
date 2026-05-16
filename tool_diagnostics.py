@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from typing import Any, Iterable
 
@@ -72,6 +73,10 @@ SAFE_HEALTH_FIELDS = {
     "temp_dir_writable",
     "cache_version",
 }
+URL_VALUE_RE = re.compile(r"\b(?:https?|ftp)://|www\.", re.IGNORECASE)
+WINDOWS_PATH_VALUE_RE = re.compile(r"(?:[A-Za-z]:\\|\\\\)")
+PRIVATE_PATH_VALUE_RE = re.compile(r"(^|\s)/(?:app|data|etc|home|mnt|root|tmp|users|var|workspace)/", re.IGNORECASE)
+TOKEN_VALUE_RE = re.compile(r"\b(?:gh[pousr]_|github_pat_|xox[baprs]-)[A-Za-z0-9_-]{8,}", re.IGNORECASE)
 
 
 @dataclass
@@ -95,9 +100,9 @@ class CapabilityRow:
         self.name = clean_label(self.name, 80) or "unknown"
         self.family = clean_label(self.family, 60) or "other"
         self.status = normalize_status(self.status, self.enabled)
-        self.adapter = clean_label(self.adapter, 80)
-        self.mode = clean_label(self.mode, 80)
-        self.backend = clean_label(self.backend, 80)
+        self.adapter = safe_display_label(self.adapter, 80)
+        self.mode = safe_display_label(self.mode, 80)
+        self.backend = safe_display_label(self.backend, 80)
         self.error_count = max(0, int(self.error_count or 0))
         self.warning_count = max(0, int(self.warning_count or 0))
         self.recent_failure_categories = [clean_label(item, 80) for item in self.recent_failure_categories[:5]]
@@ -108,6 +113,20 @@ class CapabilityRow:
 
 def clean_label(value: Any, limit: int = 120) -> str:
     return sanitize_text(str(value or ""), limit)
+
+
+def safe_display_label(value: Any, limit: int = 120) -> str:
+    text = clean_label(value, limit)
+    if not text:
+        return ""
+    if (
+        URL_VALUE_RE.search(text)
+        or WINDOWS_PATH_VALUE_RE.search(text)
+        or PRIVATE_PATH_VALUE_RE.search(text)
+        or TOKEN_VALUE_RE.search(text)
+    ):
+        return "[redacted]"
+    return text
 
 
 def normalize_status(status: Any, enabled: bool = False) -> str:
@@ -128,7 +147,7 @@ def sanitize_health_details(details: dict[str, Any] | None) -> dict[str, Any]:
         if isinstance(raw_value, bool | int | float):
             clean[key] = raw_value
         elif isinstance(raw_value, str):
-            clean[key] = clean_label(raw_value, 120)
+            clean[key] = safe_display_label(raw_value, 120)
     return clean
 
 
@@ -160,16 +179,19 @@ def adapter_row(item: dict[str, Any]) -> CapabilityRow:
     name = clean_label(item.get("name") or "unknown", 80)
     status = normalize_status(item.get("status"), enabled)
     details = {key: value for key, value in item.items() if key in SAFE_HEALTH_FIELDS}
+    configured = bool(item.get("configured", enabled)) if "configured" in item else enabled
+    available_default = enabled and status not in {"disabled", "not_implemented", "unavailable", "unconfigured", "error", "failing"}
+    available = bool(item.get("available", available_default)) if "available" in item else available_default
     return CapabilityRow(
         name=name,
         family=adapter_family(name),
         enabled=enabled,
-        configured=enabled,
-        available=status not in {"unavailable", "error", "failing"},
+        configured=configured,
+        available=available,
         status=status,
-        adapter=clean_label(item.get("adapter") or "", 80),
-        mode=clean_label(item.get("mode") or "", 80),
-        backend=clean_label(item.get("backend") or "", 80),
+        adapter=safe_display_label(item.get("adapter") or "", 80),
+        mode=safe_display_label(item.get("mode") or "", 80),
+        backend=safe_display_label(item.get("backend") or "", 80),
         error_count=int(item.get("error_count", 0) or 0),
         warning_count=int(item.get("warning_count", 0) or 0),
         details=details,
@@ -225,9 +247,10 @@ def apply_event_failures(rows: dict[str, CapabilityRow], events: Iterable[System
             continue
         row = rows[row_name]
         category = failure_category_for_event(event)
-        row.warning_count += 1
         if event.level in {"error", "critical"}:
             row.error_count += 1
+        else:
+            row.warning_count += 1
         if category and category not in row.recent_failure_categories:
             row.recent_failure_categories.append(category)
         if row.status == "ok":
