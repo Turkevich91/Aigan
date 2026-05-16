@@ -122,7 +122,7 @@ from mcp_servers import web
 from reaction_memory import ReactionSpec
 from scripts import import_telegram_export
 from scripts.import_telegram_export import ImportOptions
-from self_analysis import SelfAnalysisService, classify_complaint
+from self_analysis import SelfAnalysisService, classify_complaint, classify_reaction_complaint
 from system_log import SystemEvent, SystemLogStore, redact_secrets
 from tool_diagnostics import (
     CapabilityRow,
@@ -6392,6 +6392,32 @@ class SystemHealthTests(unittest.TestCase):
         self.assertIsNotNone(signal)
         self.assertEqual("web_search", signal.category)
 
+    def test_reaction_complaint_classifier_detects_insensitive_reaction(self) -> None:
+        signal = classify_reaction_complaint(
+            "this reaction looks like approval",
+            has_recent_reaction=True,
+            rationale_state="stored_rationale",
+            decision_action="sent",
+            decision_reason="sent",
+            emotion_class="positive_celebratory",
+            target_fingerprint="abc123",
+        )
+
+        self.assertIsNotNone(signal)
+        self.assertEqual("insensitive_reaction", signal.category)
+        self.assertIn("Reaction complaint signal", signal.sample)
+        self.assertNotIn("this reaction looks like approval", signal.sample)
+
+    def test_reaction_complaint_classifier_detects_missing_rationale_gap(self) -> None:
+        signal = classify_reaction_complaint(
+            "Aigan why did you put that reaction?",
+            bot_username="thrd_ua_bot",
+            rationale_state="missing_decision",
+        )
+
+        self.assertIsNotNone(signal)
+        self.assertEqual("reaction_reasoning_gap", signal.category)
+
     def test_complaint_temperature_reports_at_threshold(self) -> None:
         class FakeReporter:
             is_configured = True
@@ -6424,6 +6450,49 @@ class SystemHealthTests(unittest.TestCase):
             self.assertIn("issues/99", store.active_complaints(1)[0].github_issue_url)
             store.close()
 
+    def test_reaction_complaint_temperature_reports_sanitized_self_report(self) -> None:
+        class FakeReporter:
+            is_configured = True
+
+            def __init__(self) -> None:
+                self.calls = []
+
+            def create_self_report_issue(self, **kwargs):
+                self.calls.append(kwargs)
+                return SimpleNamespace(url="https://github.com/Turkevich91/Aigan/issues/100")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = SystemLogStore(Path(tmpdir) / "health.sqlite3", retention_days=14)
+            reporter = FakeReporter()
+            service = SelfAnalysisService(
+                store=store,
+                reporter=reporter,
+                complaint_lookback_seconds=86400,
+                complaint_report_temperature=1,
+            )
+
+            cluster = service.record_reaction_complaint_signal(
+                text="this reaction looks like approval of sample payload marker",
+                has_recent_reaction=True,
+                decision_action="sent",
+                decision_reason="sent",
+                emotion_class="positive_celebratory",
+                rationale_state="stored_rationale",
+                target_fingerprint="targetabc",
+            )
+
+            self.assertIsNotNone(cluster)
+            self.assertEqual("insensitive_reaction", cluster.category)
+            self.assertEqual(1, len(reporter.calls))
+            body = reporter.calls[0]["body"]
+            self.assertIn("insensitive_reaction", body)
+            self.assertIn("targetabc", body)
+            self.assertNotIn("sample payload marker", body)
+            event = next(event for event in store.latest_events(5) if event.event_type == "reaction_complaint_signal")
+            self.assertEqual("reaction_complaint_signal", event.event_type)
+            self.assertEqual("targetabc", event.details["target"])
+            store.close()
+
     def test_passive_group_complaint_stays_silent_but_records_temperature(self) -> None:
         message = FakeMessage("Aigan bot problem: web search не працює", message_id=5000)
         context = SimpleNamespace(bot=SimpleNamespace(username="thrd_ua_bot", id=8712856238))
@@ -6435,6 +6504,44 @@ class SystemHealthTests(unittest.TestCase):
         self.assertEqual(1, len(clusters))
         self.assertEqual("web_search", clusters[0].category)
         self.assertEqual(1, clusters[0].temperature)
+
+    def test_passive_group_reaction_complaint_records_temperature_without_reply(self) -> None:
+        self.assertIsNotNone(main.REACTION_MEMORY)
+        main.REACTION_MEMORY.record_outbound_decision(
+            chat_id=-1001,
+            target_message_id=5002,
+            target_memory_id=None,
+            item=None,
+            policy_version="outbound_reaction_emotion_policy_v1",
+            phase="pre_embedding",
+            action="sent",
+            reason_code="sent",
+            rationale="Stored sanitized rationale.",
+            severity_flags=("safe_positive",),
+            emotion_class="positive_celebratory",
+            confidence=0.9,
+            score=0.8,
+            sent_spec=ReactionSpec(reaction_type="emoji", reaction_key="emoji:fire", base_emoji="\N{FIRE}"),
+            details={"policy": "outbound_reaction_emotion_policy_v1"},
+        )
+        message = FakeMessage("this looks like approval", message_id=5003)
+        context = SimpleNamespace(bot=SimpleNamespace(username="thrd_ua_bot", id=8712856238))
+
+        asyncio.run(main.text_message(SimpleNamespace(effective_message=message), context))
+
+        self.assertEqual([], message.reply_calls)
+        clusters = main.SYSTEM_LOG.active_complaints(3)
+        self.assertTrue(any(cluster.category == "insensitive_reaction" for cluster in clusters))
+
+    def test_reaction_reasoning_gap_records_when_challenged_without_decision(self) -> None:
+        message = FakeMessage("Aigan why did you put that reaction?", message_id=5004)
+        message.reply_to_message = SimpleNamespace(message_id=5999, from_user=FakeUser(user_id=222, username="human"))
+        context = SimpleNamespace(bot=SimpleNamespace(username="thrd_ua_bot", id=8712856238))
+
+        asyncio.run(main.text_message(SimpleNamespace(effective_message=message), context))
+
+        clusters = main.SYSTEM_LOG.active_complaints(5)
+        self.assertTrue(any(cluster.category == "reaction_reasoning_gap" for cluster in clusters))
 
     def test_health_command_is_admin_only(self) -> None:
         admin_message = FakeMessage("/health")

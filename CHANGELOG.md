@@ -1,5 +1,11 @@
 # Aigan Changelog
 
+## 2026-05-16 - Reaction misfire self-analysis
+
+- Added reaction-specific complaint classification for insensitive reactions, rationale gaps, tone boundaries, fake empathy, and sycophancy.
+- Linked reaction complaints to recent outbound reaction decision records using sanitized behavior metadata and target hashes.
+- Kept reaction self-reports free of raw chat text while adding regressions for passive complaints, missing rationale challenges, and sanitized GitHub reports.
+
 ## 2026-05-16 - Outbound reaction empathy preflight
 
 - Added a final empathy/perception preflight before Telegram outbound reactions are sent.

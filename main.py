@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import hashlib
 import html
 import io
 import logging
@@ -1226,6 +1227,47 @@ def message_text(message: Message) -> str:
     return (message.text or message.caption or "").strip()
 
 
+REACTION_COMPLAINT_RECENT_SECONDS = 86400
+
+
+def reaction_decision_is_recent(record: Any, *, max_age_seconds: int = REACTION_COMPLAINT_RECENT_SECONDS) -> bool:
+    if record is None:
+        return False
+    try:
+        created_at = datetime.fromisoformat(str(getattr(record, "created_at", "")))
+    except ValueError:
+        return False
+    if created_at.tzinfo is None:
+        created_at = created_at.replace(tzinfo=timezone.utc)
+    return (datetime.now(timezone.utc) - created_at.astimezone(timezone.utc)).total_seconds() <= max_age_seconds
+
+
+def reaction_complaint_target_hash(chat_id: int, target_message_id: int | None, target_memory_id: int | None) -> str:
+    basis = f"{chat_id}:{target_message_id or 0}:{target_memory_id or 0}"
+    return hashlib.sha256(basis.encode("utf-8")).hexdigest()[:16]
+
+
+def reaction_decision_for_complaint(message: Message) -> Any | None:
+    if REACTION_MEMORY is None:
+        return None
+    reply = getattr(message, "reply_to_message", None)
+    target_message_id = getattr(reply, "message_id", None) if reply is not None else None
+    if target_message_id is not None:
+        return REACTION_MEMORY.latest_outbound_decision(chat_id=int(message.chat_id), target_message_id=target_message_id)
+    record = REACTION_MEMORY.latest_outbound_decision(chat_id=int(message.chat_id))
+    return record if reaction_decision_is_recent(record) else None
+
+
+def reaction_rationale_state(record: Any | None) -> str:
+    if record is None:
+        return "missing_decision"
+    reason_code = str(getattr(record, "reason_code", "") or "")
+    rationale = str(getattr(record, "rationale", "") or "").strip()
+    if not rationale or reason_code in {"insufficient_rationale", "missing_memory_item"}:
+        return "insufficient_rationale"
+    return "stored_rationale"
+
+
 def remember_self_complaint_signal(
     message: Message,
     *,
@@ -1236,6 +1278,35 @@ def remember_self_complaint_signal(
         return
     text = message_text(message)
     if not text:
+        return
+    reaction_record = reaction_decision_for_complaint(message)
+    target_hash = ""
+    if reaction_record is not None:
+        target_hash = reaction_complaint_target_hash(
+            int(message.chat_id),
+            getattr(reaction_record, "target_message_id", None),
+            getattr(reaction_record, "target_memory_id", None),
+        )
+    reaction_cluster = SELF_ANALYSIS.record_reaction_complaint_signal(
+        text=text,
+        bot_username=bot_username or BOT_USERNAME,
+        reply_to_bot=reply_to_bot,
+        chat_id=message.chat_id,
+        user_id=message_user_id(message),
+        has_recent_reaction=bool(reaction_record is not None and getattr(reaction_record, "action", "") == "sent"),
+        rationale_state=reaction_rationale_state(reaction_record),
+        decision_action=str(getattr(reaction_record, "action", "") or ""),
+        decision_reason=str(getattr(reaction_record, "reason_code", "") or ""),
+        emotion_class=str(getattr(reaction_record, "emotion_class", "") or ""),
+        target_fingerprint=target_hash,
+    )
+    if reaction_cluster is not None:
+        LOGGER.info(
+            "Reaction complaint signal category=%s temperature=%s chat_id=%s",
+            reaction_cluster.category,
+            reaction_cluster.temperature,
+            message.chat_id,
+        )
         return
     cluster = SELF_ANALYSIS.record_complaint_signal(
         text=text,
