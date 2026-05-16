@@ -2925,6 +2925,7 @@ class PersistentMemoryTests(unittest.TestCase):
 
         record = main.REACTION_MEMORY.latest_outbound_decision(chat_id=-1001, target_message_id=971)
         self.assertIsNotNone(record)
+        self.assertEqual("outbound_reaction_emotion_policy_v1", record.policy_version)
         self.assertEqual("sent", record.action)
         self.assertEqual("emoji:u1f525", record.sent_reaction_key)
         self.assertEqual("positive_celebratory", record.candidate_reaction_class)
@@ -2971,6 +2972,9 @@ class PersistentMemoryTests(unittest.TestCase):
         self.assertEqual("skipped", record.action)
         self.assertEqual("score_below_min", record.reason_code)
         self.assertIsNotNone(record.score)
+        self.assertEqual(0.0, record.confidence)
+        self.assertEqual("unclassified", record.emotion_class)
+        self.assertEqual("outbound_reaction_emotion_policy_v1", record.policy_version)
 
     def test_outbound_reaction_skips_when_rationale_is_missing(self) -> None:
         self.assertIsNotNone(main.REACTION_MEMORY)

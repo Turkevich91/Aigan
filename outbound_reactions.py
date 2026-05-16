@@ -18,8 +18,8 @@ from reaction_memory import ReactionMemoryStore, ReactionSpec, safe_code
 
 EventCallback = Callable[..., None]
 ValueProvider = Callable[[], int | str | None]
-DECISION_POLICY_VERSION = "outbound_reaction_decision_v1"
-EMOTION_POLICY_VERSION = "outbound_reaction_emotion_policy_v1"
+DECISION_POLICY_VERSION = "outbound_reaction_emotion_policy_v1"
+EMOTION_POLICY_VERSION = DECISION_POLICY_VERSION
 TERM_WORD_RE = re.compile(r"[\w']+", re.UNICODE)
 
 
@@ -351,7 +351,6 @@ class OutboundReactionAdapter:
                 reason_code="score_below_min",
                 rationale="Skipped because the relevance score did not meet the configured reaction threshold.",
                 score=score,
-                confidence=score,
                 details={"min_score": self.config.min_score},
             )
             return
