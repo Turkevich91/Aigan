@@ -690,6 +690,9 @@ class OutboundReactionAdapter:
         own_content = (item.text or "").casefold()
         source_content = self._source_context_for_policy(item).casefold()
         combined_content = f"{own_content} {source_content}".strip()
+        own_tokens = self._term_tokens(own_content)
+        source_tokens = self._term_tokens(source_content)
+        combined_tokens = self._term_tokens(combined_content)
         flags: list[str] = []
         has_own_text = bool((item.text or "").strip())
         has_source_context = bool(
@@ -697,10 +700,6 @@ class OutboundReactionAdapter:
         )
         if not has_own_text and has_source_context:
             flags.append("source_only")
-        if item.forward_origin:
-            flags.append("forwarded")
-        if item.attachment_type and item.attachment_type not in {"", "text"}:
-            flags.append(f"attachment:{safe_code(item.attachment_type)}")
         if item.attachment_type in {"video", "animation"} and not item.vision_summary and not item.source_text:
             return EmotionPolicyDecision(
                 emotion_class="ambiguous_sensitive",
@@ -710,7 +709,7 @@ class OutboundReactionAdapter:
                 rationale="Skipped because media context was incomplete and the reaction could be misread.",
                 severity_flags=tuple(flags + ["incomplete_media_context"]),
             )
-        if self._has_any(combined_content, SARCASM_MEME_TERMS):
+        if self._has_any(combined_content, SARCASM_MEME_TERMS, combined_tokens):
             return EmotionPolicyDecision(
                 emotion_class="ambiguous_sensitive",
                 confidence=0.35,
@@ -720,15 +719,15 @@ class OutboundReactionAdapter:
                 severity_flags=tuple(flags + ["sarcasm_or_meme"]),
             )
 
-        own_grief = self._hit_count(own_content, GRIEF_TERMS)
-        own_horror = self._hit_count(own_content, HORROR_TERMS)
-        own_condemnation = self._hit_count(own_content, CONDEMNATION_TERMS)
-        own_ambiguous = self._hit_count(own_content, AMBIGUOUS_TERMS)
-        own_positive = self._hit_count(own_content, POSITIVE_TERMS)
-        source_grief = self._hit_count(source_content, GRIEF_TERMS)
-        source_horror = self._hit_count(source_content, HORROR_TERMS)
-        source_condemnation = self._hit_count(source_content, CONDEMNATION_TERMS)
-        source_ambiguous = self._hit_count(source_content, AMBIGUOUS_TERMS)
+        own_grief = self._hit_count(own_content, GRIEF_TERMS, own_tokens)
+        own_horror = self._hit_count(own_content, HORROR_TERMS, own_tokens)
+        own_condemnation = self._hit_count(own_content, CONDEMNATION_TERMS, own_tokens)
+        own_ambiguous = self._hit_count(own_content, AMBIGUOUS_TERMS, own_tokens)
+        own_positive = self._hit_count(own_content, POSITIVE_TERMS, own_tokens)
+        source_grief = self._hit_count(source_content, GRIEF_TERMS, source_tokens)
+        source_horror = self._hit_count(source_content, HORROR_TERMS, source_tokens)
+        source_condemnation = self._hit_count(source_content, CONDEMNATION_TERMS, source_tokens)
+        source_ambiguous = self._hit_count(source_content, AMBIGUOUS_TERMS, source_tokens)
         source_sensitive = source_grief + source_horror + source_condemnation
         if not has_own_text and source_sensitive:
             flags.append("source_sensitive")
@@ -830,16 +829,22 @@ class OutboundReactionAdapter:
         )
 
     @staticmethod
-    def _hit_count(content: str, terms: tuple[str, ...]) -> int:
+    def _hit_count(content: str, terms: tuple[str, ...], tokens: list[str] | None = None) -> int:
         if not content:
             return 0
         normalized = content.casefold()
-        tokens = TERM_WORD_RE.findall(normalized)
-        return sum(1 for term in terms if OutboundReactionAdapter._term_matches(normalized, tokens, term))
+        term_tokens = tokens if tokens is not None else OutboundReactionAdapter._term_tokens(normalized)
+        return sum(1 for term in terms if OutboundReactionAdapter._term_matches(normalized, term_tokens, term))
 
     @staticmethod
-    def _has_any(content: str, terms: tuple[str, ...]) -> bool:
-        return OutboundReactionAdapter._hit_count(content, terms) > 0
+    def _has_any(content: str, terms: tuple[str, ...], tokens: list[str] | None = None) -> bool:
+        return OutboundReactionAdapter._hit_count(content, terms, tokens) > 0
+
+    @staticmethod
+    def _term_tokens(content: str) -> list[str]:
+        if not content:
+            return []
+        return TERM_WORD_RE.findall(content.casefold())
 
     @staticmethod
     def _term_matches(content: str, tokens: list[str], term: str) -> bool:
