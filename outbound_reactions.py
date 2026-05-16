@@ -13,11 +13,12 @@ from telegram.constants import ChatType
 from telegram.error import BadRequest
 
 from memory import MemoryItem
-from reaction_memory import ReactionMemoryStore, ReactionSpec
+from reaction_memory import ReactionMemoryStore, ReactionSpec, safe_code
 
 
 EventCallback = Callable[..., None]
 ValueProvider = Callable[[], int | str | None]
+DECISION_POLICY_VERSION = "outbound_reaction_decision_v1"
 
 
 @dataclass(frozen=True)
@@ -106,8 +107,27 @@ class OutboundReactionAdapter:
         }
 
     async def _maybe_react(self, message: Any, item: MemoryItem | None) -> None:
-        if item is None or not self._is_eligible_message(message, item):
+        if item is None:
             self._skip_count += 1
+            self._record_decision(
+                message,
+                item,
+                action="skipped",
+                reason_code="missing_memory_item",
+                rationale="Skipped because no persisted target message was available for a safe reaction decision.",
+            )
+            return
+
+        skip_reason = self._eligibility_skip_reason(message, item)
+        if skip_reason is not None:
+            self._skip_count += 1
+            self._record_decision(
+                message,
+                item,
+                action="skipped",
+                reason_code=skip_reason,
+                rationale=f"Skipped because the target failed the outbound reaction eligibility gate: {skip_reason}.",
+            )
             return
 
         chat_id = int(item.chat_id)
@@ -118,15 +138,32 @@ class OutboundReactionAdapter:
                 message_obj=message,
                 details={"eligible_since_sent": self._eligible_since_sent[chat_id]},
             )
+            self._record_decision(
+                message,
+                item,
+                action="skipped",
+                reason_code="rate_gate",
+                rationale="Skipped because the per-chat eligible-message counter has not reached the configured reaction interval.",
+                details={"eligible_since_sent": self._eligible_since_sent[chat_id]},
+            )
             return
 
         now = time.time()
         last_sent_at = self._last_sent_at.get(chat_id, 0.0)
         if now - last_sent_at < max(0, self.config.cooldown_seconds):
+            remaining = int(self.config.cooldown_seconds - (now - last_sent_at))
             self._emit(
                 event_type="outbound_reaction_skipped_cooldown",
                 message_obj=message,
-                details={"remaining_seconds": int(self.config.cooldown_seconds - (now - last_sent_at))},
+                details={"remaining_seconds": remaining},
+            )
+            self._record_decision(
+                message,
+                item,
+                action="skipped",
+                reason_code="cooldown",
+                rationale="Skipped because the chat-level outbound reaction cooldown is still active.",
+                details={"remaining_seconds": remaining},
             )
             return
 
@@ -137,17 +174,76 @@ class OutboundReactionAdapter:
                 message_obj=message,
                 details={"score": round(score, 3), "min_score": self.config.min_score},
             )
+            self._record_decision(
+                message,
+                item,
+                action="skipped",
+                reason_code="score_below_min",
+                rationale="Skipped because the relevance score did not meet the configured reaction threshold.",
+                score=score,
+                confidence=score,
+                details={"min_score": self.config.min_score},
+            )
             return
 
         primary = self._select_reaction(chat_id, item)
+        send_rationale = self._send_attempt_rationale(item, score)
+        if not send_rationale.strip():
+            self._record_decision(
+                message,
+                item,
+                action="skipped",
+                reason_code="insufficient_rationale",
+                rationale="Skipped because no sufficient outbound reaction rationale was available.",
+                score=score,
+                confidence=score,
+                candidate_spec=primary,
+                candidate_reaction_class=self._reaction_class(primary),
+            )
+            return
+
+        self._record_decision(
+            message,
+            item,
+            action="send_attempt",
+            reason_code="eligible_score",
+            rationale=send_rationale,
+            score=score,
+            confidence=score,
+            candidate_spec=primary,
+            candidate_reaction_class=self._reaction_class(primary),
+        )
         sent_spec = await self._send_reaction(message, primary, fallback=True)
         if sent_spec is None:
+            self._record_decision(
+                message,
+                item,
+                action="skipped",
+                reason_code="send_failed",
+                rationale="Skipped because Telegram did not accept the candidate reaction and no fallback was sent.",
+                score=score,
+                confidence=score,
+                candidate_spec=primary,
+                candidate_reaction_class=self._reaction_class(primary),
+            )
             return
 
         self._last_sent_at[chat_id] = now
         self._eligible_since_sent[chat_id] = 0
         self._sent_count += 1
         self._record_outbound_reaction(message, item, sent_spec)
+        self._record_decision(
+            message,
+            item,
+            action="sent",
+            reason_code="sent",
+            rationale=send_rationale,
+            score=score,
+            confidence=score,
+            candidate_spec=primary,
+            candidate_reaction_class=self._reaction_class(primary),
+            sent_spec=sent_spec,
+        )
         self._emit(
             event_type="outbound_reaction_sent",
             message_obj=message,
@@ -155,35 +251,40 @@ class OutboundReactionAdapter:
         )
 
     def _is_eligible_message(self, message: Any, item: MemoryItem) -> bool:
+        return self._eligibility_skip_reason(message, item) is None
+
+    def _eligibility_skip_reason(self, message: Any, item: MemoryItem) -> str | None:
         if item.is_bot or item.message_id is None:
-            return False
+            return "bot_or_missing_message_id"
         chat_type = str(getattr(getattr(message, "chat", None), "type", "") or item.chat_type or "")
         if chat_type not in {ChatType.GROUP, ChatType.SUPERGROUP, "group", "supergroup"}:
-            return False
+            return "unsupported_chat_type"
         user = getattr(message, "from_user", None)
         if user is None or bool(getattr(user, "is_bot", False)):
-            return False
+            return "missing_or_bot_sender"
         text = self._message_text(message)
         stripped = text.strip()
         if stripped.startswith("/"):
-            return False
+            return "command"
         trigger = (self.config.bot_trigger or "").strip()
         if trigger and stripped.startswith(trigger):
-            return False
+            return "bot_trigger"
         username = str(self.bot_username_provider() or "").strip().lstrip("@")
         if username and re.search(rf"@{re.escape(username)}\b", text, flags=re.IGNORECASE):
-            return False
+            return "bot_mention"
         bot_id = self.bot_id_provider()
         reply = getattr(message, "reply_to_message", None)
         reply_user = getattr(reply, "from_user", None)
         if bot_id is not None and reply_user is not None and getattr(reply_user, "id", None) == bot_id:
-            return False
+            return "reply_to_bot"
         if item.attachment_type in {"sticker", "dice", "poll", "location", "contact"} and not (item.text or item.source_text):
-            return False
+            return "unsupported_attachment"
         content = self._content_for_scoring(item).strip()
         if len(content) < 8 and not (item.source_text or item.vision_summary or item.source_url):
-            return False
-        return bool(content)
+            return "insufficient_content"
+        if not content:
+            return "empty_content"
+        return None
 
     def relevance_score(self, message: Any, item: MemoryItem) -> float:
         content = self._content_for_scoring(item)
@@ -288,6 +389,84 @@ class OutboundReactionAdapter:
             received_at=datetime.now(timezone.utc),
             raw_json=raw_json,
         )
+
+    def _record_decision(
+        self,
+        message: Any,
+        item: MemoryItem | None,
+        *,
+        action: str,
+        reason_code: str,
+        rationale: str,
+        score: float | None = None,
+        confidence: float = 0.0,
+        candidate_spec: ReactionSpec | None = None,
+        candidate_reaction_class: str = "",
+        sent_spec: ReactionSpec | None = None,
+        details: dict[str, object] | None = None,
+    ) -> None:
+        if self.reaction_memory is None:
+            return
+        try:
+            target_message_id = getattr(item, "message_id", None) if item is not None else getattr(message, "message_id", None)
+            target_memory_id = getattr(item, "id", None) if item is not None else None
+            chat_id = int(getattr(item, "chat_id", None) if item is not None else getattr(message, "chat_id", 0) or 0)
+            self.reaction_memory.record_outbound_decision(
+                chat_id=chat_id,
+                target_message_id=target_message_id,
+                target_memory_id=target_memory_id,
+                item=item,
+                policy_version=DECISION_POLICY_VERSION,
+                phase="pre_embedding",
+                action=action,
+                reason_code=reason_code,
+                rationale=rationale,
+                severity_flags=self._decision_feature_flags(item),
+                emotion_class="unclassified",
+                confidence=confidence,
+                score=score,
+                candidate_spec=candidate_spec,
+                candidate_reaction_class=candidate_reaction_class,
+                sent_spec=sent_spec,
+                details=details or {},
+            )
+        except Exception as exc:
+            self._error_count += 1
+            self._emit(
+                level="warning",
+                event_type="outbound_reaction_decision_record_failed",
+                message_obj=message,
+                message=type(exc).__name__,
+            )
+
+    def _decision_feature_flags(self, item: MemoryItem | None) -> tuple[str, ...]:
+        if item is None:
+            return ("missing_memory_item",)
+        flags: list[str] = []
+        if item.text:
+            flags.append("has_text")
+        if item.source_text or item.source_title or item.source_url:
+            flags.append("source_context")
+        if item.vision_summary:
+            flags.append("vision_summary")
+        if item.forward_origin:
+            flags.append("forwarded")
+        if item.content_kind:
+            flags.append(f"content:{safe_code(item.content_kind)}")
+        if item.attachment_type:
+            flags.append(f"attachment:{safe_code(item.attachment_type)}")
+        return tuple(flags)
+
+    def _reaction_class(self, spec: ReactionSpec) -> str:
+        value = spec.base_emoji or spec.reaction_key
+        if value in {"🔥", "👍", "❤️", "😂"}:
+            return "positive_or_celebratory"
+        if value in {"👀", "🤔"}:
+            return "neutral_or_ambiguous"
+        return "custom_or_unknown"
+
+    def _send_attempt_rationale(self, item: MemoryItem, score: float) -> str:
+        return "Reaction was allowed because the target passed eligibility, rate, cooldown, and score gates."
 
     def _content_for_scoring(self, item: MemoryItem) -> str:
         values = [

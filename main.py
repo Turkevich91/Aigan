@@ -2270,6 +2270,50 @@ def should_wait_for_followup_context(message: Message, prompt: str) -> bool:
     return any(phrase in lowered for phrase in wait_phrases)
 
 
+def is_reaction_explanation_request(prompt: str) -> bool:
+    lowered = " ".join((prompt or "").casefold().split())
+    if not lowered:
+        return False
+    reason_terms = (
+        "why",
+        "reason",
+        "explain",
+        "почему",
+        "зачем",
+        "чому",
+        "навіщо",
+        "поясни",
+        "объясни",
+    )
+    reaction_terms = (
+        "reaction",
+        "react",
+        "emoji",
+        "emote",
+        "реакц",
+        "эмод",
+        "емод",
+        "смайл",
+        "огон",
+        "вогон",
+        "лайк",
+        "постав",
+    )
+    return any(term in lowered for term in reason_terms) and any(term in lowered for term in reaction_terms)
+
+
+def reaction_decision_explanation_for_message(message: Message, prompt: str) -> str | None:
+    if not is_reaction_explanation_request(prompt) or REACTION_MEMORY is None:
+        return None
+    reply = getattr(message, "reply_to_message", None)
+    target_message_id = getattr(reply, "message_id", None) if reply is not None else None
+    if target_message_id is not None:
+        record = REACTION_MEMORY.latest_outbound_decision(chat_id=int(message.chat_id), target_message_id=target_message_id)
+    else:
+        record = REACTION_MEMORY.latest_outbound_decision(chat_id=int(message.chat_id))
+    return REACTION_MEMORY.explain_outbound_decision(record)
+
+
 def has_url(text: str) -> bool:
     return bool(re.search(r"https?://\S+", text))
 
@@ -6100,6 +6144,22 @@ async def handle_prompt(
             details={"prompt_chars": len(prompt), "identity": bool(PUBLIC_IDENTITY_RE.search(prompt or ""))},
         )
         await send_reply(message, privacy_response)
+        return
+
+    reaction_explanation = reaction_decision_explanation_for_message(message, prompt)
+    if reaction_explanation is not None:
+        histories[message.chat_id].append(f"{user_label(message)}: {prompt[:500]}")
+        histories[message.chat_id].append(f"Aigan: {reaction_explanation[:500]}")
+        passive_contexts[message.chat_id].append(f"Aigan: {clip_text(reaction_explanation, 700)}")
+        remember_bot_message(message.chat_id, reaction_explanation)
+        system_event(
+            component="outbound_reactions",
+            event_type="outbound_reaction_explained",
+            telegram_message=message,
+            message="outbound_reaction_explained",
+            details={"has_reply_target": getattr(message, "reply_to_message", None) is not None},
+        )
+        await send_reply(message, reaction_explanation)
         return
 
     has_current_payload = has_current_context_payload(message)
