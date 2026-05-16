@@ -1190,6 +1190,28 @@ class ToolRuntimeTests(unittest.TestCase):
         self.assertIn("No capabilities matched: [redacted]", text)
         self.assertNotIn("C:\\Users", text)
 
+    def test_tool_diagnostics_redacts_file_urls_and_single_segment_paths(self) -> None:
+        text = render_row(
+            CapabilityRow(
+                name="media_frames",
+                family="media",
+                enabled=True,
+                configured=True,
+                available=True,
+                status="ok",
+                adapter="file:///var/lib/aigan.sqlite3",
+                mode="/tmp",
+                backend="/opt/aigan",
+            ).normalized()
+        )
+
+        self.assertIn("adapter=[redacted]", text)
+        self.assertIn("mode=[redacted]", text)
+        self.assertIn("backend=[redacted]", text)
+        self.assertNotIn("file://", text)
+        self.assertNotIn("/tmp", text)
+        self.assertNotIn("/opt", text)
+
     def test_recent_tool_events_keeps_tool_failures_after_unrelated_noise(self) -> None:
         main.SYSTEM_LOG.record_event(
             level="warning",
@@ -1203,6 +1225,26 @@ class ToolRuntimeTests(unittest.TestCase):
                 component="command",
                 event_type="command_denied_admin",
                 message=f"noise-{index}",
+            )
+
+        events = main.recent_tool_events()
+
+        self.assertTrue(any(event.component == "tool_runtime" for event in events))
+        self.assertFalse(any(event.component == "command" for event in events))
+
+    def test_recent_tool_events_queries_tool_components_before_noise_cap(self) -> None:
+        main.SYSTEM_LOG.record_event(
+            level="warning",
+            component="tool_runtime",
+            event_type="tool_operation_failed",
+            details={"tool": "media_transcript", "failure_category": "download_failed"},
+        )
+        for index in range(520):
+            main.SYSTEM_LOG.record_event(
+                level="warning",
+                component="command",
+                event_type="command_denied_admin",
+                message=f"newer-noise-{index}",
             )
 
         events = main.recent_tool_events()
@@ -1235,6 +1277,25 @@ class ToolRuntimeTests(unittest.TestCase):
         self.assertTrue(any(event.component == "github_reporting" for event in events))
         self.assertEqual(1, by_name["web_image_search"].recent_warning_count)
         self.assertEqual(1, by_name["github_reporting"].recent_error_count)
+
+    def test_agent_run_error_degrades_mcp_backed_capabilities(self) -> None:
+        main.SYSTEM_LOG.record_event(
+            level="error",
+            component="agent",
+            event_type="run_error",
+            details={"failure_category": "runner_error"},
+        )
+
+        rows = build_capability_rows(
+            {"status": "ok", "adapter_count": 0, "error_count": 0, "adapters": []},
+            events=main.recent_tool_events(),
+        )
+        by_name = {item.name: item for item in rows}
+
+        self.assertEqual(1, by_name["web_search"].recent_error_count)
+        self.assertEqual(1, by_name["youtube_captions"].recent_error_count)
+        self.assertEqual("degraded", by_name["web_search"].status)
+        self.assertEqual("degraded", by_name["youtube_captions"].status)
 
     def test_github_reporting_row_uses_reporter_configuration(self) -> None:
         original_config = main.CONFIG
@@ -1275,6 +1336,14 @@ class ToolRuntimeTests(unittest.TestCase):
         self.assertFalse(row.configured)
         self.assertFalse(row.available)
         self.assertEqual("unconfigured", row.status)
+
+    def test_tool_runtime_summary_failure_returns_error_row(self) -> None:
+        with patch.object(main.TOOL_RUNTIME, "health_summary", side_effect=RuntimeError("boom")):
+            rows = {item.name: item for item in main.tool_capability_rows()}
+
+        self.assertEqual("error", rows["tool_runtime"].status)
+        self.assertFalse(rows["tool_runtime"].available)
+        self.assertEqual(1, rows["tool_runtime"].error_count)
 
     def test_configured_rows_include_reaction_memory(self) -> None:
         rows = {item.name: item for item in main.configured_capability_rows()}

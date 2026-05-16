@@ -3632,13 +3632,10 @@ def configured_capability_rows() -> list[CapabilityRow]:
 def recent_tool_events() -> list[Any]:
     if SYSTEM_LOG is None:
         return []
-    try:
-        events = SYSTEM_LOG.events_since(CONFIG.health_report_lookback_seconds, "warning", 500)
-    except Exception:
-        return []
     tool_components = {
         "tool_runtime",
         "agent_tool",
+        "agent",
         "memory_vector",
         "memory",
         "outbound_reactions",
@@ -3647,6 +3644,18 @@ def recent_tool_events() -> list[Any]:
         "startup",
         "shutdown",
     }
+    try:
+        if hasattr(SYSTEM_LOG, "events_since_for_components"):
+            events = SYSTEM_LOG.events_since_for_components(
+                CONFIG.health_report_lookback_seconds,
+                tool_components,
+                "warning",
+                500,
+            )
+        else:
+            events = SYSTEM_LOG.events_since(CONFIG.health_report_lookback_seconds, "warning", 500)
+    except Exception:
+        return []
     filtered = []
     for event in events:
         details = event.details if isinstance(event.details, dict) else {}
@@ -3655,9 +3664,31 @@ def recent_tool_events() -> list[Any]:
     return filtered[:200]
 
 
+def tool_runtime_summary_for_diagnostics() -> dict[str, Any]:
+    try:
+        return TOOL_RUNTIME.health_summary()
+    except Exception:
+        return {
+            "status": "error",
+            "adapter_count": 0,
+            "error_count": 1,
+            "adapters": [
+                {
+                    "name": "tool_runtime",
+                    "enabled": True,
+                    "configured": True,
+                    "available": False,
+                    "status": "error",
+                    "adapter": "runtime",
+                    "error_count": 1,
+                }
+            ],
+        }
+
+
 def tool_capability_rows() -> list[CapabilityRow]:
     return build_capability_rows(
-        TOOL_RUNTIME.health_summary(),
+        tool_runtime_summary_for_diagnostics(),
         events=recent_tool_events(),
         extra_rows=configured_capability_rows(),
     )

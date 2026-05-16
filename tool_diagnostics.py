@@ -55,9 +55,9 @@ SAFE_HEALTH_FIELDS = {
     "temp_dir_writable",
     "cache_version",
 }
-URL_VALUE_RE = re.compile(r"\b(?:https?|ftp)://|www\.", re.IGNORECASE)
+URL_VALUE_RE = re.compile(r"\b(?:https?|ftp|file)://|www\.", re.IGNORECASE)
 WINDOWS_PATH_VALUE_RE = re.compile(r"(?:[A-Za-z]:\\|\\\\)")
-POSIX_PATH_VALUE_RE = re.compile(r"(^|\s)(?:~|/(?:[^/\s]+/)+[^/\s]*)")
+POSIX_PATH_VALUE_RE = re.compile(r"(^|\s)(?:~(?:/|\b)|/(?:[A-Za-z0-9._-]+)(?:/[^/\s]+)*)")
 TOKEN_VALUE_RE = re.compile(r"\b(?:gh[pousr]_|github_pat_|xox[baprs]-)[A-Za-z0-9_-]{8,}", re.IGNORECASE)
 SAFE_CATEGORY_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_.:-]{0,79}$")
 ROW_DETAIL_FIELDS = ("adapter_count", "backlog", "dimensions", "max_bytes")
@@ -259,47 +259,56 @@ def apply_event_failures(rows: dict[str, CapabilityRow], events: Iterable[System
     for event in events:
         if event.level not in {"warning", "error", "critical"}:
             continue
-        row_name = capability_name_for_event(event, rows)
-        if not row_name:
+        row_names = capability_names_for_event(event, rows)
+        if not row_names:
             continue
-        row = rows[row_name]
         category = failure_category_for_event(event)
-        if event.level in {"error", "critical"}:
-            row.error_count += 1
-            row.recent_error_count += 1
-        else:
-            row.recent_warning_count += 1
-            if not is_runtime_error_event_already_counted(event, row):
-                row.warning_count += 1
-        if category and category not in row.recent_failure_categories:
-            row.recent_failure_categories.append(category)
-        if row.status == "ok":
-            row.status = "degraded"
-            row.next_action = next_action_for_status(row.status)
-        elif row.status in {"disabled", "not_implemented"}:
-            row.next_action = next_action_for_status(row.status)
-        row.normalized()
+        for row_name in row_names:
+            row = rows[row_name]
+            if event.level in {"error", "critical"}:
+                row.error_count += 1
+                row.recent_error_count += 1
+            else:
+                row.recent_warning_count += 1
+                if not is_runtime_error_event_already_counted(event, row):
+                    row.warning_count += 1
+            if category and category not in row.recent_failure_categories:
+                row.recent_failure_categories.append(category)
+            if row.status == "ok":
+                row.status = "degraded"
+                row.next_action = next_action_for_status(row.status)
+            elif row.status in {"disabled", "not_implemented"}:
+                row.next_action = next_action_for_status(row.status)
+            row.normalized()
 
 
 def capability_name_for_event(event: SystemEvent, rows: dict[str, CapabilityRow]) -> str:
+    names = capability_names_for_event(event, rows)
+    return names[0] if names else ""
+
+
+def capability_names_for_event(event: SystemEvent, rows: dict[str, CapabilityRow]) -> list[str]:
     tool = safe_display_label(event.details.get("tool") if isinstance(event.details, dict) else "", 80)
     if tool in rows:
-        return tool
-    component_map = {
+        return [tool]
+    component_map: dict[str, str | list[str]] = {
         "tool_runtime": "tool_runtime",
         "memory_vector": "memory_embeddings",
         "memory": "memory_store",
         "outbound_reactions": "outbound_reactions",
         "image_search": "web_image_search",
         "github_reporting": "github_reporting",
+        "agent": ["web_search", "youtube_captions"],
         "agent_tool": "tool_runtime",
         "startup": "tool_runtime",
         "shutdown": "tool_runtime",
     }
     mapped = component_map.get(event.component)
+    if isinstance(mapped, list):
+        return [name for name in mapped if name in rows]
     if mapped in rows:
-        return mapped
-    return event.component if event.component in rows else ""
+        return [mapped]
+    return [event.component] if event.component in rows else []
 
 
 def is_runtime_error_event_already_counted(event: SystemEvent, row: CapabilityRow) -> bool:

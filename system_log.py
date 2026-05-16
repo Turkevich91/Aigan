@@ -254,6 +254,35 @@ class SystemLogStore:
             ).fetchall()
         return [row_to_event(row) for row in rows]
 
+    def events_since_for_components(
+        self,
+        seconds: int,
+        components: list[str] | tuple[str, ...] | set[str],
+        min_level: str = "info",
+        limit: int = 200,
+    ) -> list[SystemEvent]:
+        clean_components = sorted({sanitize_text(str(item), 80) for item in components if str(item or "").strip()})
+        if not clean_components:
+            return []
+        cutoff = format_datetime(utc_now() - timedelta(seconds=max(1, int(seconds))))
+        allowed = allowed_levels(min_level)
+        level_placeholders = ",".join("?" for _ in allowed)
+        component_placeholders = ",".join("?" for _ in clean_components)
+        params: list[Any] = [cutoff, *allowed, *clean_components, max(1, min(int(limit), 500))]
+        with self._lock:
+            rows = self._conn.execute(
+                f"""
+                SELECT * FROM system_events
+                WHERE created_at >= ?
+                  AND level IN ({level_placeholders})
+                  AND component IN ({component_placeholders})
+                ORDER BY datetime(created_at) DESC, id DESC
+                LIMIT ?
+                """,
+                params,
+            ).fetchall()
+        return [row_to_event(row) for row in rows]
+
     def health_summary(self, lookback_seconds: int = 21600) -> dict[str, Any]:
         events = self.events_since(lookback_seconds, "info", 500)
         counts = {"info": 0, "warning": 0, "error": 0, "critical": 0}
