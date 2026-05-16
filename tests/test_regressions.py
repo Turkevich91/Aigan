@@ -111,7 +111,7 @@ from reaction_memory import ReactionSpec
 from scripts import import_telegram_export
 from scripts.import_telegram_export import ImportOptions
 from self_analysis import SelfAnalysisService, classify_complaint
-from system_log import SystemLogStore, redact_secrets
+from system_log import SystemEvent, SystemLogStore, redact_secrets
 from tool_diagnostics import (
     CapabilityRow,
     adapter_family,
@@ -1221,9 +1221,9 @@ class ToolRuntimeTests(unittest.TestCase):
                 configured=True,
                 available=True,
                 status="ok",
-                adapter="./data/aigan.sqlite3",
-                mode="localhost:8080/private",
-                backend="x.com/path?token=secret",
+                adapter="models/whisper/ggml.bin",
+                mode="s3://bucket/private-key",
+                backend="uploads/audio.m4a",
             ).normalized()
         )
         unmatched = render_capability_matrix([], query="192.168.1.10:8080/path")
@@ -1234,10 +1234,34 @@ class ToolRuntimeTests(unittest.TestCase):
         self.assertIn("backend=[redacted]", text)
         self.assertIn("No capabilities matched: [redacted]", unmatched)
         self.assertNotIn("data/media/file.jpg", text)
-        self.assertNotIn("./data", text)
-        self.assertNotIn("localhost", text)
-        self.assertNotIn("x.com", text)
+        self.assertNotIn("models/whisper", text)
+        self.assertNotIn("s3://", text)
+        self.assertNotIn("uploads/audio", text)
         self.assertNotIn("192.168", unmatched)
+
+    def test_tool_diagnostics_failure_categories_keep_stable_dotted_codes(self) -> None:
+        rows = build_capability_rows(
+            {"status": "ok", "adapter_count": 0, "error_count": 0, "adapters": []},
+            events=[
+                SystemEvent(
+                    id=1,
+                    created_at="2026-01-01T00:00:00+00:00",
+                    level="warning",
+                    component="web",
+                    event_type="prefetch_failed",
+                    chat_id=None,
+                    user_id=None,
+                    route="",
+                    duration_ms=None,
+                    message="",
+                    details={"failure_category": "provider.timeout"},
+                )
+            ],
+        )
+        row = {item.name: item for item in rows}["web_search"]
+
+        self.assertIn("provider.timeout", row.recent_failure_categories)
+        self.assertNotIn("[redacted]", row.recent_failure_categories)
 
     def test_recent_tool_events_keeps_tool_failures_after_unrelated_noise(self) -> None:
         main.SYSTEM_LOG.record_event(
@@ -1278,6 +1302,33 @@ class ToolRuntimeTests(unittest.TestCase):
 
         self.assertTrue(any(event.component == "tool_runtime" for event in events))
         self.assertFalse(any(event.component == "command" for event in events))
+
+    def test_recent_tool_events_keeps_tool_detail_outside_known_components(self) -> None:
+        main.SYSTEM_LOG.record_event(
+            level="warning",
+            component="future_adapter",
+            event_type="tool_operation_failed",
+            details={"tool": "stt_openai", "failure_category": "provider.timeout"},
+        )
+        for index in range(520):
+            main.SYSTEM_LOG.record_event(
+                level="warning",
+                component="command",
+                event_type="command_denied_admin",
+                message=f"newer-noise-{index}",
+            )
+
+        events = main.recent_tool_events()
+        rows = build_capability_rows(
+            {"status": "ok", "adapter_count": 0, "error_count": 0, "adapters": []},
+            events=events,
+        )
+        row = {item.name: item for item in rows}["stt_openai"]
+
+        self.assertTrue(any(event.component == "future_adapter" for event in events))
+        self.assertEqual("not_implemented", row.status)
+        self.assertEqual(1, row.recent_warning_count)
+        self.assertEqual(["provider.timeout"], row.recent_failure_categories)
 
     def test_recent_tool_events_include_image_search_and_github_reporting(self) -> None:
         main.SYSTEM_LOG.record_event(
@@ -1406,6 +1457,7 @@ class ToolRuntimeTests(unittest.TestCase):
         self.assertEqual("error", rows["tool_runtime"].status)
         self.assertFalse(rows["tool_runtime"].available)
         self.assertEqual(1, rows["tool_runtime"].error_count)
+        self.assertEqual("core", rows["tool_runtime"].family)
 
     def test_configured_rows_include_reaction_memory(self) -> None:
         rows = {item.name: item for item in main.configured_capability_rows()}

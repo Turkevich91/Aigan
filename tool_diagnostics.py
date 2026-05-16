@@ -56,17 +56,23 @@ SAFE_HEALTH_FIELDS = {
     "cache_version",
 }
 URL_VALUE_RE = re.compile(
-    r"\b(?:https?|ftp|file)://|www\.|"
+    r"\b[A-Za-z][A-Za-z0-9+.-]{1,}://|www\.|"
     r"\blocalhost(?::\d+)?(?:[/?#][^\s]*)?|"
     r"\b(?:\d{1,3}\.){3}\d{1,3}(?::\d+)?(?:[/?#][^\s]*)?|"
     r"\b(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,}(?::\d+)?(?:[/?#][^\s]*)?",
     re.IGNORECASE,
 )
+CATEGORY_URL_VALUE_RE = re.compile(
+    r"\b[A-Za-z][A-Za-z0-9+.-]{1,}://|www\.|"
+    r"\blocalhost(?::\d+|[/?#])|"
+    r"\b(?:\d{1,3}\.){3}\d{1,3}(?::\d+|[/?#])|"
+    r"\b(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,}(?::\d+|[/?#])",
+    re.IGNORECASE,
+)
 WINDOWS_PATH_VALUE_RE = re.compile(r"(?:[A-Za-z]:\\|\\\\)")
 POSIX_PATH_VALUE_RE = re.compile(r"(^|\s)(?:~(?:/|\b)|/(?:[A-Za-z0-9._-]+)(?:/[^/\s]+)*)")
 RELATIVE_PATH_VALUE_RE = re.compile(
-    r"(^|\s)(?:\.{1,2}[\\/]|(?:data|media|cache|tmp|private|logs?|db|sqlite|downloads?)[\\/]|"
-    r"(?:[A-Za-z0-9_.-]+[\\/])+(?:[^\\/\s]*\.(?:sqlite3?|db|jpg|jpeg|png|webp|gif|mp4|mov|mkv|mp3|wav|ogg|json|log|env|txt|pdf)))",
+    r"(^|\s)(?:\.{1,2}[\\/]|(?:[A-Za-z0-9_.-]+[\\/])+[^\\/\s]+)",
     re.IGNORECASE,
 )
 TOKEN_VALUE_RE = re.compile(r"\b(?:gh[pousr]_|github_pat_|xox[baprs]-)[A-Za-z0-9_-]{8,}", re.IGNORECASE)
@@ -138,11 +144,19 @@ def safe_display_label(value: Any, limit: int = 120) -> str:
 
 
 def safe_failure_category_label(value: Any, limit: int = 80) -> str:
-    text = safe_display_label(value, limit).strip()
+    text = clean_label(value, limit).strip()
     if not text:
         return ""
     if text == "[redacted]":
         return text
+    if (
+        CATEGORY_URL_VALUE_RE.search(text)
+        or WINDOWS_PATH_VALUE_RE.search(text)
+        or POSIX_PATH_VALUE_RE.search(text)
+        or RELATIVE_PATH_VALUE_RE.search(text)
+        or TOKEN_VALUE_RE.search(text)
+    ):
+        return "[redacted]"
     if SAFE_CATEGORY_RE.fullmatch(text):
         return text
     return "freeform"
@@ -216,6 +230,8 @@ def adapter_row(item: dict[str, Any]) -> CapabilityRow:
 
 
 def adapter_family(name: str) -> str:
+    if name in {"tool_runtime", "system_log"}:
+        return "core"
     if name in {"outbound_reactions", "reaction_memory"}:
         return "reactions"
     if name.startswith("web_"):

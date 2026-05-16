@@ -3629,6 +3629,7 @@ def recent_tool_events() -> list[Any]:
                 tool_components,
                 "warning",
                 500,
+                include_tool_details=True,
             )
         else:
             events = SYSTEM_LOG.events_since(CONFIG.health_report_lookback_seconds, "warning", 500)

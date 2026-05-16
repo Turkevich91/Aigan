@@ -260,6 +260,7 @@ class SystemLogStore:
         components: list[str] | tuple[str, ...] | set[str],
         min_level: str = "info",
         limit: int = 200,
+        include_tool_details: bool = False,
     ) -> list[SystemEvent]:
         clean_components = sorted({sanitize_text(str(item), 80) for item in components if str(item or "").strip()})
         if not clean_components:
@@ -268,14 +269,18 @@ class SystemLogStore:
         allowed = allowed_levels(min_level)
         level_placeholders = ",".join("?" for _ in allowed)
         component_placeholders = ",".join("?" for _ in clean_components)
-        params: list[Any] = [cutoff, *allowed, *clean_components, max(1, min(int(limit), 500))]
+        tool_details_filter = " OR details_json LIKE ?" if include_tool_details else ""
+        params: list[Any] = [cutoff, *allowed, *clean_components]
+        if include_tool_details:
+            params.append('%"tool"%')
+        params.append(max(1, min(int(limit), 500)))
         with self._lock:
             rows = self._conn.execute(
                 f"""
                 SELECT * FROM system_events
                 WHERE created_at >= ?
                   AND level IN ({level_placeholders})
-                  AND component IN ({component_placeholders})
+                  AND (component IN ({component_placeholders}){tool_details_filter})
                 ORDER BY datetime(created_at) DESC, id DESC
                 LIMIT ?
                 """,
