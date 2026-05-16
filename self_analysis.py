@@ -36,6 +36,9 @@ BOT_WORDS = {
     "bot",
     "бот",
     "бота",
+    "боте",
+    "боті",
+    "ботом",
     "боту",
     "агент",
     "аіган",
@@ -98,14 +101,14 @@ REACTION_TERMS = (
     "posted reaction",
     "posted emoji",
     "reacted",
-    "реакц",
+    "реакц*",
     "эмод",
     "емод",
     "смайл",
     "огон",
     "вогон",
     "лайк",
-    "постав",
+    "постав*",
 )
 REACTION_REASON_TERMS = (
     "why",
@@ -117,8 +120,8 @@ REACTION_REASON_TERMS = (
     "зачем",
     "чому",
     "навіщо",
-    "поясн",
-    "объясн",
+    "поясн*",
+    "объясн*",
 )
 REACTION_REASON_CHALLENGE_TERMS = (
     "explain that reaction",
@@ -128,6 +131,7 @@ REACTION_REASON_CHALLENGE_TERMS = (
     "what was the logic",
     "why did you do that",
     "why did you put",
+    "why did you put that reaction",
     "why did you react",
     "why did you react that way",
     "why did you send",
@@ -170,10 +174,16 @@ REACTION_INSENSITIVE_TERMS = (
 )
 REACTION_PASSIVE_COMPLAINT_TERMS = (
     "inappropriate reaction",
+    "explain that reaction",
+    "explain this reaction",
+    "explain your reaction",
     "wrong emoji",
     "wrong reaction",
+    "why did you put",
+    "why did you put that reaction",
     "why did you react",
     "why did you react that way",
+    "why did you send",
     "why that reaction",
     "why this reaction",
 )
@@ -220,6 +230,11 @@ def has_marker(lowered: str, marker: str) -> bool:
     clean_marker = marker.casefold().strip()
     if not clean_marker:
         return False
+    if clean_marker.endswith("*"):
+        stem = clean_marker[:-1].strip()
+        if not stem:
+            return False
+        return re.search(rf"(?<![\w-]){re.escape(stem)}", lowered, re.UNICODE) is not None
     if re.match(r"[\w-]", clean_marker, re.UNICODE) or re.search(r"[\w-]$", clean_marker, re.UNICODE):
         return re.search(rf"(?<![\w-]){re.escape(clean_marker)}(?![\w-])", lowered, re.UNICODE) is not None
     return clean_marker in lowered
