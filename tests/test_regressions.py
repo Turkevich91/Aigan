@@ -107,6 +107,7 @@ from telegram.constants import ChatType, ParseMode
 from telegram.error import BadRequest
 
 import main
+from outbound_reactions import EmotionPolicyDecision
 from media_frames import (
     CommandOutput,
     FfmpegMediaFrameAdapter,
@@ -3417,6 +3418,214 @@ class PersistentMemoryTests(unittest.TestCase):
         self.assertEqual("skipped", record.action)
         self.assertEqual("ambiguous_sensitive", record.emotion_class)
         self.assertEqual("emotion_sensitive_ambiguous", record.reason_code)
+
+    def test_outbound_reaction_empathy_preflight_blocks_positive_policy_escape(self) -> None:
+        self.assertIsNotNone(main.REACTION_MEMORY)
+        config = main.OutboundReactionConfig(
+            enabled=True,
+            every_n_messages=1,
+            cooldown_seconds=0,
+            min_score=0.0,
+            allowed_emoji=("\N{FIRE}",),
+            use_custom_emoji=False,
+        )
+        events: list[dict[str, object]] = []
+        adapter = main.OutboundReactionAdapter(
+            config=config,
+            reaction_memory=main.REACTION_MEMORY,
+            event_callback=lambda **kwargs: events.append(kwargs),
+        )
+        adapter._classify_emotion_policy = lambda _item, _score: EmotionPolicyDecision(
+            emotion_class="positive_celebratory",
+            confidence=0.95,
+            allow_reaction=True,
+            reason_code="emotion_policy_allowed",
+            rationale="Detected safely positive direct-chat content.",
+            severity_flags=("safe_positive",),
+        )
+        message = FakeMessage("great news victory after victims killed in attack", message_id=989)
+        item_id = main.MEMORY.save_message(
+            chat_id=-1001,
+            message_id=989,
+            sender_label="Tester",
+            user_id=111,
+            text=message.text,
+            created_at=datetime.now(timezone.utc),
+        )
+
+        asyncio.run(adapter.on_message_ingested(message, main.MEMORY.item_by_id(item_id), "pre_embedding"))
+
+        message.bot.set_message_reaction.assert_not_awaited()
+        record = main.REACTION_MEMORY.latest_outbound_decision(chat_id=-1001, target_message_id=989)
+        self.assertIsNotNone(record)
+        self.assertEqual("skipped", record.action)
+        self.assertEqual("empathy_preflight_approval_risk", record.reason_code)
+        self.assertEqual("positive_celebratory", record.emotion_class)
+        self.assertEqual("emoji:u1f525", record.candidate_reaction_key)
+        self.assertIn("approval_risk", record.severity_flags)
+        self.assertIn("positive_framing_sensitive", record.severity_flags)
+        self.assertNotIn(message.text, json.dumps(record.details, ensure_ascii=False))
+        self.assertTrue(any(event.get("event_type") == "outbound_reaction_skipped_empathy_preflight" for event in events))
+
+    def test_outbound_reaction_empathy_preflight_covers_documented_approval_risk_terms(self) -> None:
+        self.assertIsNotNone(main.REACTION_MEMORY)
+        config = main.OutboundReactionConfig(
+            enabled=True,
+            every_n_messages=1,
+            cooldown_seconds=0,
+            min_score=0.0,
+            allowed_emoji=("\N{FIRE}",),
+            use_custom_emoji=False,
+        )
+        adapter = main.OutboundReactionAdapter(config=config, reaction_memory=main.REACTION_MEMORY)
+        adapter._classify_emotion_policy = lambda _item, _score: EmotionPolicyDecision(
+            emotion_class="positive_celebratory",
+            confidence=0.95,
+            allow_reaction=True,
+            reason_code="emotion_policy_allowed",
+            rationale="Detected safely positive direct-chat content.",
+            severity_flags=("safe_positive",),
+        )
+
+        cases = (
+            (993, "great news success: rivals were humiliated"),
+            (994, "great news success: violence succeeded"),
+        )
+        for message_id, text in cases:
+            with self.subTest(text=text):
+                message = FakeMessage(text, message_id=message_id)
+                item_id = main.MEMORY.save_message(
+                    chat_id=-1001,
+                    message_id=message_id,
+                    sender_label="Tester",
+                    user_id=111,
+                    text=message.text,
+                    created_at=datetime.now(timezone.utc),
+                )
+
+                asyncio.run(adapter.on_message_ingested(message, main.MEMORY.item_by_id(item_id), "pre_embedding"))
+
+                message.bot.set_message_reaction.assert_not_awaited()
+                record = main.REACTION_MEMORY.latest_outbound_decision(chat_id=-1001, target_message_id=message_id)
+                self.assertIsNotNone(record)
+                self.assertEqual("skipped", record.action)
+                self.assertEqual("empathy_preflight_approval_risk", record.reason_code)
+                self.assertIn("approval_risk", record.severity_flags)
+
+    def test_outbound_reaction_empathy_preflight_requires_direct_context_for_sympathy(self) -> None:
+        self.assertIsNotNone(main.REACTION_MEMORY)
+        config = main.OutboundReactionConfig(
+            enabled=True,
+            every_n_messages=1,
+            cooldown_seconds=0,
+            min_score=0.0,
+            allowed_emoji=("\N{CRYING FACE}",),
+            use_custom_emoji=False,
+        )
+        adapter = main.OutboundReactionAdapter(config=config, reaction_memory=main.REACTION_MEMORY)
+        adapter._classify_emotion_policy = lambda _item, _score: EmotionPolicyDecision(
+            emotion_class="grief_sympathy",
+            confidence=0.91,
+            allow_reaction=True,
+            reason_code="emotion_policy_allowed",
+            rationale="Detected grief from source context.",
+            severity_flags=("source_sensitive",),
+        )
+        message = FakeMessage("look at this update with enough neutral context", message_id=990)
+        item_id = main.MEMORY.save_message(
+            chat_id=-1001,
+            message_id=990,
+            sender_label="Tester",
+            user_id=111,
+            text=message.text,
+            source_text="victims killed in an attack",
+            source_title="Forwarded source",
+            created_at=datetime.now(timezone.utc),
+        )
+
+        asyncio.run(adapter.on_message_ingested(message, main.MEMORY.item_by_id(item_id), "pre_embedding"))
+
+        message.bot.set_message_reaction.assert_not_awaited()
+        record = main.REACTION_MEMORY.latest_outbound_decision(chat_id=-1001, target_message_id=990)
+        self.assertIsNotNone(record)
+        self.assertEqual("skipped", record.action)
+        self.assertEqual("empathy_preflight_insufficient_context", record.reason_code)
+        self.assertEqual("grief_sympathy", record.emotion_class)
+        self.assertEqual("emoji:u1f622", record.candidate_reaction_key)
+        self.assertIn("insufficient_direct_context", record.severity_flags)
+
+    def test_outbound_reaction_empathy_preflight_blocks_forwarded_sympathy_escape(self) -> None:
+        self.assertIsNotNone(main.REACTION_MEMORY)
+        config = main.OutboundReactionConfig(
+            enabled=True,
+            every_n_messages=1,
+            cooldown_seconds=0,
+            min_score=0.0,
+            allowed_emoji=("\N{CRYING FACE}",),
+            use_custom_emoji=False,
+        )
+        adapter = main.OutboundReactionAdapter(config=config, reaction_memory=main.REACTION_MEMORY)
+        adapter._classify_emotion_policy = lambda _item, _score: EmotionPolicyDecision(
+            emotion_class="grief_sympathy",
+            confidence=0.91,
+            allow_reaction=True,
+            reason_code="emotion_policy_allowed",
+            rationale="Detected grief in forwarded text.",
+            severity_flags=("sensitive", "grief"),
+        )
+        message = FakeMessage("sad news: victims died in a shocking attack", message_id=992)
+        item_id = main.MEMORY.save_message(
+            chat_id=-1001,
+            message_id=992,
+            sender_label="Tester",
+            user_id=111,
+            text=message.text,
+            forward_origin="Source Channel",
+            created_at=datetime.now(timezone.utc),
+        )
+
+        asyncio.run(adapter.on_message_ingested(message, main.MEMORY.item_by_id(item_id), "pre_embedding"))
+
+        message.bot.set_message_reaction.assert_not_awaited()
+        record = main.REACTION_MEMORY.latest_outbound_decision(chat_id=-1001, target_message_id=992)
+        self.assertIsNotNone(record)
+        self.assertEqual("skipped", record.action)
+        self.assertEqual("empathy_preflight_insufficient_context", record.reason_code)
+        self.assertEqual("grief_sympathy", record.emotion_class)
+        self.assertIn("forwarded_context", record.severity_flags)
+        self.assertIn("insufficient_direct_context", record.severity_flags)
+
+    def test_outbound_reaction_empathy_preflight_blocks_positive_framing_of_harm(self) -> None:
+        self.assertIsNotNone(main.REACTION_MEMORY)
+        config = main.OutboundReactionConfig(
+            enabled=True,
+            every_n_messages=1,
+            cooldown_seconds=0,
+            min_score=0.0,
+            allowed_emoji=("\N{CRYING FACE}", "\N{FIRE}"),
+            use_custom_emoji=False,
+        )
+        adapter = main.OutboundReactionAdapter(config=config, reaction_memory=main.REACTION_MEMORY)
+        message = FakeMessage("great news victory: victims killed in a shocking attack", message_id=991)
+        item_id = main.MEMORY.save_message(
+            chat_id=-1001,
+            message_id=991,
+            sender_label="Tester",
+            user_id=111,
+            text=message.text,
+            created_at=datetime.now(timezone.utc),
+        )
+
+        asyncio.run(adapter.on_message_ingested(message, main.MEMORY.item_by_id(item_id), "pre_embedding"))
+
+        message.bot.set_message_reaction.assert_not_awaited()
+        record = main.REACTION_MEMORY.latest_outbound_decision(chat_id=-1001, target_message_id=991)
+        self.assertIsNotNone(record)
+        self.assertEqual("skipped", record.action)
+        self.assertEqual("empathy_preflight_approval_risk", record.reason_code)
+        self.assertEqual("grief_sympathy", record.emotion_class)
+        self.assertIn("positive_framing_sensitive", record.severity_flags)
+        self.assertIn("approval_risk", record.severity_flags)
 
     def test_reaction_explanation_prompt_uses_stored_decision(self) -> None:
         self.assertIsNotNone(main.REACTION_MEMORY)

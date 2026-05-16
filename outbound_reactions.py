@@ -126,10 +126,15 @@ CONDEMNATION_TERMS = (
     "crime",
     "criminal",
     "cruel",
+    "humiliat",
     "injustice",
     "occup",
+    "suffer",
+    "suffering",
     "threat",
     "torture",
+    "violence",
+    "violent",
     "war crime",
     "засуд",
     "злочин",
@@ -147,7 +152,9 @@ CONDEMNATION_TERMS = (
 STEM_TERMS = {
     "celebrat",
     "congrat",
+    "humiliat",
     "occup",
+    "suffer",
 }
 
 BENIGN_TERM_CONTEXTS: dict[str, tuple[str, ...]] = {
@@ -201,6 +208,14 @@ class EmotionPolicyDecision:
     reason_code: str
     rationale: str
     severity_flags: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class EmpathyPreflightDecision:
+    allow_reaction: bool
+    reason_code: str
+    rationale: str
+    risk_flags: tuple[str, ...] = ()
 
 
 class ReactionAdapter(Protocol):
@@ -402,6 +417,38 @@ class OutboundReactionAdapter:
                 emotion_class=policy.emotion_class,
                 severity_flags=policy.severity_flags,
                 details={"policy": EMOTION_POLICY_VERSION},
+            )
+            return
+
+        preflight = self._empathy_preflight(item, policy)
+        if not preflight.allow_reaction:
+            self._skip_count += 1
+            self._emit(
+                event_type="outbound_reaction_skipped_empathy_preflight",
+                message_obj=message,
+                details={
+                    "reason_code": preflight.reason_code,
+                    "emotion_class": policy.emotion_class,
+                    "risk_flags": list(preflight.risk_flags),
+                },
+            )
+            self._record_decision(
+                message,
+                item,
+                action="skipped",
+                reason_code=preflight.reason_code,
+                rationale=preflight.rationale,
+                score=score,
+                confidence=policy.confidence,
+                candidate_spec=primary,
+                candidate_reaction_class=policy.emotion_class,
+                emotion_class=policy.emotion_class,
+                severity_flags=self._merge_severity_flags(policy.severity_flags, preflight.risk_flags),
+                details={
+                    "policy": EMOTION_POLICY_VERSION,
+                    "preflight": "empathy_perception",
+                    "risk_flags": list(preflight.risk_flags),
+                },
             )
             return
 
@@ -678,6 +725,105 @@ class OutboundReactionAdapter:
 
     def _send_attempt_rationale(self, item: MemoryItem, score: float, policy: EmotionPolicyDecision) -> str:
         return policy.rationale
+
+    def _empathy_preflight(
+        self,
+        item: MemoryItem,
+        policy: EmotionPolicyDecision,
+    ) -> EmpathyPreflightDecision:
+        threshold = EMOTION_CONFIDENCE_MIN.get(policy.emotion_class, 1.0)
+        if policy.confidence < threshold:
+            return EmpathyPreflightDecision(
+                allow_reaction=False,
+                reason_code="empathy_preflight_low_confidence",
+                rationale="Skipped because the final empathy preflight found insufficient confidence for a public reaction.",
+                risk_flags=self._merge_severity_flags(policy.severity_flags, ("low_confidence",)),
+            )
+
+        own_content = (item.text or "").casefold()
+        source_content = self._source_context_for_policy(item).casefold()
+        own_tokens = self._term_tokens(own_content)
+        source_tokens = self._term_tokens(source_content)
+        own_positive = self._hit_count(own_content, POSITIVE_TERMS, own_tokens)
+        own_grief = self._hit_count(own_content, GRIEF_TERMS, own_tokens)
+        own_horror = self._hit_count(own_content, HORROR_TERMS, own_tokens)
+        own_condemnation = self._hit_count(own_content, CONDEMNATION_TERMS, own_tokens)
+        source_grief = self._hit_count(source_content, GRIEF_TERMS, source_tokens)
+        source_horror = self._hit_count(source_content, HORROR_TERMS, source_tokens)
+        source_condemnation = self._hit_count(source_content, CONDEMNATION_TERMS, source_tokens)
+        own_sensitive = own_grief + own_horror + own_condemnation
+        source_sensitive = source_grief + source_horror + source_condemnation
+        direct_text_present = bool((item.text or "").strip())
+        risk_flags: list[str] = []
+
+        if source_sensitive:
+            risk_flags.append("source_sensitive")
+        if item.forward_origin:
+            risk_flags.append("forwarded_context")
+        if item.attachment_type in {"video", "animation"} and not item.vision_summary and not item.source_text:
+            risk_flags.append("incomplete_media_context")
+        if own_sensitive and own_positive and policy.emotion_class != "condemnation_outrage":
+            risk_flags.append("positive_framing_sensitive")
+
+        if policy.emotion_class == "positive_celebratory" and (own_sensitive or source_sensitive or risk_flags):
+            return EmpathyPreflightDecision(
+                allow_reaction=False,
+                reason_code="empathy_preflight_approval_risk",
+                rationale=(
+                    "Skipped because the final empathy preflight found that a positive reaction could be perceived "
+                    "as approval of harm, suffering, coercion, or injustice."
+                ),
+                risk_flags=self._merge_severity_flags(policy.severity_flags, risk_flags, ("approval_risk",)),
+            )
+
+        if policy.emotion_class in {"grief_sympathy", "horror_shock", "condemnation_outrage", "despair_heavy_news"}:
+            if not direct_text_present or not own_sensitive:
+                return EmpathyPreflightDecision(
+                    allow_reaction=False,
+                    reason_code="empathy_preflight_insufficient_context",
+                    rationale=(
+                        "Skipped because the final empathy preflight requires direct message evidence before sending "
+                        "a sympathy, shock, outrage, or despair reaction."
+                    ),
+                    risk_flags=self._merge_severity_flags(policy.severity_flags, risk_flags, ("insufficient_direct_context",)),
+                )
+            if item.forward_origin:
+                return EmpathyPreflightDecision(
+                    allow_reaction=False,
+                    reason_code="empathy_preflight_insufficient_context",
+                    rationale=(
+                        "Skipped because the final empathy preflight requires non-forwarded direct context before "
+                        "sending a sympathy, shock, outrage, or despair reaction."
+                    ),
+                    risk_flags=self._merge_severity_flags(policy.severity_flags, risk_flags, ("insufficient_direct_context",)),
+                )
+            if "positive_framing_sensitive" in risk_flags:
+                return EmpathyPreflightDecision(
+                    allow_reaction=False,
+                    reason_code="empathy_preflight_approval_risk",
+                    rationale=(
+                        "Skipped because the final empathy preflight found positive framing around sensitive content, "
+                        "so even an empathetic reaction could be misread."
+                    ),
+                    risk_flags=self._merge_severity_flags(policy.severity_flags, risk_flags, ("approval_risk",)),
+                )
+
+        if policy.emotion_class == "uncertainty_doubt" and (own_sensitive or source_sensitive):
+            return EmpathyPreflightDecision(
+                allow_reaction=False,
+                reason_code="empathy_preflight_approval_risk",
+                rationale=(
+                    "Skipped because the final empathy preflight found that a doubt reaction on sensitive content "
+                    "could look dismissive or approving."
+                ),
+                risk_flags=self._merge_severity_flags(policy.severity_flags, risk_flags, ("approval_risk",)),
+            )
+
+        return EmpathyPreflightDecision(
+            allow_reaction=True,
+            reason_code="empathy_preflight_allowed",
+            rationale="Final empathy preflight found no approval-risk for the selected reaction.",
+        )
 
     def _classify_emotion_policy(self, item: MemoryItem, score: float) -> EmotionPolicyDecision:
         own_content = (item.text or "").casefold()
