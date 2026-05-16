@@ -19,29 +19,8 @@ STATUS_ORDER = [
     "disabled",
     "not_implemented",
 ]
-NON_FAILURE_STATUSES = {"ok", "disabled", "not_implemented"}
 DEGRADED_STATUSES = {"degraded", "unavailable", "unconfigured", "warming", "unknown"}
 FAILING_STATUSES = {"failing", "error"}
-UNSAFE_KEY_PARTS = (
-    "token",
-    "secret",
-    "password",
-    "api_key",
-    "apikey",
-    "cookie",
-    "path",
-    "file",
-    "url",
-    "prompt",
-    "payload",
-    "transcript",
-    "ocr",
-    "document",
-    "text",
-    "caption",
-    "message",
-    "media",
-)
 SAFE_HEALTH_FIELDS = {
     "mode",
     "backend",
@@ -51,6 +30,9 @@ SAFE_HEALTH_FIELDS = {
     "available",
     "warning_count",
     "runtime_error_count",
+    "adapter_count",
+    "backlog",
+    "dimensions",
     "max_bytes",
     "max_duration_seconds",
     "max_audio_bytes",
@@ -77,6 +59,8 @@ URL_VALUE_RE = re.compile(r"\b(?:https?|ftp)://|www\.", re.IGNORECASE)
 WINDOWS_PATH_VALUE_RE = re.compile(r"(?:[A-Za-z]:\\|\\\\)")
 POSIX_PATH_VALUE_RE = re.compile(r"(^|\s)(?:~|/(?:[^/\s]+/)+[^/\s]*)")
 TOKEN_VALUE_RE = re.compile(r"\b(?:gh[pousr]_|github_pat_|xox[baprs]-)[A-Za-z0-9_-]{8,}", re.IGNORECASE)
+SAFE_CATEGORY_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_.:-]{0,79}$")
+ROW_DETAIL_FIELDS = ("adapter_count", "backlog", "dimensions", "max_bytes")
 
 
 @dataclass
@@ -92,6 +76,8 @@ class CapabilityRow:
     backend: str = ""
     error_count: int = 0
     warning_count: int = 0
+    recent_error_count: int = 0
+    recent_warning_count: int = 0
     recent_failure_categories: list[str] = field(default_factory=list)
     next_action: str = ""
     details: dict[str, Any] = field(default_factory=dict)
@@ -105,7 +91,17 @@ class CapabilityRow:
         self.backend = safe_display_label(self.backend, 80)
         self.error_count = max(0, int(self.error_count or 0))
         self.warning_count = max(0, int(self.warning_count or 0))
-        self.recent_failure_categories = [clean_label(item, 80) for item in self.recent_failure_categories[:5]]
+        self.recent_error_count = max(0, int(self.recent_error_count or 0))
+        self.recent_warning_count = max(0, int(self.recent_warning_count or 0))
+        if self.status == "ok" and (
+            self.error_count or self.warning_count or self.recent_error_count or self.recent_warning_count
+        ):
+            self.status = "degraded"
+        self.recent_failure_categories = [
+            category
+            for category in (safe_failure_category_label(item, 80) for item in self.recent_failure_categories[:5])
+            if category
+        ]
         self.next_action = clean_label(self.next_action or next_action_for_status(self.status), 120)
         self.details = sanitize_health_details(self.details)
         return self
@@ -129,6 +125,17 @@ def safe_display_label(value: Any, limit: int = 120) -> str:
     return text
 
 
+def safe_failure_category_label(value: Any, limit: int = 80) -> str:
+    text = safe_display_label(value, limit).strip()
+    if not text:
+        return ""
+    if text == "[redacted]":
+        return text
+    if SAFE_CATEGORY_RE.fullmatch(text):
+        return text
+    return "freeform"
+
+
 def normalize_status(status: Any, enabled: bool = False) -> str:
     value = str(status or "").strip().casefold()
     if not value:
@@ -141,8 +148,6 @@ def sanitize_health_details(details: dict[str, Any] | None) -> dict[str, Any]:
     for raw_key, raw_value in (details or {}).items():
         key = clean_label(raw_key, 80)
         if not key or key not in SAFE_HEALTH_FIELDS:
-            continue
-        if any(part in key.casefold() for part in UNSAFE_KEY_PARTS):
             continue
         if isinstance(raw_value, bool | int | float):
             clean[key] = raw_value
@@ -261,8 +266,11 @@ def apply_event_failures(rows: dict[str, CapabilityRow], events: Iterable[System
         category = failure_category_for_event(event)
         if event.level in {"error", "critical"}:
             row.error_count += 1
+            row.recent_error_count += 1
         else:
-            row.warning_count += 1
+            row.recent_warning_count += 1
+            if not is_runtime_error_event_already_counted(event, row):
+                row.warning_count += 1
         if category and category not in row.recent_failure_categories:
             row.recent_failure_categories.append(category)
         if row.status == "ok":
@@ -282,6 +290,8 @@ def capability_name_for_event(event: SystemEvent, rows: dict[str, CapabilityRow]
         "memory_vector": "memory_embeddings",
         "memory": "memory_store",
         "outbound_reactions": "outbound_reactions",
+        "image_search": "web_image_search",
+        "github_reporting": "github_reporting",
         "agent_tool": "tool_runtime",
         "startup": "tool_runtime",
         "shutdown": "tool_runtime",
@@ -292,13 +302,17 @@ def capability_name_for_event(event: SystemEvent, rows: dict[str, CapabilityRow]
     return event.component if event.component in rows else ""
 
 
+def is_runtime_error_event_already_counted(event: SystemEvent, row: CapabilityRow) -> bool:
+    return event.component == "tool_runtime" and event.event_type == "tool_operation_failed" and row.error_count > 0
+
+
 def failure_category_for_event(event: SystemEvent) -> str:
     details = event.details if isinstance(event.details, dict) else {}
     for key in ("failure_category", "category", "operation", "exception_type"):
         value = details.get(key)
         if value:
-            return safe_display_label(value, 80)
-    return safe_display_label(event.event_type, 80)
+            return safe_failure_category_label(value, 80)
+    return safe_failure_category_label(event.event_type, 80)
 
 
 def sort_key(row: CapabilityRow) -> tuple[int, str, str]:
@@ -352,7 +366,7 @@ def filter_rows(rows: Iterable[CapabilityRow], query: str = "") -> list[Capabili
 def render_capability_matrix(rows: Iterable[CapabilityRow], *, query: str = "", max_rows: int = 30) -> str:
     selected = filter_rows(rows, query)
     if not selected:
-        return f"Tool capabilities\nOverall: unknown\nNo capabilities matched: {clean_label(query, 80)}"
+        return f"Tool capabilities\nOverall: unknown\nNo capabilities matched: {safe_display_label(query, 80)}"
     lines = [
         "Tool capabilities",
         f"Overall: {overall_status(selected)}",
@@ -388,18 +402,21 @@ def render_row(row: CapabilityRow) -> str:
         parts.append(f"warnings={row.warning_count}")
     if row.recent_failure_categories:
         parts.append("recent=" + ",".join(row.recent_failure_categories[:3]))
+    for key in ROW_DETAIL_FIELDS:
+        if key in row.details:
+            parts.append(f"{key}={row.details[key]}")
     if row.next_action and row.next_action != "none":
         parts.append(f"next={row.next_action}")
     return "- " + ", ".join(parts)
 
 
 def render_recent_failures(rows: Iterable[CapabilityRow]) -> str:
-    failures = [row for row in rows if row.warning_count or row.error_count or row.status in FAILING_STATUSES]
+    failures = [row for row in rows if row.recent_warning_count or row.recent_error_count]
     if not failures:
         return "Recent tool failures\n- none"
     lines = ["Recent tool failures"]
-    for row in sorted(failures, key=lambda item: (-(item.error_count + item.warning_count), item.name))[:8]:
-        count = row.error_count + row.warning_count
+    for row in sorted(failures, key=lambda item: (-(item.recent_error_count + item.recent_warning_count), item.name))[:8]:
+        count = row.recent_error_count + row.recent_warning_count
         categories = ",".join(row.recent_failure_categories[:3]) or row.status
         lines.append(f"- {row.name}: {count} recent, {categories}, next={row.next_action or next_action_for_status(row.status)}")
     return "\n".join(lines)

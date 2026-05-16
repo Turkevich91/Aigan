@@ -3590,14 +3590,15 @@ def configured_capability_rows() -> list[CapabilityRow]:
             adapter="mcp_web",
         )
     )
+    vision_configured = CONFIG.image_analysis_enabled and bool(CONFIG.vision_model)
     rows.append(
         CapabilityRow(
             name="image_understanding",
             family="vision",
             enabled=CONFIG.image_analysis_enabled,
-            configured=CONFIG.image_analysis_enabled,
-            available=CONFIG.image_analysis_enabled,
-            status="ok" if CONFIG.image_analysis_enabled else "disabled",
+            configured=vision_configured,
+            available=vision_configured,
+            status="ok" if vision_configured else ("unconfigured" if CONFIG.image_analysis_enabled else "disabled"),
             adapter="vision",
             backend=CONFIG.vision_model,
             details={"max_bytes": CONFIG.image_max_bytes},
@@ -3641,6 +3642,8 @@ def recent_tool_events() -> list[Any]:
         "memory_vector",
         "memory",
         "outbound_reactions",
+        "image_search",
+        "github_reporting",
         "startup",
         "shutdown",
     }

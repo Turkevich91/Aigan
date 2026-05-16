@@ -1010,6 +1010,26 @@ class ToolRuntimeTests(unittest.TestCase):
             self.assertNotIn(fake_telegram_secret(), text)
             store.close()
 
+    def test_tool_diagnostics_replaces_freeform_failure_category(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = SystemLogStore(Path(tmpdir) / "events.sqlite3", retention_days=14)
+            store.record_event(
+                level="warning",
+                component="tool_runtime",
+                event_type="tool_operation_failed",
+                details={"tool": "media_transcript", "failure_category": "raw private chat text"},
+            )
+
+            rows = build_capability_rows(
+                {"status": "ok", "adapter_count": 0, "error_count": 0, "adapters": []},
+                events=store.events_since(21600, "warning", 20),
+            )
+            text = render_recent_failures(rows)
+
+            self.assertIn("freeform", text)
+            self.assertNotIn("raw private chat text", text)
+            store.close()
+
     def test_tool_diagnostics_redacts_unsafe_failure_category(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             store = SystemLogStore(Path(tmpdir) / "events.sqlite3", retention_days=14)
@@ -1066,6 +1086,110 @@ class ToolRuntimeTests(unittest.TestCase):
         self.assertIn("errors=1", text)
         self.assertIn("warnings=2", text)
 
+    def test_tool_diagnostics_adapter_warning_degrades_status(self) -> None:
+        rows = build_capability_rows(
+            {
+                "status": "ok",
+                "adapter_count": 1,
+                "error_count": 0,
+                "adapters": [
+                    {
+                        "name": "media_transcript",
+                        "enabled": True,
+                        "status": "ok",
+                        "adapter": "media",
+                        "warning_count": 1,
+                    }
+                ],
+            }
+        )
+        row = {item.name: item for item in rows}["media_transcript"]
+
+        self.assertEqual("degraded", row.status)
+        self.assertEqual("degraded", render_capability_matrix(rows).splitlines()[1].replace("Overall: ", ""))
+
+    def test_tool_diagnostics_runtime_warning_event_does_not_double_count_adapter_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = SystemLogStore(Path(tmpdir) / "events.sqlite3", retention_days=14)
+            store.record_event(
+                level="warning",
+                component="tool_runtime",
+                event_type="tool_operation_failed",
+                details={"tool": "media_transcript", "failure_category": "provider_unavailable"},
+            )
+
+            rows = build_capability_rows(
+                {
+                    "status": "degraded",
+                    "adapter_count": 1,
+                    "error_count": 1,
+                    "adapters": [
+                        {
+                            "name": "media_transcript",
+                            "enabled": True,
+                            "status": "degraded",
+                            "adapter": "media",
+                            "error_count": 1,
+                        }
+                    ],
+                },
+                events=store.events_since(21600, "warning", 20),
+            )
+            row_text = render_row({item.name: item for item in rows}["media_transcript"])
+            failure_text = render_recent_failures(rows)
+
+            self.assertIn("errors=1", row_text)
+            self.assertNotIn("warnings=1", row_text)
+            self.assertIn("media_transcript: 1 recent", failure_text)
+            store.close()
+
+    def test_tool_diagnostics_renders_safe_memory_embedding_details(self) -> None:
+        text = render_row(
+            CapabilityRow(
+                name="memory_embeddings",
+                family="memory",
+                enabled=True,
+                configured=True,
+                available=True,
+                status="ok",
+                details={"backlog": 7, "dimensions": 1536},
+            ).normalized()
+        )
+
+        self.assertIn("backlog=7", text)
+        self.assertIn("dimensions=1536", text)
+
+    def test_tool_diagnostics_preserves_allowlisted_planned_fields(self) -> None:
+        rows = build_capability_rows(
+            {
+                "status": "ok",
+                "adapter_count": 1,
+                "error_count": 0,
+                "adapters": [
+                    {
+                        "name": "ocr",
+                        "enabled": True,
+                        "status": "ok",
+                        "adapter": "ocr",
+                        "ocr_enabled": True,
+                        "local_ocr_enabled": False,
+                        "caption_backend": "telegram",
+                    }
+                ],
+            }
+        )
+        details = {item.name: item for item in rows}["ocr"].details
+
+        self.assertTrue(details["ocr_enabled"])
+        self.assertFalse(details["local_ocr_enabled"])
+        self.assertEqual("telegram", details["caption_backend"])
+
+    def test_tool_diagnostics_unmatched_query_redacts_unsafe_value(self) -> None:
+        text = render_capability_matrix([], query="C:\\Users\\private\\media.mp4")
+
+        self.assertIn("No capabilities matched: [redacted]", text)
+        self.assertNotIn("C:\\Users", text)
+
     def test_recent_tool_events_keeps_tool_failures_after_unrelated_noise(self) -> None:
         main.SYSTEM_LOG.record_event(
             level="warning",
@@ -1086,6 +1210,32 @@ class ToolRuntimeTests(unittest.TestCase):
         self.assertTrue(any(event.component == "tool_runtime" for event in events))
         self.assertFalse(any(event.component == "command" for event in events))
 
+    def test_recent_tool_events_include_image_search_and_github_reporting(self) -> None:
+        main.SYSTEM_LOG.record_event(
+            level="warning",
+            component="image_search",
+            event_type="search_failed",
+            details={"failure_category": "search_failed"},
+        )
+        main.SYSTEM_LOG.record_event(
+            level="error",
+            component="github_reporting",
+            event_type="self_report_failed",
+            details={"failure_category": "provider_unavailable"},
+        )
+
+        events = main.recent_tool_events()
+        rows = build_capability_rows(
+            {"status": "ok", "adapter_count": 0, "error_count": 0, "adapters": []},
+            events=events,
+        )
+        by_name = {item.name: item for item in rows}
+
+        self.assertTrue(any(event.component == "image_search" for event in events))
+        self.assertTrue(any(event.component == "github_reporting" for event in events))
+        self.assertEqual(1, by_name["web_image_search"].recent_warning_count)
+        self.assertEqual(1, by_name["github_reporting"].recent_error_count)
+
     def test_github_reporting_row_uses_reporter_configuration(self) -> None:
         original_config = main.CONFIG
         try:
@@ -1105,6 +1255,19 @@ class ToolRuntimeTests(unittest.TestCase):
         try:
             main.CONFIG = replace(main.CONFIG, memory_vector_enabled=True, memory_embedding_model="")
             row = {item.name: item for item in main.memory_capability_rows()}["memory_embeddings"]
+        finally:
+            main.CONFIG = original_config
+
+        self.assertTrue(row.enabled)
+        self.assertFalse(row.configured)
+        self.assertFalse(row.available)
+        self.assertEqual("unconfigured", row.status)
+
+    def test_image_understanding_blank_model_is_unconfigured(self) -> None:
+        original_config = main.CONFIG
+        try:
+            main.CONFIG = replace(main.CONFIG, image_analysis_enabled=True, vision_model="")
+            row = {item.name: item for item in main.configured_capability_rows()}["image_understanding"]
         finally:
             main.CONFIG = original_config
 
