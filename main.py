@@ -3548,7 +3548,15 @@ def configured_capability_rows() -> list[CapabilityRow]:
     rows = memory_capability_rows()
     youtube_audio_fallback_enabled = _env_bool("YOUTUBE_AUDIO_FALLBACK", False)
     youtube_transcription_model = os.getenv("YOUTUBE_TRANSCRIPTION_MODEL", "gpt-4o-mini-transcribe").strip()
-    youtube_audio_fallback_configured = youtube_audio_fallback_enabled and bool(youtube_transcription_model)
+    youtube_max_duration_raw = os.getenv("YOUTUBE_MAX_DURATION_SECONDS", "1200").strip()
+    youtube_max_duration: int | None
+    try:
+        youtube_max_duration = int(youtube_max_duration_raw)
+    except ValueError:
+        youtube_max_duration = None
+    youtube_audio_fallback_configured = (
+        youtube_audio_fallback_enabled and bool(youtube_transcription_model) and youtube_max_duration is not None
+    )
     rows.append(
         CapabilityRow(
             name="stt_openai",
@@ -3564,8 +3572,12 @@ def configured_capability_rows() -> list[CapabilityRow]:
             adapter="youtube_audio_fallback",
             mode="youtube_audio_fallback",
             backend=youtube_transcription_model,
-            details={"max_duration_seconds": int(os.getenv("YOUTUBE_MAX_DURATION_SECONDS", "1200"))},
-            next_action="check configuration" if youtube_audio_fallback_enabled and not youtube_transcription_model else "",
+            details={"max_duration_seconds": youtube_max_duration} if youtube_max_duration is not None else {},
+            next_action=(
+                "check configuration"
+                if youtube_audio_fallback_enabled and (not youtube_transcription_model or youtube_max_duration is None)
+                else ""
+            ),
         )
     )
     rows.append(

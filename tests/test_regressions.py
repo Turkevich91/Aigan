@@ -1205,10 +1205,10 @@ class ToolRuntimeTests(unittest.TestCase):
         self.assertEqual("telegram", details["caption_backend"])
 
     def test_tool_diagnostics_unmatched_query_redacts_unsafe_value(self) -> None:
-        text = render_capability_matrix([], query="C:\\Users\\private\\media.mp4")
+        text = render_capability_matrix([], query="C:/Users/private/media.mp4")
 
         self.assertIn("No capabilities matched: [redacted]", text)
-        self.assertNotIn("C:\\Users", text)
+        self.assertNotIn("C:/Users", text)
 
     def test_tool_diagnostics_redacts_file_urls_and_single_segment_paths(self) -> None:
         text = render_row(
@@ -1306,6 +1306,30 @@ class ToolRuntimeTests(unittest.TestCase):
 
         self.assertIn("[redacted]", row.recent_failure_categories)
         self.assertNotIn("api.internal", row.recent_failure_categories)
+
+    def test_tool_diagnostics_failure_categories_redact_prefixed_hostnames(self) -> None:
+        rows = build_capability_rows(
+            {"status": "ok", "adapter_count": 0, "error_count": 0, "adapters": []},
+            events=[
+                SystemEvent(
+                    id=1,
+                    created_at="2026-01-01T00:00:00+00:00",
+                    level="warning",
+                    component="web",
+                    event_type="prefetch_failed",
+                    chat_id=None,
+                    user_id=None,
+                    route="",
+                    duration_ms=None,
+                    message="",
+                    details={"failure_category": "provider.internal"},
+                )
+            ],
+        )
+        row = {item.name: item for item in rows}["web_search"]
+
+        self.assertIn("[redacted]", row.recent_failure_categories)
+        self.assertNotIn("provider.internal", row.recent_failure_categories)
 
     def test_recent_tool_events_keeps_tool_failures_after_unrelated_noise(self) -> None:
         main.SYSTEM_LOG.record_event(
@@ -1496,6 +1520,45 @@ class ToolRuntimeTests(unittest.TestCase):
         self.assertFalse(row.configured)
         self.assertFalse(row.available)
         self.assertEqual("unconfigured", row.status)
+
+    def test_stt_openai_row_handles_bad_youtube_max_duration(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "YOUTUBE_AUDIO_FALLBACK": "true",
+                "YOUTUBE_TRANSCRIPTION_MODEL": "gpt-4o-mini-transcribe",
+                "YOUTUBE_MAX_DURATION_SECONDS": "not-a-number",
+            },
+        ):
+            row = {item.name: item for item in main.configured_capability_rows()}["stt_openai"]
+
+        self.assertTrue(row.enabled)
+        self.assertFalse(row.configured)
+        self.assertFalse(row.available)
+        self.assertEqual("unconfigured", row.status)
+        self.assertEqual({}, row.details)
+
+    def test_adapter_row_prefers_reported_family(self) -> None:
+        rows = build_capability_rows(
+            {
+                "status": "ok",
+                "adapter_count": 1,
+                "error_count": 0,
+                "adapters": [
+                    {
+                        "name": "custom_live_backend",
+                        "family": "stt",
+                        "enabled": True,
+                        "configured": True,
+                        "available": True,
+                        "status": "ok",
+                    }
+                ],
+            }
+        )
+        row = {item.name: item for item in rows}["custom_live_backend"]
+
+        self.assertEqual("stt", row.family)
 
     def test_memory_capability_rows_do_not_scan_embedding_backlog(self) -> None:
         if main.MEMORY is None:

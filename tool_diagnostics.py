@@ -69,7 +69,7 @@ CATEGORY_URL_VALUE_RE = re.compile(
     r"\b(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,}(?::\d+|[/?#])",
     re.IGNORECASE,
 )
-WINDOWS_PATH_VALUE_RE = re.compile(r"(?:[A-Za-z]:\\|\\\\)")
+WINDOWS_PATH_VALUE_RE = re.compile(r"(?:[A-Za-z]:[\\/]|\\\\)")
 POSIX_PATH_VALUE_RE = re.compile(r"(^|\s)(?:~(?:/|\b)|/(?:[A-Za-z0-9._-]+)(?:/[^/\s]+)*)")
 RELATIVE_PATH_VALUE_RE = re.compile(
     r"(^|\s)(?:\.{1,2}[\\/]|(?:[A-Za-z0-9_.-]+[\\/])+[^\\/\s]+)",
@@ -112,27 +112,10 @@ SAFE_CATEGORY_PREFIXES = (
     "web_",
     "yt_dlp_",
 )
-SAFE_DOTTED_CATEGORY_PREFIXES = (
-    "adapter.",
-    "caption.",
-    "decode.",
-    "download.",
-    "ffmpeg.",
-    "github.",
-    "image.",
-    "memory.",
-    "ocr.",
-    "openai.",
-    "provider.",
-    "runtime.",
-    "stt.",
-    "telegram.",
-    "tool.",
-    "transcript.",
-    "vision.",
-    "web.",
-    "yt_dlp.",
-)
+SAFE_DOTTED_CATEGORY_VALUES = {
+    "provider.timeout",
+    "yt_dlp.unavailable",
+}
 ROW_DETAIL_FIELDS = ("adapter_count", "backlog", "dimensions", "max_bytes")
 
 
@@ -140,7 +123,7 @@ def is_safe_category_code(text: str) -> bool:
     if text in SAFE_CATEGORY_VALUES:
         return True
     if "." in text:
-        return text.startswith(SAFE_DOTTED_CATEGORY_PREFIXES)
+        return text in SAFE_DOTTED_CATEGORY_VALUES
     return text.startswith(SAFE_CATEGORY_PREFIXES)
 
 
@@ -274,6 +257,9 @@ def static_capability_rows() -> list[CapabilityRow]:
 def adapter_row(item: dict[str, Any]) -> CapabilityRow:
     enabled = bool(item.get("enabled", False))
     name = safe_display_label(item.get("name") or "unknown", 80) or "unknown"
+    family = safe_display_label(item.get("family") or "", 60)
+    if not family or family == "[redacted]":
+        family = adapter_family(name)
     status = normalize_status(item.get("status"), enabled)
     details = {key: value for key, value in item.items() if key in SAFE_HEALTH_FIELDS}
     configured = bool(item.get("configured", enabled)) if "configured" in item else enabled
@@ -281,7 +267,7 @@ def adapter_row(item: dict[str, Any]) -> CapabilityRow:
     available = bool(item.get("available", available_default)) if "available" in item else available_default
     return CapabilityRow(
         name=name,
-        family=adapter_family(name),
+        family=family,
         enabled=enabled,
         configured=configured,
         available=available,
