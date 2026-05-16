@@ -3197,6 +3197,42 @@ class PersistentMemoryTests(unittest.TestCase):
         self.assertEqual("ambiguous_low_confidence", record.emotion_class)
         self.assertIn("source_context", record.severity_flags)
 
+    def test_outbound_reaction_positive_text_with_sensitive_source_skips_positive(self) -> None:
+        self.assertIsNotNone(main.REACTION_MEMORY)
+        config = main.OutboundReactionConfig(
+            enabled=True,
+            every_n_messages=1,
+            cooldown_seconds=0,
+            min_score=0.0,
+            allowed_emoji=("\N{FIRE}", "\N{CRYING FACE}"),
+            use_custom_emoji=False,
+        )
+        adapter = main.OutboundReactionAdapter(config=config, reaction_memory=main.REACTION_MEMORY)
+        message = FakeMessage("great news success release", message_id=988)
+        item_id = main.MEMORY.save_message(
+            chat_id=-1001,
+            message_id=988,
+            sender_label="Tester",
+            user_id=111,
+            text=message.text,
+            source_text="victims killed in an attack",
+            source_title="Forwarded source",
+            created_at=datetime.now(timezone.utc),
+        )
+
+        asyncio.run(adapter.on_message_ingested(message, main.MEMORY.item_by_id(item_id), "pre_embedding"))
+
+        message.bot.set_message_reaction.assert_not_awaited()
+        record = main.REACTION_MEMORY.latest_outbound_decision(chat_id=-1001, target_message_id=988)
+        self.assertIsNotNone(record)
+        self.assertEqual("skipped", record.action)
+        self.assertEqual("ambiguous_sensitive", record.emotion_class)
+        self.assertEqual("emotion_source_sensitive_context", record.reason_code)
+        self.assertIn("source_context", record.severity_flags)
+        self.assertIn("source_sensitive", record.severity_flags)
+        self.assertIn("source_context_conflict", record.severity_flags)
+        self.assertNotEqual("emoji:u1f525", record.sent_reaction_key)
+
     def test_outbound_reaction_term_matching_avoids_common_substrings(self) -> None:
         self.assertIsNotNone(main.REACTION_MEMORY)
         config = main.OutboundReactionConfig(

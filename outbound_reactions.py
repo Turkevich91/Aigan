@@ -732,8 +732,17 @@ class OutboundReactionAdapter:
         source_condemnation = self._hit_count(source_content, CONDEMNATION_TERMS, source_tokens)
         source_ambiguous = self._hit_count(source_content, AMBIGUOUS_TERMS, source_tokens)
         source_sensitive = source_grief + source_horror + source_condemnation
-        if not has_own_text and source_sensitive:
+        if source_sensitive:
             flags.append("source_sensitive")
+        if source_sensitive and own_positive and not (own_grief + own_horror + own_condemnation):
+            return EmotionPolicyDecision(
+                emotion_class="ambiguous_sensitive",
+                confidence=0.4,
+                allow_reaction=False,
+                reason_code="emotion_source_sensitive_context",
+                rationale="Skipped because source context contains sensitive content and a positive reaction could be misread.",
+                severity_flags=tuple(flags + ["sensitive", "source_context_conflict"]),
+            )
         # Source, URL, and vision summaries are untrusted context: they can add caution
         # after direct-chat text establishes a class, but they cannot drive a reaction.
         grief = own_grief + (min(source_grief, 1) if own_grief else 0)
