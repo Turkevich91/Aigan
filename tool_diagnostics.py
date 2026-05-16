@@ -62,6 +62,7 @@ URL_VALUE_RE = re.compile(
     r"\b(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,}(?::\d+)?(?:[/?#][^\s]*)?",
     re.IGNORECASE,
 )
+IPV6_VALUE_RE = re.compile(r"(?i)(?:^|[\s=\[])(?:[0-9a-f]{0,4}:){2,}[0-9a-f]{0,4}(?:\]?(?::\d+)?)?")
 CATEGORY_URL_VALUE_RE = re.compile(
     r"\b[A-Za-z][A-Za-z0-9+.-]{1,}://|www\.|"
     r"\blocalhost(?::\d+|[/?#])|"
@@ -143,6 +144,7 @@ ROW_DETAIL_FIELDS = (
     "adapter_count",
     "backlog",
     "dimensions",
+    "model",
     "max_bytes",
     "max_duration_seconds",
     "max_audio_bytes",
@@ -243,6 +245,7 @@ def safe_display_label(value: Any, limit: int = 120) -> str:
         return ""
     if (
         URL_VALUE_RE.search(text)
+        or IPV6_VALUE_RE.search(text)
         or WINDOWS_PATH_VALUE_RE.search(text)
         or POSIX_PATH_VALUE_RE.search(text)
         or RELATIVE_PATH_VALUE_RE.search(text)
@@ -262,6 +265,7 @@ def safe_failure_category_label(value: Any, limit: int = 80) -> str:
         return text
     if (
         CATEGORY_URL_VALUE_RE.search(text)
+        or IPV6_VALUE_RE.search(text)
         or WINDOWS_PATH_VALUE_RE.search(text)
         or POSIX_PATH_VALUE_RE.search(text)
         or RELATIVE_PATH_VALUE_RE.search(text)
@@ -476,11 +480,20 @@ def is_failure_event(event: SystemEvent) -> bool:
 
 def failure_category_for_event(event: SystemEvent) -> str:
     details = event.details if isinstance(event.details, dict) else {}
-    for key in ("failure_category", "category", "operation", "exception_type"):
+    for key in ("failure_category", "category"):
         value = details.get(key)
         if value:
             return safe_failure_category_label(value, 80)
-    return safe_failure_category_label(event.event_type, 80)
+    event_category = safe_failure_category_label(event.event_type, 80)
+    if event_category and event_category not in {"[redacted]", "freeform"}:
+        return event_category
+    for key in ("operation", "exception_type"):
+        value = details.get(key)
+        if value:
+            category = safe_failure_category_label(value, 80)
+            if category and category not in {"[redacted]", "freeform"}:
+                return category
+    return event_category
 
 
 def sort_key(row: CapabilityRow) -> tuple[int, str, str]:

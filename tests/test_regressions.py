@@ -1268,6 +1268,7 @@ class ToolRuntimeTests(unittest.TestCase):
                         "ocr_enabled": True,
                         "local_ocr_enabled": False,
                         "caption_backend": "telegram",
+                        "model": "gpt-4o-mini",
                     }
                 ],
             }
@@ -1278,9 +1279,11 @@ class ToolRuntimeTests(unittest.TestCase):
         self.assertTrue(details["ocr_enabled"])
         self.assertFalse(details["local_ocr_enabled"])
         self.assertEqual("telegram", details["caption_backend"])
+        self.assertEqual("gpt-4o-mini", details["model"])
         self.assertIn("ocr_enabled=true", text)
         self.assertIn("local_ocr_enabled=false", text)
         self.assertIn("caption_backend=telegram", text)
+        self.assertIn("model=gpt-4o-mini", text)
 
     def test_tool_diagnostics_unmatched_query_redacts_unsafe_value(self) -> None:
         text = render_capability_matrix([], query="C:/Users/private/media.mp4")
@@ -1358,6 +1361,30 @@ class ToolRuntimeTests(unittest.TestCase):
         self.assertNotIn("/srv/model", text)
         self.assertNotIn("data/file", text)
         self.assertNotIn("./tmp", text)
+
+    def test_tool_diagnostics_redacts_ipv6_values(self) -> None:
+        text = render_row(
+            CapabilityRow(
+                name="media_frames",
+                family="media",
+                enabled=True,
+                configured=True,
+                available=True,
+                status="ok",
+                adapter="fd00::1",
+                mode="[fe80::1]:8080",
+                backend="host=2001:db8::1",
+                details={"model": "fd00::2"},
+            ).normalized()
+        )
+
+        self.assertIn("adapter=[redacted]", text)
+        self.assertIn("mode=[redacted]", text)
+        self.assertIn("backend=[redacted]", text)
+        self.assertIn("model=[redacted]", text)
+        self.assertNotIn("fd00", text)
+        self.assertNotIn("fe80", text)
+        self.assertNotIn("2001:db8", text)
 
     def test_tool_diagnostics_redacts_freeform_display_labels(self) -> None:
         text = render_row(
@@ -1549,6 +1576,30 @@ class ToolRuntimeTests(unittest.TestCase):
         self.assertEqual("degraded", row.status)
         self.assertEqual(1, row.recent_warning_count)
         self.assertEqual(["outbound_reaction_adapter_error"], row.recent_failure_categories)
+
+    def test_tool_diagnostics_tool_operation_falls_back_to_event_type(self) -> None:
+        rows = build_capability_rows(
+            {"status": "ok", "adapter_count": 0, "error_count": 0, "adapters": []},
+            events=[
+                SystemEvent(
+                    id=1,
+                    created_at="2026-01-01T00:00:00+00:00",
+                    level="warning",
+                    component="tool_runtime",
+                    event_type="tool_operation_failed",
+                    chat_id=None,
+                    user_id=None,
+                    route="",
+                    duration_ms=None,
+                    message="",
+                    details={"tool": "media_transcript", "operation": "cleanup"},
+                )
+            ],
+        )
+        row = {item.name: item for item in rows}["media_transcript"]
+
+        self.assertEqual(["tool_operation_failed"], row.recent_failure_categories)
+        self.assertNotIn("[redacted]", row.recent_failure_categories)
 
     def test_recent_tool_events_keeps_tool_failures_after_unrelated_noise(self) -> None:
         main.SYSTEM_LOG.record_event(
