@@ -104,7 +104,6 @@ REACTION_TERMS = (
     "огон*",
     "вогон*",
     "лайк",
-    "постав*",
 )
 REACTION_REASON_TERMS = (
     "why",
@@ -159,6 +158,7 @@ REACTION_APPROVAL_TERMS = (
 REACTION_INSENSITIVE_TERMS = (
     "inappropriate",
     "insensitive",
+    "wrong emoji",
     "wrong reaction",
     "bad emoji",
     "bad emoji reaction",
@@ -380,6 +380,9 @@ def classify_reaction_complaint(
     )
     has_reaction_context = bool(has_recent_reaction or has_reaction_marker)
     has_temporal_reaction_context = bool(has_recent_reaction and mentions_bot)
+    has_specific_insensitive_temporal_marker = bool(
+        has_temporal_reaction_context and has_any_marker(lowered, REACTION_INSENSITIVE_HINT_TERMS)
+    )
     has_explicit_or_temporal_context = bool(has_reaction_marker or has_temporal_reaction_context)
     temporal_context_points_to_non_reaction_output = bool(
         has_temporal_reaction_context and not has_reaction_marker and has_non_reaction_output_marker
@@ -414,11 +417,15 @@ def classify_reaction_complaint(
         category = "fake_empathy"
     elif has_tone_marker and has_reaction_category_context:
         category = "tone_boundary"
-    elif has_approval_marker and (has_reaction_marker or has_recent_reaction):
+    elif (
+        has_approval_marker
+        and (has_reaction_marker or has_recent_reaction)
+        and not temporal_context_points_to_non_reaction_output
+    ):
         category = "insensitive_reaction"
     elif (
         has_insensitive_marker
-        and has_explicit_or_temporal_context
+        and (has_reaction_marker or has_specific_insensitive_temporal_marker)
         and not temporal_context_points_to_non_reaction_output
     ):
         category = "insensitive_reaction"

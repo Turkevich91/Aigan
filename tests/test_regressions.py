@@ -6483,6 +6483,7 @@ class SystemHealthTests(unittest.TestCase):
     def test_reaction_complaint_classifier_allows_unmentioned_explicit_reaction_complaints(self) -> None:
         cases = (
             ("inappropriate reaction", "insensitive_reaction"),
+            ("wrong emoji", "insensitive_reaction"),
             ("why did you put that reaction?", "reaction_reasoning_gap"),
             ("why did you react that way?", "reaction_reasoning_gap"),
         )
@@ -6532,10 +6533,13 @@ class SystemHealthTests(unittest.TestCase):
             "Aigan, approval is required",
             "Aigan, why is the sky blue?",
             "Aigan, your response was fake empathy",
+            "Aigan, your response looks like support",
+            "Aigan, this is not ok",
             "I had a bad reaction to dinner",
             "Aigan, I had a bad reaction to dinner",
             "Aigan, I had a bad reaction to dinner and it was not ok",
             "Aigan, why did you put that message?",
+            "\u0410\u0456\u0433\u0430\u043d, \u043f\u043e\u0441\u0442\u0430\u0432\u0438\u0432 \u0437\u0430\u0434\u0430\u0447\u0443 \u043d\u0435 \u0442\u0430\u043a",
             "\u044f \u043f\u0456\u0434\u0442\u0440\u0438\u043c\u0443\u044e \u043f\u043b\u0430\u043d",
             "Aigan, \u0431\u0435\u0442\u043e\u043d is solid",
         )
@@ -6583,7 +6587,6 @@ class SystemHealthTests(unittest.TestCase):
         self.assertFalse(has_marker("\u0440\u043e\u0431\u043e\u0442\u0430", "\u0431\u043e\u0442"))
         self.assertTrue(has_marker("\u0441\u0442\u0430\u0432\u0438\u0442\u044c \u043b\u0430\u0439\u043a", "\u043b\u0430\u0439\u043a"))
         self.assertTrue(has_marker("\u043f\u043e\u044f\u0441\u043d\u0438 \u0440\u0435\u0430\u043a\u0446\u0456\u044e", "\u0440\u0435\u0430\u043a\u0446*"))
-        self.assertTrue(has_marker("\u043f\u043e\u0441\u0442\u0430\u0432\u0438\u0432", "\u043f\u043e\u0441\u0442\u0430\u0432*"))
         self.assertTrue(has_marker("\u044d\u043c\u043e\u0434\u0437\u0438", "\u044d\u043c\u043e\u0434*"))
         self.assertTrue(has_marker("\u0435\u043c\u043e\u0434\u0437\u0456", "\u0435\u043c\u043e\u0434*"))
         self.assertTrue(has_marker("\u043d\u0435\u0443\u043c\u0435\u0441\u0442\u043d\u0430\u044f", "\u043d\u0435\u0443\u043c\u0435\u0441\u0442*"))
@@ -6745,6 +6748,34 @@ class SystemHealthTests(unittest.TestCase):
             details={"policy": "outbound_reaction_emotion_policy_v1"},
         )
         message = FakeMessage("bad emoji", message_id=5006)
+        context = SimpleNamespace(bot=SimpleNamespace(username="thrd_ua_bot", id=8712856238))
+
+        asyncio.run(main.text_message(SimpleNamespace(effective_message=message), context))
+
+        self.assertEqual([], message.reply_calls)
+        clusters = main.SYSTEM_LOG.active_complaints(5)
+        self.assertTrue(any(cluster.category == "insensitive_reaction" for cluster in clusters))
+
+    def test_passive_group_wrong_emoji_complaint_uses_recent_reaction_lookup(self) -> None:
+        self.assertIsNotNone(main.REACTION_MEMORY)
+        main.REACTION_MEMORY.record_outbound_decision(
+            chat_id=-1001,
+            target_message_id=5020,
+            target_memory_id=None,
+            item=None,
+            policy_version="outbound_reaction_emotion_policy_v1",
+            phase="pre_embedding",
+            action="sent",
+            reason_code="sent",
+            rationale="Stored sanitized rationale.",
+            severity_flags=("safe_positive",),
+            emotion_class="positive_celebratory",
+            confidence=0.9,
+            score=0.8,
+            sent_spec=ReactionSpec(reaction_type="emoji", reaction_key="emoji:fire", base_emoji="\N{FIRE}"),
+            details={"policy": "outbound_reaction_emotion_policy_v1"},
+        )
+        message = FakeMessage("wrong emoji", message_id=5021)
         context = SimpleNamespace(bot=SimpleNamespace(username="thrd_ua_bot", id=8712856238))
 
         asyncio.run(main.text_message(SimpleNamespace(effective_message=message), context))
