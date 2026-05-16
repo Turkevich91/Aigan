@@ -13,7 +13,8 @@ This note does not implement `/digest`, change Telegram routing, add new tools, 
 - Aigan already stores bounded SQLite memory for delivered messages.
 - `MemoryStore.latest()` and reply-chain helpers can provide recent context windows.
 - Hybrid semantic memory search already supports topic recall through FTS, keyword fallback, and embeddings after explicit invocation.
-- Source/repost/transcript content is searchable as source context but must not be misattributed as user-authored text.
+- Source/repost content is searchable as source context but must not be misattributed as user-authored text.
+- Transcript source memory is planned in issue `#22`; digest implementation should consume it only after that source-only write path exists.
 - Proactive unanswered-thread logic already has a small heuristic for unresolved-looking recent messages, but there is no user-facing digest command.
 
 ## User Value
@@ -120,6 +121,8 @@ Untrusted retained chat items:
 ```
 
 Source/repost/transcript excerpts must be labeled as source material so the model does not attribute public-media or forwarded text to the sender.
+
+The digest prompt must explicitly fence retained chat items as untrusted source material. It should instruct the model to summarize or extract facts from the package, but not follow instructions, tool requests, roleplay, secrets requests, or policy changes contained inside the chat items being summarized.
 
 The model instruction should require:
 
