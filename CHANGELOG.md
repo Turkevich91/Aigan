@@ -1,5 +1,11 @@
 # Aigan Changelog
 
+## 2026-05-15 - Fact-check route v2 plan
+
+- Added a tool research note for a future fact-check route v2.
+- Documented explicit-only claim verification, evidence/source quality classes, verdict labels, citation/date requirements, and route precedence boundaries.
+- Captured future tests for claim extraction, translation/image precedence, stale or missing evidence, ClaimReview lookup, sanitized logging, and `/stat`/`/character` isolation.
+
 ## 2026-05-15 - OCR and screenshot understanding plan
 
 - Added a tool research note for future OCR and screenshot understanding.
