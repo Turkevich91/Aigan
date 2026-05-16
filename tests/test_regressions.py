@@ -1263,6 +1263,30 @@ class ToolRuntimeTests(unittest.TestCase):
         self.assertIn("provider.timeout", row.recent_failure_categories)
         self.assertNotIn("[redacted]", row.recent_failure_categories)
 
+    def test_tool_diagnostics_failure_categories_redact_unknown_dotted_hosts(self) -> None:
+        rows = build_capability_rows(
+            {"status": "ok", "adapter_count": 0, "error_count": 0, "adapters": []},
+            events=[
+                SystemEvent(
+                    id=1,
+                    created_at="2026-01-01T00:00:00+00:00",
+                    level="warning",
+                    component="web",
+                    event_type="prefetch_failed",
+                    chat_id=None,
+                    user_id=None,
+                    route="",
+                    duration_ms=None,
+                    message="",
+                    details={"failure_category": "api.internal"},
+                )
+            ],
+        )
+        row = {item.name: item for item in rows}["web_search"]
+
+        self.assertIn("[redacted]", row.recent_failure_categories)
+        self.assertNotIn("api.internal", row.recent_failure_categories)
+
     def test_recent_tool_events_keeps_tool_failures_after_unrelated_noise(self) -> None:
         main.SYSTEM_LOG.record_event(
             level="warning",

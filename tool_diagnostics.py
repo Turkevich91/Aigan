@@ -77,6 +77,27 @@ RELATIVE_PATH_VALUE_RE = re.compile(
 )
 TOKEN_VALUE_RE = re.compile(r"\b(?:gh[pousr]_|github_pat_|xox[baprs]-)[A-Za-z0-9_-]{8,}", re.IGNORECASE)
 SAFE_CATEGORY_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_.:-]{0,79}$")
+SAFE_DOTTED_CATEGORY_PREFIXES = (
+    "adapter.",
+    "caption.",
+    "decode.",
+    "download.",
+    "ffmpeg.",
+    "github.",
+    "image.",
+    "memory.",
+    "ocr.",
+    "openai.",
+    "provider.",
+    "runtime.",
+    "stt.",
+    "telegram.",
+    "tool.",
+    "transcript.",
+    "vision.",
+    "web.",
+    "yt_dlp.",
+)
 ROW_DETAIL_FIELDS = ("adapter_count", "backlog", "dimensions", "max_bytes")
 
 
@@ -149,6 +170,8 @@ def safe_failure_category_label(value: Any, limit: int = 80) -> str:
         return ""
     if text == "[redacted]":
         return text
+    if "." in text and SAFE_CATEGORY_RE.fullmatch(text) and not text.startswith(SAFE_DOTTED_CATEGORY_PREFIXES):
+        return "[redacted]"
     if (
         CATEGORY_URL_VALUE_RE.search(text)
         or WINDOWS_PATH_VALUE_RE.search(text)
