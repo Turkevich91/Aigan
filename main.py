@@ -32,7 +32,8 @@ from reaction_memory import ReactionAsset, ReactionMemoryStore, ReactionPreferen
 from github_reporting import GitHubReporter
 from self_analysis import SelfAnalysisService
 from social_memory import SocialMemoryStore, SocialObservation
-from system_log import SystemLogStore, sanitize_text
+from system_log import SystemEvent, SystemLogStore, sanitize_text
+from tool_diagnostics import CapabilityRow, build_capability_rows, render_capability_matrix, render_recent_failures
 from tool_runtime import ToolRuntime
 
 try:
@@ -821,6 +822,8 @@ LOCALIZED_COMMAND_ALIASES = {
     "статистика": "stats",
     "самопочуття": "health",
     "здоровя": "health",
+    "тулзи": "tools",
+    "стан_тулзів": "tool_health",
     "логи": "logs",
     "самоаналіз": "selfcheck",
     "скарги": "complaints",
@@ -3483,6 +3486,253 @@ def tool_runtime_health_text() -> str:
     return "\n".join(lines)
 
 
+def memory_capability_rows() -> list[CapabilityRow]:
+    rows = [
+        CapabilityRow(
+            name="memory_store",
+            family="memory",
+            enabled=MEMORY is not None,
+            configured=CONFIG.memory_enabled,
+            available=MEMORY is not None,
+            status="ok" if MEMORY is not None else "disabled",
+            adapter="MemoryStore" if MEMORY is not None else "null",
+            mode="sqlite" if MEMORY is not None else "",
+        )
+    ]
+    if MEMORY is None or not CONFIG.memory_vector_enabled:
+        rows.append(
+            CapabilityRow(
+                name="memory_embeddings",
+                family="memory",
+                enabled=False,
+                configured=CONFIG.memory_vector_enabled,
+                available=False,
+                status="disabled",
+                adapter="semantic_memory",
+                mode="embeddings",
+            )
+        )
+        return rows
+    if not CONFIG.memory_embedding_model:
+        rows.append(
+            CapabilityRow(
+                name="memory_embeddings",
+                family="memory",
+                enabled=True,
+                configured=False,
+                available=False,
+                status="unconfigured",
+                adapter="semantic_memory",
+                mode="embeddings",
+                next_action="check configuration",
+            )
+        )
+        return rows
+    rows.append(
+        CapabilityRow(
+            name="memory_embeddings",
+            family="memory",
+            enabled=True,
+            configured=True,
+            available=True,
+            status="ok",
+            adapter="semantic_memory",
+            mode="embeddings",
+            details={"dimensions": CONFIG.memory_embedding_dimensions},
+        )
+    )
+    return rows
+
+
+def configured_capability_rows() -> list[CapabilityRow]:
+    rows = memory_capability_rows()
+    youtube_audio_fallback_enabled = _env_bool("YOUTUBE_AUDIO_FALLBACK", False)
+    youtube_transcription_model = os.getenv("YOUTUBE_TRANSCRIPTION_MODEL", "gpt-4o-mini-transcribe").strip()
+    youtube_max_duration_raw = os.getenv("YOUTUBE_MAX_DURATION_SECONDS", "1200").strip()
+    youtube_max_duration: int | None
+    try:
+        youtube_max_duration = int(youtube_max_duration_raw)
+    except ValueError:
+        youtube_max_duration = None
+    youtube_audio_fallback_configured = (
+        youtube_audio_fallback_enabled
+        and bool(youtube_transcription_model)
+        and youtube_max_duration is not None
+        and youtube_max_duration > 0
+    )
+    rows.append(
+        CapabilityRow(
+            name="stt_openai",
+            family="stt",
+            enabled=youtube_audio_fallback_enabled,
+            configured=youtube_audio_fallback_configured,
+            available=youtube_audio_fallback_configured,
+            status=(
+                "ok"
+                if youtube_audio_fallback_configured
+                else ("unconfigured" if youtube_audio_fallback_enabled else "disabled")
+            ),
+            adapter="youtube_audio_fallback",
+            mode="youtube_audio_fallback",
+            backend=youtube_transcription_model,
+            details={"max_duration_seconds": youtube_max_duration} if youtube_max_duration and youtube_max_duration > 0 else {},
+            next_action=(
+                "check configuration"
+                if youtube_audio_fallback_enabled
+                and (not youtube_transcription_model or youtube_max_duration is None or youtube_max_duration <= 0)
+                else ""
+            ),
+        )
+    )
+    rows.append(
+        CapabilityRow(
+            name="system_log",
+            family="core",
+            enabled=SYSTEM_LOG is not None,
+            configured=CONFIG.system_log_enabled,
+            available=SYSTEM_LOG is not None,
+            status="ok" if SYSTEM_LOG is not None else "disabled",
+            adapter="SystemLogStore" if SYSTEM_LOG is not None else "null",
+        )
+    )
+    rows.append(
+        CapabilityRow(
+            name="web_image_search",
+            family="web",
+            enabled=CONFIG.web_image_search_enabled,
+            configured=CONFIG.web_image_search_enabled,
+            available=CONFIG.web_image_search_enabled,
+            status="ok" if CONFIG.web_image_search_enabled else "disabled",
+            adapter="mcp_web",
+        )
+    )
+    vision_configured = CONFIG.image_analysis_enabled and bool(CONFIG.vision_model)
+    rows.append(
+        CapabilityRow(
+            name="image_understanding",
+            family="vision",
+            enabled=CONFIG.image_analysis_enabled,
+            configured=vision_configured,
+            available=vision_configured,
+            status="ok" if vision_configured else ("unconfigured" if CONFIG.image_analysis_enabled else "disabled"),
+            adapter="vision",
+            backend=CONFIG.vision_model,
+            details={"max_bytes": CONFIG.image_max_bytes},
+        )
+    )
+    rows.append(
+        CapabilityRow(
+            name="reaction_memory",
+            family="reactions",
+            enabled=REACTION_MEMORY is not None,
+            configured=CONFIG.memory_enabled and CONFIG.reactions_enabled,
+            available=REACTION_MEMORY is not None,
+            status="ok" if REACTION_MEMORY is not None else "disabled",
+            adapter="ReactionMemoryStore" if REACTION_MEMORY is not None else "null",
+        )
+    )
+    rows.append(
+        CapabilityRow(
+            name="github_reporting",
+            family="reporting",
+            enabled=CONFIG.github_reporting_enabled,
+            configured=GITHUB_REPORTER.is_configured,
+            available=GITHUB_REPORTER.is_configured,
+            status="ok" if GITHUB_REPORTER.is_configured else ("unconfigured" if CONFIG.github_reporting_enabled else "disabled"),
+            adapter="GitHubReporter",
+        )
+    )
+    return rows
+
+
+def recent_tool_events() -> list[Any]:
+    if SYSTEM_LOG is None:
+        return []
+    tool_components = {
+        "tool_runtime",
+        "agent_tool",
+        "web",
+        "memory_vector",
+        "memory",
+        "outbound_reactions",
+        "image_search",
+        "github_reporting",
+        "startup",
+        "shutdown",
+    }
+    try:
+        if hasattr(SYSTEM_LOG, "events_since_for_components"):
+            events = SYSTEM_LOG.events_since_for_components(
+                CONFIG.health_report_lookback_seconds,
+                tool_components,
+                "warning",
+                500,
+                include_tool_details=True,
+            )
+        else:
+            events = SYSTEM_LOG.events_since(CONFIG.health_report_lookback_seconds, "warning", 500)
+    except Exception:
+        return [
+            SystemEvent(
+                id=0,
+                created_at=datetime.now(timezone.utc).isoformat(),
+                level="error",
+                component="system_log",
+                event_type="health_report_failed",
+                chat_id=None,
+                user_id=None,
+                route="",
+                duration_ms=None,
+                message="",
+                details={"failure_category": "health_report_failed"},
+            )
+        ]
+    filtered = []
+    for event in events:
+        details = event.details if isinstance(event.details, dict) else {}
+        if details.get("tool") or event.component in tool_components:
+            filtered.append(event)
+    return filtered[:200]
+
+
+def tool_runtime_summary_for_diagnostics() -> dict[str, Any]:
+    try:
+        return TOOL_RUNTIME.health_summary()
+    except Exception:
+        return {
+            "status": "error",
+            "adapter_count": 0,
+            "error_count": 1,
+            "adapters": [
+                {
+                    "name": "tool_runtime",
+                    "enabled": True,
+                    "configured": True,
+                    "available": False,
+                    "status": "error",
+                    "adapter": "runtime",
+                    "error_count": 1,
+                }
+            ],
+        }
+
+
+def tool_capability_rows() -> list[CapabilityRow]:
+    return build_capability_rows(
+        tool_runtime_summary_for_diagnostics(),
+        events=recent_tool_events(),
+        extra_rows=configured_capability_rows(),
+    )
+
+
+def tool_capability_diagnostics_text(args: str = "") -> str:
+    query = (args or "").strip()
+    rows = tool_capability_rows()
+    if query.casefold() == "failures":
+        return render_recent_failures(rows)
+    return render_capability_matrix(rows, query=query)
+
+
 def clean_web_prefetch_query(text: str) -> str:
     text = re.sub(r"@\w+", " ", text)
     text = text.replace(DEFAULT_CONTEXT_PROMPT, " ")
@@ -4774,7 +5024,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if not allow_command(message, "help"):
         return
     await message.reply_text(
-        f"У групі клич мене так: {CONFIG.bot_trigger} питання, /ai, /питай, /п, /а, згадка або reply. Сервісні: /ids (/айді), /context (/контекст), /version (/версія), /stat (/стат), /character (/характер), /interests (/інтереси), /health (/самопочуття), /logs (/логи), /selfcheck (/самоаналіз), /complaints (/скарги), /memory_search (/память, /памʼять, /пошук_памяті), /proactive_now (/проактив)."
+        f"У групі клич мене так: {CONFIG.bot_trigger} питання, /ai, /питай, /п, /а, згадка або reply. Сервісні: /ids (/айді), /context (/контекст), /version (/версія), /stat (/стат), /character (/характер), /interests (/інтереси), /health (/самопочуття), /tools (/тулзи), /tool_health (/стан_тулзів), /logs (/логи), /selfcheck (/самоаналіз), /complaints (/скарги), /memory_search (/память, /памʼять, /пошук_памяті), /proactive_now (/проактив)."
     )
 
 
@@ -5113,6 +5363,27 @@ async def health_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     )
 
 
+async def handle_tools_command(message: Message, args: str | None = None, command_name: str = "tools") -> None:
+    if not allow_admin_command(message, command_name):
+        await deny_admin_command(message, command_name)
+        return
+    await send_reply(message, tool_capability_diagnostics_text(args or ""))
+
+
+async def tools_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    if message is None:
+        return
+    await handle_tools_command(message, command_args_from_text(message.text))
+
+
+async def tool_health_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    if message is None:
+        return
+    await handle_tools_command(message, command_args_from_text(message.text), "tool_health")
+
+
 async def handle_logs_command(message: Message, args: str | None = None) -> None:
     if not allow_admin_command(message, "logs"):
         await deny_admin_command(message, "logs")
@@ -5205,6 +5476,10 @@ async def localized_command_alias(update: Update, context: ContextTypes.DEFAULT_
         await handle_stats_command(message, args)
     elif command == "health":
         await health_command(update, context)
+    elif command == "tools":
+        await handle_tools_command(message, args)
+    elif command == "tool_health":
+        await handle_tools_command(message, args, "tool_health")
     elif command == "logs":
         await handle_logs_command(message, args)
     elif command == "selfcheck":
@@ -6415,6 +6690,8 @@ def main() -> None:
     application.add_handler(CommandHandler(["character", "profile"], character_command))
     application.add_handler(CommandHandler(["stat", "stats"], stats_command))
     application.add_handler(CommandHandler(["health"], health_command))
+    application.add_handler(CommandHandler(["tools"], tools_command))
+    application.add_handler(CommandHandler(["tool_health"], tool_health_command))
     application.add_handler(CommandHandler(["logs"], logs_command))
     application.add_handler(CommandHandler(["selfcheck"], selfcheck_command))
     application.add_handler(CommandHandler(["complaints"], complaints_command))

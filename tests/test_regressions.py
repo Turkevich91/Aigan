@@ -8,7 +8,7 @@ from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import ANY, AsyncMock, patch
+from unittest.mock import ANY, AsyncMock, PropertyMock, patch
 
 TEST_DB_PATH = os.path.join(tempfile.gettempdir(), f"aigan-test-{os.getpid()}.sqlite3")
 try:
@@ -111,7 +111,15 @@ from reaction_memory import ReactionSpec
 from scripts import import_telegram_export
 from scripts.import_telegram_export import ImportOptions
 from self_analysis import SelfAnalysisService, classify_complaint
-from system_log import SystemLogStore, redact_secrets
+from system_log import SystemEvent, SystemLogStore, redact_secrets
+from tool_diagnostics import (
+    CapabilityRow,
+    adapter_family,
+    build_capability_rows,
+    render_capability_matrix,
+    render_recent_failures,
+    render_row,
+)
 from tool_runtime import NullToolAdapter, ToolRuntime
 
 VALID_JPEG = b"\xff\xd8\xff\xe0" + b"valid-jpeg"
@@ -839,6 +847,1127 @@ class ToolRuntimeTests(unittest.TestCase):
 
         self.assertTrue(any(item["name"] == "outbound_reactions" for item in health["adapters"]))
         self.assertIn("outbound_reactions", main.tool_runtime_health_text())
+
+    def test_tool_diagnostics_static_future_tools_are_not_failures(self) -> None:
+        rows = build_capability_rows({"status": "ok", "adapter_count": 0, "error_count": 0, "adapters": []})
+        by_name = {row.name: row for row in rows}
+        text = render_capability_matrix(rows)
+
+        self.assertEqual("not_implemented", by_name["media_transcript"].status)
+        self.assertEqual("disabled", by_name["stt_local"].status)
+        self.assertIn("Overall: ok", text)
+        self.assertIn("media_transcript", text)
+
+    def test_tool_diagnostics_ignores_unsafe_adapter_fields(self) -> None:
+        runtime_summary = {
+            "status": "ok",
+            "adapter_count": 1,
+            "error_count": 0,
+            "adapters": [
+                {
+                    "name": "unsafe_adapter",
+                    "enabled": True,
+                    "status": "ok",
+                    "adapter": "\\\\private\\adapter",
+                    "mode": "C:\\Users\\private\\mode",
+                    "backend": f"https://example.test/?token={fake_openai_secret()}",
+                    "error_count": 0,
+                    "source_url": f"https://example.test/?token={fake_openai_secret()}",
+                    "prompt": f"raw {fake_openai_secret()}",
+                    "local_path": "C:\\Users\\private\\media.mp4",
+                }
+            ],
+        }
+
+        text = render_capability_matrix(build_capability_rows(runtime_summary))
+
+        self.assertIn("unsafe_adapter", text)
+        self.assertNotIn(fake_openai_secret(), text)
+        self.assertNotIn("C:\\Users", text)
+        self.assertNotIn("https://example.test", text)
+        self.assertNotIn("\\\\private", text)
+        self.assertNotIn("source_url", text)
+        self.assertNotIn("prompt", text)
+        self.assertIn("[redacted]", text)
+
+    def test_tool_diagnostics_redacts_unsafe_adapter_name_and_posix_paths(self) -> None:
+        text = render_capability_matrix(
+            build_capability_rows(
+                {
+                    "status": "ok",
+                    "adapter_count": 1,
+                    "error_count": 0,
+                    "adapters": [
+                        {
+                            "name": "/opt/private/backend",
+                            "enabled": True,
+                            "status": "ok",
+                            "adapter": "/srv/private/adapter",
+                            "mode": "~/private/mode",
+                            "backend": "/usr/local/private/backend",
+                        }
+                    ],
+                }
+            )
+        )
+
+        self.assertNotIn("/opt/private", text)
+        self.assertNotIn("/srv/private", text)
+        self.assertNotIn("/usr/local", text)
+        self.assertNotIn("~/private", text)
+        self.assertIn("[redacted]", text)
+
+    def test_tool_diagnostics_preserves_adapter_configured_available_fields(self) -> None:
+        rows = build_capability_rows(
+            {
+                "status": "ok",
+                "adapter_count": 1,
+                "error_count": 0,
+                "adapters": [
+                    {
+                        "name": "future_backend",
+                        "enabled": True,
+                        "configured": False,
+                        "available": False,
+                        "status": "unconfigured",
+                        "adapter": "backend",
+                    }
+                ],
+            }
+        )
+        row = {item.name: item for item in rows}["future_backend"]
+
+        self.assertFalse(row.configured)
+        self.assertFalse(row.available)
+        self.assertEqual("unconfigured", row.status)
+
+    def test_tool_diagnostics_live_adapter_overrides_config_row(self) -> None:
+        rows = build_capability_rows(
+            {
+                "status": "degraded",
+                "adapter_count": 1,
+                "error_count": 1,
+                "adapters": [
+                    {
+                        "name": "image_understanding",
+                        "enabled": True,
+                        "available": False,
+                        "status": "error",
+                        "adapter": "vision_adapter",
+                        "error_count": 1,
+                    }
+                ],
+            },
+            extra_rows=[
+                CapabilityRow(
+                    name="image_understanding",
+                    family="vision",
+                    enabled=True,
+                    configured=True,
+                    available=True,
+                    status="ok",
+                    adapter="config",
+                )
+            ],
+        )
+        row = {item.name: item for item in rows}["image_understanding"]
+
+        self.assertEqual("error", row.status)
+        self.assertEqual("vision_adapter", row.adapter)
+        self.assertFalse(row.available)
+
+    def test_tool_diagnostics_family_mapper_matches_static_families(self) -> None:
+        self.assertEqual("stt", adapter_family("stt_openai"))
+        self.assertEqual("web", adapter_family("web_image_search"))
+        self.assertEqual("documents", adapter_family("document_ingest"))
+        self.assertEqual("fact_check", adapter_family("fact_check"))
+        self.assertEqual("digest", adapter_family("chat_digest"))
+
+    def test_tool_diagnostics_aggregates_sanitized_tool_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = SystemLogStore(Path(tmpdir) / "events.sqlite3", retention_days=14)
+            store.record_event(
+                level="warning",
+                component="tool_runtime",
+                event_type="tool_operation_failed",
+                message=f"download failed {fake_openai_secret()}",
+                details={
+                    "tool": "media_transcript",
+                    "failure_category": "download_failed",
+                    "token": fake_telegram_secret(),
+                },
+            )
+
+            rows = build_capability_rows(
+                {"status": "ok", "adapter_count": 0, "error_count": 0, "adapters": []},
+                events=store.events_since(21600, "warning", 20),
+            )
+            text = render_recent_failures(rows)
+
+            self.assertIn("media_transcript", text)
+            self.assertIn("download_failed", text)
+            self.assertNotIn(fake_openai_secret(), text)
+            self.assertNotIn(fake_telegram_secret(), text)
+            store.close()
+
+    def test_tool_diagnostics_replaces_freeform_failure_category(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = SystemLogStore(Path(tmpdir) / "events.sqlite3", retention_days=14)
+            store.record_event(
+                level="warning",
+                component="tool_runtime",
+                event_type="tool_operation_failed",
+                details={"tool": "media_transcript", "failure_category": "raw private chat text"},
+            )
+
+            rows = build_capability_rows(
+                {"status": "ok", "adapter_count": 0, "error_count": 0, "adapters": []},
+                events=store.events_since(21600, "warning", 20),
+            )
+            text = render_recent_failures(rows)
+
+            self.assertIn("freeform", text)
+            self.assertNotIn("raw private chat text", text)
+            store.close()
+
+    def test_tool_diagnostics_redacts_unsafe_failure_category(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = SystemLogStore(Path(tmpdir) / "events.sqlite3", retention_days=14)
+            store.record_event(
+                level="warning",
+                component="tool_runtime",
+                event_type="tool_operation_failed",
+                details={"tool": "media_transcript", "failure_category": "C:\\Users\\private\\media.mp4"},
+            )
+
+            rows = build_capability_rows(
+                {"status": "ok", "adapter_count": 0, "error_count": 0, "adapters": []},
+                events=store.events_since(21600, "warning", 20),
+            )
+            text = render_recent_failures(rows)
+
+            self.assertNotIn("C:\\Users", text)
+            self.assertIn("[redacted]", text)
+            store.close()
+
+    def test_tool_diagnostics_redacts_unknown_single_token_failure_category(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = SystemLogStore(Path(tmpdir) / "events.sqlite3", retention_days=14)
+            store.record_event(
+                level="warning",
+                component="tool_runtime",
+                event_type="tool_operation_failed",
+                details={"tool": "media_transcript", "failure_category": "opaqueSecret12345"},
+            )
+
+            rows = build_capability_rows(
+                {"status": "ok", "adapter_count": 0, "error_count": 0, "adapters": []},
+                events=store.events_since(21600, "warning", 20),
+            )
+            text = render_recent_failures(rows)
+
+            self.assertIn("[redacted]", text)
+            self.assertNotIn("opaqueSecret12345", text)
+            store.close()
+
+    def test_tool_diagnostics_redacts_prefixed_token_like_failure_category(self) -> None:
+        rows = build_capability_rows(
+            {"status": "ok", "adapter_count": 0, "error_count": 0, "adapters": []},
+            events=[
+                SystemEvent(
+                    id=1,
+                    created_at="2026-01-01T00:00:00+00:00",
+                    level="warning",
+                    component="web",
+                    event_type="prefetch_failed",
+                    chat_id=None,
+                    user_id=None,
+                    route="",
+                    duration_ms=None,
+                    message="",
+                    details={"failure_category": "openai_api_key_shadow"},
+                )
+            ],
+        )
+        row = {item.name: item for item in rows}["web_search"]
+
+        self.assertIn("[redacted]", row.recent_failure_categories)
+        self.assertNotIn("openai_api_key_shadow", row.recent_failure_categories)
+
+    def test_tool_diagnostics_counts_error_event_once(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = SystemLogStore(Path(tmpdir) / "events.sqlite3", retention_days=14)
+            store.record_event(
+                level="error",
+                component="tool_runtime",
+                event_type="tool_operation_failed",
+                details={"tool": "media_transcript", "failure_category": "provider_unavailable"},
+            )
+
+            rows = build_capability_rows(
+                {"status": "ok", "adapter_count": 0, "error_count": 0, "adapters": []},
+                events=store.events_since(21600, "warning", 20),
+            )
+            text = render_recent_failures(rows)
+
+            self.assertIn("media_transcript: 1 recent", text)
+            store.close()
+
+    def test_tool_diagnostics_render_row_shows_errors_and_warnings(self) -> None:
+        text = render_row(
+            CapabilityRow(
+                name="media_transcript",
+                family="media",
+                enabled=True,
+                configured=True,
+                available=False,
+                status="degraded",
+                error_count=1,
+                warning_count=2,
+            ).normalized()
+        )
+
+        self.assertIn("errors=1", text)
+        self.assertIn("warnings=2", text)
+
+    def test_tool_diagnostics_adapter_warning_degrades_status(self) -> None:
+        rows = build_capability_rows(
+            {
+                "status": "ok",
+                "adapter_count": 1,
+                "error_count": 0,
+                "adapters": [
+                    {
+                        "name": "media_transcript",
+                        "enabled": True,
+                        "status": "ok",
+                        "adapter": "media",
+                        "warning_count": 1,
+                    }
+                ],
+            }
+        )
+        row = {item.name: item for item in rows}["media_transcript"]
+
+        self.assertEqual("degraded", row.status)
+        self.assertEqual("degraded", render_capability_matrix(rows).splitlines()[1].replace("Overall: ", ""))
+
+    def test_tool_diagnostics_invalid_adapter_counts_do_not_raise(self) -> None:
+        rows = build_capability_rows(
+            {
+                "status": "ok",
+                "adapter_count": "not-a-number",
+                "error_count": "also-bad",
+                "adapters": [
+                    {
+                        "name": "media_transcript",
+                        "enabled": True,
+                        "status": "ok",
+                        "adapter": "media",
+                        "warning_count": "not-a-number",
+                        "error_count": "also-bad",
+                    }
+                ],
+            }
+        )
+        by_name = {item.name: item for item in rows}
+
+        self.assertEqual(0, by_name["tool_runtime"].error_count)
+        self.assertEqual({"adapter_count": 0}, by_name["tool_runtime"].details)
+        self.assertEqual(0, by_name["media_transcript"].warning_count)
+        self.assertEqual(0, by_name["media_transcript"].error_count)
+
+    def test_tool_diagnostics_ignores_success_warning_events(self) -> None:
+        rows = build_capability_rows(
+            {"status": "ok", "adapter_count": 0, "error_count": 0, "adapters": []},
+            events=[
+                SystemEvent(
+                    id=1,
+                    created_at="2026-01-01T00:00:00+00:00",
+                    level="warning",
+                    component="github_reporting",
+                    event_type="self_report_created",
+                    chat_id=None,
+                    user_id=None,
+                    route="",
+                    duration_ms=None,
+                    message="",
+                    details={},
+                )
+            ],
+        )
+        row = {item.name: item for item in rows}["github_reporting"]
+
+        self.assertEqual("disabled", row.status)
+        self.assertEqual(0, row.recent_warning_count)
+        self.assertEqual("Recent tool failures\n- none", render_recent_failures(rows))
+
+    def test_tool_diagnostics_runtime_warning_event_does_not_double_count_adapter_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = SystemLogStore(Path(tmpdir) / "events.sqlite3", retention_days=14)
+            store.record_event(
+                level="warning",
+                component="tool_runtime",
+                event_type="tool_operation_failed",
+                details={"tool": "media_transcript", "failure_category": "provider_unavailable"},
+            )
+
+            rows = build_capability_rows(
+                {
+                    "status": "degraded",
+                    "adapter_count": 1,
+                    "error_count": 1,
+                    "adapters": [
+                        {
+                            "name": "media_transcript",
+                            "enabled": True,
+                            "status": "degraded",
+                            "adapter": "media",
+                            "error_count": 1,
+                        }
+                    ],
+                },
+                events=store.events_since(21600, "warning", 20),
+            )
+            row_text = render_row({item.name: item for item in rows}["media_transcript"])
+            failure_text = render_recent_failures(rows)
+
+            self.assertIn("errors=1", row_text)
+            self.assertNotIn("warnings=1", row_text)
+            self.assertIn("media_transcript: 1 recent", failure_text)
+            store.close()
+
+    def test_tool_diagnostics_renders_safe_memory_embedding_details(self) -> None:
+        text = render_row(
+            CapabilityRow(
+                name="memory_embeddings",
+                family="memory",
+                enabled=True,
+                configured=True,
+                available=True,
+                status="ok",
+                details={"backlog": 7, "dimensions": 1536},
+            ).normalized()
+        )
+
+        self.assertIn("backlog=7", text)
+        self.assertIn("dimensions=1536", text)
+
+    def test_tool_diagnostics_preserves_allowlisted_planned_fields(self) -> None:
+        rows = build_capability_rows(
+            {
+                "status": "ok",
+                "adapter_count": 1,
+                "error_count": 0,
+                "adapters": [
+                    {
+                        "name": "ocr",
+                        "enabled": True,
+                        "status": "ok",
+                        "adapter": "ocr",
+                        "ocr_enabled": True,
+                        "local_ocr_enabled": False,
+                        "caption_backend": "telegram",
+                        "model": "gpt-4o-mini",
+                    }
+                ],
+            }
+        )
+        details = {item.name: item for item in rows}["ocr"].details
+        text = render_row({item.name: item for item in rows}["ocr"])
+
+        self.assertTrue(details["ocr_enabled"])
+        self.assertFalse(details["local_ocr_enabled"])
+        self.assertEqual("telegram", details["caption_backend"])
+        self.assertEqual("gpt-4o-mini", details["model"])
+        self.assertIn("ocr_enabled=true", text)
+        self.assertIn("local_ocr_enabled=false", text)
+        self.assertIn("caption_backend=telegram", text)
+        self.assertIn("model=gpt-4o-mini", text)
+
+    def test_tool_diagnostics_unmatched_query_redacts_unsafe_value(self) -> None:
+        text = render_capability_matrix([], query="C:/Users/private/media.mp4")
+
+        self.assertIn("No capabilities matched: [redacted]", text)
+        self.assertNotIn("C:/Users", text)
+
+    def test_tool_diagnostics_redacts_file_urls_and_single_segment_paths(self) -> None:
+        text = render_row(
+            CapabilityRow(
+                name="media_frames",
+                family="media",
+                enabled=True,
+                configured=True,
+                available=True,
+                status="ok",
+                adapter="file:///var/lib/aigan.sqlite3",
+                mode="/tmp",
+                backend="/opt/aigan",
+            ).normalized()
+        )
+
+        self.assertIn("adapter=[redacted]", text)
+        self.assertIn("mode=[redacted]", text)
+        self.assertIn("backend=[redacted]", text)
+        self.assertNotIn("file://", text)
+        self.assertNotIn("/tmp", text)
+        self.assertNotIn("/opt", text)
+
+    def test_tool_diagnostics_redacts_bare_urls_and_relative_paths(self) -> None:
+        text = render_row(
+            CapabilityRow(
+                name="data/media/file.jpg",
+                family="media",
+                enabled=True,
+                configured=True,
+                available=True,
+                status="ok",
+                adapter="models/whisper/ggml.bin",
+                mode="s3://bucket/private-key",
+                backend="uploads/audio.m4a",
+            ).normalized()
+        )
+        unmatched = render_capability_matrix([], query="192.168.1.10:8080/path")
+
+        self.assertIn("[redacted]: enabled", text)
+        self.assertIn("adapter=[redacted]", text)
+        self.assertIn("mode=[redacted]", text)
+        self.assertIn("backend=[redacted]", text)
+        self.assertIn("No capabilities matched: [redacted]", unmatched)
+        self.assertNotIn("data/media/file.jpg", text)
+        self.assertNotIn("models/whisper", text)
+        self.assertNotIn("s3://", text)
+        self.assertNotIn("uploads/audio", text)
+        self.assertNotIn("192.168", unmatched)
+
+    def test_tool_diagnostics_redacts_embedded_path_values(self) -> None:
+        text = render_row(
+            CapabilityRow(
+                name="media_frames",
+                family="media",
+                enabled=True,
+                configured=True,
+                available=True,
+                status="ok",
+                adapter="backend path=/srv/model",
+                mode="cache=data/file.bin",
+                backend="workdir=./tmp/cache",
+            ).normalized()
+        )
+
+        self.assertIn("adapter=[redacted]", text)
+        self.assertIn("mode=[redacted]", text)
+        self.assertIn("backend=[redacted]", text)
+        self.assertNotIn("/srv/model", text)
+        self.assertNotIn("data/file", text)
+        self.assertNotIn("./tmp", text)
+
+    def test_tool_diagnostics_redacts_ipv6_values(self) -> None:
+        text = render_row(
+            CapabilityRow(
+                name="media_frames",
+                family="media",
+                enabled=True,
+                configured=True,
+                available=True,
+                status="ok",
+                adapter="fd00::1",
+                mode="[fe80::1]:8080",
+                backend="host=2001:db8::1",
+                details={"model": "fd00::2"},
+            ).normalized()
+        )
+
+        self.assertIn("adapter=[redacted]", text)
+        self.assertIn("mode=[redacted]", text)
+        self.assertIn("backend=[redacted]", text)
+        self.assertIn("model=[redacted]", text)
+        self.assertNotIn("fd00", text)
+        self.assertNotIn("fe80", text)
+        self.assertNotIn("2001:db8", text)
+
+    def test_tool_diagnostics_redacts_freeform_display_labels(self) -> None:
+        text = render_row(
+            CapabilityRow(
+                name="private chat excerpt",
+                family="media",
+                enabled=True,
+                configured=True,
+                available=True,
+                status="ok",
+                adapter="prompt says hello",
+                mode="transcript excerpt",
+                backend="operator note",
+            ).normalized()
+        )
+
+        self.assertIn("[redacted]: enabled", text)
+        self.assertIn("adapter=[redacted]", text)
+        self.assertIn("mode=[redacted]", text)
+        self.assertIn("backend=[redacted]", text)
+        self.assertNotIn("private chat excerpt", text)
+        self.assertNotIn("prompt says hello", text)
+        self.assertNotIn("transcript excerpt", text)
+        self.assertNotIn("operator note", text)
+
+    def test_tool_diagnostics_redacts_opaque_token_like_labels(self) -> None:
+        text = render_row(
+            CapabilityRow(
+                name="media_frames",
+                family="media",
+                enabled=True,
+                configured=True,
+                available=True,
+                status="ok",
+                adapter="AKIAIOSFODNN7EXAMPLE",
+                mode="customBearerToken1234567890",
+                backend="safe_backend",
+            ).normalized()
+        )
+
+        self.assertIn("adapter=[redacted]", text)
+        self.assertIn("mode=[redacted]", text)
+        self.assertIn("backend=safe_backend", text)
+        self.assertNotIn("AKIA", text)
+        self.assertNotIn("customBearerToken", text)
+
+    def test_tool_diagnostics_availability_fields_shape_ok_status(self) -> None:
+        rows = build_capability_rows(
+            {
+                "status": "ok",
+                "adapter_count": 2,
+                "error_count": 0,
+                "adapters": [
+                    {
+                        "name": "media_transcript",
+                        "enabled": True,
+                        "configured": False,
+                        "available": False,
+                        "status": "ok",
+                    },
+                    {
+                        "name": "media_frames",
+                        "enabled": True,
+                        "configured": True,
+                        "available": False,
+                        "status": "ok",
+                    },
+                ],
+            }
+        )
+        by_name = {item.name: item for item in rows}
+        transcript_text = render_row(by_name["media_transcript"])
+        frames_text = render_row(by_name["media_frames"])
+
+        self.assertEqual("unconfigured", by_name["media_transcript"].status)
+        self.assertEqual("unavailable", by_name["media_frames"].status)
+        self.assertIn("configured=false", transcript_text)
+        self.assertIn("available=false", transcript_text)
+        self.assertIn("available=false", frames_text)
+
+    def test_tool_diagnostics_failure_categories_keep_stable_dotted_codes(self) -> None:
+        rows = build_capability_rows(
+            {"status": "ok", "adapter_count": 0, "error_count": 0, "adapters": []},
+            events=[
+                SystemEvent(
+                    id=1,
+                    created_at="2026-01-01T00:00:00+00:00",
+                    level="warning",
+                    component="web",
+                    event_type="prefetch_failed",
+                    chat_id=None,
+                    user_id=None,
+                    route="",
+                    duration_ms=None,
+                    message="",
+                    details={"failure_category": "provider.timeout"},
+                )
+            ],
+        )
+        row = {item.name: item for item in rows}["web_search"]
+
+        self.assertIn("provider.timeout", row.recent_failure_categories)
+        self.assertNotIn("[redacted]", row.recent_failure_categories)
+
+    def test_tool_diagnostics_failure_categories_redact_unknown_dotted_hosts(self) -> None:
+        rows = build_capability_rows(
+            {"status": "ok", "adapter_count": 0, "error_count": 0, "adapters": []},
+            events=[
+                SystemEvent(
+                    id=1,
+                    created_at="2026-01-01T00:00:00+00:00",
+                    level="warning",
+                    component="web",
+                    event_type="prefetch_failed",
+                    chat_id=None,
+                    user_id=None,
+                    route="",
+                    duration_ms=None,
+                    message="",
+                    details={"failure_category": "api.internal"},
+                )
+            ],
+        )
+        row = {item.name: item for item in rows}["web_search"]
+
+        self.assertIn("[redacted]", row.recent_failure_categories)
+        self.assertNotIn("api.internal", row.recent_failure_categories)
+
+    def test_tool_diagnostics_failure_categories_redact_prefixed_hostnames(self) -> None:
+        rows = build_capability_rows(
+            {"status": "ok", "adapter_count": 0, "error_count": 0, "adapters": []},
+            events=[
+                SystemEvent(
+                    id=1,
+                    created_at="2026-01-01T00:00:00+00:00",
+                    level="warning",
+                    component="web",
+                    event_type="prefetch_failed",
+                    chat_id=None,
+                    user_id=None,
+                    route="",
+                    duration_ms=None,
+                    message="",
+                    details={"failure_category": "provider.internal"},
+                )
+            ],
+        )
+        row = {item.name: item for item in rows}["web_search"]
+
+        self.assertIn("[redacted]", row.recent_failure_categories)
+        self.assertNotIn("provider.internal", row.recent_failure_categories)
+
+    def test_tool_diagnostics_keeps_safe_embedding_failure_category(self) -> None:
+        rows = build_capability_rows(
+            {"status": "ok", "adapter_count": 0, "error_count": 0, "adapters": []},
+            extra_rows=[CapabilityRow("memory_embeddings", "memory", True, True, True, "ok")],
+            events=[
+                SystemEvent(
+                    id=1,
+                    created_at="2026-01-01T00:00:00+00:00",
+                    level="warning",
+                    component="memory_vector",
+                    event_type="embedding_failed",
+                    chat_id=None,
+                    user_id=None,
+                    route="",
+                    duration_ms=None,
+                    message="",
+                    details={},
+                )
+            ],
+        )
+        row = {item.name: item for item in rows}["memory_embeddings"]
+
+        self.assertEqual(["embedding_failed"], row.recent_failure_categories)
+
+    def test_tool_diagnostics_counts_warning_error_event_as_failure(self) -> None:
+        rows = build_capability_rows(
+            {
+                "status": "ok",
+                "adapter_count": 1,
+                "error_count": 0,
+                "adapters": [
+                    {
+                        "name": "outbound_reactions",
+                        "family": "reactions",
+                        "enabled": True,
+                        "status": "ok",
+                    }
+                ],
+            },
+            events=[
+                SystemEvent(
+                    id=1,
+                    created_at="2026-01-01T00:00:00+00:00",
+                    level="warning",
+                    component="outbound_reactions",
+                    event_type="outbound_reaction_adapter_error",
+                    chat_id=None,
+                    user_id=None,
+                    route="",
+                    duration_ms=None,
+                    message="",
+                    details={},
+                )
+            ],
+        )
+        row = {item.name: item for item in rows}["outbound_reactions"]
+
+        self.assertEqual("degraded", row.status)
+        self.assertEqual(1, row.recent_warning_count)
+        self.assertEqual(["outbound_reaction_adapter_error"], row.recent_failure_categories)
+
+    def test_tool_diagnostics_tool_operation_falls_back_to_event_type(self) -> None:
+        rows = build_capability_rows(
+            {"status": "ok", "adapter_count": 0, "error_count": 0, "adapters": []},
+            events=[
+                SystemEvent(
+                    id=1,
+                    created_at="2026-01-01T00:00:00+00:00",
+                    level="warning",
+                    component="tool_runtime",
+                    event_type="tool_operation_failed",
+                    chat_id=None,
+                    user_id=None,
+                    route="",
+                    duration_ms=None,
+                    message="",
+                    details={"tool": "media_transcript", "operation": "cleanup"},
+                )
+            ],
+        )
+        row = {item.name: item for item in rows}["media_transcript"]
+
+        self.assertEqual(["tool_operation_failed"], row.recent_failure_categories)
+        self.assertNotIn("[redacted]", row.recent_failure_categories)
+
+    def test_recent_tool_events_keeps_tool_failures_after_unrelated_noise(self) -> None:
+        main.SYSTEM_LOG.record_event(
+            level="warning",
+            component="tool_runtime",
+            event_type="tool_operation_failed",
+            details={"tool": "media_transcript", "failure_category": "download_failed"},
+        )
+        for index in range(250):
+            main.SYSTEM_LOG.record_event(
+                level="warning",
+                component="command",
+                event_type="command_denied_admin",
+                message=f"noise-{index}",
+            )
+
+        events = main.recent_tool_events()
+
+        self.assertTrue(any(event.component == "tool_runtime" for event in events))
+        self.assertFalse(any(event.component == "command" for event in events))
+
+    def test_recent_tool_events_queries_tool_components_before_noise_cap(self) -> None:
+        main.SYSTEM_LOG.record_event(
+            level="warning",
+            component="tool_runtime",
+            event_type="tool_operation_failed",
+            details={"tool": "media_transcript", "failure_category": "download_failed"},
+        )
+        for index in range(520):
+            main.SYSTEM_LOG.record_event(
+                level="warning",
+                component="command",
+                event_type="command_denied_admin",
+                message=f"newer-noise-{index}",
+            )
+
+        events = main.recent_tool_events()
+
+        self.assertTrue(any(event.component == "tool_runtime" for event in events))
+        self.assertFalse(any(event.component == "command" for event in events))
+
+    def test_recent_tool_events_keeps_tool_detail_outside_known_components(self) -> None:
+        main.SYSTEM_LOG.record_event(
+            level="warning",
+            component="future_adapter",
+            event_type="tool_operation_failed",
+            details={"tool": "stt_openai", "failure_category": "provider.timeout"},
+        )
+        for index in range(520):
+            main.SYSTEM_LOG.record_event(
+                level="warning",
+                component="command",
+                event_type="command_denied_admin",
+                message=f"newer-noise-{index}",
+            )
+
+        events = main.recent_tool_events()
+        rows = build_capability_rows(
+            {"status": "ok", "adapter_count": 0, "error_count": 0, "adapters": []},
+            events=events,
+        )
+        row = {item.name: item for item in rows}["stt_openai"]
+
+        self.assertTrue(any(event.component == "future_adapter" for event in events))
+        self.assertEqual("not_implemented", row.status)
+        self.assertEqual(1, row.recent_warning_count)
+        self.assertEqual(["provider.timeout"], row.recent_failure_categories)
+
+    def test_recent_tool_events_include_image_search_and_github_reporting(self) -> None:
+        main.SYSTEM_LOG.record_event(
+            level="warning",
+            component="image_search",
+            event_type="search_failed",
+            details={"failure_category": "search_failed"},
+        )
+        main.SYSTEM_LOG.record_event(
+            level="error",
+            component="github_reporting",
+            event_type="self_report_failed",
+            details={"failure_category": "provider_unavailable"},
+        )
+
+        events = main.recent_tool_events()
+        rows = build_capability_rows(
+            {"status": "ok", "adapter_count": 0, "error_count": 0, "adapters": []},
+            events=events,
+        )
+        by_name = {item.name: item for item in rows}
+
+        self.assertTrue(any(event.component == "image_search" for event in events))
+        self.assertTrue(any(event.component == "github_reporting" for event in events))
+        self.assertEqual(1, by_name["web_image_search"].recent_warning_count)
+        self.assertEqual(1, by_name["github_reporting"].recent_error_count)
+
+    def test_recent_tool_events_query_failure_degrades_system_log(self) -> None:
+        class BrokenSystemLog:
+            def events_since_for_components(self, *args, **kwargs):
+                raise RuntimeError("db down")
+
+        with patch.object(main, "SYSTEM_LOG", BrokenSystemLog()):
+            events = main.recent_tool_events()
+        rows = build_capability_rows(
+            {"status": "ok", "adapter_count": 0, "error_count": 0, "adapters": []},
+            events=events,
+        )
+        row = {item.name: item for item in rows}["system_log"]
+
+        self.assertEqual("degraded", row.status)
+        self.assertEqual(1, row.recent_error_count)
+        self.assertEqual(["health_report_failed"], row.recent_failure_categories)
+
+    def test_agent_run_error_without_tool_detail_does_not_degrade_mcp_rows(self) -> None:
+        main.SYSTEM_LOG.record_event(
+            level="error",
+            component="agent",
+            event_type="run_error",
+            details={"failure_category": "runner_error"},
+        )
+
+        rows = build_capability_rows(
+            {"status": "ok", "adapter_count": 0, "error_count": 0, "adapters": []},
+            events=main.recent_tool_events(),
+        )
+        by_name = {item.name: item for item in rows}
+
+        self.assertEqual(0, by_name["web_search"].recent_error_count)
+        self.assertEqual(0, by_name["youtube_captions"].recent_error_count)
+        self.assertEqual("ok", by_name["web_search"].status)
+        self.assertEqual("ok", by_name["youtube_captions"].status)
+
+    def test_web_prefetch_failure_degrades_web_search(self) -> None:
+        main.SYSTEM_LOG.record_event(
+            level="error",
+            component="web",
+            event_type="prefetch_failed",
+            details={"failure_category": "prefetch_failed"},
+        )
+
+        rows = build_capability_rows(
+            {"status": "ok", "adapter_count": 0, "error_count": 0, "adapters": []},
+            events=main.recent_tool_events(),
+        )
+        row = {item.name: item for item in rows}["web_search"]
+
+        self.assertEqual(1, row.recent_error_count)
+        self.assertEqual("degraded", row.status)
+
+    def test_github_reporting_row_uses_reporter_configuration(self) -> None:
+        original_config = main.CONFIG
+        try:
+            main.CONFIG = replace(main.CONFIG, github_reporting_enabled=True)
+            with patch.object(type(main.GITHUB_REPORTER), "is_configured", new_callable=PropertyMock, return_value=False):
+                row = {item.name: item for item in main.configured_capability_rows()}["github_reporting"]
+        finally:
+            main.CONFIG = original_config
+
+        self.assertTrue(row.enabled)
+        self.assertFalse(row.configured)
+        self.assertFalse(row.available)
+        self.assertEqual("unconfigured", row.status)
+
+    def test_memory_embeddings_blank_model_is_unconfigured(self) -> None:
+        original_config = main.CONFIG
+        try:
+            main.CONFIG = replace(main.CONFIG, memory_vector_enabled=True, memory_embedding_model="")
+            row = {item.name: item for item in main.memory_capability_rows()}["memory_embeddings"]
+        finally:
+            main.CONFIG = original_config
+
+        self.assertTrue(row.enabled)
+        self.assertFalse(row.configured)
+        self.assertFalse(row.available)
+        self.assertEqual("unconfigured", row.status)
+
+    def test_stt_openai_row_reflects_youtube_audio_fallback(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "YOUTUBE_AUDIO_FALLBACK": "true",
+                "YOUTUBE_TRANSCRIPTION_MODEL": "gpt-4o-mini-transcribe",
+                "YOUTUBE_MAX_DURATION_SECONDS": "60",
+            },
+        ):
+            row = {item.name: item for item in main.configured_capability_rows()}["stt_openai"]
+
+        self.assertTrue(row.enabled)
+        self.assertTrue(row.configured)
+        self.assertTrue(row.available)
+        self.assertEqual("ok", row.status)
+        self.assertEqual("youtube_audio_fallback", row.adapter)
+        self.assertEqual("gpt-4o-mini-transcribe", row.backend)
+        self.assertEqual({"max_duration_seconds": 60}, row.details)
+
+    def test_stt_openai_row_requires_youtube_transcription_model(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "YOUTUBE_AUDIO_FALLBACK": "true",
+                "YOUTUBE_TRANSCRIPTION_MODEL": "",
+            },
+        ):
+            row = {item.name: item for item in main.configured_capability_rows()}["stt_openai"]
+
+        self.assertTrue(row.enabled)
+        self.assertFalse(row.configured)
+        self.assertFalse(row.available)
+        self.assertEqual("unconfigured", row.status)
+
+    def test_stt_openai_row_handles_bad_youtube_max_duration(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "YOUTUBE_AUDIO_FALLBACK": "true",
+                "YOUTUBE_TRANSCRIPTION_MODEL": "gpt-4o-mini-transcribe",
+                "YOUTUBE_MAX_DURATION_SECONDS": "not-a-number",
+            },
+        ):
+            row = {item.name: item for item in main.configured_capability_rows()}["stt_openai"]
+
+        self.assertTrue(row.enabled)
+        self.assertFalse(row.configured)
+        self.assertFalse(row.available)
+        self.assertEqual("unconfigured", row.status)
+        self.assertEqual({}, row.details)
+
+    def test_stt_openai_row_requires_positive_youtube_max_duration(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "YOUTUBE_AUDIO_FALLBACK": "true",
+                "YOUTUBE_TRANSCRIPTION_MODEL": "gpt-4o-mini-transcribe",
+                "YOUTUBE_MAX_DURATION_SECONDS": "0",
+            },
+        ):
+            row = {item.name: item for item in main.configured_capability_rows()}["stt_openai"]
+
+        self.assertTrue(row.enabled)
+        self.assertFalse(row.configured)
+        self.assertFalse(row.available)
+        self.assertEqual("unconfigured", row.status)
+        self.assertEqual({}, row.details)
+
+    def test_adapter_row_prefers_reported_family(self) -> None:
+        rows = build_capability_rows(
+            {
+                "status": "ok",
+                "adapter_count": 1,
+                "error_count": 0,
+                "adapters": [
+                    {
+                        "name": "custom_live_backend",
+                        "family": "stt",
+                        "enabled": True,
+                        "configured": True,
+                        "available": True,
+                        "status": "ok",
+                    }
+                ],
+            }
+        )
+        row = {item.name: item for item in rows}["custom_live_backend"]
+
+        self.assertEqual("stt", row.family)
+
+    def test_memory_capability_rows_do_not_scan_embedding_backlog(self) -> None:
+        if main.MEMORY is None:
+            self.skipTest("memory store disabled")
+        original_config = main.CONFIG
+        try:
+            main.CONFIG = replace(
+                main.CONFIG,
+                memory_vector_enabled=True,
+                memory_embedding_model="text-embedding-3-small",
+            )
+            with patch.object(main.MEMORY, "embedding_backlog_count", side_effect=AssertionError("should not scan")):
+                row = {item.name: item for item in main.memory_capability_rows()}["memory_embeddings"]
+        finally:
+            main.CONFIG = original_config
+
+        self.assertEqual("ok", row.status)
+        self.assertEqual({"dimensions": main.CONFIG.memory_embedding_dimensions}, row.details)
+
+    def test_image_understanding_blank_model_is_unconfigured(self) -> None:
+        original_config = main.CONFIG
+        try:
+            main.CONFIG = replace(main.CONFIG, image_analysis_enabled=True, vision_model="")
+            row = {item.name: item for item in main.configured_capability_rows()}["image_understanding"]
+        finally:
+            main.CONFIG = original_config
+
+        self.assertTrue(row.enabled)
+        self.assertFalse(row.configured)
+        self.assertFalse(row.available)
+        self.assertEqual("unconfigured", row.status)
+
+    def test_tool_runtime_summary_failure_returns_error_row(self) -> None:
+        with patch.object(main.TOOL_RUNTIME, "health_summary", side_effect=RuntimeError("boom")):
+            rows = {item.name: item for item in main.tool_capability_rows()}
+
+        self.assertEqual("error", rows["tool_runtime"].status)
+        self.assertFalse(rows["tool_runtime"].available)
+        self.assertEqual(1, rows["tool_runtime"].error_count)
+        self.assertEqual("core", rows["tool_runtime"].family)
+
+    def test_configured_rows_include_reaction_memory(self) -> None:
+        rows = {item.name: item for item in main.configured_capability_rows()}
+
+        self.assertIn("reaction_memory", rows)
+        self.assertEqual("reactions", rows["reaction_memory"].family)
+
+    def test_tools_command_is_admin_only(self) -> None:
+        admin_message = FakeMessage("/tools")
+        non_admin_message = FakeMessage("/tools")
+        non_admin_message.from_user = FakeUser(user_id=123, username="guest")
+
+        asyncio.run(main.tools_command(SimpleNamespace(effective_message=admin_message), SimpleNamespace()))
+        asyncio.run(main.tools_command(SimpleNamespace(effective_message=non_admin_message), SimpleNamespace()))
+
+        self.assertIn("Tool capabilities", admin_message.reply_calls[0]["text"])
+        self.assertTrue(non_admin_message.reply_calls)
+        self.assertNotIn("Tool capabilities", non_admin_message.reply_calls[0]["text"])
+
+    def test_tool_health_failures_renders_recent_sanitized_failure(self) -> None:
+        main.SYSTEM_LOG.record_event(
+            level="warning",
+            component="tool_runtime",
+            event_type="tool_operation_failed",
+            message=f"OPENAI_API_KEY={fake_openai_secret()}",
+            details={"tool": "outbound_reactions", "failure_category": "timeout"},
+        )
+        message = FakeMessage("/tool_health failures")
+
+        asyncio.run(main.tool_health_command(SimpleNamespace(effective_message=message), SimpleNamespace()))
+
+        reply = message.reply_calls[0]["text"]
+        self.assertIn("Recent tool failures", reply)
+        self.assertIn("outbound_reactions", reply)
+        self.assertIn("timeout", reply)
+        self.assertNotIn(fake_openai_secret(), reply)
+
+    def test_localized_tools_alias_routes_to_diagnostics(self) -> None:
+        message = FakeMessage("/тулзи")
+        context = SimpleNamespace(bot=SimpleNamespace(username="thrd_ua_bot"))
+
+        asyncio.run(main.localized_command_alias(SimpleNamespace(effective_message=message), context))
+
+        self.assertIn("Tool capabilities", message.reply_calls[0]["text"])
 
 
 class PersistentMemoryTests(unittest.TestCase):
