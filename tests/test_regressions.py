@@ -122,7 +122,7 @@ from mcp_servers import web
 from reaction_memory import ReactionSpec
 from scripts import import_telegram_export
 from scripts.import_telegram_export import ImportOptions
-from self_analysis import SelfAnalysisService, classify_complaint, classify_reaction_complaint
+from self_analysis import SelfAnalysisService, classify_complaint, classify_reaction_complaint, has_marker
 from system_log import SystemEvent, SystemLogStore, redact_secrets
 from tool_diagnostics import (
     CapabilityRow,
@@ -6474,6 +6474,37 @@ class SystemHealthTests(unittest.TestCase):
         self.assertIsNotNone(signal)
         self.assertEqual("reaction_reasoning_gap", signal.category)
 
+    def test_reaction_complaint_classifier_allows_unmentioned_explicit_reaction_complaints(self) -> None:
+        cases = (
+            ("inappropriate reaction", "insensitive_reaction"),
+            ("why did you react that way?", "reaction_reasoning_gap"),
+        )
+        for text, category in cases:
+            with self.subTest(text=text):
+                signal = classify_reaction_complaint(
+                    text,
+                    has_recent_reaction=True,
+                    rationale_state="stored_rationale",
+                    decision_action="sent",
+                    target_fingerprint="abc123",
+                )
+
+                self.assertIsNotNone(signal)
+                self.assertEqual(category, signal.category)
+
+    def test_reaction_complaint_classifier_uses_multilingual_temporal_reason_challenge(self) -> None:
+        signal = classify_reaction_complaint(
+            "\u0447\u043e\u043c\u0443 \u0442\u0438 \u0446\u0435 \u0437\u0440\u043e\u0431\u0438\u0432?",
+            reply_to_bot=True,
+            has_recent_reaction=True,
+            rationale_state="stored_rationale",
+            decision_action="sent",
+            target_fingerprint="abc123",
+        )
+
+        self.assertIsNotNone(signal)
+        self.assertEqual("reaction_reasoning_gap", signal.category)
+
     def test_reaction_complaint_classifier_rejects_broad_passive_markers(self) -> None:
         cases = (
             "I support the plan and the tone sounds fine",
@@ -6485,6 +6516,7 @@ class SystemHealthTests(unittest.TestCase):
             "Aigan, why is the sky blue?",
             "Aigan, your response was fake empathy",
             "I had a bad reaction to dinner",
+            "Aigan, I had a bad reaction to dinner",
             "\u044f \u043f\u0456\u0434\u0442\u0440\u0438\u043c\u0443\u044e \u043f\u043b\u0430\u043d",
             "Aigan, \u0431\u0435\u0442\u043e\u043d is solid",
         )
@@ -6517,6 +6549,16 @@ class SystemHealthTests(unittest.TestCase):
         )
 
         self.assertIsNone(signal)
+
+    def test_marker_matching_uses_unicode_boundaries(self) -> None:
+        self.assertFalse(has_marker("\u0434\u0438\u0437\u043b\u0430\u0439\u043a", "\u043b\u0430\u0439\u043a"))
+        self.assertFalse(has_marker("\u0440\u043e\u0431\u043e\u0442\u0430", "\u0431\u043e\u0442"))
+        self.assertTrue(has_marker("\u0441\u0442\u0430\u0432\u0438\u0442\u044c \u043b\u0430\u0439\u043a", "\u043b\u0430\u0439\u043a"))
+
+    def test_reaction_complaint_target_label_is_not_id_hash(self) -> None:
+        self.assertEqual("linked", main.reaction_complaint_target_label(123, None))
+        self.assertEqual("linked", main.reaction_complaint_target_label(None, 456))
+        self.assertEqual("unlinked", main.reaction_complaint_target_label(None, None))
 
     def test_generic_complaint_does_not_select_reaction_health_category(self) -> None:
         signal = classify_complaint("Aigan bot bug fake empathy", bot_username="thrd_ua_bot")

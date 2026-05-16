@@ -129,10 +129,15 @@ REACTION_REASON_CHALLENGE_TERMS = (
     "why did you do that",
     "why did you put",
     "why did you react",
+    "why did you react that way",
     "why did you send",
     "why that reaction",
     "why this reaction",
     "why'd you do that",
+    "зачем ты это сделал",
+    "навіщо ти це зробив",
+    "почему ты это сделал",
+    "чому ти це зробив",
 )
 REACTION_APPROVAL_TERMS = (
     "approval of harm",
@@ -155,12 +160,22 @@ REACTION_INSENSITIVE_TERMS = (
     "inappropriate",
     "insensitive",
     "wrong reaction",
-    "bad reaction",
+    "bad emoji",
+    "bad emoji reaction",
     "tone deaf",
     "not ok",
     "неумест",
     "недореч",
     "не так",
+)
+REACTION_PASSIVE_COMPLAINT_TERMS = (
+    "inappropriate reaction",
+    "wrong emoji",
+    "wrong reaction",
+    "why did you react",
+    "why did you react that way",
+    "why that reaction",
+    "why this reaction",
 )
 REACTION_FAKE_EMPATHY_TERMS = (
     "fake empathy",
@@ -205,10 +220,8 @@ def has_marker(lowered: str, marker: str) -> bool:
     clean_marker = marker.casefold().strip()
     if not clean_marker:
         return False
-    if re.fullmatch(r"[a-z0-9_-]+", clean_marker):
-        return re.search(rf"(?<![a-z0-9_-]){re.escape(clean_marker)}(?![a-z0-9_-])", lowered) is not None
-    if re.search(r"[a-z0-9]", clean_marker):
-        return re.search(rf"(?<![a-z0-9_-]){re.escape(clean_marker)}(?![a-z0-9_-])", lowered) is not None
+    if re.match(r"[\w-]", clean_marker, re.UNICODE) or re.search(r"[\w-]$", clean_marker, re.UNICODE):
+        return re.search(rf"(?<![\w-]){re.escape(clean_marker)}(?![\w-])", lowered, re.UNICODE) is not None
     return clean_marker in lowered
 
 
@@ -233,8 +246,9 @@ def has_reaction_complaint_hint(
     mentions_bot = reply_to_bot or has_any_marker(lowered, bot_markers)
     has_reaction_marker = has_any_marker(lowered, REACTION_TERMS)
     has_approval_marker = has_any_marker(lowered, REACTION_APPROVAL_TERMS)
+    has_passive_complaint_marker = has_any_marker(lowered, REACTION_PASSIVE_COMPLAINT_TERMS)
     if not mentions_bot:
-        return has_reaction_marker or has_approval_marker
+        return has_approval_marker or has_passive_complaint_marker
     return (
         has_reaction_marker
         or has_approval_marker
@@ -303,6 +317,7 @@ def classify_reaction_complaint(
     has_reason_challenge_marker = has_any_marker(lowered, REACTION_REASON_CHALLENGE_TERMS)
     has_approval_marker = has_any_marker(lowered, REACTION_APPROVAL_TERMS)
     has_insensitive_marker = has_any_marker(lowered, REACTION_INSENSITIVE_TERMS)
+    has_passive_complaint_marker = has_any_marker(lowered, REACTION_PASSIVE_COMPLAINT_TERMS)
     has_fake_empathy_marker = has_any_marker(lowered, REACTION_FAKE_EMPATHY_TERMS)
     has_tone_marker = has_any_marker(lowered, REACTION_TONE_TERMS)
     has_sycophancy_marker = has_any_marker(lowered, REACTION_SYCOPHANCY_TERMS)
@@ -327,7 +342,9 @@ def classify_reaction_complaint(
 
     if not (mentions_bot or has_recent_reaction):
         return None
-    if not mentions_bot and not has_approval_marker:
+    if not mentions_bot and not (
+        has_approval_marker or (has_recent_reaction and has_passive_complaint_marker)
+    ):
         return None
     if not has_reaction_context and not has_approval_marker:
         return None

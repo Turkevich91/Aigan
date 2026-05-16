@@ -1243,9 +1243,8 @@ def reaction_decision_is_recent(record: Any, *, max_age_seconds: int = REACTION_
     return 0 <= age_seconds <= max_age_seconds
 
 
-def reaction_complaint_target_hash(chat_id: int, target_message_id: int | None, target_memory_id: int | None) -> str:
-    basis = f"{chat_id}:{target_message_id or 0}:{target_memory_id or 0}"
-    return hashlib.sha256(basis.encode("utf-8")).hexdigest()[:16]
+def reaction_complaint_target_label(target_message_id: int | None, target_memory_id: int | None) -> str:
+    return "linked" if target_message_id is not None or target_memory_id is not None else "unlinked"
 
 
 def reaction_decision_for_complaint(message: Message) -> Any | None:
@@ -1298,10 +1297,9 @@ def remember_self_complaint_signal(
         reply_to_bot=reply_to_bot,
     )
     reaction_record = reaction_decision_for_complaint(message) if has_reaction_hint else None
-    target_hash = ""
+    target_label = ""
     if reaction_record is not None:
-        target_hash = reaction_complaint_target_hash(
-            int(message.chat_id),
+        target_label = reaction_complaint_target_label(
             getattr(reaction_record, "target_message_id", None),
             getattr(reaction_record, "target_memory_id", None),
         )
@@ -1316,7 +1314,7 @@ def remember_self_complaint_signal(
         decision_action=str(getattr(reaction_record, "action", "") or ""),
         decision_reason=str(getattr(reaction_record, "reason_code", "") or ""),
         emotion_class=str(getattr(reaction_record, "emotion_class", "") or ""),
-        target_fingerprint=target_hash,
+        target_fingerprint=target_label,
     )
     if reaction_cluster is not None:
         LOGGER.info(
