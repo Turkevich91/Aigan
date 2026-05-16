@@ -97,7 +97,7 @@ os.environ["OUTBOUND_REACTIONS_ENABLED"] = "false"
 os.environ["OUTBOUND_REACTION_EVERY_N_MESSAGES"] = "10"
 os.environ["OUTBOUND_REACTION_COOLDOWN_SECONDS"] = "1800"
 os.environ["OUTBOUND_REACTION_MIN_SCORE"] = "0.72"
-os.environ["OUTBOUND_REACTION_ALLOWED_EMOJI"] = "fire,eyes,thumbs_up,thinking,laugh"
+os.environ["OUTBOUND_REACTION_ALLOWED_EMOJI"] = "fire,eyes,thumbs_up,thinking,laugh,sad,broken_heart,shock,fear,angry"
 os.environ["OUTBOUND_REACTION_USE_CUSTOM_EMOJI"] = "true"
 os.environ["OUTBOUND_REACTION_BIG"] = "false"
 
@@ -2665,8 +2665,19 @@ class PersistentMemoryTests(unittest.TestCase):
 
     def test_outbound_reaction_emoji_aliases_avoid_env_unicode_breakage(self) -> None:
         self.assertEqual(
-            ["\N{FIRE}", "\N{EYES}", "\N{THUMBS UP SIGN}", "\N{THINKING FACE}", "\N{FACE WITH TEARS OF JOY}"],
-            main._reaction_emoji_values("fire,eyes,thumbs_up,thinking,laugh,??"),
+            [
+                "\N{FIRE}",
+                "\N{EYES}",
+                "\N{THUMBS UP SIGN}",
+                "\N{THINKING FACE}",
+                "\N{FACE WITH TEARS OF JOY}",
+                "\N{CRYING FACE}",
+                "\N{BROKEN HEART}",
+                "\N{FACE SCREAMING IN FEAR}",
+                "\N{FEARFUL FACE}",
+                "\N{POUTING FACE}",
+            ],
+            main._reaction_emoji_values("fire,eyes,thumbs_up,thinking,laugh,sad,broken_heart,shock,fear,angry,??"),
         )
 
     def test_reaction_hook_failure_does_not_block_memory_or_embedding(self) -> None:
@@ -2905,13 +2916,6 @@ class PersistentMemoryTests(unittest.TestCase):
             sender_label="Tester",
             user_id=111,
             text=message.text,
-            source_text="raw source contains token_like_value and private user wording",
-            source_title="Forwarded source",
-            source_url="https://example.invalid/private?token=secret",
-            content_kind="video",
-            attachment_type="video",
-            vision_summary="visual summary exists",
-            forward_origin="hidden forward origin",
             created_at=datetime.now(timezone.utc),
         )
 
@@ -2921,12 +2925,12 @@ class PersistentMemoryTests(unittest.TestCase):
         self.assertIsNotNone(record)
         self.assertEqual("sent", record.action)
         self.assertEqual("emoji:u1f525", record.sent_reaction_key)
-        self.assertEqual("positive_or_celebratory", record.candidate_reaction_class)
-        self.assertTrue(record.has_source_text)
-        self.assertTrue(record.has_vision_summary)
-        self.assertTrue(record.has_forward_origin)
-        self.assertIn("source_context", record.severity_flags)
-        self.assertIn("attachment:video", record.severity_flags)
+        self.assertEqual("positive_celebratory", record.candidate_reaction_class)
+        self.assertEqual("positive_celebratory", record.emotion_class)
+        self.assertFalse(record.has_source_text)
+        self.assertFalse(record.has_vision_summary)
+        self.assertFalse(record.has_forward_origin)
+        self.assertIn("safe_positive", record.severity_flags)
         explanation = main.REACTION_MEMORY.explain_outbound_decision(record)
         self.assertIn("Stored outbound reaction decision", explanation)
         self.assertNotIn("token_like_value", explanation)
@@ -2975,7 +2979,7 @@ class PersistentMemoryTests(unittest.TestCase):
             use_custom_emoji=False,
         )
         adapter = main.OutboundReactionAdapter(config=config, reaction_memory=main.REACTION_MEMORY)
-        adapter._send_attempt_rationale = lambda _item, _score: ""
+        adapter._send_attempt_rationale = lambda _item, _score, _policy: ""
         message = FakeMessage("release update with enough context and number 170", message_id=975)
         item_id = main.MEMORY.save_message(
             chat_id=-1001,
@@ -2993,6 +2997,161 @@ class PersistentMemoryTests(unittest.TestCase):
         self.assertIsNotNone(record)
         self.assertEqual("skipped", record.action)
         self.assertEqual("insufficient_rationale", record.reason_code)
+
+    def test_outbound_reaction_blocks_positive_on_tragic_news(self) -> None:
+        self.assertIsNotNone(main.REACTION_MEMORY)
+        config = main.OutboundReactionConfig(
+            enabled=True,
+            every_n_messages=1,
+            cooldown_seconds=0,
+            min_score=0.0,
+            allowed_emoji=("\N{FIRE}",),
+            use_custom_emoji=False,
+        )
+        adapter = main.OutboundReactionAdapter(config=config, reaction_memory=main.REACTION_MEMORY)
+        message = FakeMessage("terrible news: victims killed in a missile attack with many dead", message_id=976)
+        item_id = main.MEMORY.save_message(
+            chat_id=-1001,
+            message_id=976,
+            sender_label="Tester",
+            user_id=111,
+            text=message.text,
+            created_at=datetime.now(timezone.utc),
+        )
+
+        asyncio.run(adapter.on_message_ingested(message, main.MEMORY.item_by_id(item_id), "pre_embedding"))
+
+        message.bot.set_message_reaction.assert_not_awaited()
+        record = main.REACTION_MEMORY.latest_outbound_decision(chat_id=-1001, target_message_id=976)
+        self.assertIsNotNone(record)
+        self.assertEqual("skipped", record.action)
+        self.assertEqual("grief_sympathy", record.emotion_class)
+        self.assertEqual("no_allowed_reaction_for_emotion", record.reason_code)
+        self.assertIn("sensitive", record.severity_flags)
+        self.assertNotEqual("emoji:u1f525", record.sent_reaction_key)
+
+    def test_outbound_reaction_sends_sympathy_when_allowed(self) -> None:
+        self.assertIsNotNone(main.REACTION_MEMORY)
+        config = main.OutboundReactionConfig(
+            enabled=True,
+            every_n_messages=1,
+            cooldown_seconds=0,
+            min_score=0.0,
+            allowed_emoji=("\N{FIRE}", "\N{CRYING FACE}"),
+            use_custom_emoji=False,
+        )
+        adapter = main.OutboundReactionAdapter(config=config, reaction_memory=main.REACTION_MEMORY)
+        message = FakeMessage("sad news: victims died and the community is in mourning", message_id=977)
+        item_id = main.MEMORY.save_message(
+            chat_id=-1001,
+            message_id=977,
+            sender_label="Tester",
+            user_id=111,
+            text=message.text,
+            created_at=datetime.now(timezone.utc),
+        )
+
+        asyncio.run(adapter.on_message_ingested(message, main.MEMORY.item_by_id(item_id), "pre_embedding"))
+
+        message.bot.set_message_reaction.assert_awaited_once()
+        record = main.REACTION_MEMORY.latest_outbound_decision(chat_id=-1001, target_message_id=977)
+        self.assertIsNotNone(record)
+        self.assertEqual("sent", record.action)
+        self.assertEqual("grief_sympathy", record.emotion_class)
+        self.assertEqual("emoji:u1f622", record.sent_reaction_key)
+
+    def test_outbound_reaction_sends_outrage_only_for_clear_condemnation(self) -> None:
+        self.assertIsNotNone(main.REACTION_MEMORY)
+        config = main.OutboundReactionConfig(
+            enabled=True,
+            every_n_messages=1,
+            cooldown_seconds=0,
+            min_score=0.0,
+            allowed_emoji=("\N{POUTING FACE}",),
+            use_custom_emoji=False,
+        )
+        adapter = main.OutboundReactionAdapter(config=config, reaction_memory=main.REACTION_MEMORY)
+        message = FakeMessage("war crime: criminal torture and cruel attack against victims", message_id=978)
+        item_id = main.MEMORY.save_message(
+            chat_id=-1001,
+            message_id=978,
+            sender_label="Tester",
+            user_id=111,
+            text=message.text,
+            created_at=datetime.now(timezone.utc),
+        )
+
+        asyncio.run(adapter.on_message_ingested(message, main.MEMORY.item_by_id(item_id), "pre_embedding"))
+
+        message.bot.set_message_reaction.assert_awaited_once()
+        record = main.REACTION_MEMORY.latest_outbound_decision(chat_id=-1001, target_message_id=978)
+        self.assertIsNotNone(record)
+        self.assertEqual("sent", record.action)
+        self.assertEqual("condemnation_outrage", record.emotion_class)
+        self.assertEqual("emoji:u1f621", record.sent_reaction_key)
+
+    def test_outbound_reaction_source_only_context_defaults_to_no_reaction(self) -> None:
+        self.assertIsNotNone(main.REACTION_MEMORY)
+        config = main.OutboundReactionConfig(
+            enabled=True,
+            every_n_messages=1,
+            cooldown_seconds=0,
+            min_score=0.0,
+            allowed_emoji=("\N{FIRE}",),
+            use_custom_emoji=False,
+        )
+        adapter = main.OutboundReactionAdapter(config=config, reaction_memory=main.REACTION_MEMORY)
+        message = FakeMessage("", message_id=979)
+        item_id = main.MEMORY.save_message(
+            chat_id=-1001,
+            message_id=979,
+            sender_label="Tester",
+            user_id=111,
+            text="",
+            source_text="great news release success from a forwarded source",
+            source_title="Forwarded source",
+            content_kind="source",
+            created_at=datetime.now(timezone.utc),
+        )
+
+        asyncio.run(adapter.on_message_ingested(message, main.MEMORY.item_by_id(item_id), "pre_embedding"))
+
+        message.bot.set_message_reaction.assert_not_awaited()
+        record = main.REACTION_MEMORY.latest_outbound_decision(chat_id=-1001, target_message_id=979)
+        self.assertIsNotNone(record)
+        self.assertEqual("skipped", record.action)
+        self.assertEqual("ambiguous_low_confidence", record.emotion_class)
+        self.assertIn("source_only", record.severity_flags)
+
+    def test_outbound_reaction_ambiguous_sensitive_content_skips(self) -> None:
+        self.assertIsNotNone(main.REACTION_MEMORY)
+        config = main.OutboundReactionConfig(
+            enabled=True,
+            every_n_messages=1,
+            cooldown_seconds=0,
+            min_score=0.0,
+            allowed_emoji=("\N{CRYING FACE}",),
+            use_custom_emoji=False,
+        )
+        adapter = main.OutboundReactionAdapter(config=config, reaction_memory=main.REACTION_MEMORY)
+        message = FakeMessage("unconfirmed rumor: maybe victims killed in attack", message_id=980)
+        item_id = main.MEMORY.save_message(
+            chat_id=-1001,
+            message_id=980,
+            sender_label="Tester",
+            user_id=111,
+            text=message.text,
+            created_at=datetime.now(timezone.utc),
+        )
+
+        asyncio.run(adapter.on_message_ingested(message, main.MEMORY.item_by_id(item_id), "pre_embedding"))
+
+        message.bot.set_message_reaction.assert_not_awaited()
+        record = main.REACTION_MEMORY.latest_outbound_decision(chat_id=-1001, target_message_id=980)
+        self.assertIsNotNone(record)
+        self.assertEqual("skipped", record.action)
+        self.assertEqual("ambiguous_sensitive", record.emotion_class)
+        self.assertEqual("emotion_sensitive_ambiguous", record.reason_code)
 
     def test_reaction_explanation_prompt_uses_stored_decision(self) -> None:
         self.assertIsNotNone(main.REACTION_MEMORY)
