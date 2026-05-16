@@ -112,7 +112,14 @@ from scripts import import_telegram_export
 from scripts.import_telegram_export import ImportOptions
 from self_analysis import SelfAnalysisService, classify_complaint
 from system_log import SystemLogStore, redact_secrets
-from tool_diagnostics import build_capability_rows, render_capability_matrix, render_recent_failures
+from tool_diagnostics import (
+    CapabilityRow,
+    adapter_family,
+    build_capability_rows,
+    render_capability_matrix,
+    render_recent_failures,
+    render_row,
+)
 from tool_runtime import NullToolAdapter, ToolRuntime
 
 VALID_JPEG = b"\xff\xd8\xff\xe0" + b"valid-jpeg"
@@ -883,6 +890,33 @@ class ToolRuntimeTests(unittest.TestCase):
         self.assertNotIn("prompt", text)
         self.assertIn("[redacted]", text)
 
+    def test_tool_diagnostics_redacts_unsafe_adapter_name_and_posix_paths(self) -> None:
+        text = render_capability_matrix(
+            build_capability_rows(
+                {
+                    "status": "ok",
+                    "adapter_count": 1,
+                    "error_count": 0,
+                    "adapters": [
+                        {
+                            "name": "/opt/private/backend",
+                            "enabled": True,
+                            "status": "ok",
+                            "adapter": "/srv/private/adapter",
+                            "mode": "~/private/mode",
+                            "backend": "/usr/local/private/backend",
+                        }
+                    ],
+                }
+            )
+        )
+
+        self.assertNotIn("/opt/private", text)
+        self.assertNotIn("/srv/private", text)
+        self.assertNotIn("/usr/local", text)
+        self.assertNotIn("~/private", text)
+        self.assertIn("[redacted]", text)
+
     def test_tool_diagnostics_preserves_adapter_configured_available_fields(self) -> None:
         rows = build_capability_rows(
             {
@@ -906,6 +940,48 @@ class ToolRuntimeTests(unittest.TestCase):
         self.assertFalse(row.configured)
         self.assertFalse(row.available)
         self.assertEqual("unconfigured", row.status)
+
+    def test_tool_diagnostics_live_adapter_overrides_config_row(self) -> None:
+        rows = build_capability_rows(
+            {
+                "status": "degraded",
+                "adapter_count": 1,
+                "error_count": 1,
+                "adapters": [
+                    {
+                        "name": "image_understanding",
+                        "enabled": True,
+                        "available": False,
+                        "status": "error",
+                        "adapter": "vision_adapter",
+                        "error_count": 1,
+                    }
+                ],
+            },
+            extra_rows=[
+                CapabilityRow(
+                    name="image_understanding",
+                    family="vision",
+                    enabled=True,
+                    configured=True,
+                    available=True,
+                    status="ok",
+                    adapter="config",
+                )
+            ],
+        )
+        row = {item.name: item for item in rows}["image_understanding"]
+
+        self.assertEqual("error", row.status)
+        self.assertEqual("vision_adapter", row.adapter)
+        self.assertFalse(row.available)
+
+    def test_tool_diagnostics_family_mapper_matches_static_families(self) -> None:
+        self.assertEqual("stt", adapter_family("stt_openai"))
+        self.assertEqual("web", adapter_family("web_image_search"))
+        self.assertEqual("documents", adapter_family("document_ingest"))
+        self.assertEqual("fact_check", adapter_family("fact_check"))
+        self.assertEqual("digest", adapter_family("chat_digest"))
 
     def test_tool_diagnostics_aggregates_sanitized_tool_failure(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -934,6 +1010,26 @@ class ToolRuntimeTests(unittest.TestCase):
             self.assertNotIn(fake_telegram_secret(), text)
             store.close()
 
+    def test_tool_diagnostics_redacts_unsafe_failure_category(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = SystemLogStore(Path(tmpdir) / "events.sqlite3", retention_days=14)
+            store.record_event(
+                level="warning",
+                component="tool_runtime",
+                event_type="tool_operation_failed",
+                details={"tool": "media_transcript", "failure_category": "C:\\Users\\private\\media.mp4"},
+            )
+
+            rows = build_capability_rows(
+                {"status": "ok", "adapter_count": 0, "error_count": 0, "adapters": []},
+                events=store.events_since(21600, "warning", 20),
+            )
+            text = render_recent_failures(rows)
+
+            self.assertNotIn("C:\\Users", text)
+            self.assertIn("[redacted]", text)
+            store.close()
+
     def test_tool_diagnostics_counts_error_event_once(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             store = SystemLogStore(Path(tmpdir) / "events.sqlite3", retention_days=14)
@@ -953,6 +1049,43 @@ class ToolRuntimeTests(unittest.TestCase):
             self.assertIn("media_transcript: 1 recent", text)
             store.close()
 
+    def test_tool_diagnostics_render_row_shows_errors_and_warnings(self) -> None:
+        text = render_row(
+            CapabilityRow(
+                name="media_transcript",
+                family="media",
+                enabled=True,
+                configured=True,
+                available=False,
+                status="degraded",
+                error_count=1,
+                warning_count=2,
+            ).normalized()
+        )
+
+        self.assertIn("errors=1", text)
+        self.assertIn("warnings=2", text)
+
+    def test_recent_tool_events_keeps_tool_failures_after_unrelated_noise(self) -> None:
+        main.SYSTEM_LOG.record_event(
+            level="warning",
+            component="tool_runtime",
+            event_type="tool_operation_failed",
+            details={"tool": "media_transcript", "failure_category": "download_failed"},
+        )
+        for index in range(250):
+            main.SYSTEM_LOG.record_event(
+                level="warning",
+                component="command",
+                event_type="command_denied_admin",
+                message=f"noise-{index}",
+            )
+
+        events = main.recent_tool_events()
+
+        self.assertTrue(any(event.component == "tool_runtime" for event in events))
+        self.assertFalse(any(event.component == "command" for event in events))
+
     def test_github_reporting_row_uses_reporter_configuration(self) -> None:
         original_config = main.CONFIG
         try:
@@ -966,6 +1099,25 @@ class ToolRuntimeTests(unittest.TestCase):
         self.assertFalse(row.configured)
         self.assertFalse(row.available)
         self.assertEqual("unconfigured", row.status)
+
+    def test_memory_embeddings_blank_model_is_unconfigured(self) -> None:
+        original_config = main.CONFIG
+        try:
+            main.CONFIG = replace(main.CONFIG, memory_vector_enabled=True, memory_embedding_model="")
+            row = {item.name: item for item in main.memory_capability_rows()}["memory_embeddings"]
+        finally:
+            main.CONFIG = original_config
+
+        self.assertTrue(row.enabled)
+        self.assertFalse(row.configured)
+        self.assertFalse(row.available)
+        self.assertEqual("unconfigured", row.status)
+
+    def test_configured_rows_include_reaction_memory(self) -> None:
+        rows = {item.name: item for item in main.configured_capability_rows()}
+
+        self.assertIn("reaction_memory", rows)
+        self.assertEqual("reactions", rows["reaction_memory"].family)
 
     def test_tools_command_is_admin_only(self) -> None:
         admin_message = FakeMessage("/tools")

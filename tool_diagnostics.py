@@ -75,7 +75,7 @@ SAFE_HEALTH_FIELDS = {
 }
 URL_VALUE_RE = re.compile(r"\b(?:https?|ftp)://|www\.", re.IGNORECASE)
 WINDOWS_PATH_VALUE_RE = re.compile(r"(?:[A-Za-z]:\\|\\\\)")
-PRIVATE_PATH_VALUE_RE = re.compile(r"(^|\s)/(?:app|data|etc|home|mnt|root|tmp|users|var|workspace)/", re.IGNORECASE)
+POSIX_PATH_VALUE_RE = re.compile(r"(^|\s)(?:~|/(?:[^/\s]+/)+[^/\s]*)")
 TOKEN_VALUE_RE = re.compile(r"\b(?:gh[pousr]_|github_pat_|xox[baprs]-)[A-Za-z0-9_-]{8,}", re.IGNORECASE)
 
 
@@ -97,7 +97,7 @@ class CapabilityRow:
     details: dict[str, Any] = field(default_factory=dict)
 
     def normalized(self) -> "CapabilityRow":
-        self.name = clean_label(self.name, 80) or "unknown"
+        self.name = safe_display_label(self.name, 80) or "unknown"
         self.family = clean_label(self.family, 60) or "other"
         self.status = normalize_status(self.status, self.enabled)
         self.adapter = safe_display_label(self.adapter, 80)
@@ -122,7 +122,7 @@ def safe_display_label(value: Any, limit: int = 120) -> str:
     if (
         URL_VALUE_RE.search(text)
         or WINDOWS_PATH_VALUE_RE.search(text)
-        or PRIVATE_PATH_VALUE_RE.search(text)
+        or POSIX_PATH_VALUE_RE.search(text)
         or TOKEN_VALUE_RE.search(text)
     ):
         return "[redacted]"
@@ -176,7 +176,7 @@ def static_capability_rows() -> list[CapabilityRow]:
 
 def adapter_row(item: dict[str, Any]) -> CapabilityRow:
     enabled = bool(item.get("enabled", False))
-    name = clean_label(item.get("name") or "unknown", 80)
+    name = safe_display_label(item.get("name") or "unknown", 80) or "unknown"
     status = normalize_status(item.get("status"), enabled)
     details = {key: value for key, value in item.items() if key in SAFE_HEALTH_FIELDS}
     configured = bool(item.get("configured", enabled)) if "configured" in item else enabled
@@ -201,10 +201,22 @@ def adapter_row(item: dict[str, Any]) -> CapabilityRow:
 def adapter_family(name: str) -> str:
     if name in {"outbound_reactions", "reaction_memory"}:
         return "reactions"
+    if name.startswith("web_"):
+        return "web"
+    if name == "telegram_transcription" or "transcript" in name or "media" in name or "youtube" in name:
+        return "media"
+    if name.startswith("stt_") or name == "transcription_backend":
+        return "stt"
+    if "document" in name:
+        return "documents"
+    if name == "fact_check" or name.startswith("fact_"):
+        return "fact_check"
+    if "digest" in name:
+        return "digest"
+    if "github" in name:
+        return "reporting"
     if "memory" in name:
         return "memory"
-    if "transcript" in name or "media" in name or "youtube" in name:
-        return "media"
     if "ocr" in name or "image" in name or "vision" in name:
         return "vision"
     return "tools"
@@ -217,6 +229,8 @@ def build_capability_rows(
     extra_rows: Iterable[CapabilityRow] = (),
 ) -> list[CapabilityRow]:
     rows: dict[str, CapabilityRow] = {row.name: row.normalized() for row in static_capability_rows()}
+    for row in extra_rows:
+        rows[row.name] = row.normalized()
     summary = runtime_summary or {}
     rows["tool_runtime"] = CapabilityRow(
         name="tool_runtime",
@@ -232,8 +246,6 @@ def build_capability_rows(
     for item in summary.get("adapters", []) or []:
         row = adapter_row(dict(item or {}))
         rows[row.name] = row
-    for row in extra_rows:
-        rows[row.name] = row.normalized()
     apply_event_failures(rows, events)
     return sorted(rows.values(), key=sort_key)
 
@@ -262,7 +274,7 @@ def apply_event_failures(rows: dict[str, CapabilityRow], events: Iterable[System
 
 
 def capability_name_for_event(event: SystemEvent, rows: dict[str, CapabilityRow]) -> str:
-    tool = clean_label(event.details.get("tool") if isinstance(event.details, dict) else "", 80)
+    tool = safe_display_label(event.details.get("tool") if isinstance(event.details, dict) else "", 80)
     if tool in rows:
         return tool
     component_map = {
@@ -285,8 +297,8 @@ def failure_category_for_event(event: SystemEvent) -> str:
     for key in ("failure_category", "category", "operation", "exception_type"):
         value = details.get(key)
         if value:
-            return clean_label(value, 80)
-    return clean_label(event.event_type, 80)
+            return safe_display_label(value, 80)
+    return safe_display_label(event.event_type, 80)
 
 
 def sort_key(row: CapabilityRow) -> tuple[int, str, str]:
@@ -372,7 +384,7 @@ def render_row(row: CapabilityRow) -> str:
         parts.append(f"backend={row.backend}")
     if row.error_count:
         parts.append(f"errors={row.error_count}")
-    elif row.warning_count:
+    if row.warning_count:
         parts.append(f"warnings={row.warning_count}")
     if row.recent_failure_categories:
         parts.append("recent=" + ",".join(row.recent_failure_categories[:3]))

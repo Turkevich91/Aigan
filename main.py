@@ -3513,6 +3513,21 @@ def memory_capability_rows() -> list[CapabilityRow]:
             )
         )
         return rows
+    if not CONFIG.memory_embedding_model:
+        rows.append(
+            CapabilityRow(
+                name="memory_embeddings",
+                family="memory",
+                enabled=True,
+                configured=False,
+                available=False,
+                status="unconfigured",
+                adapter="semantic_memory",
+                mode="embeddings",
+                next_action="check configuration",
+            )
+        )
+        return rows
     try:
         backlog = MEMORY.embedding_backlog_count(
             model=CONFIG.memory_embedding_model,
@@ -3590,6 +3605,17 @@ def configured_capability_rows() -> list[CapabilityRow]:
     )
     rows.append(
         CapabilityRow(
+            name="reaction_memory",
+            family="reactions",
+            enabled=REACTION_MEMORY is not None,
+            configured=CONFIG.memory_enabled and CONFIG.reactions_enabled,
+            available=REACTION_MEMORY is not None,
+            status="ok" if REACTION_MEMORY is not None else "disabled",
+            adapter="ReactionMemoryStore" if REACTION_MEMORY is not None else "null",
+        )
+    )
+    rows.append(
+        CapabilityRow(
             name="github_reporting",
             family="reporting",
             enabled=CONFIG.github_reporting_enabled,
@@ -3606,9 +3632,24 @@ def recent_tool_events() -> list[Any]:
     if SYSTEM_LOG is None:
         return []
     try:
-        return SYSTEM_LOG.events_since(CONFIG.health_report_lookback_seconds, "warning", 200)
+        events = SYSTEM_LOG.events_since(CONFIG.health_report_lookback_seconds, "warning", 500)
     except Exception:
         return []
+    tool_components = {
+        "tool_runtime",
+        "agent_tool",
+        "memory_vector",
+        "memory",
+        "outbound_reactions",
+        "startup",
+        "shutdown",
+    }
+    filtered = []
+    for event in events:
+        details = event.details if isinstance(event.details, dict) else {}
+        if details.get("tool") or event.component in tool_components:
+            filtered.append(event)
+    return filtered[:200]
 
 
 def tool_capability_rows() -> list[CapabilityRow]:
