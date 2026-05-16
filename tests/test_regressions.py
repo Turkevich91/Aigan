@@ -6572,6 +6572,8 @@ class SystemHealthTests(unittest.TestCase):
     def test_reaction_complaint_hint_detects_specific_insensitive_phrases(self) -> None:
         self.assertTrue(has_reaction_complaint_hint("Aigan, that was insensitive", bot_username="thrd_ua_bot"))
         self.assertTrue(has_reaction_complaint_hint("this reaction is inappropriate"))
+        self.assertTrue(has_reaction_complaint_hint("bad emoji"))
+        self.assertTrue(has_reaction_complaint_hint("\u043d\u0435\u0443\u043c\u0435\u0441\u0442\u043d\u0430\u044f \u0440\u0435\u0430\u043a\u0446\u0438\u044f"))
         self.assertFalse(
             has_reaction_complaint_hint("I had a bad reaction to dinner and it was not ok")
         )
@@ -6721,6 +6723,62 @@ class SystemHealthTests(unittest.TestCase):
 
         self.assertEqual([], message.reply_calls)
         clusters = main.SYSTEM_LOG.active_complaints(3)
+        self.assertTrue(any(cluster.category == "insensitive_reaction" for cluster in clusters))
+
+    def test_passive_group_bad_emoji_complaint_uses_recent_reaction_lookup(self) -> None:
+        self.assertIsNotNone(main.REACTION_MEMORY)
+        main.REACTION_MEMORY.record_outbound_decision(
+            chat_id=-1001,
+            target_message_id=5005,
+            target_memory_id=None,
+            item=None,
+            policy_version="outbound_reaction_emotion_policy_v1",
+            phase="pre_embedding",
+            action="sent",
+            reason_code="sent",
+            rationale="Stored sanitized rationale.",
+            severity_flags=("safe_positive",),
+            emotion_class="positive_celebratory",
+            confidence=0.9,
+            score=0.8,
+            sent_spec=ReactionSpec(reaction_type="emoji", reaction_key="emoji:fire", base_emoji="\N{FIRE}"),
+            details={"policy": "outbound_reaction_emotion_policy_v1"},
+        )
+        message = FakeMessage("bad emoji", message_id=5006)
+        context = SimpleNamespace(bot=SimpleNamespace(username="thrd_ua_bot", id=8712856238))
+
+        asyncio.run(main.text_message(SimpleNamespace(effective_message=message), context))
+
+        self.assertEqual([], message.reply_calls)
+        clusters = main.SYSTEM_LOG.active_complaints(5)
+        self.assertTrue(any(cluster.category == "insensitive_reaction" for cluster in clusters))
+
+    def test_passive_group_multilingual_reaction_complaint_uses_recent_lookup(self) -> None:
+        self.assertIsNotNone(main.REACTION_MEMORY)
+        main.REACTION_MEMORY.record_outbound_decision(
+            chat_id=-1001,
+            target_message_id=5007,
+            target_memory_id=None,
+            item=None,
+            policy_version="outbound_reaction_emotion_policy_v1",
+            phase="pre_embedding",
+            action="sent",
+            reason_code="sent",
+            rationale="Stored sanitized rationale.",
+            severity_flags=("safe_positive",),
+            emotion_class="positive_celebratory",
+            confidence=0.9,
+            score=0.8,
+            sent_spec=ReactionSpec(reaction_type="emoji", reaction_key="emoji:fire", base_emoji="\N{FIRE}"),
+            details={"policy": "outbound_reaction_emotion_policy_v1"},
+        )
+        message = FakeMessage("\u043d\u0435\u0443\u043c\u0435\u0441\u0442\u043d\u0430\u044f \u0440\u0435\u0430\u043a\u0446\u0438\u044f", message_id=5008)
+        context = SimpleNamespace(bot=SimpleNamespace(username="thrd_ua_bot", id=8712856238))
+
+        asyncio.run(main.text_message(SimpleNamespace(effective_message=message), context))
+
+        self.assertEqual([], message.reply_calls)
+        clusters = main.SYSTEM_LOG.active_complaints(5)
         self.assertTrue(any(cluster.category == "insensitive_reaction" for cluster in clusters))
 
     def test_reaction_complaint_lookup_ignores_recent_skips_after_sent_reaction(self) -> None:

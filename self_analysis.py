@@ -294,8 +294,11 @@ def has_reaction_complaint_hint(
     has_reaction_marker = has_any_marker(lowered, REACTION_TERMS)
     has_approval_marker = has_any_marker(lowered, REACTION_APPROVAL_TERMS)
     has_passive_complaint_marker = has_any_marker(lowered, REACTION_PASSIVE_COMPLAINT_TERMS)
+    has_specific_insensitive_reaction_marker = bool(
+        has_reaction_marker and has_any_marker(lowered, REACTION_INSENSITIVE_HINT_TERMS)
+    )
     if not mentions_bot:
-        return has_approval_marker or has_passive_complaint_marker
+        return has_approval_marker or has_passive_complaint_marker or has_specific_insensitive_reaction_marker
     return (
         has_reaction_marker
         or has_approval_marker
@@ -372,6 +375,9 @@ def classify_reaction_complaint(
     has_non_reaction_output_marker = has_any_marker(lowered, NON_REACTION_BOT_OUTPUT_TERMS)
     has_personal_reaction_context = has_any_marker(lowered, PERSONAL_REACTION_CONTEXT_TERMS)
     has_bot_reaction_output_context = has_any_marker(lowered, BOT_REACTION_OUTPUT_TERMS)
+    has_specific_insensitive_reaction_marker = bool(
+        has_reaction_marker and has_any_marker(lowered, REACTION_INSENSITIVE_HINT_TERMS)
+    )
     has_reaction_context = bool(has_recent_reaction or has_reaction_marker)
     has_temporal_reaction_context = bool(has_recent_reaction and mentions_bot)
     has_explicit_or_temporal_context = bool(has_reaction_marker or has_temporal_reaction_context)
@@ -393,7 +399,8 @@ def classify_reaction_complaint(
     if not (mentions_bot or has_recent_reaction):
         return None
     if not mentions_bot and not (
-        has_approval_marker or (has_recent_reaction and has_passive_complaint_marker)
+        has_approval_marker
+        or (has_recent_reaction and (has_passive_complaint_marker or has_specific_insensitive_reaction_marker))
     ):
         return None
     if not has_reaction_context and not has_approval_marker:
