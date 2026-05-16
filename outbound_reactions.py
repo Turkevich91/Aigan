@@ -126,10 +126,15 @@ CONDEMNATION_TERMS = (
     "crime",
     "criminal",
     "cruel",
+    "humiliat",
     "injustice",
     "occup",
+    "suffer",
+    "suffering",
     "threat",
     "torture",
+    "violence",
+    "violent",
     "war crime",
     "засуд",
     "злочин",
@@ -147,7 +152,9 @@ CONDEMNATION_TERMS = (
 STEM_TERMS = {
     "celebrat",
     "congrat",
+    "humiliat",
     "occup",
+    "suffer",
 }
 
 BENIGN_TERM_CONTEXTS: dict[str, tuple[str, ...]] = {

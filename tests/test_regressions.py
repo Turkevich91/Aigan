@@ -3467,6 +3467,51 @@ class PersistentMemoryTests(unittest.TestCase):
         self.assertNotIn(message.text, json.dumps(record.details, ensure_ascii=False))
         self.assertTrue(any(event.get("event_type") == "outbound_reaction_skipped_empathy_preflight" for event in events))
 
+    def test_outbound_reaction_empathy_preflight_covers_documented_approval_risk_terms(self) -> None:
+        self.assertIsNotNone(main.REACTION_MEMORY)
+        config = main.OutboundReactionConfig(
+            enabled=True,
+            every_n_messages=1,
+            cooldown_seconds=0,
+            min_score=0.0,
+            allowed_emoji=("\N{FIRE}",),
+            use_custom_emoji=False,
+        )
+        adapter = main.OutboundReactionAdapter(config=config, reaction_memory=main.REACTION_MEMORY)
+        adapter._classify_emotion_policy = lambda _item, _score: EmotionPolicyDecision(
+            emotion_class="positive_celebratory",
+            confidence=0.95,
+            allow_reaction=True,
+            reason_code="emotion_policy_allowed",
+            rationale="Detected safely positive direct-chat content.",
+            severity_flags=("safe_positive",),
+        )
+
+        cases = (
+            (993, "great news success: rivals were humiliated"),
+            (994, "great news success: violence succeeded"),
+        )
+        for message_id, text in cases:
+            with self.subTest(text=text):
+                message = FakeMessage(text, message_id=message_id)
+                item_id = main.MEMORY.save_message(
+                    chat_id=-1001,
+                    message_id=message_id,
+                    sender_label="Tester",
+                    user_id=111,
+                    text=message.text,
+                    created_at=datetime.now(timezone.utc),
+                )
+
+                asyncio.run(adapter.on_message_ingested(message, main.MEMORY.item_by_id(item_id), "pre_embedding"))
+
+                message.bot.set_message_reaction.assert_not_awaited()
+                record = main.REACTION_MEMORY.latest_outbound_decision(chat_id=-1001, target_message_id=message_id)
+                self.assertIsNotNone(record)
+                self.assertEqual("skipped", record.action)
+                self.assertEqual("empathy_preflight_approval_risk", record.reason_code)
+                self.assertIn("approval_risk", record.severity_flags)
+
     def test_outbound_reaction_empathy_preflight_requires_direct_context_for_sympathy(self) -> None:
         self.assertIsNotNone(main.REACTION_MEMORY)
         config = main.OutboundReactionConfig(
