@@ -1,5 +1,11 @@
 # Aigan Changelog
 
+## 2026-05-15 - Document and PDF ingest plan
+
+- Added a tool research note for future document/PDF ingest.
+- Documented explicit-only Telegram document handling, PDF/plain-text extraction, source-only memory storage, and temp-file cleanup.
+- Captured future tests for file limits, extraction failures, OCR-required PDFs, source attribution, and `/stat`/`/character` isolation.
+
 ## 2026-05-15 - Chat digest commands plan
 
 - Added a tool research note for future chat digest commands.

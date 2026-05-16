@@ -274,6 +274,7 @@ Future tool research notes:
 - [`docs/tool-research/local-stt-vps-benchmark.md`](docs/tool-research/local-stt-vps-benchmark.md)
 - [`docs/tool-research/transcript-memory-integration.md`](docs/tool-research/transcript-memory-integration.md)
 - [`docs/tool-research/chat-digest-commands.md`](docs/tool-research/chat-digest-commands.md)
+- [`docs/tool-research/document-pdf-ingest.md`](docs/tool-research/document-pdf-ingest.md)
 
 Long text replies are split by the delivery layer instead of being truncated at the first Telegram limit:
 
