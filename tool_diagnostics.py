@@ -76,6 +76,7 @@ RELATIVE_PATH_VALUE_RE = re.compile(
     re.IGNORECASE,
 )
 TOKEN_VALUE_RE = re.compile(r"\b(?:gh[pousr]_|github_pat_|xox[baprs]-)[A-Za-z0-9_-]{8,}", re.IGNORECASE)
+SAFE_DISPLAY_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_.:-]{0,79}$")
 SAFE_CATEGORY_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_.:-]{0,79}$")
 SAFE_PREFIXED_CATEGORY_RE = re.compile(r"^[a-z]+(?:_[a-z]+){1,5}$")
 UNSAFE_CATEGORY_PARTS = (
@@ -138,7 +139,32 @@ FAILURE_EVENT_TYPES = SAFE_CATEGORY_VALUES - {"freeform"} | {
     "run_error",
     "tool_operation_failed",
 }
-ROW_DETAIL_FIELDS = ("adapter_count", "backlog", "dimensions", "max_bytes")
+ROW_DETAIL_FIELDS = (
+    "adapter_count",
+    "backlog",
+    "dimensions",
+    "max_bytes",
+    "max_duration_seconds",
+    "max_audio_bytes",
+    "max_download_bytes",
+    "max_pixels",
+    "max_extracted_chars",
+    "max_frame_count",
+    "timestamps_supported",
+    "diarization_supported",
+    "streaming_supported",
+    "local_backend_available",
+    "yt_dlp_available",
+    "ffmpeg_available",
+    "vision_enabled",
+    "ocr_enabled",
+    "local_ocr_enabled",
+    "caption_backend",
+    "stt_backend",
+    "telegram_download_available",
+    "temp_dir_writable",
+    "cache_version",
+)
 
 
 def safe_nonnegative_int(value: Any) -> int:
@@ -188,6 +214,11 @@ class CapabilityRow:
         self.warning_count = safe_nonnegative_int(self.warning_count)
         self.recent_error_count = safe_nonnegative_int(self.recent_error_count)
         self.recent_warning_count = safe_nonnegative_int(self.recent_warning_count)
+        if self.enabled and self.status == "ok":
+            if not self.configured:
+                self.status = "unconfigured"
+            elif not self.available:
+                self.status = "unavailable"
         if self.status == "ok" and (
             self.error_count or self.warning_count or self.recent_error_count or self.recent_warning_count
         ):
@@ -217,6 +248,8 @@ def safe_display_label(value: Any, limit: int = 120) -> str:
         or RELATIVE_PATH_VALUE_RE.search(text)
         or TOKEN_VALUE_RE.search(text)
     ):
+        return "[redacted]"
+    if not SAFE_DISPLAY_RE.fullmatch(text):
         return "[redacted]"
     return text
 
@@ -525,6 +558,10 @@ def render_capability_matrix(rows: Iterable[CapabilityRow], *, query: str = "", 
 def render_row(row: CapabilityRow) -> str:
     enabled = "enabled" if row.enabled else "disabled"
     parts = [f"{row.name}: {enabled}"]
+    if row.enabled and not row.configured:
+        parts.append("configured=false")
+    if row.enabled and not row.available:
+        parts.append("available=false")
     if row.adapter:
         parts.append(f"adapter={row.adapter}")
     if row.mode:
@@ -539,10 +576,16 @@ def render_row(row: CapabilityRow) -> str:
         parts.append("recent=" + ",".join(row.recent_failure_categories[:3]))
     for key in ROW_DETAIL_FIELDS:
         if key in row.details:
-            parts.append(f"{key}={row.details[key]}")
+            parts.append(f"{key}={format_detail_value(row.details[key])}")
     if row.next_action and row.next_action != "none":
         parts.append(f"next={row.next_action}")
     return "- " + ", ".join(parts)
+
+
+def format_detail_value(value: Any) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    return str(value)
 
 
 def render_recent_failures(rows: Iterable[CapabilityRow]) -> str:

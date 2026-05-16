@@ -32,7 +32,7 @@ from reaction_memory import ReactionAsset, ReactionMemoryStore, ReactionPreferen
 from github_reporting import GitHubReporter
 from self_analysis import SelfAnalysisService
 from social_memory import SocialMemoryStore, SocialObservation
-from system_log import SystemLogStore, sanitize_text
+from system_log import SystemEvent, SystemLogStore, sanitize_text
 from tool_diagnostics import CapabilityRow, build_capability_rows, render_capability_matrix, render_recent_failures
 from tool_runtime import ToolRuntime
 
@@ -3672,7 +3672,21 @@ def recent_tool_events() -> list[Any]:
         else:
             events = SYSTEM_LOG.events_since(CONFIG.health_report_lookback_seconds, "warning", 500)
     except Exception:
-        return []
+        return [
+            SystemEvent(
+                id=0,
+                created_at=datetime.now(timezone.utc).isoformat(),
+                level="error",
+                component="system_log",
+                event_type="health_report_failed",
+                chat_id=None,
+                user_id=None,
+                route="",
+                duration_ms=None,
+                message="",
+                details={"failure_category": "health_report_failed"},
+            )
+        ]
     filtered = []
     for event in events:
         details = event.details if isinstance(event.details, dict) else {}

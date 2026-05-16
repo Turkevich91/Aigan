@@ -1273,10 +1273,14 @@ class ToolRuntimeTests(unittest.TestCase):
             }
         )
         details = {item.name: item for item in rows}["ocr"].details
+        text = render_row({item.name: item for item in rows}["ocr"])
 
         self.assertTrue(details["ocr_enabled"])
         self.assertFalse(details["local_ocr_enabled"])
         self.assertEqual("telegram", details["caption_backend"])
+        self.assertIn("ocr_enabled=true", text)
+        self.assertIn("local_ocr_enabled=false", text)
+        self.assertIn("caption_backend=telegram", text)
 
     def test_tool_diagnostics_unmatched_query_redacts_unsafe_value(self) -> None:
         text = render_capability_matrix([], query="C:/Users/private/media.mp4")
@@ -1354,6 +1358,64 @@ class ToolRuntimeTests(unittest.TestCase):
         self.assertNotIn("/srv/model", text)
         self.assertNotIn("data/file", text)
         self.assertNotIn("./tmp", text)
+
+    def test_tool_diagnostics_redacts_freeform_display_labels(self) -> None:
+        text = render_row(
+            CapabilityRow(
+                name="private chat excerpt",
+                family="media",
+                enabled=True,
+                configured=True,
+                available=True,
+                status="ok",
+                adapter="prompt says hello",
+                mode="transcript excerpt",
+                backend="operator note",
+            ).normalized()
+        )
+
+        self.assertIn("[redacted]: enabled", text)
+        self.assertIn("adapter=[redacted]", text)
+        self.assertIn("mode=[redacted]", text)
+        self.assertIn("backend=[redacted]", text)
+        self.assertNotIn("private chat excerpt", text)
+        self.assertNotIn("prompt says hello", text)
+        self.assertNotIn("transcript excerpt", text)
+        self.assertNotIn("operator note", text)
+
+    def test_tool_diagnostics_availability_fields_shape_ok_status(self) -> None:
+        rows = build_capability_rows(
+            {
+                "status": "ok",
+                "adapter_count": 2,
+                "error_count": 0,
+                "adapters": [
+                    {
+                        "name": "media_transcript",
+                        "enabled": True,
+                        "configured": False,
+                        "available": False,
+                        "status": "ok",
+                    },
+                    {
+                        "name": "media_frames",
+                        "enabled": True,
+                        "configured": True,
+                        "available": False,
+                        "status": "ok",
+                    },
+                ],
+            }
+        )
+        by_name = {item.name: item for item in rows}
+        transcript_text = render_row(by_name["media_transcript"])
+        frames_text = render_row(by_name["media_frames"])
+
+        self.assertEqual("unconfigured", by_name["media_transcript"].status)
+        self.assertEqual("unavailable", by_name["media_frames"].status)
+        self.assertIn("configured=false", transcript_text)
+        self.assertIn("available=false", transcript_text)
+        self.assertIn("available=false", frames_text)
 
     def test_tool_diagnostics_failure_categories_keep_stable_dotted_codes(self) -> None:
         rows = build_capability_rows(
@@ -1580,6 +1642,23 @@ class ToolRuntimeTests(unittest.TestCase):
         self.assertTrue(any(event.component == "github_reporting" for event in events))
         self.assertEqual(1, by_name["web_image_search"].recent_warning_count)
         self.assertEqual(1, by_name["github_reporting"].recent_error_count)
+
+    def test_recent_tool_events_query_failure_degrades_system_log(self) -> None:
+        class BrokenSystemLog:
+            def events_since_for_components(self, *args, **kwargs):
+                raise RuntimeError("db down")
+
+        with patch.object(main, "SYSTEM_LOG", BrokenSystemLog()):
+            events = main.recent_tool_events()
+        rows = build_capability_rows(
+            {"status": "ok", "adapter_count": 0, "error_count": 0, "adapters": []},
+            events=events,
+        )
+        row = {item.name: item for item in rows}["system_log"]
+
+        self.assertEqual("degraded", row.status)
+        self.assertEqual(1, row.recent_error_count)
+        self.assertEqual(["health_report_failed"], row.recent_failure_categories)
 
     def test_agent_run_error_without_tool_detail_does_not_degrade_mcp_rows(self) -> None:
         main.SYSTEM_LOG.record_event(
