@@ -8,6 +8,7 @@ Private runtime details, host aliases, local paths, MCP endpoints, logs, databas
 
 - Start from a GitHub issue. Use the implementing agent's normal prefix for pipeline tasks, for example `[codex]` for Codex-owned work. Reserve `[DEV]` for this pipeline contract and closely related contract-maintenance issues only.
 - Keep `AGENTS.md` as the concise entrypoint and use this file for the detailed pipeline.
+- For `[DEV]` contract-maintenance work, follow the stable contract as it existed before the current change. Do not recursively apply rules that are being added or edited in the same PR.
 - Before implementation, move the task Project status to `In Progress`; new planning work starts as `Todo`.
 - Work on a task branch, commit intentional changes, push, and open a PR.
 - Request Copilot review on the PR. Treat Copilot as a dry code reviewer: useful for code-level risk, not a context owner and not an approval authority.
@@ -19,6 +20,8 @@ Private runtime details, host aliases, local paths, MCP endpoints, logs, databas
 - When Copilot has no relevant new comments, spawn or ask a reviewer sub-agent for a final blocker-focused pass, then run the final tests.
 - Mark the PR ready only after the final gates pass. Squash merge, delete the branch, close/update the task issue, and update the parent epic checklist when applicable.
 - After a task is closed, if the parent epic still has `Todo` child issues, either continue to the next task immediately or create a 1-minute Heartbeat with `NEXT_STEP=start_next_task` before ending the ReAct session.
+- When the last child task of an epic is closed, run the epic completion testing gate before declaring the epic complete.
+- Deploy only after the deploy gate passes: tests are green, bookkeeping is complete, the target worktree is clean, persistent data is backed up, required environment keys are reconciled, and post-deploy validation has a named fallback.
 - Each loop needs new evidence. Repeated comments, repeated test failures, stale CI, missing reviewer response, or unchanged merge blockers must hit a cap and escalate.
 
 ## Epic Task State Machine
@@ -56,7 +59,18 @@ stateDiagram-v2
     UpdateEpic --> NextTaskHeartbeat: epic still has Todo tasks and session is ending
     UpdateEpic --> SelectTask: epic still has Todo tasks and agent continues now
     NextTaskHeartbeat --> SelectTask: Heartbeat wakes after 1 minute
-    UpdateEpic --> [*]: epic complete
+    UpdateEpic --> EpicFinalTests: no Todo tasks remain
+    EpicFinalTests --> DeployDecision: final epic checks pass
+    EpicFinalTests --> EscalateBlocked: final epic checks fail past cap
+    DeployDecision --> FinishEpic: no deploy requested or required
+    DeployDecision --> PreDeployGuard: deploy requested or required
+    PreDeployGuard --> Deploy: clean target, backup, and env reconciliation pass
+    PreDeployGuard --> EscalateBlocked: dirty target, backup failure, or missing env
+    Deploy --> PostDeployValidation: deploy command succeeds
+    Deploy --> EscalateBlocked: deploy fails past cap
+    PostDeployValidation --> FinishEpic: smoke and integrity checks pass
+    PostDeployValidation --> EscalateBlocked: smoke, logs, or data checks fail
+    FinishEpic --> [*]: epic complete
     EscalateBlocked --> [*]: sanitized blocked handoff recorded
 ```
 
@@ -97,6 +111,7 @@ sequenceDiagram
         RA-->>CA: return findings or mergeable verdict
         CA->>GH: run final gates, mark ready, squash merge
         CA->>GH: delete branch, close task, update epic
+        CA->>CA: if epic is complete, run epic tests and deploy gates
     end
 ```
 
@@ -139,9 +154,34 @@ flowchart TD
     Q --> R{"Epic still has Todo tasks?"}
     R -- "Yes, continuing now" --> S["Select next epic task"]
     R -- "Yes, session ending" --> T["Create 1-minute Heartbeat: NEXT_STEP=start_next_task"]
-    R -- "No" --> U["Finish epic loop"]
+    R -- "No" --> U["Run epic completion testing gate"]
+    U --> U1{"Epic tests pass?"}
+    U1 -- "No" --> X
+    U1 -- "Yes" --> V{"Deploy requested or required?"}
+    V -- "No" --> W["Close epic as complete"]
+    V -- "Yes" --> V1["Create data backup and reconcile environment keys"]
+    V1 --> V2{"Target clean, backup ok, env ok?"}
+    V2 -- "No" --> X
+    V2 -- "Yes" --> V3["Deploy current main"]
+    V3 --> V4["Run post-deploy smoke and integrity checks"]
+    V4 --> V5{"Deploy validation passed?"}
+    V5 -- "No" --> X
+    V5 -- "Yes" --> W
     X --> Y["Escalate to human or create follow-up issue"]
 ```
+
+## Epic Testing And Deploy Gates
+
+- The task-level final checks prove the PR is mergeable. The epic-level final checks prove the full accumulated epic is releasable.
+- At the end of an epic, verify GitHub state first: all child issues closed or Done, parent checklist complete, all PRs merged, local `main` synced to remote `main`, and no intended change left unmerged.
+- Run fast local checks when the local environment is meaningful. If local data, dependencies, or runtime state are not representative, treat local checks as advisory and run authoritative checks in the configured production-like environment from private operator context.
+- The minimum generic epic gate is: focused feature checks where applicable, full test suite, Docker build, Docker test run when Docker is part of deployment, `git diff --check`, sanitized grep over public diffs, and a final reviewer verdict for any late deploy/test edits.
+- A deploy target must be clean before mutation. Dirty tracked files, untracked code, unknown artifacts, missing secrets, or unclear runtime state block deploy. Do not stash, reset, overwrite, delete, or migrate unknown live state automatically.
+- Before live tests or deploy, create a backup of persistent data and capture sanitized baseline facts such as durable table counts, artifact counts/sizes, target commit, service status, and expected environment key names.
+- Reconcile environment keys before deploy. Add safe non-secret defaults when the release expects them; block and ask for any required secret or value whose safe default is unknown. Never print environment values.
+- Post-deploy validation must verify the deployed commit, service status, recent sanitized logs, admin diagnostics, feature-specific smoke tests, and persistent data integrity against the pre-deploy baseline.
+- If post-deploy validation requires waiting, create a Heartbeat with `NEXT_STEP=check_deploy_validation`, target commit, wait owner, wait count, wait limit, validation status, rollback or block fallback, and sanitized notes.
+- If unexpected data loss, artifact loss, repeated smoke failure, or unclear runtime drift appears, stop the deploy loop, preserve evidence privately, restore from backup only when the restore path is understood, and create a revised deploy plan.
 
 ## Liveness And Loop Guards
 
@@ -194,6 +234,11 @@ Wake-up recovery algorithm:
 - Reviewer sub-agent is unavailable or returns no verdict: agent uses the wait cap and escalates rather than sleeping forever.
 - PR mergeability stays blocked after bounded retries: agent records the merge blocker and stops the merge loop.
 - Project item or epic checklist update fails after merge: agent records the bookkeeping follow-up and does not reopen completed code work.
+- Epic final tests fail after the attempt cap: agent records the failure signature and does not deploy.
+- Deploy target has dirty tracked files, untracked code, or unknown artifacts: agent blocks deploy and records a sanitized handoff.
+- Required environment keys are missing: agent adds safe non-secret defaults or blocks on secrets and unknown values.
+- Data backup or baseline capture fails: agent blocks deploy.
+- Post-deploy commit, service, log, smoke, or data-integrity validation fails: agent stops the loop and follows the named rollback or blocked-handoff path.
 
 ## Handoff Checklist
 
@@ -207,6 +252,8 @@ Wake-up recovery algorithm:
 - Task issue gets a concise completion note with important pitfalls, decisions, and verification.
 - Parent epic checklist is updated after task completion when a parent epic exists.
 - If the parent epic still has Todo tasks and the session is ending, a 1-minute next-task Heartbeat is scheduled with `NEXT_STEP=start_next_task`.
+- When the parent epic has no Todo tasks, the epic completion testing result is recorded before closing the epic.
+- If deploy is part of completion, the backup id, deployed commit, environment reconciliation status, smoke result, data-integrity result, and any deploy-validation Heartbeat are named with sanitized details only.
 
 ## References
 
@@ -218,3 +265,9 @@ Wake-up recovery algorithm:
 - LangGraph interrupt and resume patterns: https://docs.langchain.com/oss/python/langgraph/interrupts
 - LangGraph persistence and checkpointing: https://docs.langchain.com/oss/javascript/langgraph/persistence
 - AutoGen termination and handoff patterns: https://microsoft.github.io/autogen/stable/user-guide/agentchat-user-guide/tutorial/human-in-the-loop.html
+- Docker Compose production guidance: https://docs.docker.com/compose/how-tos/production/
+- Docker Compose automated testing and single-host deployment guidance: https://docs.docker.com/compose/intro/features-uses/
+- GitHub deployment environments and protection rules: https://docs.github.com/actions/reference/workflows-and-actions/deployments-and-environments
+- Google SRE release engineering: https://sre.google/sre-book/release-engineering/
+- Google SRE canarying releases: https://sre.google/workbook/canarying-releases/
+- DORA continuous delivery capability: https://dora.dev/capabilities/continuous-delivery/
