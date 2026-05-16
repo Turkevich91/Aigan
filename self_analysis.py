@@ -23,12 +23,22 @@ class ComplaintSignal:
     reason: str
 
 
+REACTION_HEALTH_CATEGORIES = {
+    "insensitive_reaction",
+    "reaction_reasoning_gap",
+    "tone_boundary",
+    "fake_empathy",
+    "sycophancy",
+}
 BOT_WORDS = {
     "aigan",
     "thrd_ua_bot",
     "bot",
     "бот",
     "бота",
+    "боте",
+    "боті",
+    "ботом",
     "боту",
     "агент",
     "аіган",
@@ -74,6 +84,243 @@ CATEGORY_PATTERNS = [
     ("telegram_delivery", ("telegram", "телеграм", "відпов", "ответ", "повідом", "сообщ")),
     ("agent_quality", ("галюцин", "hallucin", "бреше", "врет", "туп", "клоун")),
 ]
+REACTION_TERMS = (
+    "reaction",
+    "react",
+    "emoji",
+    "emote",
+    "smile",
+    "smiley",
+    "fire emoji",
+    "fire reaction",
+    "thumbs up",
+    "posted reaction",
+    "posted emoji",
+    "reacted",
+    "реакц*",
+    "эмод*",
+    "емод*",
+    "смайл",
+    "огон*",
+    "вогон*",
+    "лайк",
+)
+REACTION_REASON_TERMS = (
+    "why",
+    "reason",
+    "rationale",
+    "explain",
+    "what logic",
+    "почему",
+    "зачем",
+    "чому",
+    "навіщо",
+    "поясн*",
+    "объясн*",
+)
+REACTION_REASON_CHALLENGE_TERMS = (
+    "explain that reaction",
+    "explain this reaction",
+    "explain your reaction",
+    "what logic did you use",
+    "what was the logic",
+    "why did you do that",
+    "why did you put",
+    "why did you put that reaction",
+    "why did you react",
+    "why did you react that way",
+    "why did you send",
+    "why that reaction",
+    "why this reaction",
+    "why'd you do that",
+    "зачем ты это сделал",
+    "навіщо ти це зробив",
+    "почему ты это сделал",
+    "чому ти це зробив",
+)
+REACTION_APPROVAL_TERMS = (
+    "approval of harm",
+    "looks like approval",
+    "looks like you approve",
+    "looks like support",
+    "looks like endorsement",
+    "looks approving",
+    "approving reaction",
+    "endorsing reaction",
+    "supporting harm",
+    "looks like you liked the idea",
+    "виглядає як підтримка",
+    "виглядає як схвалення",
+    "похоже на одобрение",
+    "схоже на підтримку",
+    "схоже на схвалення",
+)
+REACTION_INSENSITIVE_TERMS = (
+    "inappropriate",
+    "insensitive",
+    "wrong emoji",
+    "wrong reaction",
+    "bad emoji",
+    "bad emoji reaction",
+    "tone deaf",
+    "not ok",
+    "неумест*",
+    "недореч*",
+    "не так",
+)
+BROAD_INSENSITIVE_TERMS = ("not ok", "не так")
+REACTION_INSENSITIVE_HINT_TERMS = tuple(
+    marker for marker in REACTION_INSENSITIVE_TERMS if marker not in BROAD_INSENSITIVE_TERMS
+)
+REACTION_PASSIVE_COMPLAINT_TERMS = (
+    "inappropriate reaction",
+    "reaction is inappropriate",
+    "reaction was inappropriate",
+    "that reaction is inappropriate",
+    "this reaction is inappropriate",
+    "explain that reaction",
+    "explain this reaction",
+    "explain your reaction",
+    "wrong emoji",
+    "wrong reaction",
+    "why did you put",
+    "why did you put that reaction",
+    "why did you react",
+    "why did you react that way",
+    "why did you send",
+    "why that reaction",
+    "why this reaction",
+)
+REACTION_FAKE_EMPATHY_TERMS = (
+    "fake empathy",
+    "performative empathy",
+    "pretend empathy",
+    "фальшив*",
+)
+REACTION_TONE_TERMS = (
+    "tone boundary",
+    "crossed a tone boundary",
+    "wrong tone",
+    "bad tone",
+    "too cheerful",
+    "too casual",
+    "tone deaf",
+    "не тот тон",
+    "плохой тон",
+    "перейшов межу",
+    "перешел границу",
+)
+REACTION_SYCOPHANCY_TERMS = (
+    "sycophancy",
+    "sycophantic",
+    "sycophant",
+    "yes-man",
+    "yes man",
+    "agree with everything",
+    "поддаки*",
+)
+NON_REACTION_BOT_OUTPUT_TERMS = (
+    "answer",
+    "message",
+    "post",
+    "posted",
+    "reply",
+    "response",
+    "said",
+    "відповідь",
+    "ответ",
+    "повідомлення",
+    "сообщение",
+)
+PERSONAL_REACTION_CONTEXT_TERMS = (
+    "bad reaction to",
+    "had a reaction to",
+    "my reaction to",
+    "reaction to dinner",
+    "reaction to food",
+    "reaction to medication",
+    "reaction to medicine",
+    "reaction to treatment",
+    "reaction to vaccine",
+    "allergic reaction",
+)
+BOT_REACTION_OUTPUT_TERMS = (
+    "bot reaction",
+    "your reaction",
+    "this reaction",
+    "that reaction",
+    "emoji",
+    "emote",
+    "fire reaction",
+    "posted reaction",
+    "posted emoji",
+    "reacted",
+)
+
+
+def has_marker(lowered: str, marker: str) -> bool:
+    clean_marker = marker.casefold().strip()
+    if not clean_marker:
+        return False
+    if clean_marker.endswith("*"):
+        stem = clean_marker[:-1].strip()
+        if not stem:
+            return False
+        return re.search(rf"(?<![\w-]){re.escape(stem)}", lowered, re.UNICODE) is not None
+    if re.match(r"[\w-]", clean_marker, re.UNICODE) or re.search(r"[\w-]$", clean_marker, re.UNICODE):
+        return re.search(rf"(?<![\w-]){re.escape(clean_marker)}(?![\w-])", lowered, re.UNICODE) is not None
+    return clean_marker in lowered
+
+
+def has_any_marker(lowered: str, markers: tuple[str, ...] | set[str]) -> bool:
+    return any(has_marker(lowered, marker) for marker in markers)
+
+
+def has_reaction_complaint_hint(
+    text: str,
+    *,
+    bot_username: str | None = None,
+    reply_to_bot: bool = False,
+) -> bool:
+    clean = sanitize_text(text or "", 500)
+    if not clean:
+        return False
+    lowered = clean.casefold()
+    bot_markers = set(BOT_WORDS)
+    if bot_username:
+        bot_markers.add(bot_username.casefold().lstrip("@"))
+        bot_markers.add("@" + bot_username.casefold().lstrip("@"))
+    mentions_bot = reply_to_bot or has_any_marker(lowered, bot_markers)
+    has_reaction_marker = has_any_marker(lowered, REACTION_TERMS)
+    has_approval_marker = has_any_marker(lowered, REACTION_APPROVAL_TERMS)
+    has_passive_complaint_marker = has_any_marker(lowered, REACTION_PASSIVE_COMPLAINT_TERMS)
+    has_specific_insensitive_reaction_marker = bool(
+        has_reaction_marker and has_any_marker(lowered, REACTION_INSENSITIVE_HINT_TERMS)
+    )
+    has_specific_health_reaction_marker = bool(
+        has_reaction_marker
+        and (
+            has_any_marker(lowered, REACTION_FAKE_EMPATHY_TERMS)
+            or has_any_marker(lowered, REACTION_TONE_TERMS)
+            or has_any_marker(lowered, REACTION_SYCOPHANCY_TERMS)
+        )
+    )
+    if not mentions_bot:
+        return (
+            has_approval_marker
+            or has_passive_complaint_marker
+            or has_specific_insensitive_reaction_marker
+            or has_specific_health_reaction_marker
+        )
+    return (
+        has_reaction_marker
+        or has_approval_marker
+        or has_any_marker(lowered, REACTION_FAKE_EMPATHY_TERMS)
+        or has_any_marker(lowered, REACTION_TONE_TERMS)
+        or has_any_marker(lowered, REACTION_SYCOPHANCY_TERMS)
+        or has_any_marker(lowered, REACTION_INSENSITIVE_HINT_TERMS)
+        or has_any_marker(lowered, REACTION_REASON_CHALLENGE_TERMS)
+    )
 
 
 def classify_complaint(
@@ -91,7 +338,7 @@ def classify_complaint(
         bot_markers.add(bot_username.casefold().lstrip("@"))
         bot_markers.add("@" + bot_username.casefold().lstrip("@"))
 
-    mentions_bot = reply_to_bot or any(marker in lowered for marker in bot_markers)
+    mentions_bot = reply_to_bot or has_any_marker(lowered, bot_markers)
     has_complaint = any(marker in lowered for marker in COMPLAINT_WORDS)
     if not (mentions_bot and has_complaint):
         return None
@@ -104,6 +351,137 @@ def classify_complaint(
         fingerprint=fingerprint,
         sample=clean,
         reason="bot-related complaint signal",
+    )
+
+
+def classify_reaction_complaint(
+    text: str,
+    *,
+    bot_username: str | None = None,
+    reply_to_bot: bool = False,
+    has_recent_reaction: bool = False,
+    rationale_state: str = "",
+    decision_action: str = "",
+    decision_reason: str = "",
+    emotion_class: str = "",
+    target_fingerprint: str = "",
+) -> ComplaintSignal | None:
+    clean = sanitize_text(text or "", 500)
+    if not clean:
+        return None
+    lowered = clean.casefold()
+    bot_markers = set(BOT_WORDS)
+    if bot_username:
+        bot_markers.add(bot_username.casefold().lstrip("@"))
+        bot_markers.add("@" + bot_username.casefold().lstrip("@"))
+
+    mentions_bot = reply_to_bot or has_any_marker(lowered, bot_markers)
+    has_reaction_marker = has_any_marker(lowered, REACTION_TERMS)
+    has_reason_marker = has_any_marker(lowered, REACTION_REASON_TERMS)
+    has_reason_challenge_marker = has_any_marker(lowered, REACTION_REASON_CHALLENGE_TERMS)
+    has_approval_marker = has_any_marker(lowered, REACTION_APPROVAL_TERMS)
+    has_insensitive_marker = has_any_marker(lowered, REACTION_INSENSITIVE_TERMS)
+    has_passive_complaint_marker = has_any_marker(lowered, REACTION_PASSIVE_COMPLAINT_TERMS)
+    has_fake_empathy_marker = has_any_marker(lowered, REACTION_FAKE_EMPATHY_TERMS)
+    has_tone_marker = has_any_marker(lowered, REACTION_TONE_TERMS)
+    has_sycophancy_marker = has_any_marker(lowered, REACTION_SYCOPHANCY_TERMS)
+    has_non_reaction_output_marker = has_any_marker(lowered, NON_REACTION_BOT_OUTPUT_TERMS)
+    has_personal_reaction_context = has_any_marker(lowered, PERSONAL_REACTION_CONTEXT_TERMS)
+    has_bot_reaction_output_context = has_any_marker(lowered, BOT_REACTION_OUTPUT_TERMS)
+    has_specific_insensitive_reaction_marker = bool(
+        has_reaction_marker and has_any_marker(lowered, REACTION_INSENSITIVE_HINT_TERMS)
+    )
+    has_specific_health_reaction_marker = bool(
+        has_reaction_marker and (has_fake_empathy_marker or has_tone_marker or has_sycophancy_marker)
+    )
+    has_reaction_context = bool(has_recent_reaction or has_reaction_marker)
+    has_temporal_reaction_context = bool(has_recent_reaction and mentions_bot)
+    has_specific_insensitive_temporal_marker = bool(
+        has_temporal_reaction_context and has_any_marker(lowered, REACTION_INSENSITIVE_HINT_TERMS)
+    )
+    has_explicit_or_temporal_context = bool(has_reaction_marker or has_temporal_reaction_context)
+    temporal_context_points_to_non_reaction_output = bool(
+        has_temporal_reaction_context and not has_reaction_marker and has_non_reaction_output_marker
+    )
+    has_reaction_category_context = bool(
+        has_explicit_or_temporal_context and not temporal_context_points_to_non_reaction_output
+    )
+    has_reason_context = bool(
+        has_reaction_marker
+        or (
+            has_temporal_reaction_context
+            and has_reason_challenge_marker
+            and not temporal_context_points_to_non_reaction_output
+        )
+    )
+
+    if not (mentions_bot or has_recent_reaction):
+        return None
+    if not mentions_bot and not (
+        has_approval_marker
+        or (
+            has_recent_reaction
+            and (
+                has_passive_complaint_marker
+                or has_specific_insensitive_reaction_marker
+                or has_specific_health_reaction_marker
+            )
+        )
+    ):
+        return None
+    if not has_reaction_context and not has_approval_marker:
+        return None
+    if has_personal_reaction_context and not has_bot_reaction_output_context:
+        return None
+
+    if has_sycophancy_marker and has_reaction_category_context:
+        category = "sycophancy"
+    elif has_fake_empathy_marker and has_reaction_category_context:
+        category = "fake_empathy"
+    elif has_tone_marker and has_reaction_category_context:
+        category = "tone_boundary"
+    elif (
+        has_approval_marker
+        and (has_reaction_marker or has_recent_reaction)
+        and not temporal_context_points_to_non_reaction_output
+    ):
+        category = "insensitive_reaction"
+    elif (
+        has_insensitive_marker
+        and (has_reaction_marker or has_specific_insensitive_temporal_marker)
+        and not temporal_context_points_to_non_reaction_output
+    ):
+        category = "insensitive_reaction"
+    elif (
+        has_reason_marker
+        and has_reason_context
+        and (has_recent_reaction or rationale_state in {"missing_decision", "insufficient_rationale"})
+    ):
+        category = "reaction_reasoning_gap"
+    else:
+        return None
+    if category not in REACTION_HEALTH_CATEGORIES:
+        return None
+
+    context_bits = [
+        f"category={category}",
+        f"target={safe_detail_code(target_fingerprint or 'unlinked')}",
+        f"decision={safe_detail_code(decision_action or 'unknown')}",
+        f"reason={safe_detail_code(decision_reason or 'unknown')}",
+        f"emotion={safe_detail_code(emotion_class or 'unknown')}",
+        f"rationale={safe_detail_code(rationale_state or 'unknown')}",
+    ]
+    sample = "Reaction complaint signal: " + "; ".join(context_bits)
+    fingerprint_basis = (
+        f"{category}:{target_fingerprint or normalize_for_fingerprint(lowered)}:"
+        f"{rationale_state}:{decision_reason}:{emotion_class}"
+    )
+    fingerprint = hashlib.sha256(fingerprint_basis.encode("utf-8")).hexdigest()[:16]
+    return ComplaintSignal(
+        category=category,
+        fingerprint=fingerprint,
+        sample=sanitize_text(sample, 300),
+        reason="reaction-specific complaint signal",
     )
 
 
@@ -121,6 +499,14 @@ def normalize_for_fingerprint(lowered: str) -> str:
     words = re.findall(r"[a-zа-яіїєґ0-9*]+", text, flags=re.IGNORECASE)
     meaningful = [word for word in words if len(word) >= 3 and word not in BOT_WORDS]
     return " ".join(meaningful[:8]) or "general"
+
+
+def safe_detail_code(value: str) -> str:
+    redacted = redact_secrets(str(value or ""))
+    if "[redacted]" in redacted.casefold():
+        return "redacted"
+    text = re.sub(r"[^a-z0-9_.:-]+", "_", redacted.casefold()).strip("_")
+    return text[:80] if text else "unknown"
 
 
 class SelfAnalysisService:
@@ -174,6 +560,65 @@ class SelfAnalysisService:
                 "fingerprint": cluster.fingerprint,
                 "reason": signal.reason,
                 "sample_preview": signal.sample,
+            },
+        )
+        self._maybe_report_complaint(cluster)
+        return cluster
+
+    def record_reaction_complaint_signal(
+        self,
+        *,
+        text: str,
+        bot_username: str | None = None,
+        reply_to_bot: bool = False,
+        chat_id: int | None = None,
+        user_id: int | None = None,
+        has_recent_reaction: bool = False,
+        rationale_state: str = "",
+        decision_action: str = "",
+        decision_reason: str = "",
+        emotion_class: str = "",
+        target_fingerprint: str = "",
+    ) -> ComplaintCluster | None:
+        if self.store is None:
+            return None
+        signal = classify_reaction_complaint(
+            text,
+            bot_username=bot_username,
+            reply_to_bot=reply_to_bot,
+            has_recent_reaction=has_recent_reaction,
+            rationale_state=rationale_state,
+            decision_action=decision_action,
+            decision_reason=decision_reason,
+            emotion_class=emotion_class,
+            target_fingerprint=target_fingerprint,
+        )
+        if signal is None:
+            return None
+
+        cluster = self.store.upsert_complaint(
+            fingerprint=signal.fingerprint,
+            category=signal.category,
+            sample=signal.sample,
+            window_seconds=self.complaint_lookback_seconds,
+        )
+        self.store.record_event(
+            level="warning",
+            component="self_analysis",
+            event_type="reaction_complaint_signal",
+            chat_id=chat_id,
+            user_id=user_id,
+            message=f"{cluster.category} temperature={cluster.temperature}",
+            details={
+                "category": cluster.category,
+                "temperature": cluster.temperature,
+                "fingerprint": cluster.fingerprint,
+                "reason": signal.reason,
+                "target": safe_detail_code(target_fingerprint or "unlinked"),
+                "decision": safe_detail_code(decision_action or "unknown"),
+                "decision_reason": safe_detail_code(decision_reason or "unknown"),
+                "emotion": safe_detail_code(emotion_class or "unknown"),
+                "rationale": safe_detail_code(rationale_state or "unknown"),
             },
         )
         self._maybe_report_complaint(cluster)

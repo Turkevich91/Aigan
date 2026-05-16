@@ -318,7 +318,7 @@ Ukrainian aliases:
 
 The system log stores metadata such as route decisions, tool failures, Telegram delivery fallbacks, image-search failures, pending/debounce events, and command usage. It must not store secrets, raw prompts, `.env`, private chat dumps, or full user messages.
 
-User complaints about the bot are treated as temperature signals, not confirmed bugs. A first similar complaint starts at `temperature=1`; repeated similar complaints inside `COMPLAINT_LOOKBACK_SECONDS` raise the temperature. When `COMPLAINT_REPORT_TEMPERATURE` is reached and GitHub reporting is enabled, Aigan creates a sanitized `[Aigan] self-report: ...` issue and adds it to the configured GitHub Project.
+User complaints about the bot are treated as temperature signals, not confirmed bugs. A first similar complaint starts at `temperature=1`; repeated similar complaints inside `COMPLAINT_LOOKBACK_SECONDS` raise the temperature. Reaction-specific criticism is classified into psychological-health categories such as `insensitive_reaction`, `reaction_reasoning_gap`, `tone_boundary`, `fake_empathy`, and `sycophancy`, with only behavior-level reaction decision metadata and a keyed non-reversible target fingerprint stored in self-reports when a reaction target is linked. When `COMPLAINT_REPORT_TEMPERATURE` is reached and GitHub reporting is enabled, Aigan creates a sanitized `[Aigan] self-report: ...` issue and adds it to the configured GitHub Project.
 
 ```env
 SYSTEM_LOG_ENABLED=true

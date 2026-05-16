@@ -1,5 +1,7 @@
 import asyncio
 import base64
+import hashlib
+import hmac
 import html
 import io
 import logging
@@ -33,7 +35,7 @@ from media_frames import FfmpegMediaFrameAdapter, MediaFrameAdapter, MediaFrameL
 from outbound_reactions import NullReactionAdapter, OutboundReactionAdapter, OutboundReactionConfig, ReactionAdapter
 from reaction_memory import ReactionAsset, ReactionMemoryStore, ReactionPreference, ReactionSpec
 from github_reporting import GitHubReporter
-from self_analysis import SelfAnalysisService
+from self_analysis import SelfAnalysisService, has_reaction_complaint_hint
 from social_memory import SocialMemoryStore, SocialObservation
 from system_log import SystemEvent, SystemLogStore, sanitize_text
 from tool_diagnostics import CapabilityRow, build_capability_rows, render_capability_matrix, render_recent_failures
@@ -1226,6 +1228,70 @@ def message_text(message: Message) -> str:
     return (message.text or message.caption or "").strip()
 
 
+REACTION_COMPLAINT_RECENT_SECONDS = 86400
+
+
+def reaction_decision_is_recent(record: Any, *, max_age_seconds: int = REACTION_COMPLAINT_RECENT_SECONDS) -> bool:
+    if record is None:
+        return False
+    try:
+        created_at = datetime.fromisoformat(str(getattr(record, "created_at", "")))
+    except ValueError:
+        return False
+    if created_at.tzinfo is None:
+        created_at = created_at.replace(tzinfo=timezone.utc)
+    age_seconds = (datetime.now(timezone.utc) - created_at.astimezone(timezone.utc)).total_seconds()
+    return 0 <= age_seconds <= max_age_seconds
+
+
+def reaction_complaint_target_fingerprint(
+    chat_id: int | str | None,
+    target_message_id: int | None,
+    target_memory_id: int | None,
+) -> str:
+    if target_message_id is None and target_memory_id is None:
+        return "unlinked"
+    salt = os.getenv("COMPLAINT_TARGET_HASH_SALT", "").strip() or CONFIG.telegram_token
+    if not salt:
+        return "linked"
+    payload = f"reaction-target-v1:{chat_id or ''}:{target_message_id or ''}:{target_memory_id or ''}"
+    digest = hmac.new(salt.encode("utf-8"), payload.encode("utf-8"), hashlib.sha256).hexdigest()[:16]
+    return f"target_{digest}"
+
+
+def reaction_decision_for_complaint(message: Message) -> Any | None:
+    if REACTION_MEMORY is None:
+        return None
+    chat_id = int(message.chat_id)
+    current_message_id = getattr(message, "message_id", None)
+    reply = getattr(message, "reply_to_message", None)
+    target_message_id = getattr(reply, "message_id", None) if reply is not None else None
+    if target_message_id is not None:
+        record = REACTION_MEMORY.latest_outbound_decision(
+            chat_id=chat_id,
+            target_message_id=target_message_id,
+            action="sent",
+        )
+        if record is not None:
+            return record if reaction_decision_is_recent(record) else None
+    record = REACTION_MEMORY.latest_outbound_decision(
+        chat_id=chat_id,
+        action="sent",
+        exclude_target_message_id=current_message_id,
+    )
+    return record if reaction_decision_is_recent(record) else None
+
+
+def reaction_rationale_state(record: Any | None) -> str:
+    if record is None:
+        return "missing_decision"
+    reason_code = str(getattr(record, "reason_code", "") or "")
+    rationale = str(getattr(record, "rationale", "") or "").strip()
+    if not rationale or reason_code in {"insufficient_rationale", "missing_memory_item"}:
+        return "insufficient_rationale"
+    return "stored_rationale"
+
+
 def remember_self_complaint_signal(
     message: Message,
     *,
@@ -1236,6 +1302,40 @@ def remember_self_complaint_signal(
         return
     text = message_text(message)
     if not text:
+        return
+    has_reaction_hint = has_reaction_complaint_hint(
+        text,
+        bot_username=bot_username or BOT_USERNAME,
+        reply_to_bot=reply_to_bot,
+    )
+    reaction_record = reaction_decision_for_complaint(message) if has_reaction_hint else None
+    target_fingerprint = ""
+    if reaction_record is not None:
+        target_fingerprint = reaction_complaint_target_fingerprint(
+            message.chat_id,
+            getattr(reaction_record, "target_message_id", None),
+            getattr(reaction_record, "target_memory_id", None),
+        )
+    reaction_cluster = SELF_ANALYSIS.record_reaction_complaint_signal(
+        text=text,
+        bot_username=bot_username or BOT_USERNAME,
+        reply_to_bot=reply_to_bot,
+        chat_id=message.chat_id,
+        user_id=message_user_id(message),
+        has_recent_reaction=bool(reaction_record is not None and getattr(reaction_record, "action", "") == "sent"),
+        rationale_state=reaction_rationale_state(reaction_record),
+        decision_action=str(getattr(reaction_record, "action", "") or ""),
+        decision_reason=str(getattr(reaction_record, "reason_code", "") or ""),
+        emotion_class=str(getattr(reaction_record, "emotion_class", "") or ""),
+        target_fingerprint=target_fingerprint,
+    )
+    if reaction_cluster is not None:
+        LOGGER.info(
+            "Reaction complaint signal category=%s temperature=%s chat_id=%s",
+            reaction_cluster.category,
+            reaction_cluster.temperature,
+            message.chat_id,
+        )
         return
     cluster = SELF_ANALYSIS.record_complaint_signal(
         text=text,

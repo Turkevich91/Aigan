@@ -285,6 +285,8 @@ class ReactionMemoryStore:
             );
             CREATE INDEX IF NOT EXISTS idx_outbound_reaction_decisions_target
                 ON outbound_reaction_decisions(chat_id, target_message_id, created_at, id);
+            CREATE INDEX IF NOT EXISTS idx_outbound_reaction_decisions_chat_action
+                ON outbound_reaction_decisions(chat_id, action, created_at, id);
             CREATE INDEX IF NOT EXISTS idx_outbound_reaction_decisions_memory
                 ON outbound_reaction_decisions(target_memory_id, created_at, id);
             """
@@ -724,15 +726,23 @@ class ReactionMemoryStore:
         chat_id: int,
         target_message_id: int | None = None,
         target_memory_id: int | None = None,
+        action: str | None = None,
+        exclude_target_message_id: int | None = None,
     ) -> ReactionDecisionRecord | None:
         conditions = ["chat_id = ?"]
         params: list[object] = [int(chat_id)]
         if target_message_id is not None:
             conditions.append("target_message_id = ?")
             params.append(int(target_message_id))
+        if exclude_target_message_id is not None:
+            conditions.append("(target_message_id IS NULL OR target_message_id != ?)")
+            params.append(int(exclude_target_message_id))
         if target_memory_id is not None:
             conditions.append("target_memory_id = ?")
             params.append(int(target_memory_id))
+        if action is not None:
+            conditions.append("action = ?")
+            params.append(safe_code(action))
         with self._lock:
             row = self._conn.execute(
                 f"""
