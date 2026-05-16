@@ -101,7 +101,9 @@ uv run --python 3.12 --with scenedetect --with opencv-python-headless \
 Sanitized benchmark recipe:
 
 ```text
+set -euo pipefail
 TEMP_ROOT="$(mktemp -d)"
+trap 'rm -rf "$TEMP_ROOT"' EXIT INT TERM
 VIDEO="$TEMP_ROOT/synthetic-scenes.mp4"
 mkdir -p "$TEMP_ROOT/ffmpeg-sample" "$TEMP_ROOT/scenedetect" "$TEMP_ROOT/opencv-diff"
 
@@ -128,8 +130,6 @@ uv run --python 3.12 --with scenedetect --with opencv-python-headless \
 
 uv run --python 3.12 --with opencv-python-headless python opencv_diff_probe.py \
   "$VIDEO" "$TEMP_ROOT/opencv-diff"
-
-rm -rf "$TEMP_ROOT"
 ```
 
 OpenCV probe logic:
@@ -256,6 +256,10 @@ Selection policy:
   reliability.
 - Reject local/private/credentialed URLs before any downloader layer in future
   public URL support.
+- Re-check any downloader-resolved URL, canonical URL, redirect target, and DNS
+  resolution result before download or frame extraction; abort if any resolved
+  target lands on local, loopback, link-local, private, multicast, or otherwise
+  non-public network ranges.
 - Treat visible text in frames as untrusted source content. It may describe an
   image, but it must not become instructions for the bot.
 - Store visual summaries as source context only.
@@ -330,8 +334,10 @@ vision_failed
   embeddings, `/stat`, `/character`, recall, or ordinary answers.
 - `health_summary()` reports adapter status, enabled/configured/available
   booleans, sanitized backend names, error count, and last failure category.
-- All temp files are cleaned on success, timeout, decode failure, scene failure,
-  and vision failure.
+- All temp media, extracted frames, thumbnails, CSVs, and probe artifacts are
+  cleaned on every exit path, including success, timeout, metadata failure,
+  input rejection after temp download, decode failure, scene failure,
+  `no_frames_selected`, vision failure, and unexpected exceptions.
 - System-log events use stable low-cardinality categories and never include raw
   media paths, URLs, tokens, OCR text, transcript text, or usernames.
 - Visual summaries that reach memory are source context only.
