@@ -1410,6 +1410,27 @@ class ToolRuntimeTests(unittest.TestCase):
         self.assertNotIn("transcript excerpt", text)
         self.assertNotIn("operator note", text)
 
+    def test_tool_diagnostics_redacts_opaque_token_like_labels(self) -> None:
+        text = render_row(
+            CapabilityRow(
+                name="media_frames",
+                family="media",
+                enabled=True,
+                configured=True,
+                available=True,
+                status="ok",
+                adapter="AKIAIOSFODNN7EXAMPLE",
+                mode="customBearerToken1234567890",
+                backend="safe_backend",
+            ).normalized()
+        )
+
+        self.assertIn("adapter=[redacted]", text)
+        self.assertIn("mode=[redacted]", text)
+        self.assertIn("backend=safe_backend", text)
+        self.assertNotIn("AKIA", text)
+        self.assertNotIn("customBearerToken", text)
+
     def test_tool_diagnostics_availability_fields_shape_ok_status(self) -> None:
         rows = build_capability_rows(
             {

@@ -77,6 +77,10 @@ RELATIVE_PATH_VALUE_RE = re.compile(
     re.IGNORECASE,
 )
 TOKEN_VALUE_RE = re.compile(r"\b(?:gh[pousr]_|github_pat_|xox[baprs]-)[A-Za-z0-9_-]{8,}", re.IGNORECASE)
+OPAQUE_TOKEN_VALUE_RE = re.compile(
+    r"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b|"
+    r"\b(?=[A-Za-z0-9_=.-]{20,}\b)(?=[A-Za-z0-9_=.-]*[A-Za-z])(?=[A-Za-z0-9_=.-]*\d)[A-Za-z0-9_=.-]{20,}\b"
+)
 SAFE_DISPLAY_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_.:-]{0,79}$")
 SAFE_CATEGORY_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_.:-]{0,79}$")
 SAFE_PREFIXED_CATEGORY_RE = re.compile(r"^[a-z]+(?:_[a-z]+){1,5}$")
@@ -250,6 +254,7 @@ def safe_display_label(value: Any, limit: int = 120) -> str:
         or POSIX_PATH_VALUE_RE.search(text)
         or RELATIVE_PATH_VALUE_RE.search(text)
         or TOKEN_VALUE_RE.search(text)
+        or OPAQUE_TOKEN_VALUE_RE.search(text)
     ):
         return "[redacted]"
     if not SAFE_DISPLAY_RE.fullmatch(text):
@@ -270,6 +275,7 @@ def safe_failure_category_label(value: Any, limit: int = 80) -> str:
         or POSIX_PATH_VALUE_RE.search(text)
         or RELATIVE_PATH_VALUE_RE.search(text)
         or TOKEN_VALUE_RE.search(text)
+        or OPAQUE_TOKEN_VALUE_RE.search(text)
     ):
         return "[redacted]"
     if not SAFE_CATEGORY_RE.fullmatch(text):
