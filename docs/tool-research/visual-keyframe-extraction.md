@@ -70,20 +70,92 @@ Fixture:
 - Five intended visual scenes with hard cuts every two seconds.
 - Temp video and extracted frames were deleted after measurement.
 
+Benchmark environment:
+
+- Date: 2026-05-16.
+- Runtime: local workstation, not the deployment VPS and not a Docker
+  production-like benchmark.
+- Python: 3.12.13 through `uv`.
+- `ffmpeg`/`ffprobe`: 8.1.
+- PySceneDetect: 0.7.
+- OpenCV: 4.13.0.
+- Package cache was warmed before measuring command runtimes.
+- First warm fetch observed package archive sizes around NumPy 11.8 MiB,
+  OpenCV 38 MiB, and OpenCV headless 38 MiB, plus smaller PySceneDetect CLI
+  dependencies. These are package archive observations, not installed disk size
+  measurements.
+- Local CPU/RAM were not recorded in this public note because this was a
+  directional tool-shape spike, not a deployment capacity benchmark. The future
+  adapter implementation should still get a VPS smoke test after local and
+  Docker tests are green.
+
 Warm dependency check:
 
 ```text
-uv run --python 3.12 --with scenedetect --with opencv-python-headless ...
+uv run --python 3.12 --with scenedetect --with opencv-python-headless \
+  python -c "import cv2, scenedetect"
+```
+
+Sanitized benchmark recipe:
+
+```text
+TEMP_ROOT="$(mktemp -d)"
+VIDEO="$TEMP_ROOT/synthetic-scenes.mp4"
+mkdir -p "$TEMP_ROOT/ffmpeg-sample" "$TEMP_ROOT/scenedetect" "$TEMP_ROOT/opencv-diff"
+
+ffmpeg -hide_banner -loglevel error -y \
+  -f lavfi -i "testsrc2=size=640x360:rate=24:duration=2" \
+  -f lavfi -i "smptebars=size=640x360:rate=24:duration=2" \
+  -f lavfi -i "color=c=black:size=640x360:rate=24:duration=2" \
+  -f lavfi -i "testsrc=size=640x360:rate=24:duration=2" \
+  -f lavfi -i "color=c=white:size=640x360:rate=24:duration=2" \
+  -filter_complex "[0:v][1:v][2:v][3:v][4:v]concat=n=5:v=1:a=0,format=yuv420p[v]" \
+  -map "[v]" -c:v libx264 -preset veryfast -crf 23 "$VIDEO"
+
+ffprobe -v error -select_streams v:0 \
+  -show_entries stream=width,height,avg_frame_rate,duration,nb_frames \
+  -of json "$VIDEO"
+
+ffmpeg -hide_banner -loglevel error -y -i "$VIDEO" \
+  -vf "fps=1,scale=320:-1:flags=lanczos" \
+  "$TEMP_ROOT/ffmpeg-sample/frame_%03d.jpg"
+
+uv run --python 3.12 --with scenedetect --with opencv-python-headless \
+  scenedetect -i "$VIDEO" -o "$TEMP_ROOT/scenedetect" \
+  detect-content list-scenes save-images --num-images 1 --width 320
+
+uv run --python 3.12 --with opencv-python-headless python opencv_diff_probe.py \
+  "$VIDEO" "$TEMP_ROOT/opencv-diff"
+
+rm -rf "$TEMP_ROOT"
+```
+
+OpenCV probe logic:
+
+```text
+open video with cv2.VideoCapture
+fps = capture fps or 24
+sample_every = round(fps * 0.5)
+for each sampled frame:
+  resize to width 320
+  convert to grayscale
+  blur = variance(Laplacian(gray))
+  luma = mean(gray)
+  diff = mean(absdiff(gray, previous_selected_gray))
+  keep first frame or frames with diff >= 12.0
+  write kept frame as jpg quality 85
+  otherwise increment duplicate counter
+report frames_read, selected_count, duplicates_skipped, elapsed_ms, tracemalloc_peak
 ```
 
 Results:
 
-| Method | Command shape | Wall time | Frames output | Notes |
-| --- | --- | ---: | ---: | --- |
-| `ffprobe` metadata | stream duration, fps, size, frame count | n/a | n/a | Correctly reported 10.0s, 640x360, 24 fps, 240 frames. |
-| `ffmpeg` interval sampling | `fps=1,scale=320:-1` | 66.3 ms | 10 | Fastest and simplest; produces duplicates inside unchanged scenes. |
-| PySceneDetect | `detect-content list-scenes save-images --num-images 1 --width 320` | 749.1 ms | 5 | Detected four cuts and produced five middle-scene frames plus a CSV. Progress output should be captured and sanitized. |
-| OpenCV diff/dedupe | sample every 0.5s, resize, grayscale `absdiff`, Laplacian blur, luma | 1052.6 ms process wall; 52.8 ms inner loop | 5 | Selected five unique frames and skipped 15 duplicates; measured Python peak tracing was about 1.8 MB. |
+| Method | Command shape | Wall time | Frames output | Duplicate/quality signal | Dependency footprint | Memory note |
+| --- | --- | ---: | ---: | --- | --- | --- |
+| `ffprobe` metadata | stream duration, fps, size, frame count | n/a | n/a | Correctly reported 10.0s, 640x360, 24 fps, 240 frames. | Existing FFmpeg binary; no Python packages. | Process RSS was not measured. |
+| `ffmpeg` interval sampling | `fps=1,scale=320:-1` | 66.3 ms | 10 | Represents five scenes but produces duplicate frames inside unchanged scenes. | Existing FFmpeg binary; no Python packages. | Process RSS was not measured. |
+| PySceneDetect | `detect-content list-scenes save-images --num-images 1 --width 320` | 749.1 ms | 5 | Detected four cuts and produced five middle-scene frames plus a CSV. | PySceneDetect plus OpenCV backend; warm `uv` fetch included OpenCV wheels and NumPy. | Process RSS was not measured. |
+| OpenCV diff/dedupe | sample every 0.5s, resize, grayscale `absdiff`, Laplacian blur, luma | 1052.6 ms process wall; 52.8 ms inner loop | 5 | Selected 5 of 20 sampled candidates and skipped 15 near-duplicates. | `opencv-python-headless` plus NumPy. | Python `tracemalloc` peak was about 1.8 MB, but this excludes native OpenCV/FFmpeg allocations and must not be treated as RSS. |
 
 Interpretation:
 
@@ -96,6 +168,9 @@ Interpretation:
   PySceneDetect or interval sampling.
 - The adapter should suppress or sanitize CLI progress/noise before writing
   system-log events.
+- This spike records wall-clock behavior and qualitative dependency footprint.
+  It does not prove VPS memory suitability; implementation issue `#48` should
+  add process-level RSS measurement during local/Docker/VPS validation.
 
 ## Recommended V1 Stack
 
@@ -194,9 +269,23 @@ Suggested result fields:
 - backend used: `pyscenedetect`, `ffmpeg_interval`, `opencv_dedupe`, or mixed;
 - input metadata: duration, dimensions, fps, frame count when available;
 - candidate count, selected count, skipped duplicate count;
-- selected frames as temp handles valid only during the call;
+- selected frames as scoped temp handles owned by the adapter;
 - cleanup status;
 - sanitized diagnostic details.
+
+Temp handle lifetime rule:
+
+- The adapter owns the temp directory and all extracted frame files.
+- Callers must not persist frame paths in memory, logs, GitHub issues, or user
+  replies.
+- The preferred implementation shape is `with adapter.frame_session(...) as
+  result:`, where selected frame handles remain valid only inside the context
+  manager.
+- Vision handoff must complete inside that context; cleanup runs in `finally`
+  after vision succeeds, fails, times out, or is skipped.
+- If the adapter returns a plain result object instead of a context manager, it
+  must expose an explicit `cleanup()` hook and callers must invoke it in
+  `finally` before returning from the routed operation.
 
 Suggested failure categories:
 
