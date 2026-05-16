@@ -1,7 +1,6 @@
 import asyncio
 import base64
 import html
-import inspect
 import io
 import logging
 import os
@@ -10,6 +9,7 @@ import re
 import sys
 import tempfile
 import time
+import urllib.request
 from collections import Counter, defaultdict, deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -4289,21 +4289,25 @@ Analyze the found web image or images according to the request. Reply in Ukraini
 
 async def download_visual_media_source(file_ref: Any, destination: Path, *, max_bytes: int) -> int:
     declared_size = getattr(file_ref, "file_size", None)
-    if declared_size is not None and int(declared_size) > max_bytes:
+    declared_size = int(declared_size) if declared_size is not None else None
+    if declared_size is not None and declared_size > max_bytes:
         raise ValueError("input_too_large")
 
     telegram_file = await file_ref.get_file()
-    download_to_drive = getattr(telegram_file, "download_to_drive", None)
-    if callable(download_to_drive):
-        result = download_to_drive(custom_path=destination)
-        if inspect.isawaitable(result):
-            await result
-    else:
-        data = bytes(await telegram_file.download_as_bytearray())
-        if len(data) > max_bytes:
-            raise ValueError("input_too_large")
-        destination.write_bytes(data)
+    telegram_size = getattr(telegram_file, "file_size", None)
+    telegram_size = int(telegram_size) if telegram_size is not None else None
+    if telegram_size is not None and telegram_size > max_bytes:
+        raise ValueError("input_too_large")
+    if declared_size is None and telegram_size is None:
+        raise ValueError("file_size_unavailable")
+    if getattr(telegram_file, "_credentials", None):
+        raise ValueError("encrypted_file_unsupported")
 
+    file_path = str(getattr(telegram_file, "file_path", "") or "")
+    if not file_path:
+        raise ValueError("file_path_unavailable")
+
+    await asyncio.to_thread(stream_visual_media_file, telegram_file, destination, max_bytes)
     actual_size = destination.stat().st_size
     if actual_size > max_bytes:
         try:
@@ -4312,6 +4316,50 @@ async def download_visual_media_source(file_ref: Any, destination: Path, *, max_
             pass
         raise ValueError("input_too_large")
     return actual_size
+
+
+def stream_visual_media_file(telegram_file: Any, destination: Path, max_bytes: int) -> None:
+    file_path = str(getattr(telegram_file, "file_path", "") or "")
+    local_path = Path(file_path)
+    if local_path.is_file():
+        copy_bounded_file(local_path, destination, max_bytes)
+        return
+
+    encoded_url = getattr(telegram_file, "_get_encoded_url", None)
+    if not callable(encoded_url):
+        raise ValueError("file_url_unavailable")
+    url = str(encoded_url())
+    if not url.lower().startswith(("http://", "https://")):
+        raise ValueError("file_url_unavailable")
+    download_bounded_url(url, destination, max_bytes)
+
+
+def copy_bounded_file(source: Path, destination: Path, max_bytes: int) -> None:
+    if source.stat().st_size > max_bytes:
+        raise ValueError("input_too_large")
+    bytes_seen = 0
+    with source.open("rb") as src, destination.open("wb") as dst:
+        while True:
+            chunk = src.read(1024 * 1024)
+            if not chunk:
+                break
+            bytes_seen += len(chunk)
+            if bytes_seen > max_bytes:
+                raise ValueError("input_too_large")
+            dst.write(chunk)
+
+
+def download_bounded_url(url: str, destination: Path, max_bytes: int) -> None:
+    bytes_seen = 0
+    with urllib.request.urlopen(url, timeout=30) as response, destination.open("wb") as dst:
+        while True:
+            chunk = response.read(1024 * 1024)
+            if not chunk:
+                break
+            bytes_seen += len(chunk)
+            if bytes_seen > max_bytes:
+                raise ValueError("input_too_large")
+            dst.write(chunk)
 
 
 def save_visual_media_summary_memory(

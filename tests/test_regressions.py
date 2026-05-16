@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import shutil
 import socket
 import subprocess
 import tempfile
@@ -196,8 +197,11 @@ class FakeMessage:
 
 
 class FakeTelegramFile:
-    def __init__(self, data: bytes = b"fake-image") -> None:
+    def __init__(self, data: bytes = b"fake-image", file_path: str = "", file_size: int | None = None) -> None:
         self.data = data
+        self.file_path = file_path
+        self.file_size = len(data) if file_size is None else file_size
+        self._credentials = None
 
     async def download_as_bytearray(self) -> bytearray:
         return bytearray(self.data)
@@ -225,10 +229,22 @@ class FakeVideo:
         self.file_unique_id = unique_id
         self.file_size = len(data)
         self.mime_type = mime_type
-        self._file = FakeTelegramFile(data)
+        self._temp_dir = Path(tempfile.mkdtemp())
+        self._path = self._temp_dir / "video.mp4"
+        self._path.write_bytes(data)
+        self._file = FakeTelegramFile(data, file_path=str(self._path), file_size=len(data))
 
     async def get_file(self) -> FakeTelegramFile:
         return self._file
+
+    def cleanup(self) -> None:
+        shutil.rmtree(self._temp_dir, ignore_errors=True)
+
+    def __del__(self) -> None:
+        try:
+            self.cleanup()
+        except Exception:
+            pass
 
 
 class FakeSticker:
@@ -1177,6 +1193,47 @@ class ToolRuntimeTests(unittest.TestCase):
         self.assertEqual("vision_failed", result.failure_category)
         self.assertNotIn("C:\\Users", result_text)
         self.assertNotIn(fake_openai_secret(), result_text)
+
+    def test_visual_media_download_requires_size_metadata_before_copy(self) -> None:
+        class NoSizeFileRef:
+            file_size = None
+
+            async def get_file(self):
+                return self.file
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source = Path(temp_dir) / "video.mp4"
+            source.write_bytes(b"x" * 32)
+            file_ref = NoSizeFileRef()
+            file_ref.file = FakeTelegramFile(b"", file_path=str(source))
+            file_ref.file.file_size = None
+            destination = Path(temp_dir) / "downloaded.mp4"
+
+            with patch.object(main, "copy_bounded_file", side_effect=AssertionError("copy should not start")):
+                with self.assertRaises(ValueError) as ctx:
+                    asyncio.run(main.download_visual_media_source(file_ref, destination, max_bytes=10))
+
+        self.assertEqual("file_size_unavailable", str(ctx.exception))
+
+    def test_visual_media_download_rejects_underreported_local_file_before_copying(self) -> None:
+        class UnderreportedFileRef:
+            file_size = 1
+
+            async def get_file(self):
+                return self.file
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source = Path(temp_dir) / "video.mp4"
+            source.write_bytes(b"x" * 32)
+            file_ref = UnderreportedFileRef()
+            file_ref.file = FakeTelegramFile(b"", file_path=str(source), file_size=1)
+            destination = Path(temp_dir) / "downloaded.mp4"
+
+            with self.assertRaises(ValueError) as ctx:
+                asyncio.run(main.download_visual_media_source(file_ref, destination, max_bytes=10))
+
+        self.assertEqual("input_too_large", str(ctx.exception))
+        self.assertFalse(destination.exists())
 
     def test_visual_media_summary_memory_is_source_context_only_and_searchable(self) -> None:
         if main.MEMORY is None:
