@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import shutil
 import socket
 import subprocess
 import tempfile
@@ -109,6 +110,7 @@ import main
 from media_frames import (
     CommandOutput,
     FfmpegMediaFrameAdapter,
+    MediaFrameCandidate,
     MediaFrameLimits,
     MediaFrameRequest,
     MediaFrameResult,
@@ -130,6 +132,7 @@ from tool_diagnostics import (
     render_row,
 )
 from tool_runtime import NullToolAdapter, ToolRuntime
+from visual_media_summary import summarize_visual_media_frames
 
 VALID_JPEG = b"\xff\xd8\xff\xe0" + b"valid-jpeg"
 
@@ -194,8 +197,11 @@ class FakeMessage:
 
 
 class FakeTelegramFile:
-    def __init__(self, data: bytes = b"fake-image") -> None:
+    def __init__(self, data: bytes = b"fake-image", file_path: str = "", file_size: int | None = None) -> None:
         self.data = data
+        self.file_path = file_path
+        self.file_size = len(data) if file_size is None else file_size
+        self._credentials = None
 
     async def download_as_bytearray(self) -> bytearray:
         return bytearray(self.data)
@@ -209,6 +215,36 @@ class FakePhoto:
 
     async def get_file(self) -> FakeTelegramFile:
         return self._file
+
+
+class FakeVideo:
+    def __init__(
+        self,
+        file_id: str = "video-file",
+        unique_id: str = "video-unique",
+        data: bytes = b"fake-video",
+        mime_type: str = "video/mp4",
+    ) -> None:
+        self.file_id = file_id
+        self.file_unique_id = unique_id
+        self.file_size = len(data)
+        self.mime_type = mime_type
+        self._temp_dir = Path(tempfile.mkdtemp())
+        self._path = self._temp_dir / "video.mp4"
+        self._path.write_bytes(data)
+        self._file = FakeTelegramFile(data, file_path=str(self._path), file_size=len(data))
+
+    async def get_file(self) -> FakeTelegramFile:
+        return self._file
+
+    def cleanup(self) -> None:
+        shutil.rmtree(self._temp_dir, ignore_errors=True)
+
+    def __del__(self) -> None:
+        try:
+            self.cleanup()
+        except Exception:
+            pass
 
 
 class FakeSticker:
@@ -1090,6 +1126,211 @@ class ToolRuntimeTests(unittest.TestCase):
         self.assertNotIn(fake_openai_secret(), event_text)
         self.assertNotIn(fake_telegram_secret(), event_text)
         self.assertIn("decode_failed", event_text)
+
+    def test_visual_media_summary_bounds_frames_and_omits_paths_from_prompt(self) -> None:
+        captured = {}
+
+        async def fake_vision(prompt, image_data_urls):
+            captured["prompt"] = prompt
+            captured["images"] = image_data_urls
+            return "visible summary"
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            frames = []
+            for index in range(10):
+                path = Path(temp_dir) / f"private-frame-{index}.jpg"
+                path.write_bytes(VALID_JPEG)
+                frames.append(MediaFrameCandidate(path=path, timestamp_seconds=float(index), index=index + 1))
+            frame_result = MediaFrameResult(
+                ok=True,
+                backend="ffmpeg_interval",
+                source_family="telegram_video",
+                frames=tuple(frames),
+                candidate_count=10,
+                selected_count=10,
+                truncated=True,
+            )
+
+            result = asyncio.run(
+                summarize_visual_media_frames(
+                    frame_result=frame_result,
+                    user_prompt="what is visible?",
+                    vision_runner=fake_vision,
+                    max_frames=8,
+                )
+            )
+
+            self.assertTrue(result.ok)
+            self.assertEqual(8, result.frame_count)
+            self.assertEqual(8, len(captured["images"]))
+            self.assertNotIn(str(Path(temp_dir)), captured["prompt"])
+            self.assertIn("Frame-visible text", captured["prompt"])
+
+    def test_visual_media_summary_vision_failure_returns_unavailable(self) -> None:
+        async def failing_vision(prompt, image_data_urls):
+            raise RuntimeError(f"C:\\Users\\private\\frame.jpg OPENAI_API_KEY={fake_openai_secret()}")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            frame_path = Path(temp_dir) / "frame.jpg"
+            frame_path.write_bytes(VALID_JPEG)
+            result = asyncio.run(
+                summarize_visual_media_frames(
+                    frame_result=MediaFrameResult(
+                        ok=True,
+                        backend="ffmpeg_interval",
+                        source_family="telegram_video",
+                        frames=(MediaFrameCandidate(path=frame_path, timestamp_seconds=1.0, index=1),),
+                        candidate_count=1,
+                        selected_count=1,
+                    ),
+                    user_prompt="summarize video",
+                    vision_runner=failing_vision,
+                )
+            )
+
+        result_text = json.dumps(result.__dict__, ensure_ascii=False)
+        self.assertFalse(result.ok)
+        self.assertEqual("vision_failed", result.failure_category)
+        self.assertNotIn("C:\\Users", result_text)
+        self.assertNotIn(fake_openai_secret(), result_text)
+
+    def test_visual_media_download_requires_size_metadata_before_copy(self) -> None:
+        class NoSizeFileRef:
+            file_size = None
+
+            async def get_file(self):
+                return self.file
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source = Path(temp_dir) / "video.mp4"
+            source.write_bytes(b"x" * 32)
+            file_ref = NoSizeFileRef()
+            file_ref.file = FakeTelegramFile(b"", file_path=str(source))
+            file_ref.file.file_size = None
+            destination = Path(temp_dir) / "downloaded.mp4"
+
+            with patch.object(main, "copy_bounded_file", side_effect=AssertionError("copy should not start")):
+                with self.assertRaises(ValueError) as ctx:
+                    asyncio.run(main.download_visual_media_source(file_ref, destination, max_bytes=10))
+
+        self.assertEqual("file_size_unavailable", str(ctx.exception))
+
+    def test_visual_media_download_rejects_underreported_local_file_before_copying(self) -> None:
+        class UnderreportedFileRef:
+            file_size = 1
+
+            async def get_file(self):
+                return self.file
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source = Path(temp_dir) / "video.mp4"
+            source.write_bytes(b"x" * 32)
+            file_ref = UnderreportedFileRef()
+            file_ref.file = FakeTelegramFile(b"", file_path=str(source), file_size=1)
+            destination = Path(temp_dir) / "downloaded.mp4"
+
+            with self.assertRaises(ValueError) as ctx:
+                asyncio.run(main.download_visual_media_source(file_ref, destination, max_bytes=10))
+
+        self.assertEqual("input_too_large", str(ctx.exception))
+        self.assertFalse(destination.exists())
+
+    def test_visual_media_summary_memory_is_source_context_only_and_searchable(self) -> None:
+        if main.MEMORY is None:
+            self.skipTest("memory store disabled")
+        main.MEMORY.clear_all()
+        message = FakeMessage("!m summarize this video", chat_type=ChatType.PRIVATE, message_id=4801)
+        message.video = FakeVideo()
+        existing_id = main.MEMORY.save_message(
+            chat_id=message.chat_id,
+            message_id=message.message_id,
+            chat_type=str(message.chat.type),
+            created_at=message.date,
+            sender_label=main.sender_label(message),
+            user_id=message.from_user.id,
+            username=message.from_user.username,
+            is_bot=False,
+            text="!m summarize this video",
+            content_kind="attachment",
+            attachment_type="video",
+        )
+
+        item_id = main.save_visual_media_summary_memory(
+            message,
+            summary="unique visual lighthouse source summary",
+            attachment_type="video",
+            mime_type="video/mp4",
+        )
+        item = main.MEMORY.item_by_id(item_id)
+        results = main.MEMORY.keyword_search(chat_id=message.chat_id, query="lighthouse", lookback_days=30, limit=3)
+
+        self.assertEqual(existing_id, item_id)
+        self.assertIsNotNone(item)
+        self.assertEqual("!m summarize this video", item.text)
+        self.assertEqual("", item.source_text)
+        self.assertEqual("unique visual lighthouse source summary", item.vision_summary)
+        self.assertTrue(results)
+        self.assertNotIn("lighthouse", item.text)
+        self.assertNotIn("lighthouse", item.source_text)
+
+    def test_visual_media_prompt_uses_adapter_cleans_frames_and_saves_source_summary(self) -> None:
+        if main.MEMORY is None:
+            self.skipTest("memory store disabled")
+        main.MEMORY.clear_all()
+        main.histories.clear()
+        main.passive_contexts.clear()
+        main.last_user_call.clear()
+        main.last_chat_call.clear()
+        original_adapter = main.runtime_media_frame_adapter()
+        frame_dirs = []
+        requests = []
+
+        class FakeMediaFrameAdapter:
+            async def extract_frames(self, request):
+                requests.append(request)
+                frame_dir = Path(tempfile.mkdtemp(prefix="aigan-test-frames-"))
+                frame_dirs.append(frame_dir)
+                frame_path = frame_dir / "frame_001.jpg"
+                frame_path.write_bytes(VALID_JPEG)
+                return MediaFrameResult(
+                    ok=True,
+                    backend="fake",
+                    source_family=request.source_family,
+                    frames=(MediaFrameCandidate(path=frame_path, timestamp_seconds=1.25, index=1),),
+                    candidate_count=1,
+                    selected_count=1,
+                    cleanup_status="pending",
+                    _temp_dir=frame_dir,
+                )
+
+            def health_summary(self):
+                return {"name": "media_frames", "enabled": True, "status": "ok", "adapter": "fake"}
+
+        message = FakeMessage("summarize this video", chat_type=ChatType.PRIVATE, message_id=4802)
+        message.video = FakeVideo(data=b"fake-video-bytes")
+        try:
+            main.set_media_frame_adapter(FakeMediaFrameAdapter())
+            with patch.object(main, "run_vision", new=AsyncMock(return_value="unique visual lighthouse source summary")) as run_vision:
+                handled = asyncio.run(main.handle_visual_media_prompt(message, "summarize this video", route="normal"))
+        finally:
+            main.set_media_frame_adapter(original_adapter)
+
+        results = main.MEMORY.keyword_search(chat_id=message.chat_id, query="lighthouse", lookback_days=30, limit=3)
+        item = main.MEMORY.item_by_id(results[0].item.id if results else None)
+
+        self.assertTrue(handled)
+        self.assertEqual(1, len(requests))
+        self.assertEqual("telegram_video", requests[0].source_family)
+        self.assertEqual(1, run_vision.await_count)
+        self.assertTrue(message.reply_calls)
+        self.assertIn("unique visual lighthouse", message.reply_calls[-1]["text"])
+        self.assertTrue(frame_dirs)
+        self.assertTrue(all(not frame_dir.exists() for frame_dir in frame_dirs))
+        self.assertTrue(results)
+        self.assertIsNotNone(item)
+        self.assertEqual("", item.text)
+        self.assertEqual("", item.source_text)
+        self.assertIn("unique visual lighthouse", item.vision_summary)
 
     def test_tool_diagnostics_render_media_frame_health_details(self) -> None:
         rows = build_capability_rows(
