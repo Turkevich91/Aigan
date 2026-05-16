@@ -70,9 +70,9 @@ CATEGORY_URL_VALUE_RE = re.compile(
     re.IGNORECASE,
 )
 WINDOWS_PATH_VALUE_RE = re.compile(r"(?:[A-Za-z]:[\\/]|\\\\)")
-POSIX_PATH_VALUE_RE = re.compile(r"(^|\s)(?:~(?:/|\b)|/(?:[A-Za-z0-9._-]+)(?:/[^/\s]+)*)")
+POSIX_PATH_VALUE_RE = re.compile(r"(^|[\s=])(?:~(?:/|\b)|/(?:[A-Za-z0-9._-]+)(?:/[^/\s]+)*)")
 RELATIVE_PATH_VALUE_RE = re.compile(
-    r"(^|\s)(?:\.{1,2}[\\/]|(?:[A-Za-z0-9_.-]+[\\/])+[^\\/\s]+)",
+    r"(^|[\s=])(?:\.{1,2}[\\/]|(?:[A-Za-z0-9_.-]+[\\/])+[^\\/\s]+)",
     re.IGNORECASE,
 )
 TOKEN_VALUE_RE = re.compile(r"\b(?:gh[pousr]_|github_pat_|xox[baprs]-)[A-Za-z0-9_-]{8,}", re.IGNORECASE)
@@ -92,15 +92,22 @@ SAFE_CATEGORY_VALUES = {
     "cleanup_failed",
     "decode_failed",
     "download_failed",
+    "embedding_failed",
     "freeform",
+    "health_report_failed",
+    "memory_recall_intent_failed",
     "no_valid_image",
+    "outbound_reaction_adapter_error",
     "prefetch_failed",
     "provider_unavailable",
     "runner_error",
     "search_failed",
     "self_report_failed",
+    "semantic_query_embedding_failed",
+    "selfcheck_failed",
     "timeout",
     "tool_operation_failed",
+    "worker_failed",
 }
 SAFE_CATEGORY_PREFIXES = (
     "adapter_",
@@ -427,7 +434,11 @@ def is_failure_event(event: SystemEvent) -> bool:
     details = event.details if isinstance(event.details, dict) else {}
     if any(details.get(key) for key in ("failure_category", "exception_type")):
         return True
-    return event.event_type in FAILURE_EVENT_TYPES or event.event_type.endswith("_failed")
+    return (
+        event.event_type in FAILURE_EVENT_TYPES
+        or event.event_type.endswith("_failed")
+        or event.event_type.endswith("_error")
+    )
 
 
 def failure_category_for_event(event: SystemEvent) -> str:

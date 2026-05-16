@@ -1333,6 +1333,28 @@ class ToolRuntimeTests(unittest.TestCase):
         self.assertNotIn("uploads/audio", text)
         self.assertNotIn("192.168", unmatched)
 
+    def test_tool_diagnostics_redacts_embedded_path_values(self) -> None:
+        text = render_row(
+            CapabilityRow(
+                name="media_frames",
+                family="media",
+                enabled=True,
+                configured=True,
+                available=True,
+                status="ok",
+                adapter="backend path=/srv/model",
+                mode="cache=data/file.bin",
+                backend="workdir=./tmp/cache",
+            ).normalized()
+        )
+
+        self.assertIn("adapter=[redacted]", text)
+        self.assertIn("mode=[redacted]", text)
+        self.assertIn("backend=[redacted]", text)
+        self.assertNotIn("/srv/model", text)
+        self.assertNotIn("data/file", text)
+        self.assertNotIn("./tmp", text)
+
     def test_tool_diagnostics_failure_categories_keep_stable_dotted_codes(self) -> None:
         rows = build_capability_rows(
             {"status": "ok", "adapter_count": 0, "error_count": 0, "adapters": []},
@@ -1404,6 +1426,67 @@ class ToolRuntimeTests(unittest.TestCase):
 
         self.assertIn("[redacted]", row.recent_failure_categories)
         self.assertNotIn("provider.internal", row.recent_failure_categories)
+
+    def test_tool_diagnostics_keeps_safe_embedding_failure_category(self) -> None:
+        rows = build_capability_rows(
+            {"status": "ok", "adapter_count": 0, "error_count": 0, "adapters": []},
+            extra_rows=[CapabilityRow("memory_embeddings", "memory", True, True, True, "ok")],
+            events=[
+                SystemEvent(
+                    id=1,
+                    created_at="2026-01-01T00:00:00+00:00",
+                    level="warning",
+                    component="memory_vector",
+                    event_type="embedding_failed",
+                    chat_id=None,
+                    user_id=None,
+                    route="",
+                    duration_ms=None,
+                    message="",
+                    details={},
+                )
+            ],
+        )
+        row = {item.name: item for item in rows}["memory_embeddings"]
+
+        self.assertEqual(["embedding_failed"], row.recent_failure_categories)
+
+    def test_tool_diagnostics_counts_warning_error_event_as_failure(self) -> None:
+        rows = build_capability_rows(
+            {
+                "status": "ok",
+                "adapter_count": 1,
+                "error_count": 0,
+                "adapters": [
+                    {
+                        "name": "outbound_reactions",
+                        "family": "reactions",
+                        "enabled": True,
+                        "status": "ok",
+                    }
+                ],
+            },
+            events=[
+                SystemEvent(
+                    id=1,
+                    created_at="2026-01-01T00:00:00+00:00",
+                    level="warning",
+                    component="outbound_reactions",
+                    event_type="outbound_reaction_adapter_error",
+                    chat_id=None,
+                    user_id=None,
+                    route="",
+                    duration_ms=None,
+                    message="",
+                    details={},
+                )
+            ],
+        )
+        row = {item.name: item for item in rows}["outbound_reactions"]
+
+        self.assertEqual("degraded", row.status)
+        self.assertEqual(1, row.recent_warning_count)
+        self.assertEqual(["outbound_reaction_adapter_error"], row.recent_failure_categories)
 
     def test_recent_tool_events_keeps_tool_failures_after_unrelated_noise(self) -> None:
         main.SYSTEM_LOG.record_event(
