@@ -77,8 +77,8 @@ get_media_context(
 
 Recommended internal layers:
 
-- `MediaTranscriptAdapter`: optional adapter registered through `ToolRuntime`.
-- `NullMediaTranscriptAdapter`: disabled fallback with `health_summary()`.
+- `MediaContextAdapter`: optional adapter registered through `ToolRuntime`.
+- `NullMediaContextAdapter`: disabled fallback with `health_summary()`.
 - `MediaContextResult`: structured result with success state, modality
   (`captions`, `automatic_captions`, `audio_transcription`, `visual_summary`, or
   `unavailable`), transcript or visual summary text, metadata, backend, and
@@ -163,18 +163,20 @@ Recommended future defaults:
 
 ```env
 MEDIA_CONTEXT_ENABLED=false
-MEDIA_TRANSCRIPT_ENABLED=false
-MEDIA_TRANSCRIPT_AUDIO_FALLBACK=false
-MEDIA_TRANSCRIPT_VISUAL_FALLBACK=false
-MEDIA_TRANSCRIPT_MAX_DURATION_SECONDS=1200
-MEDIA_TRANSCRIPT_MAX_AUDIO_BYTES=24000000
-MEDIA_TRANSCRIPT_MAX_VISUAL_MEDIA_BYTES=50000000
-MEDIA_TRANSCRIPT_MAX_CHARS=16000
-MEDIA_TRANSCRIPT_LANGUAGES=uk,en,ru
-MEDIA_TRANSCRIPT_MODEL=gpt-4o-mini-transcribe
+MEDIA_CONTEXT_AUDIO_FALLBACK=false
+MEDIA_CONTEXT_VISUAL_FALLBACK=false
+MEDIA_CONTEXT_MAX_DURATION_SECONDS=1200
+MEDIA_CONTEXT_MAX_AUDIO_BYTES=24000000
+MEDIA_CONTEXT_MAX_VISUAL_MEDIA_BYTES=50000000
+MEDIA_CONTEXT_MAX_CHARS=16000
+MEDIA_CONTEXT_LANGUAGES=uk,en,ru
+MEDIA_CONTEXT_TRANSCRIPTION_MODEL=gpt-4o-mini-transcribe
 ```
 
 Cookie or proxy support should not be part of v1. If ever added, it must live in private operator configuration, never in tracked docs, issues, or logs.
+If implementation needs to preserve older transcript-only flags during a
+migration, map them internally to the canonical `MEDIA_CONTEXT_*` names and keep
+diagnostics keyed by `media_context`.
 
 ## Safety And Memory Rules
 
@@ -196,7 +198,7 @@ Cookie or proxy support should not be part of v1. If ever added, it must live in
 
 The adapter `health_summary()` should expose:
 
-- `name=media_context` or `name=media_transcript`;
+- `name=media_context`;
 - `enabled`;
 - `adapter`;
 - `status`;
@@ -236,5 +238,5 @@ The adapter `health_summary()` should expose:
 3. Add OpenAI STT through the transcription backend adapter task rather than duplicating YouTube fallback logic.
 4. Add memory integration in the transcript memory task.
 5. Reuse the existing `media_frames` adapter and visual-summary helper for transcriptless fallback instead of adding a second frame extractor.
-6. Add the local MCP wrapper and wire it into agent tools only when `MEDIA_CONTEXT_ENABLED=true` or `MEDIA_TRANSCRIPT_ENABLED=true`.
+6. Add the local MCP wrapper and wire it into agent tools only when `MEDIA_CONTEXT_ENABLED=true`.
 7. Keep TikTok/Instagram/Reels support best-effort and report unavailable states honestly.
