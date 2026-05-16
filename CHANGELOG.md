@@ -1,5 +1,11 @@
 # Aigan Changelog
 
+## 2026-05-15 - Tool health diagnostics plan
+
+- Added a tool research note for future `/tools` and `/tool_health` diagnostics.
+- Documented an admin-only capability matrix, stable status vocabulary, sanitized failure aggregation, and next-action hints.
+- Captured future tests for non-admin denial, disabled/null capability rows, system-log failure counts, unsafe-field redaction, and non-regression of existing diagnostics.
+
 ## 2026-05-15 - Fact-check route v2 plan
 
 - Added a tool research note for a future fact-check route v2.
