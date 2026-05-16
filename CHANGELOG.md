@@ -1,5 +1,11 @@
 # Aigan Changelog
 
+## 2026-05-16 - Universal media transcriptless fallback plan
+
+- Updated the universal media research note with a transcriptless visual-frame fallback ladder.
+- Documented reuse of the existing `media_frames` adapter and visual summary helper instead of adding a second extractor.
+- Captured future tests for no-captions/no-audio fallback, disabled visual fallback, bounded public media acquisition, cleanup, and source-context memory isolation.
+
 ## 2026-05-15 - Tool health diagnostics plan
 
 - Added a tool research note for future `/tools` and `/tool_health` diagnostics.

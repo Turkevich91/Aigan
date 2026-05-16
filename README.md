@@ -268,6 +268,8 @@ Tool failures must not block message persistence, embeddings, memory recall, `/s
 
 The media frame extraction adapter is registered as `media_frames` and is disabled by default. When `MEDIA_FRAME_EXTRACTION_ENABLED=true`, explicit Telegram video/animation/video-document routes can use bounded ffprobe/ffmpeg frame extraction for visual summaries. These summaries are saved only as source-context vision summaries, not user-authored text, and do not enable TikTok/Instagram support or passive group handling.
 
+Universal media plans should keep the same ladder: captions first, optional audio transcription second, optional visual-frame summary only for explicit transcriptless cases, and a structured unavailable result when the media cannot be handled safely.
+
 Future tool research notes:
 
 - [`docs/tool-research/universal-media-transcript-mcp.md`](docs/tool-research/universal-media-transcript-mcp.md)
