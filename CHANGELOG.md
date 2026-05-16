@@ -1,5 +1,11 @@
 # Aigan Changelog
 
+## 2026-05-16 - Outbound reaction empathy preflight
+
+- Added a final empathy/perception preflight before Telegram outbound reactions are sent.
+- Blocked candidate reactions that could be perceived as approval of harm, suffering, coercion, humiliation, violence, death, or injustice.
+- Stored sanitized preflight skip reasons in outbound reaction decision records and added regressions for policy-escape, source-only sympathy, and positive framing of harm.
+
 ## 2026-05-16 - Universal media transcriptless fallback plan
 
 - Updated the universal media research note with a transcriptless visual-frame fallback ladder.
