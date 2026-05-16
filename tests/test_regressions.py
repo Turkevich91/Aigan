@@ -2,6 +2,7 @@ import asyncio
 import json
 import os
 import socket
+import subprocess
 import tempfile
 import unittest
 from dataclasses import replace
@@ -105,6 +106,14 @@ from telegram.constants import ChatType, ParseMode
 from telegram.error import BadRequest
 
 import main
+from media_frames import (
+    CommandOutput,
+    FfmpegMediaFrameAdapter,
+    MediaFrameLimits,
+    MediaFrameRequest,
+    MediaFrameResult,
+    NullMediaFrameAdapter,
+)
 from memory import MemoryStore
 from mcp_servers import web
 from reaction_memory import ReactionSpec
@@ -848,6 +857,202 @@ class ToolRuntimeTests(unittest.TestCase):
         self.assertTrue(any(item["name"] == "outbound_reactions" for item in health["adapters"]))
         self.assertIn("outbound_reactions", main.tool_runtime_health_text())
 
+    def test_main_tool_runtime_health_includes_disabled_media_frames(self) -> None:
+        health = main.TOOL_RUNTIME.health_summary()
+        media_frames = next(item for item in health["adapters"] if item["name"] == "media_frames")
+
+        self.assertEqual("disabled", media_frames["status"])
+        self.assertFalse(media_frames["enabled"])
+        self.assertIn("media_frames", main.tool_runtime_health_text())
+
+    def test_null_media_frame_adapter_returns_disabled_unavailable_result(self) -> None:
+        adapter = NullMediaFrameAdapter()
+        request = MediaFrameRequest(source_path="missing.mp4", source_family="telegram_cached_media")
+
+        result = asyncio.run(adapter.extract_frames(request))
+        health = adapter.health_summary()
+
+        self.assertFalse(result.ok)
+        self.assertEqual("disabled", result.failure_category)
+        self.assertEqual("disabled", health["status"])
+        self.assertFalse(health["available"])
+
+    def test_ffmpeg_media_frame_adapter_extracts_bounded_frames_and_cleans_temp(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source = Path(temp_dir) / "video.mp4"
+            source.write_bytes(b"fake-video")
+
+            def fake_runner(command, timeout_seconds):
+                if command[0] == "ffprobe":
+                    return CommandOutput(
+                        0,
+                        json.dumps(
+                            {
+                                "streams": [
+                                    {
+                                        "codec_type": "video",
+                                        "codec_name": "h264",
+                                        "width": 640,
+                                        "height": 360,
+                                        "duration": "10.0",
+                                        "avg_frame_rate": "24/1",
+                                        "nb_frames": "240",
+                                    }
+                                ],
+                                "format": {"duration": "10.0"},
+                            }
+                        ),
+                    )
+                if command[0] == "ffmpeg":
+                    pattern = str(command[-1])
+                    for index in range(1, 7):
+                        Path(pattern.replace("%03d", f"{index:03d}")).write_bytes(VALID_JPEG)
+                    return CommandOutput(0)
+                return CommandOutput(1, stderr="unexpected")
+
+            adapter = FfmpegMediaFrameAdapter(
+                limits=MediaFrameLimits(selected_frame_count=5, candidate_frame_count=8),
+                command_runner=fake_runner,
+            )
+
+            result = asyncio.run(adapter.extract_frames(MediaFrameRequest(source_path=source, source_family="telegram_cached_media")))
+            frame_paths = [frame.path for frame in result.frames]
+
+            self.assertTrue(result.ok)
+            self.assertEqual("ffmpeg_interval", result.backend)
+            self.assertEqual(6, result.candidate_count)
+            self.assertEqual(5, result.selected_count)
+            self.assertTrue(result.truncated)
+            self.assertTrue(all(path.exists() for path in frame_paths))
+
+            asyncio.run(result.cleanup())
+
+            self.assertEqual("cleaned", result.cleanup_status)
+            self.assertTrue(all(not path.exists() for path in frame_paths))
+
+    def test_ffmpeg_media_frame_adapter_rejects_oversize_without_temp_leak(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source = Path(temp_dir) / "video.mp4"
+            source.write_bytes(b"fake-video")
+            adapter = FfmpegMediaFrameAdapter(limits=MediaFrameLimits(max_bytes=10))
+
+            result = asyncio.run(
+                adapter.extract_frames(
+                    MediaFrameRequest(
+                        source_path=source,
+                        declared_size_bytes=100,
+                        provenance_label=f"OPENAI_API_KEY={fake_openai_secret()}",
+                    )
+                )
+            )
+
+        result_text = json.dumps(result.public_dict(), ensure_ascii=False)
+        self.assertFalse(result.ok)
+        self.assertEqual("input_too_large", result.failure_category)
+        self.assertEqual("not_needed", result.cleanup_status)
+        self.assertNotIn(fake_openai_secret(), result_text)
+        self.assertNotIn("abcdefghijklmnopqrstuvwxyz", result_text)
+
+    def test_ffmpeg_media_frame_adapter_cleans_after_decode_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source = Path(temp_dir) / "video.mp4"
+            source.write_bytes(b"fake-video")
+
+            def fake_runner(command, timeout_seconds):
+                if command[0] == "ffprobe":
+                    return CommandOutput(
+                        0,
+                        json.dumps(
+                            {
+                                "streams": [
+                                    {
+                                        "codec_type": "video",
+                                        "codec_name": "h264",
+                                        "width": 640,
+                                        "height": 360,
+                                        "duration": "10.0",
+                                    }
+                                ]
+                            }
+                        ),
+                    )
+                return CommandOutput(1, stderr="decode failed")
+
+            adapter = FfmpegMediaFrameAdapter(command_runner=fake_runner)
+            result = asyncio.run(adapter.extract_frames(MediaFrameRequest(source_path=source)))
+
+        self.assertFalse(result.ok)
+        self.assertEqual("decode_failed", result.failure_category)
+        self.assertEqual("cleaned", result.cleanup_status)
+        self.assertEqual("decode_failed", adapter.health_summary()["last_failure_category"])
+
+    def test_ffmpeg_media_frame_adapter_cleans_after_timeout(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source = Path(temp_dir) / "video.mp4"
+            source.write_bytes(b"fake-video")
+
+            def fake_runner(command, timeout_seconds):
+                if command[0] == "ffprobe":
+                    return CommandOutput(
+                        0,
+                        json.dumps(
+                            {
+                                "streams": [
+                                    {
+                                        "codec_type": "video",
+                                        "codec_name": "h264",
+                                        "width": 640,
+                                        "height": 360,
+                                        "duration": "10.0",
+                                    }
+                                ]
+                            }
+                        ),
+                    )
+                raise subprocess.TimeoutExpired(command, timeout_seconds)
+
+            adapter = FfmpegMediaFrameAdapter(command_runner=fake_runner)
+            result = asyncio.run(adapter.extract_frames(MediaFrameRequest(source_path=source, timeout_seconds=1)))
+
+        self.assertFalse(result.ok)
+        self.assertEqual("timeout", result.failure_category)
+        self.assertEqual("cleaned", result.cleanup_status)
+        self.assertEqual("timeout", adapter.health_summary()["last_failure_category"])
+
+    def test_media_frame_runtime_safe_call_sanitizes_unexpected_adapter_failure(self) -> None:
+        events = []
+
+        def record_event(**kwargs):
+            events.append(kwargs)
+
+        class BrokenMediaFrameAdapter:
+            def health_summary(self):
+                return {"name": "media_frames", "enabled": True, "adapter": "broken", "status": "ok"}
+
+            async def extract_frames(self, request):
+                raise RuntimeError(f"OPENAI_API_KEY={fake_openai_secret()}")
+
+        runtime = ToolRuntime(event_callback=record_event)
+        runtime.register("media_frames", BrokenMediaFrameAdapter())
+        default = MediaFrameResult.unavailable(failure_category="decode_failed")
+
+        result = asyncio.run(
+            runtime.safe_call(
+                "media_frames",
+                "extract_frames",
+                lambda: runtime.get("media_frames").extract_frames(MediaFrameRequest(source_path="media.mp4")),
+                default=default,
+                details={"failure_category": "decode_failed", "token": fake_telegram_secret()},
+            )
+        )
+
+        event_text = json.dumps(events, ensure_ascii=False)
+        self.assertEqual(default, result)
+        self.assertEqual(1, len(events))
+        self.assertNotIn(fake_openai_secret(), event_text)
+        self.assertNotIn(fake_telegram_secret(), event_text)
+        self.assertIn("decode_failed", event_text)
+
     def test_tool_diagnostics_static_future_tools_are_not_failures(self) -> None:
         rows = build_capability_rows({"status": "ok", "adapter_count": 0, "error_count": 0, "adapters": []})
         by_name = {row.name: row for row in rows}
@@ -855,6 +1060,7 @@ class ToolRuntimeTests(unittest.TestCase):
 
         self.assertEqual("not_implemented", by_name["media_transcript"].status)
         self.assertEqual("disabled", by_name["stt_local"].status)
+        self.assertEqual("not_implemented", by_name["media_frames"].status)
         self.assertIn("Overall: ok", text)
         self.assertIn("media_transcript", text)
 
