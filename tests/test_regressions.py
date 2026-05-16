@@ -953,6 +953,25 @@ class ToolRuntimeTests(unittest.TestCase):
         self.assertNotIn(fake_openai_secret(), result_text)
         self.assertNotIn("abcdefghijklmnopqrstuvwxyz", result_text)
 
+    def test_ffmpeg_media_frame_adapter_rejects_underreported_actual_size(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source = Path(temp_dir) / "video.mp4"
+            source.write_bytes(b"x" * 32)
+            adapter = FfmpegMediaFrameAdapter(limits=MediaFrameLimits(max_bytes=10))
+
+            result = asyncio.run(
+                adapter.extract_frames(
+                    MediaFrameRequest(
+                        source_path=source,
+                        declared_size_bytes=1,
+                    )
+                )
+            )
+
+        self.assertFalse(result.ok)
+        self.assertEqual("input_too_large", result.failure_category)
+        self.assertEqual("not_needed", result.cleanup_status)
+
     def test_ffmpeg_media_frame_adapter_cleans_after_decode_failure(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             source = Path(temp_dir) / "video.mp4"
@@ -1019,6 +1038,25 @@ class ToolRuntimeTests(unittest.TestCase):
         self.assertEqual("cleaned", result.cleanup_status)
         self.assertEqual("timeout", adapter.health_summary()["last_failure_category"])
 
+    def test_ffmpeg_media_frame_adapter_unexpected_error_omits_raw_exception_text(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source = Path(temp_dir) / "video.mp4"
+            source.write_bytes(b"fake-video")
+
+            def fake_runner(command, timeout_seconds):
+                raise ValueError(f"C:\\Users\\private\\media.mp4 OPENAI_API_KEY={fake_openai_secret()}")
+
+            adapter = FfmpegMediaFrameAdapter(command_runner=fake_runner)
+            result = asyncio.run(adapter.extract_frames(MediaFrameRequest(source_path=source)))
+
+        result_text = json.dumps(result.public_dict(), ensure_ascii=False)
+        self.assertFalse(result.ok)
+        self.assertEqual("unexpected_error", result.failure_category)
+        self.assertIn("valueerror", result_text)
+        self.assertNotIn("C:\\Users", result_text)
+        self.assertNotIn(fake_openai_secret(), result_text)
+        self.assertNotIn("abcdefghijklmnopqrstuvwxyz", result_text)
+
     def test_media_frame_runtime_safe_call_sanitizes_unexpected_adapter_failure(self) -> None:
         events = []
 
@@ -1052,6 +1090,33 @@ class ToolRuntimeTests(unittest.TestCase):
         self.assertNotIn(fake_openai_secret(), event_text)
         self.assertNotIn(fake_telegram_secret(), event_text)
         self.assertIn("decode_failed", event_text)
+
+    def test_tool_diagnostics_render_media_frame_health_details(self) -> None:
+        rows = build_capability_rows(
+            {
+                "status": "ok",
+                "adapter_count": 1,
+                "error_count": 0,
+                "adapters": [
+                    {
+                        "name": "media_frames",
+                        "family": "media",
+                        "enabled": True,
+                        "configured": True,
+                        "available": True,
+                        "status": "ok",
+                        "adapter": "FfmpegMediaFrameAdapter",
+                        "backend": "ffmpeg_interval",
+                        "ffprobe_available": True,
+                        "max_candidate_frames": 24,
+                    }
+                ],
+            }
+        )
+        text = render_capability_matrix(rows, query="media_frames")
+
+        self.assertIn("ffprobe_available=true", text)
+        self.assertIn("max_candidate_frames=24", text)
 
     def test_tool_diagnostics_static_future_tools_are_not_failures(self) -> None:
         rows = build_capability_rows({"status": "ok", "adapter_count": 0, "error_count": 0, "adapters": []})

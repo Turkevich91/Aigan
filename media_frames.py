@@ -264,7 +264,9 @@ class FfmpegMediaFrameAdapter:
         try:
             if not source_path.is_file():
                 return self._failure(request, "input_missing", backend="ffmpeg_interval", cleanup_status="not_needed")
-            size_bytes = request.declared_size_bytes if request.declared_size_bytes is not None else source_path.stat().st_size
+            actual_size_bytes = source_path.stat().st_size
+            declared_size_bytes = max(0, int(request.declared_size_bytes or 0))
+            size_bytes = max(actual_size_bytes, declared_size_bytes)
             if size_bytes > limits.max_bytes:
                 return self._failure(
                     request,
@@ -349,7 +351,7 @@ class FfmpegMediaFrameAdapter:
                 "unexpected_error",
                 backend="ffmpeg_interval",
                 cleanup_status="pending" if temp_dir is not None else "not_needed",
-                diagnostics={"error": f"{type(exc).__name__}: {exc}"},
+                diagnostics={"error_type": safe_code_label(type(exc).__name__, default="error")},
             )
             result._temp_dir = temp_dir
             await result.cleanup()
