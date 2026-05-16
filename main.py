@@ -33,6 +33,7 @@ from github_reporting import GitHubReporter
 from self_analysis import SelfAnalysisService
 from social_memory import SocialMemoryStore, SocialObservation
 from system_log import SystemLogStore, sanitize_text
+from tool_diagnostics import CapabilityRow, build_capability_rows, render_capability_matrix, render_recent_failures
 from tool_runtime import ToolRuntime
 
 try:
@@ -821,6 +822,8 @@ LOCALIZED_COMMAND_ALIASES = {
     "статистика": "stats",
     "самопочуття": "health",
     "здоровя": "health",
+    "тулзи": "tools",
+    "стан_тулзів": "tool_health",
     "логи": "logs",
     "самоаналіз": "selfcheck",
     "скарги": "complaints",
@@ -3483,6 +3486,147 @@ def tool_runtime_health_text() -> str:
     return "\n".join(lines)
 
 
+def memory_capability_rows() -> list[CapabilityRow]:
+    rows = [
+        CapabilityRow(
+            name="memory_store",
+            family="memory",
+            enabled=MEMORY is not None,
+            configured=CONFIG.memory_enabled,
+            available=MEMORY is not None,
+            status="ok" if MEMORY is not None else "disabled",
+            adapter="MemoryStore" if MEMORY is not None else "null",
+            mode="sqlite" if MEMORY is not None else "",
+        )
+    ]
+    if MEMORY is None or not CONFIG.memory_vector_enabled:
+        rows.append(
+            CapabilityRow(
+                name="memory_embeddings",
+                family="memory",
+                enabled=False,
+                configured=CONFIG.memory_vector_enabled,
+                available=False,
+                status="disabled",
+                adapter="semantic_memory",
+                mode="embeddings",
+            )
+        )
+        return rows
+    try:
+        backlog = MEMORY.embedding_backlog_count(
+            model=CONFIG.memory_embedding_model,
+            dimensions=CONFIG.memory_embedding_dimensions,
+            lookback_days=CONFIG.memory_semantic_lookback_days,
+        )
+    except Exception:
+        rows.append(
+            CapabilityRow(
+                name="memory_embeddings",
+                family="memory",
+                enabled=True,
+                configured=True,
+                available=False,
+                status="degraded",
+                adapter="semantic_memory",
+                mode="embeddings",
+                error_count=1,
+                next_action="inspect /logs",
+            )
+        )
+    else:
+        rows.append(
+            CapabilityRow(
+                name="memory_embeddings",
+                family="memory",
+                enabled=True,
+                configured=True,
+                available=True,
+                status="ok",
+                adapter="semantic_memory",
+                mode="embeddings",
+                details={"backlog": backlog, "dimensions": CONFIG.memory_embedding_dimensions},
+            )
+        )
+    return rows
+
+
+def configured_capability_rows() -> list[CapabilityRow]:
+    rows = memory_capability_rows()
+    rows.append(
+        CapabilityRow(
+            name="system_log",
+            family="core",
+            enabled=SYSTEM_LOG is not None,
+            configured=CONFIG.system_log_enabled,
+            available=SYSTEM_LOG is not None,
+            status="ok" if SYSTEM_LOG is not None else "disabled",
+            adapter="SystemLogStore" if SYSTEM_LOG is not None else "null",
+        )
+    )
+    rows.append(
+        CapabilityRow(
+            name="web_image_search",
+            family="web",
+            enabled=CONFIG.web_image_search_enabled,
+            configured=CONFIG.web_image_search_enabled,
+            available=CONFIG.web_image_search_enabled,
+            status="ok" if CONFIG.web_image_search_enabled else "disabled",
+            adapter="mcp_web",
+        )
+    )
+    rows.append(
+        CapabilityRow(
+            name="image_understanding",
+            family="vision",
+            enabled=CONFIG.image_analysis_enabled,
+            configured=CONFIG.image_analysis_enabled,
+            available=CONFIG.image_analysis_enabled,
+            status="ok" if CONFIG.image_analysis_enabled else "disabled",
+            adapter="vision",
+            backend=CONFIG.vision_model,
+            details={"max_bytes": CONFIG.image_max_bytes},
+        )
+    )
+    rows.append(
+        CapabilityRow(
+            name="github_reporting",
+            family="reporting",
+            enabled=CONFIG.github_reporting_enabled,
+            configured=CONFIG.github_reporting_enabled,
+            available=CONFIG.github_reporting_enabled,
+            status="ok" if CONFIG.github_reporting_enabled else "disabled",
+            adapter="GitHubReporter",
+        )
+    )
+    return rows
+
+
+def recent_tool_events() -> list[Any]:
+    if SYSTEM_LOG is None:
+        return []
+    try:
+        return SYSTEM_LOG.events_since(CONFIG.health_report_lookback_seconds, "warning", 200)
+    except Exception:
+        return []
+
+
+def tool_capability_rows() -> list[CapabilityRow]:
+    return build_capability_rows(
+        TOOL_RUNTIME.health_summary(),
+        events=recent_tool_events(),
+        extra_rows=configured_capability_rows(),
+    )
+
+
+def tool_capability_diagnostics_text(args: str = "") -> str:
+    query = (args or "").strip()
+    rows = tool_capability_rows()
+    if query.casefold() == "failures":
+        return render_recent_failures(rows)
+    return render_capability_matrix(rows, query=query)
+
+
 def clean_web_prefetch_query(text: str) -> str:
     text = re.sub(r"@\w+", " ", text)
     text = text.replace(DEFAULT_CONTEXT_PROMPT, " ")
@@ -4774,7 +4918,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if not allow_command(message, "help"):
         return
     await message.reply_text(
-        f"У групі клич мене так: {CONFIG.bot_trigger} питання, /ai, /питай, /п, /а, згадка або reply. Сервісні: /ids (/айді), /context (/контекст), /version (/версія), /stat (/стат), /character (/характер), /interests (/інтереси), /health (/самопочуття), /logs (/логи), /selfcheck (/самоаналіз), /complaints (/скарги), /memory_search (/память, /памʼять, /пошук_памяті), /proactive_now (/проактив)."
+        f"У групі клич мене так: {CONFIG.bot_trigger} питання, /ai, /питай, /п, /а, згадка або reply. Сервісні: /ids (/айді), /context (/контекст), /version (/версія), /stat (/стат), /character (/характер), /interests (/інтереси), /health (/самопочуття), /tools (/тулзи), /tool_health (/стан_тулзів), /logs (/логи), /selfcheck (/самоаналіз), /complaints (/скарги), /memory_search (/память, /памʼять, /пошук_памяті), /proactive_now (/проактив)."
     )
 
 
@@ -5113,6 +5257,27 @@ async def health_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     )
 
 
+async def handle_tools_command(message: Message, args: str | None = None, command_name: str = "tools") -> None:
+    if not allow_admin_command(message, command_name):
+        await deny_admin_command(message, command_name)
+        return
+    await send_reply(message, tool_capability_diagnostics_text(args or ""))
+
+
+async def tools_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    if message is None:
+        return
+    await handle_tools_command(message, command_args_from_text(message.text))
+
+
+async def tool_health_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    if message is None:
+        return
+    await handle_tools_command(message, command_args_from_text(message.text), "tool_health")
+
+
 async def handle_logs_command(message: Message, args: str | None = None) -> None:
     if not allow_admin_command(message, "logs"):
         await deny_admin_command(message, "logs")
@@ -5205,6 +5370,10 @@ async def localized_command_alias(update: Update, context: ContextTypes.DEFAULT_
         await handle_stats_command(message, args)
     elif command == "health":
         await health_command(update, context)
+    elif command == "tools":
+        await handle_tools_command(message, args)
+    elif command == "tool_health":
+        await handle_tools_command(message, args, "tool_health")
     elif command == "logs":
         await handle_logs_command(message, args)
     elif command == "selfcheck":
@@ -6415,6 +6584,8 @@ def main() -> None:
     application.add_handler(CommandHandler(["character", "profile"], character_command))
     application.add_handler(CommandHandler(["stat", "stats"], stats_command))
     application.add_handler(CommandHandler(["health"], health_command))
+    application.add_handler(CommandHandler(["tools"], tools_command))
+    application.add_handler(CommandHandler(["tool_health"], tool_health_command))
     application.add_handler(CommandHandler(["logs"], logs_command))
     application.add_handler(CommandHandler(["selfcheck"], selfcheck_command))
     application.add_handler(CommandHandler(["complaints"], complaints_command))

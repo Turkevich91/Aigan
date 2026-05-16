@@ -112,6 +112,7 @@ from scripts import import_telegram_export
 from scripts.import_telegram_export import ImportOptions
 from self_analysis import SelfAnalysisService, classify_complaint
 from system_log import SystemLogStore, redact_secrets
+from tool_diagnostics import build_capability_rows, render_capability_matrix, render_recent_failures
 from tool_runtime import NullToolAdapter, ToolRuntime
 
 VALID_JPEG = b"\xff\xd8\xff\xe0" + b"valid-jpeg"
@@ -839,6 +840,108 @@ class ToolRuntimeTests(unittest.TestCase):
 
         self.assertTrue(any(item["name"] == "outbound_reactions" for item in health["adapters"]))
         self.assertIn("outbound_reactions", main.tool_runtime_health_text())
+
+    def test_tool_diagnostics_static_future_tools_are_not_failures(self) -> None:
+        rows = build_capability_rows({"status": "ok", "adapter_count": 0, "error_count": 0, "adapters": []})
+        by_name = {row.name: row for row in rows}
+        text = render_capability_matrix(rows)
+
+        self.assertEqual("not_implemented", by_name["media_transcript"].status)
+        self.assertEqual("disabled", by_name["stt_local"].status)
+        self.assertIn("Overall: ok", text)
+        self.assertIn("media_transcript", text)
+
+    def test_tool_diagnostics_ignores_unsafe_adapter_fields(self) -> None:
+        runtime_summary = {
+            "status": "ok",
+            "adapter_count": 1,
+            "error_count": 0,
+            "adapters": [
+                {
+                    "name": "unsafe_adapter",
+                    "enabled": True,
+                    "status": "ok",
+                    "adapter": "unsafe",
+                    "error_count": 0,
+                    "source_url": f"https://example.test/?token={fake_openai_secret()}",
+                    "prompt": f"raw {fake_openai_secret()}",
+                    "local_path": "C:\\Users\\private\\media.mp4",
+                }
+            ],
+        }
+
+        text = render_capability_matrix(build_capability_rows(runtime_summary))
+
+        self.assertIn("unsafe_adapter", text)
+        self.assertNotIn(fake_openai_secret(), text)
+        self.assertNotIn("C:\\Users", text)
+        self.assertNotIn("source_url", text)
+        self.assertNotIn("prompt", text)
+
+    def test_tool_diagnostics_aggregates_sanitized_tool_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = SystemLogStore(Path(tmpdir) / "events.sqlite3", retention_days=14)
+            store.record_event(
+                level="warning",
+                component="tool_runtime",
+                event_type="tool_operation_failed",
+                message=f"download failed {fake_openai_secret()}",
+                details={
+                    "tool": "media_transcript",
+                    "failure_category": "download_failed",
+                    "token": fake_telegram_secret(),
+                },
+            )
+
+            rows = build_capability_rows(
+                {"status": "ok", "adapter_count": 0, "error_count": 0, "adapters": []},
+                events=store.events_since(21600, "warning", 20),
+            )
+            text = render_recent_failures(rows)
+
+            self.assertIn("media_transcript", text)
+            self.assertIn("download_failed", text)
+            self.assertNotIn(fake_openai_secret(), text)
+            self.assertNotIn(fake_telegram_secret(), text)
+            store.close()
+
+    def test_tools_command_is_admin_only(self) -> None:
+        admin_message = FakeMessage("/tools")
+        non_admin_message = FakeMessage("/tools")
+        non_admin_message.from_user = FakeUser(user_id=123, username="guest")
+
+        asyncio.run(main.tools_command(SimpleNamespace(effective_message=admin_message), SimpleNamespace()))
+        asyncio.run(main.tools_command(SimpleNamespace(effective_message=non_admin_message), SimpleNamespace()))
+
+        self.assertIn("Tool capabilities", admin_message.reply_calls[0]["text"])
+        self.assertTrue(non_admin_message.reply_calls)
+        self.assertNotIn("Tool capabilities", non_admin_message.reply_calls[0]["text"])
+
+    def test_tool_health_failures_renders_recent_sanitized_failure(self) -> None:
+        main.SYSTEM_LOG.record_event(
+            level="warning",
+            component="tool_runtime",
+            event_type="tool_operation_failed",
+            message=f"OPENAI_API_KEY={fake_openai_secret()}",
+            details={"tool": "outbound_reactions", "failure_category": "timeout"},
+        )
+        message = FakeMessage("/tool_health failures")
+
+        asyncio.run(main.tool_health_command(SimpleNamespace(effective_message=message), SimpleNamespace()))
+
+        reply = message.reply_calls[0]["text"]
+        self.assertIn("Recent tool failures", reply)
+        self.assertIn("outbound_reactions", reply)
+        self.assertIn("timeout", reply)
+        self.assertNotIn(fake_openai_secret(), reply)
+
+    def test_localized_tools_alias_routes_to_diagnostics(self) -> None:
+        message = FakeMessage("/тулзи")
+        context = SimpleNamespace(bot=SimpleNamespace(username="thrd_ua_bot"))
+
+        asyncio.run(main.localized_command_alias(SimpleNamespace(effective_message=message), context))
+
+        self.assertIn("Tool capabilities", message.reply_calls[0]["text"])
 
 
 class PersistentMemoryTests(unittest.TestCase):
