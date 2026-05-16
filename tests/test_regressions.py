@@ -2907,7 +2907,7 @@ class PersistentMemoryTests(unittest.TestCase):
         )
         adapter = main.OutboundReactionAdapter(config=config, reaction_memory=main.REACTION_MEMORY)
         message = FakeMessage(
-            "release update with enough context and number 170",
+            "great news success release with enough context and number 170",
             message_id=971,
         )
         item_id = main.MEMORY.save_message(
@@ -2916,6 +2916,8 @@ class PersistentMemoryTests(unittest.TestCase):
             sender_label="Tester",
             user_id=111,
             text=message.text,
+            source_text="private user wording with token_like_value",
+            source_url="https://example.invalid/path?token=token_like_value",
             created_at=datetime.now(timezone.utc),
         )
 
@@ -2927,9 +2929,11 @@ class PersistentMemoryTests(unittest.TestCase):
         self.assertEqual("emoji:u1f525", record.sent_reaction_key)
         self.assertEqual("positive_celebratory", record.candidate_reaction_class)
         self.assertEqual("positive_celebratory", record.emotion_class)
-        self.assertFalse(record.has_source_text)
+        self.assertTrue(record.has_source_text)
+        self.assertTrue(record.has_source_url)
         self.assertFalse(record.has_vision_summary)
         self.assertFalse(record.has_forward_origin)
+        self.assertIn("source_context", record.severity_flags)
         self.assertIn("safe_positive", record.severity_flags)
         explanation = main.REACTION_MEMORY.explain_outbound_decision(record)
         self.assertIn("Stored outbound reaction decision", explanation)
