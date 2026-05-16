@@ -1,5 +1,11 @@
 # Aigan Changelog
 
+## 2026-05-15 - OCR and screenshot understanding plan
+
+- Added a tool research note for future OCR and screenshot understanding.
+- Documented explicit-only screenshot handling, optional local OCR, vision cache reuse, source-only memory storage, and prompt-injection fencing.
+- Captured future tests for delivered-image routing, cached OCR reuse, searchable screenshot text, provider failures, cleanup, and `/stat`/`/character` isolation.
+
 ## 2026-05-15 - Document and PDF ingest plan
 
 - Added a tool research note for future document/PDF ingest.
