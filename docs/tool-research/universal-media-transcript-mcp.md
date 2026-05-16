@@ -2,6 +2,11 @@
 
 Status: research/design note for issues `#18` and `#50`.
 
+The filename is historical from the original transcript-only research note.
+The canonical future adapter/tool name in this updated design is
+`media_context`, because the ladder may return captions, audio transcripts,
+visual summaries, or a structured unavailable result.
+
 ## Scope
 
 Design a future universal media understanding tool for public video/audio URLs
@@ -100,9 +105,10 @@ Recommended internal layers:
    unhelpful empty result, and visual fallback is explicitly enabled for this
    route, enforce media byte/duration caps before any full-file download.
 9. For visual fallback, acquire media through a bounded download/copy boundary,
-   pass the temp media to the registered `media_frames` adapter, extract 3-8
-   representative frames, summarize them through the existing vision path, and
-   delete temp media and frame files in `finally`.
+   pass the temp media to the registered `media_frames` adapter, extract the
+   configured default of 5 representative frames up to the hard cap of 8,
+   summarize them through the existing vision path, and delete temp media and
+   frame files in `finally`.
 10. Return a structured unavailable result if no layer can proceed.
 
 Summary ladder:
