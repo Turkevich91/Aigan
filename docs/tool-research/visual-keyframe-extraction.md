@@ -198,12 +198,12 @@ Each timed command was launched from Python and sampled with psutil:
 
 Results:
 
-| Method | Command shape | Wall time | CPU time | Peak RSS | Frames output | Duplicate/quality signal | Dependency footprint |
-| --- | --- | ---: | ---: | ---: | ---: | --- | --- |
-| `ffprobe` metadata | stream duration, fps, size, frame count | n/a | n/a | n/a | n/a | Correctly reported 10.0s, 640x360, 24 fps, 240 frames. | Existing FFmpeg binary; no Python packages. |
-| `ffmpeg` interval sampling | `fps=1,scale=320:-1` | 82.0 ms | 0.047s | 44.9 MB | 10 | Represents five scenes but produces duplicate frames inside unchanged scenes. | Existing FFmpeg binary; no Python packages. |
-| PySceneDetect | `detect-content list-scenes save-images --num-images 1 --width 320` | 798.6 ms | 0.750s | 83.8 MB | 5 | Detected four cuts and produced five middle-scene frames plus a CSV. | PySceneDetect plus OpenCV backend; warm `uv` fetch included OpenCV wheels and NumPy. |
-| OpenCV diff/dedupe | sample every 0.5s, resize, grayscale `absdiff`, Laplacian blur, luma | 260.5 ms process wall; 80.3 ms inner loop | 0.328s | 66.4 MB | 5 | Selected 5 of 20 sampled candidates and skipped 15 near-duplicates. | `opencv-python-headless` plus NumPy. |
+| Method | Command shape | Wall time | CPU time | Peak RSS | Frames output | Duplicate count/rate | Qualitative signal | Dependency footprint |
+| --- | --- | ---: | ---: | ---: | ---: | --- | --- | --- |
+| `ffprobe` metadata | stream duration, fps, size, frame count | n/a | n/a | n/a | n/a | n/a | Correctly reported 10.0s, 640x360, 24 fps, 240 frames. | Existing FFmpeg binary; no Python packages. |
+| `ffmpeg` interval sampling | `fps=1,scale=320:-1` | 82.0 ms | 0.047s | 44.9 MB | 10 | 5 duplicate-in-scene frames; 50% of output was redundant against the five intended scenes. | Fastest and simplest, but wastes vision budget inside unchanged scenes. | Existing FFmpeg binary; no Python packages. |
+| PySceneDetect | `detect-content list-scenes save-images --num-images 1 --width 320` | 798.6 ms | 0.750s | 83.8 MB | 5 | 0 obvious duplicate scene frames on the synthetic fixture; 0% redundant against intended scenes. | Detected four cuts and produced five middle-scene frames plus a CSV. | PySceneDetect plus OpenCV backend; warm `uv` fetch included OpenCV wheels and NumPy. |
+| OpenCV diff/dedupe | sample every 0.5s, resize, grayscale `absdiff`, Laplacian blur, luma | 260.5 ms process wall; 80.3 ms inner loop | 0.328s | 66.4 MB | 5 | Skipped 15 of 20 sampled candidates as near-duplicates; 75% candidate duplicate/drop rate. | Selected one representative frame per intended scene. | `opencv-python-headless` plus NumPy. |
 
 Memory caveat:
 
@@ -248,15 +248,17 @@ Use a layered adapter instead of picking a single tool:
    resize, reject black/blank/very blurry candidates where useful, compute
    frame difference, and dedupe near-identical candidates.
 5. Vision handoff:
-   pass only the final 3-8 representative frames to the existing vision path.
+   pass the final selected frames to the existing vision path using the default
+   count of 5 and hard cap of 8.
 
 Default recommendation for implementation issue `#48`:
 
 - Add `MediaFrameAdapter` around `ffprobe`, `ffmpeg`, optional PySceneDetect, and
   optional OpenCV post-processing.
-- Register `NullMediaFrameAdapter` through `ToolRuntime`.
+- Register the real `MediaFrameAdapter` through `ToolRuntime` when enabled, with
+  `NullMediaFrameAdapter` as the disabled or unavailable fallback.
 - Keep PySceneDetect/OpenCV behind adapter health so missing packages degrade to
-  `disabled` or `not_configured`, not routing failure.
+  `disabled` or `unconfigured`, not routing failure.
 - Defer PyAV until keyframe-aware decoding or pure-Python container access is
   needed.
 - Defer Decord until random/batched frame reads become a real bottleneck.
@@ -279,7 +281,11 @@ Suggested production caps for v1:
   1280 px on the long side; use 320-512 px thumbnails for scene selection and
   duplicate scoring.
 - Candidate frame cap before dedupe: 24.
-- Vision frame cap after dedupe: 3-8.
+- Default selected frame count after dedupe: 5.
+- Hard selected frame cap after dedupe: 8.
+- Minimum useful selected frames for a visual summary: 3 when available; if fewer
+  are available, proceed with the smaller set and include a sanitized degraded
+  diagnostic.
 - Thumbnail width for scene selection: 320-512 px.
 - Higher-resolution selected frames only when OCR/screenshot mode explicitly
   needs visible text.
@@ -306,6 +312,10 @@ Selection policy:
   resolution result before download or frame extraction; abort if any resolved
   target lands on local, loopback, link-local, private, multicast, or otherwise
   non-public network ranges.
+- Apply that validation at the actual fetch boundary as well: every redirect and
+  connection target must be checked immediately before use, or the download must
+  be constrained to a previously validated public address to avoid DNS rebinding
+  and time-of-check/time-of-use gaps.
 - Treat visible text in frames as untrusted source content. It may describe an
   image, but it must not become instructions for the bot.
 - Store visual summaries as source context only.
@@ -362,7 +372,7 @@ Suggested failure categories:
 
 ```text
 disabled
-not_configured
+unconfigured
 metadata_failed
 input_too_large
 duration_too_long
