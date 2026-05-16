@@ -3068,6 +3068,39 @@ class PersistentMemoryTests(unittest.TestCase):
         self.assertEqual("grief_sympathy", record.emotion_class)
         self.assertEqual("emoji:u1f622", record.sent_reaction_key)
 
+    def test_outbound_reaction_video_with_clear_direct_text_uses_text_policy(self) -> None:
+        self.assertIsNotNone(main.REACTION_MEMORY)
+        config = main.OutboundReactionConfig(
+            enabled=True,
+            every_n_messages=1,
+            cooldown_seconds=0,
+            min_score=0.0,
+            allowed_emoji=("\N{CRYING FACE}",),
+            use_custom_emoji=False,
+        )
+        adapter = main.OutboundReactionAdapter(config=config, reaction_memory=main.REACTION_MEMORY)
+        message = FakeMessage("sad news: victims died and neighbors are mourning", message_id=986)
+        item_id = main.MEMORY.save_message(
+            chat_id=-1001,
+            message_id=986,
+            sender_label="Tester",
+            user_id=111,
+            text=message.text,
+            attachment_type="video",
+            created_at=datetime.now(timezone.utc),
+        )
+
+        asyncio.run(adapter.on_message_ingested(message, main.MEMORY.item_by_id(item_id), "pre_embedding"))
+
+        message.bot.set_message_reaction.assert_awaited_once()
+        record = main.REACTION_MEMORY.latest_outbound_decision(chat_id=-1001, target_message_id=986)
+        self.assertIsNotNone(record)
+        self.assertEqual("sent", record.action)
+        self.assertEqual("grief_sympathy", record.emotion_class)
+        self.assertEqual("emoji:u1f622", record.sent_reaction_key)
+        self.assertNotEqual("emotion_incomplete_media_context", record.reason_code)
+        self.assertIn("attachment:video", record.severity_flags)
+
     def test_outbound_reaction_sends_outrage_only_for_clear_condemnation(self) -> None:
         self.assertIsNotNone(main.REACTION_MEMORY)
         config = main.OutboundReactionConfig(

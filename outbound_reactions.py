@@ -700,15 +700,6 @@ class OutboundReactionAdapter:
         )
         if not has_own_text and has_source_context:
             flags.append("source_only")
-        if item.attachment_type in {"video", "animation"} and not item.vision_summary and not item.source_text:
-            return EmotionPolicyDecision(
-                emotion_class="ambiguous_sensitive",
-                confidence=0.25,
-                allow_reaction=False,
-                reason_code="emotion_incomplete_media_context",
-                rationale="Skipped because media context was incomplete and the reaction could be misread.",
-                severity_flags=tuple(flags + ["incomplete_media_context"]),
-            )
         if self._has_any(combined_content, SARCASM_MEME_TERMS, combined_tokens):
             return EmotionPolicyDecision(
                 emotion_class="ambiguous_sensitive",
@@ -724,6 +715,16 @@ class OutboundReactionAdapter:
         own_condemnation = self._hit_count(own_content, CONDEMNATION_TERMS, own_tokens)
         own_ambiguous = self._hit_count(own_content, AMBIGUOUS_TERMS, own_tokens)
         own_positive = self._hit_count(own_content, POSITIVE_TERMS, own_tokens)
+        own_policy_signal = own_grief + own_horror + own_condemnation + own_ambiguous + own_positive
+        if item.attachment_type in {"video", "animation"} and not item.vision_summary and not item.source_text and not own_policy_signal:
+            return EmotionPolicyDecision(
+                emotion_class="ambiguous_sensitive",
+                confidence=0.25,
+                allow_reaction=False,
+                reason_code="emotion_incomplete_media_context",
+                rationale="Skipped because media context was incomplete and the reaction could be misread.",
+                severity_flags=tuple(flags + ["incomplete_media_context"]),
+            )
         source_grief = self._hit_count(source_content, GRIEF_TERMS, source_tokens)
         source_horror = self._hit_count(source_content, HORROR_TERMS, source_tokens)
         source_condemnation = self._hit_count(source_content, CONDEMNATION_TERMS, source_tokens)
