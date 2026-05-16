@@ -192,25 +192,33 @@ Measurement wrapper:
 ```text
 $measureProcess = @'
 import json
+import os
 import psutil
 import subprocess
 import sys
+import tempfile
 import time
 
 cmd = sys.argv[1:]
 if cmd and cmd[0] == "--":
     cmd = cmd[1:]
+timeout_s = float(os.getenv("AIGAN_BENCH_TIMEOUT_S", "300"))
 started = time.perf_counter()
-proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-root = psutil.Process(proc.pid)
 peak_rss = 0
 cpu_time = 0.0
-while proc.poll() is None:
-    processes = [root]
+timed_out = False
+
+def read_preview(path, limit=400):
+    with open(path, "rb") as handle:
+        return handle.read(limit).decode("utf-8", errors="replace")
+
+def sample_tree(root):
+    global peak_rss, cpu_time
     try:
+        processes = [root]
         processes.extend(root.children(recursive=True))
     except psutil.Error:
-        pass
+        processes = []
     rss = 0
     cpu = 0.0
     for process in processes:
@@ -223,15 +231,49 @@ while proc.poll() is None:
         cpu += float(times.user + times.system)
     peak_rss = max(peak_rss, rss)
     cpu_time = max(cpu_time, cpu)
-    time.sleep(0.01)
-stdout, stderr = proc.communicate()
+
+with tempfile.NamedTemporaryFile(delete=False) as stdout_file, tempfile.NamedTemporaryFile(delete=False) as stderr_file:
+    stdout_path = stdout_file.name
+    stderr_path = stderr_file.name
+    proc = subprocess.Popen(cmd, stdout=stdout_file, stderr=stderr_file)
+
+try:
+    root = psutil.Process(proc.pid)
+    while True:
+        sample_tree(root)
+        if proc.poll() is not None:
+            break
+        if time.perf_counter() - started > timeout_s:
+            timed_out = True
+            try:
+                for child in root.children(recursive=True):
+                    child.kill()
+                root.kill()
+            except psutil.Error:
+                proc.kill()
+            break
+        time.sleep(0.01)
+    # Take one last process-tree sample before wait() releases short-lived process
+    # accounting, which keeps fast commands from losing their final CPU total.
+    sample_tree(root)
+    exit_code = proc.wait()
+    stdout_preview = read_preview(stdout_path)
+    stderr_preview = read_preview(stderr_path)
+finally:
+    try:
+        os.remove(stdout_path)
+        os.remove(stderr_path)
+    except OSError:
+        pass
+
 print(json.dumps({
-    "exit_code": proc.returncode,
+    "exit_code": exit_code,
+    "timed_out": timed_out,
     "wall_ms": round((time.perf_counter() - started) * 1000, 1),
     "cpu_time_s": round(cpu_time, 3),
     "peak_rss_mb": round(peak_rss / 1024 / 1024, 1),
-    "stdout_preview": stdout[:400],
-    "stderr_preview": stderr[:400],
+    "stdout_preview": stdout_preview,
+    "stderr_preview": stderr_preview,
 }, sort_keys=True))
 '@
 
