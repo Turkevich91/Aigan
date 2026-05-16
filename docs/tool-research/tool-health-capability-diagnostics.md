@@ -123,6 +123,7 @@ Use a small stable vocabulary:
 - `unconfigured`: needs credentials, model, dependency, or endpoint before it can run.
 - `degraded`: works but has recent warnings/failures or partial backend availability.
 - `failing`: enabled but recent attempts are failing consistently.
+- `error`: direct `ToolRuntime` adapter health failure, such as `health_summary()` raising; render as an urgent failing row unless a later mapper safely normalizes it.
 - `unavailable`: dependency, provider, local binary, or network is unavailable.
 - `warming`: startup, cache build, model load, or backfill is in progress.
 - `unknown`: health could not be computed safely.
