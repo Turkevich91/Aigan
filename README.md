@@ -266,7 +266,7 @@ Each tool family should provide a small adapter with:
 
 Tool failures must not block message persistence, embeddings, memory recall, `/stat`, `/character`, Telegram routing, or normal replies. Tool outputs that are later saved to memory must be stored as source context, not as user-authored text.
 
-The media frame extraction adapter is registered as `media_frames` and is disabled by default. When `MEDIA_FRAME_EXTRACTION_ENABLED=true`, it provides a bounded ffprobe/ffmpeg frame extraction boundary for future explicit visual-media routes; it does not by itself enable TikTok/Instagram support, passive group handling, or visual summary memory writes.
+The media frame extraction adapter is registered as `media_frames` and is disabled by default. When `MEDIA_FRAME_EXTRACTION_ENABLED=true`, explicit Telegram video/animation/video-document routes can use bounded ffprobe/ffmpeg frame extraction for visual summaries. These summaries are saved only as source-context vision summaries, not user-authored text, and do not enable TikTok/Instagram support or passive group handling.
 
 Future tool research notes:
 

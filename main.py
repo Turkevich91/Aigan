@@ -1,12 +1,14 @@
 import asyncio
 import base64
 import html
+import inspect
 import io
 import logging
 import os
 import random
 import re
 import sys
+import tempfile
 import time
 from collections import Counter, defaultdict, deque
 from dataclasses import dataclass
@@ -27,7 +29,7 @@ from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandl
 
 from mcp_servers.web import fetch_binary_url, search_image_candidates, search_web
 from memory import EmbeddingCandidate, MemoryItem, MemoryStore, SemanticMemoryResult
-from media_frames import FfmpegMediaFrameAdapter, MediaFrameAdapter, MediaFrameLimits, NullMediaFrameAdapter
+from media_frames import FfmpegMediaFrameAdapter, MediaFrameAdapter, MediaFrameLimits, MediaFrameRequest, MediaFrameResult, NullMediaFrameAdapter
 from outbound_reactions import NullReactionAdapter, OutboundReactionAdapter, OutboundReactionConfig, ReactionAdapter
 from reaction_memory import ReactionAsset, ReactionMemoryStore, ReactionPreference, ReactionSpec
 from github_reporting import GitHubReporter
@@ -36,6 +38,7 @@ from social_memory import SocialMemoryStore, SocialObservation
 from system_log import SystemEvent, SystemLogStore, sanitize_text
 from tool_diagnostics import CapabilityRow, build_capability_rows, render_capability_matrix, render_recent_failures
 from tool_runtime import ToolRuntime
+from visual_media_summary import VISUAL_MEDIA_UNAVAILABLE_MESSAGE, VisualMediaSummaryResult, summarize_visual_media_frames
 
 try:
     from openai.types.shared import Reasoning
@@ -1258,6 +1261,46 @@ def has_supported_image(message: Message) -> bool:
     return image_file_ref_from(message) is not None
 
 
+def visual_media_file_ref_from(value: Any) -> tuple[Any, str, str] | None:
+    video = getattr(value, "video", None)
+    if video is not None:
+        return video, getattr(video, "mime_type", "") or "video/mp4", "video"
+
+    animation = getattr(value, "animation", None)
+    if animation is not None:
+        return animation, getattr(animation, "mime_type", "") or "video/mp4", "animation"
+
+    video_note = getattr(value, "video_note", None)
+    if video_note is not None:
+        return video_note, "video/mp4", "video_note"
+
+    document = getattr(value, "document", None)
+    mime_type = getattr(document, "mime_type", "") if document is not None else ""
+    if document is not None and mime_type.startswith("video/"):
+        return document, mime_type or "video/mp4", "document"
+
+    return None
+
+
+def visual_media_source_from_context(message: Message) -> tuple[Any, Any, str, str] | None:
+    for source in (
+        message,
+        getattr(message, "reply_to_message", None),
+        getattr(message, "external_reply", None),
+    ):
+        if source is None:
+            continue
+        ref = visual_media_file_ref_from(source)
+        if ref is not None:
+            file_ref, mime_type, attachment_type = ref
+            return source, file_ref, mime_type, attachment_type
+    return None
+
+
+def has_supported_visual_media(message: Message) -> bool:
+    return visual_media_source_from_context(message) is not None
+
+
 def image_suffix_for_mime(mime_type: str) -> str:
     mapping = {
         "image/jpeg": ".jpg",
@@ -1267,6 +1310,16 @@ def image_suffix_for_mime(mime_type: str) -> str:
         "image/gif": ".gif",
     }
     return mapping.get((mime_type or "").split(";")[0].lower(), ".img")
+
+
+def video_suffix_for_mime(mime_type: str) -> str:
+    mapping = {
+        "video/mp4": ".mp4",
+        "video/quicktime": ".mov",
+        "video/webm": ".webm",
+        "video/x-matroska": ".mkv",
+    }
+    return mapping.get((mime_type or "").split(";")[0].lower(), ".mp4")
 
 
 def reaction_asset_filename(reaction_key: str, suffix: str) -> str:
@@ -1829,7 +1882,7 @@ def is_forwarded_message(message: Message) -> bool:
 
 
 def has_current_context_payload(message: Message) -> bool:
-    return is_forwarded_message(message) or has_supported_image(message)
+    return is_forwarded_message(message) or has_supported_image(message) or has_supported_visual_media(message)
 
 
 def referenced_context_available(message: Message) -> bool:
@@ -2173,6 +2226,31 @@ def is_context_dependent_request(prompt: str) -> bool:
         "вот это",
     )
     return any(keyword in lowered for keyword in keywords)
+
+
+def is_visual_media_request(prompt: str) -> bool:
+    lowered = prompt.lower()
+    keywords = (
+        "video",
+        "clip",
+        "short",
+        "shorts",
+        "frame",
+        "frames",
+        "scene",
+        "scenes",
+        "visible",
+        "watch",
+        "відео",
+        "видео",
+        "ролик",
+        "кліп",
+        "клип",
+        "кадр",
+        "кадры",
+        "шортс",
+    )
+    return any(keyword in lowered for keyword in keywords) or is_context_dependent_request(prompt)
 
 
 def should_wait_for_followup_context(message: Message, prompt: str) -> bool:
@@ -4209,6 +4287,216 @@ Analyze the found web image or images according to the request. Reply in Ukraini
         return ""
 
 
+async def download_visual_media_source(file_ref: Any, destination: Path, *, max_bytes: int) -> int:
+    declared_size = getattr(file_ref, "file_size", None)
+    if declared_size is not None and int(declared_size) > max_bytes:
+        raise ValueError("input_too_large")
+
+    telegram_file = await file_ref.get_file()
+    download_to_drive = getattr(telegram_file, "download_to_drive", None)
+    if callable(download_to_drive):
+        result = download_to_drive(custom_path=destination)
+        if inspect.isawaitable(result):
+            await result
+    else:
+        data = bytes(await telegram_file.download_as_bytearray())
+        if len(data) > max_bytes:
+            raise ValueError("input_too_large")
+        destination.write_bytes(data)
+
+    actual_size = destination.stat().st_size
+    if actual_size > max_bytes:
+        try:
+            destination.unlink()
+        except OSError:
+            pass
+        raise ValueError("input_too_large")
+    return actual_size
+
+
+def save_visual_media_summary_memory(
+    message: Message,
+    *,
+    summary: str,
+    attachment_type: str,
+    mime_type: str,
+) -> int | None:
+    if MEMORY is None or not summary.strip():
+        return None
+
+    existing = MEMORY.message_by_message_id(message.chat_id, getattr(message, "message_id", None))
+    if existing is not None:
+        item_id = existing.id
+    else:
+        user = getattr(message, "from_user", None)
+        item_id = MEMORY.save_message(
+            chat_id=message.chat_id,
+            message_id=getattr(message, "message_id", None),
+            chat_type=str(getattr(message.chat, "type", "")),
+            created_at=message_datetime(message),
+            sender_label=sender_label(message),
+            user_id=getattr(user, "id", None),
+            username=getattr(user, "username", "") or "",
+            is_bot=False,
+            text="",
+            source_text="",
+            content_kind="attachment",
+            attachment_type=attachment_type or "video",
+            mime_type=mime_type,
+            raw_note="visual media summary",
+        )
+
+    MEMORY.update_vision_summary(item_id, summary)
+    enqueue_memory_embedding(item_id)
+    return item_id
+
+
+async def handle_visual_media_prompt(
+    message: Message,
+    prompt: str,
+    *,
+    route: str = "visual_media_summary",
+    skip_cooldown: bool = False,
+    record_user_history: bool = True,
+) -> bool:
+    source_ref = visual_media_source_from_context(message)
+    if source_ref is None:
+        return False
+    if message.chat.type != ChatType.PRIVATE and not is_visual_media_request(prompt):
+        return False
+    if not should_allow_chat(message):
+        LOGGER.warning("Ignoring visual media from non-allowed chat_id=%s", message.chat_id)
+        return True
+    if not CONFIG.image_analysis_enabled:
+        await message.reply_text("Visual media analysis is disabled in configuration.")
+        return True
+
+    left = cooldown_left(message)
+    if left > 0 and not skip_cooldown:
+        await message.reply_text(f"Wait {left}s before the next request.")
+        return True
+
+    if not skip_cooldown:
+        mark_cooldown(message)
+
+    _source, file_ref, mime_type, attachment_type = source_ref
+    await message.get_bot().send_chat_action(chat_id=message.chat_id, action=ChatAction.TYPING)
+    source_family = f"telegram_{attachment_type or 'video'}"
+    declared_size = getattr(file_ref, "file_size", None)
+    with tempfile.TemporaryDirectory(prefix="aigan-visual-media-") as temp_dir:
+        source_path = Path(temp_dir) / ("source" + video_suffix_for_mime(mime_type))
+        try:
+            actual_size = await download_visual_media_source(
+                file_ref,
+                source_path,
+                max_bytes=CONFIG.media_frame_max_bytes,
+            )
+        except Exception as exc:
+            LOGGER.info("Visual media download failed category=%s", type(exc).__name__)
+            system_event(
+                level="warning",
+                component="visual_media",
+                event_type="download_failed",
+                telegram_message=message,
+                route=route,
+                message=type(exc).__name__,
+                details={"attachment_type": attachment_type, "mime_type": mime_type},
+            )
+            await send_reply(message, VISUAL_MEDIA_UNAVAILABLE_MESSAGE)
+            return True
+
+        frame_result = await TOOL_RUNTIME.safe_call(
+            "media_frames",
+            "extract_frames",
+            lambda: runtime_media_frame_adapter().extract_frames(
+                MediaFrameRequest(
+                    source_path=source_path,
+                    source_family=source_family,
+                    provenance_label=attachment_type or "video",
+                    mime_type=mime_type,
+                    declared_size_bytes=declared_size or actual_size,
+                    selected_frame_count=CONFIG.media_frame_selected_count,
+                    max_selected_frame_count=CONFIG.media_frame_max_selected_count,
+                    timeout_seconds=CONFIG.media_frame_timeout_seconds,
+                    mode="visual_summary",
+                )
+            ),
+            default=MediaFrameResult.unavailable(
+                failure_category="unexpected_error",
+                source_family=source_family,
+                user_message=VISUAL_MEDIA_UNAVAILABLE_MESSAGE,
+            ),
+            event_context={"telegram_message": message, "route": route},
+            details={"source_family": source_family, "attachment_type": attachment_type},
+        )
+        try:
+            try:
+                memory_context = await prepare_memory_context(message, prompt)
+                summary_result = await summarize_visual_media_frames(
+                    frame_result=frame_result,
+                    user_prompt=prompt,
+                    vision_runner=run_vision,
+                    max_frames=CONFIG.media_frame_max_selected_count,
+                    max_frame_bytes=CONFIG.image_max_bytes,
+                    timeout_seconds=120,
+                    reference_context=build_reference_context(message),
+                    memory_context=memory_context,
+                )
+            except Exception as exc:
+                LOGGER.info("Visual media summary failed category=%s", type(exc).__name__)
+                summary_result = VisualMediaSummaryResult(
+                    ok=False,
+                    failure_category="unexpected_error",
+                    user_message=VISUAL_MEDIA_UNAVAILABLE_MESSAGE,
+                    source_family=source_family,
+                )
+        finally:
+            await frame_result.cleanup()
+
+    if not summary_result.ok:
+        system_event(
+            level="warning",
+            component="visual_media",
+            event_type="summary_failed",
+            telegram_message=message,
+            route=route,
+            message=summary_result.failure_category,
+            details={
+                "frame_count": summary_result.frame_count,
+                "source_family": summary_result.source_family,
+                "cleanup_status": frame_result.cleanup_status,
+            },
+        )
+        await send_reply(message, summary_result.user_message or VISUAL_MEDIA_UNAVAILABLE_MESSAGE)
+        return True
+
+    if record_user_history:
+        histories[message.chat_id].append(f"{user_label(message)}: {prompt[:500]}")
+    histories[message.chat_id].append(f"Aigan: {summary_result.summary[:500]}")
+    passive_contexts[message.chat_id].append(f"Aigan: {clip_text(summary_result.summary, 700)}")
+    save_visual_media_summary_memory(
+        message,
+        summary=summary_result.summary,
+        attachment_type=attachment_type,
+        mime_type=mime_type,
+    )
+    remember_bot_message(message.chat_id, summary_result.summary)
+    system_event(
+        component="visual_media",
+        event_type="summary_success",
+        telegram_message=message,
+        route=route,
+        message=summary_result.source_family,
+        details={
+            "frame_count": summary_result.frame_count,
+            "truncated": summary_result.truncated,
+            "cleanup_status": frame_result.cleanup_status,
+        },
+    )
+    await send_reply(message, summary_result.summary)
+    return True
+
+
 def save_sent_web_images(message: Message, images: list[WebImageResult], vision_summary: str = "") -> None:
     for image in images:
         save_external_image_memory(
@@ -5593,6 +5881,11 @@ async def handle_pending_or_observe(message: Message, context: ContextTypes.DEFA
     )
     if has_supported_image(message):
         await handle_image_prompt(message, prompt)
+    elif has_supported_visual_media(message):
+        handled = await handle_visual_media_prompt(message, prompt, route="pending_context")
+        if not handled:
+            remember_observed_message(message, label=f"{sender_label(message)} (forwarded context)")
+            await handle_prompt(message, context, prompt, allow_pending_wait=False)
     else:
         remember_observed_message(message, label=f"{sender_label(message)} (forwarded context)")
         await handle_prompt(message, context, prompt, allow_pending_wait=False)
@@ -5626,6 +5919,8 @@ async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if chat_type == ChatType.PRIVATE:
         prompt = DEFAULT_CONTEXT_PROMPT if is_forwarded_message(message) else current_text
         if not prompt and has_supported_image(message):
+            prompt = DEFAULT_CONTEXT_PROMPT
+        if not prompt and has_supported_visual_media(message):
             prompt = DEFAULT_CONTEXT_PROMPT
         if not prompt:
             return
@@ -5831,12 +6126,23 @@ async def handle_prompt_generation(
             "prompt_chars": len(prompt),
             "has_reference": build_reference_context(message) != "(none)",
             "has_image": has_supported_image(message),
+            "has_visual_media": has_supported_visual_media(message),
             "has_url": has_url(prompt),
             "allow_pending_wait": allow_pending_wait,
             "memory_recall_confidence": recall_intent.confidence if recall_intent else 0.0,
             "memory_recall_reason": recall_intent.reason if recall_intent else "",
         },
     )
+
+    if has_supported_visual_media(message) and await handle_visual_media_prompt(
+        message,
+        prompt,
+        route=route,
+        skip_cooldown=True,
+        record_user_history=False,
+    ):
+        record_chat_answer(message, prompt, route)
+        return
 
     if route == "internet_image_send" and await maybe_send_internet_image(message, prompt):
         record_chat_answer(message, prompt, route)
