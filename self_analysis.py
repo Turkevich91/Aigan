@@ -120,6 +120,20 @@ REACTION_REASON_TERMS = (
     "поясн",
     "объясн",
 )
+REACTION_REASON_CHALLENGE_TERMS = (
+    "explain that reaction",
+    "explain this reaction",
+    "explain your reaction",
+    "what logic did you use",
+    "what was the logic",
+    "why did you do that",
+    "why did you put",
+    "why did you react",
+    "why did you send",
+    "why that reaction",
+    "why this reaction",
+    "why'd you do that",
+)
 REACTION_APPROVAL_TERMS = (
     "approval of harm",
     "looks like approval",
@@ -162,9 +176,10 @@ REACTION_TONE_TERMS = (
     "too cheerful",
     "too casual",
     "tone deaf",
-    "тон",
-    "границ",
-    "меж",
+    "не тот тон",
+    "плохой тон",
+    "перейшов межу",
+    "перешел границу",
 )
 REACTION_SYCOPHANCY_TERMS = (
     "sycophancy",
@@ -191,6 +206,8 @@ def has_marker(lowered: str, marker: str) -> bool:
     if not clean_marker:
         return False
     if re.fullmatch(r"[a-z0-9_-]+", clean_marker):
+        return re.search(rf"(?<![a-z0-9_-]){re.escape(clean_marker)}(?![a-z0-9_-])", lowered) is not None
+    if re.search(r"[a-z0-9]", clean_marker):
         return re.search(rf"(?<![a-z0-9_-]){re.escape(clean_marker)}(?![a-z0-9_-])", lowered) is not None
     return clean_marker in lowered
 
@@ -224,7 +241,7 @@ def has_reaction_complaint_hint(
         or has_any_marker(lowered, REACTION_FAKE_EMPATHY_TERMS)
         or has_any_marker(lowered, REACTION_TONE_TERMS)
         or has_any_marker(lowered, REACTION_SYCOPHANCY_TERMS)
-        or has_any_marker(lowered, REACTION_REASON_TERMS)
+        or has_any_marker(lowered, REACTION_REASON_CHALLENGE_TERMS)
     )
 
 
@@ -283,6 +300,7 @@ def classify_reaction_complaint(
     mentions_bot = reply_to_bot or has_any_marker(lowered, bot_markers)
     has_reaction_marker = has_any_marker(lowered, REACTION_TERMS)
     has_reason_marker = has_any_marker(lowered, REACTION_REASON_TERMS)
+    has_reason_challenge_marker = has_any_marker(lowered, REACTION_REASON_CHALLENGE_TERMS)
     has_approval_marker = has_any_marker(lowered, REACTION_APPROVAL_TERMS)
     has_insensitive_marker = has_any_marker(lowered, REACTION_INSENSITIVE_TERMS)
     has_fake_empathy_marker = has_any_marker(lowered, REACTION_FAKE_EMPATHY_TERMS)
@@ -295,19 +313,30 @@ def classify_reaction_complaint(
     temporal_context_points_to_non_reaction_output = bool(
         has_temporal_reaction_context and not has_reaction_marker and has_non_reaction_output_marker
     )
+    has_reaction_category_context = bool(
+        has_explicit_or_temporal_context and not temporal_context_points_to_non_reaction_output
+    )
+    has_reason_context = bool(
+        has_reaction_marker
+        or (
+            has_temporal_reaction_context
+            and has_reason_challenge_marker
+            and not temporal_context_points_to_non_reaction_output
+        )
+    )
 
     if not (mentions_bot or has_recent_reaction):
         return None
-    if not mentions_bot and not (has_reaction_marker or has_approval_marker):
+    if not mentions_bot and not has_approval_marker:
         return None
     if not has_reaction_context and not has_approval_marker:
         return None
 
-    if has_sycophancy_marker and has_explicit_or_temporal_context:
+    if has_sycophancy_marker and has_reaction_category_context:
         category = "sycophancy"
-    elif has_fake_empathy_marker and has_explicit_or_temporal_context:
+    elif has_fake_empathy_marker and has_reaction_category_context:
         category = "fake_empathy"
-    elif has_tone_marker and has_explicit_or_temporal_context:
+    elif has_tone_marker and has_reaction_category_context:
         category = "tone_boundary"
     elif has_approval_marker and (has_reaction_marker or has_recent_reaction):
         category = "insensitive_reaction"
@@ -319,7 +348,7 @@ def classify_reaction_complaint(
         category = "insensitive_reaction"
     elif (
         has_reason_marker
-        and has_explicit_or_temporal_context
+        and has_reason_context
         and (has_recent_reaction or rationale_state in {"missing_decision", "insufficient_rationale"})
     ):
         category = "reaction_reasoning_gap"

@@ -1239,7 +1239,8 @@ def reaction_decision_is_recent(record: Any, *, max_age_seconds: int = REACTION_
         return False
     if created_at.tzinfo is None:
         created_at = created_at.replace(tzinfo=timezone.utc)
-    return (datetime.now(timezone.utc) - created_at.astimezone(timezone.utc)).total_seconds() <= max_age_seconds
+    age_seconds = (datetime.now(timezone.utc) - created_at.astimezone(timezone.utc)).total_seconds()
+    return 0 <= age_seconds <= max_age_seconds
 
 
 def reaction_complaint_target_hash(chat_id: int, target_message_id: int | None, target_memory_id: int | None) -> str:
@@ -1260,8 +1261,8 @@ def reaction_decision_for_complaint(message: Message) -> Any | None:
             target_message_id=target_message_id,
             action="sent",
         )
-        if reaction_decision_is_recent(record):
-            return record
+        if record is not None:
+            return record if reaction_decision_is_recent(record) else None
     record = REACTION_MEMORY.latest_outbound_decision(
         chat_id=chat_id,
         action="sent",

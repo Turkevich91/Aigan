@@ -6482,7 +6482,11 @@ class SystemHealthTests(unittest.TestCase):
             "Aigan posted inappropriate message",
             "Aigan, the tone sounds fine",
             "Aigan, approval is required",
+            "Aigan, why is the sky blue?",
+            "Aigan, your response was fake empathy",
+            "I had a bad reaction to dinner",
             "\u044f \u043f\u0456\u0434\u0442\u0440\u0438\u043c\u0443\u044e \u043f\u043b\u0430\u043d",
+            "Aigan, \u0431\u0435\u0442\u043e\u043d is solid",
         )
         for text in cases:
             with self.subTest(text=text):
@@ -6501,6 +6505,15 @@ class SystemHealthTests(unittest.TestCase):
             "Aigan why did you dislike that?",
             bot_username="thrd_ua_bot",
             rationale_state="missing_decision",
+        )
+
+        self.assertIsNone(signal)
+        signal = classify_reaction_complaint(
+            "Aigan disliked the idea",
+            bot_username="thrd_ua_bot",
+            has_recent_reaction=True,
+            rationale_state="stored_rationale",
+            decision_action="sent",
         )
 
         self.assertIsNone(signal)
@@ -6741,10 +6754,28 @@ class SystemHealthTests(unittest.TestCase):
                 (old_created_at, record_id),
             )
             main.REACTION_MEMORY._conn.commit()
+        main.REACTION_MEMORY.record_outbound_decision(
+            chat_id=-1001,
+            target_message_id=5019,
+            target_memory_id=None,
+            item=None,
+            policy_version="outbound_reaction_emotion_policy_v1",
+            phase="pre_embedding",
+            action="sent",
+            reason_code="sent",
+            rationale="New unrelated reaction.",
+            emotion_class="positive_celebratory",
+            sent_spec=ReactionSpec(reaction_type="emoji", reaction_key="emoji:fire", base_emoji="\N{FIRE}"),
+        )
         message = FakeMessage("Aigan why did you put that reaction?", message_id=5014)
         message.reply_to_message = SimpleNamespace(message_id=5013, from_user=FakeUser(user_id=222, username="human"))
 
         self.assertIsNone(main.reaction_decision_for_complaint(message))
+
+    def test_reaction_decision_recency_rejects_future_timestamp(self) -> None:
+        record = SimpleNamespace(created_at=(datetime.now(timezone.utc) + timedelta(days=1)).isoformat())
+
+        self.assertFalse(main.reaction_decision_is_recent(record))
 
     def test_reaction_reasoning_gap_records_when_challenged_without_decision(self) -> None:
         message = FakeMessage("Aigan why did you put that reaction?", message_id=5004)
