@@ -1,6 +1,7 @@
 .env
 .env.*
 !.env.example
+AGENTS.local.md
 
 data/
 logs/
