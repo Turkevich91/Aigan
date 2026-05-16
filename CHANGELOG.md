@@ -1,5 +1,11 @@
 # Aigan Changelog
 
+## 2026-05-15 - Chat digest commands plan
+
+- Added a tool research note for future chat digest commands.
+- Documented explicit-only digest routing, bounded memory selection, topic/time-window modes, unresolved-thread handling, and source attribution rules.
+- Captured future tests for parser behavior, timezone windows, prompt caps, safety, and non-regression of memory/stat/profile flows.
+
 ## 2026-05-15 - Transcript memory integration plan
 
 - Added a tool research note for future transcript memory writes.
