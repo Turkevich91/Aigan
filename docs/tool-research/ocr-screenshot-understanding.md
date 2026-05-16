@@ -192,7 +192,7 @@ Suggested memory payload:
 - `source_text` stores visible OCR text, extracted UI text, or scanned-page text;
 - `vision_summary` stores the concise visual summary;
 - `content_kind="image"` for Telegram images, or `content_kind="document"`/`"scanned_document"` only when document ingest owns the parent file;
-- `attachment_type` such as `photo`, `image_document`, `screenshot`, `infographic`, or `scanned_pdf_page`;
+- `attachment_type` keeps the current live values such as `photo` or `document`; a future adapter may add normalized subtypes such as `screenshot`, `infographic`, `image_document`, or `scanned_pdf_page` only with explicit migration tests;
 - `source_title` stores a sanitized label such as `screenshot`, `infographic`, or sanitized filename when available;
 - `source_url=""` for Telegram-delivered images unless a safe public URL path is later added;
 - `raw_note` contains compact sanitized provenance such as `telegram screenshot OCR`.
