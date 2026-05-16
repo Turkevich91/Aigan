@@ -55,9 +55,17 @@ SAFE_HEALTH_FIELDS = {
     "temp_dir_writable",
     "cache_version",
 }
-URL_VALUE_RE = re.compile(r"\b(?:https?|ftp|file)://|www\.", re.IGNORECASE)
+URL_VALUE_RE = re.compile(
+    r"\b(?:https?|ftp|file)://|www\.|\b(?:[A-Za-z0-9-]{2,}\.)+[A-Za-z]{2,}(?::\d+)?(?:[/?#][^\s]*)?",
+    re.IGNORECASE,
+)
 WINDOWS_PATH_VALUE_RE = re.compile(r"(?:[A-Za-z]:\\|\\\\)")
 POSIX_PATH_VALUE_RE = re.compile(r"(^|\s)(?:~(?:/|\b)|/(?:[A-Za-z0-9._-]+)(?:/[^/\s]+)*)")
+RELATIVE_PATH_VALUE_RE = re.compile(
+    r"(^|\s)(?:\.{1,2}[\\/]|(?:data|media|cache|tmp|private|logs?|db|sqlite|downloads?)[\\/]|"
+    r"(?:[A-Za-z0-9_.-]+[\\/])+(?:[^\\/\s]*\.(?:sqlite3?|db|jpg|jpeg|png|webp|gif|mp4|mov|mkv|mp3|wav|ogg|json|log|env|txt|pdf)))",
+    re.IGNORECASE,
+)
 TOKEN_VALUE_RE = re.compile(r"\b(?:gh[pousr]_|github_pat_|xox[baprs]-)[A-Za-z0-9_-]{8,}", re.IGNORECASE)
 SAFE_CATEGORY_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_.:-]{0,79}$")
 ROW_DETAIL_FIELDS = ("adapter_count", "backlog", "dimensions", "max_bytes")
@@ -119,6 +127,7 @@ def safe_display_label(value: Any, limit: int = 120) -> str:
         URL_VALUE_RE.search(text)
         or WINDOWS_PATH_VALUE_RE.search(text)
         or POSIX_PATH_VALUE_RE.search(text)
+        or RELATIVE_PATH_VALUE_RE.search(text)
         or TOKEN_VALUE_RE.search(text)
     ):
         return "[redacted]"

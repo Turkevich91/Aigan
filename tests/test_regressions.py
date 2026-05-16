@@ -1212,6 +1212,33 @@ class ToolRuntimeTests(unittest.TestCase):
         self.assertNotIn("/tmp", text)
         self.assertNotIn("/opt", text)
 
+    def test_tool_diagnostics_redacts_bare_urls_and_relative_paths(self) -> None:
+        text = render_row(
+            CapabilityRow(
+                name="data/media/file.jpg",
+                family="media",
+                enabled=True,
+                configured=True,
+                available=True,
+                status="ok",
+                adapter="./data/aigan.sqlite3",
+                mode="../private/file",
+                backend="example.com/path?token=secret",
+            ).normalized()
+        )
+        unmatched = render_capability_matrix([], query="example.com/path?token=secret")
+
+        self.assertIn("[redacted]: enabled", text)
+        self.assertIn("adapter=[redacted]", text)
+        self.assertIn("mode=[redacted]", text)
+        self.assertIn("backend=[redacted]", text)
+        self.assertIn("No capabilities matched: [redacted]", unmatched)
+        self.assertNotIn("data/media/file.jpg", text)
+        self.assertNotIn("./data", text)
+        self.assertNotIn("../private", text)
+        self.assertNotIn("example.com", text)
+        self.assertNotIn("example.com", unmatched)
+
     def test_recent_tool_events_keeps_tool_failures_after_unrelated_noise(self) -> None:
         main.SYSTEM_LOG.record_event(
             level="warning",
