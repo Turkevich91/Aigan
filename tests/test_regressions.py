@@ -6440,6 +6440,40 @@ class SystemHealthTests(unittest.TestCase):
                 self.assertEqual(category, signal.category)
                 self.assertNotIn(text, signal.sample)
 
+    def test_reaction_complaint_classifier_uses_temporal_context_for_health_categories(self) -> None:
+        cases = (
+            ("Aigan, that was fake empathy", "fake_empathy"),
+            ("Aigan, that crossed a tone boundary", "tone_boundary"),
+            ("Aigan, that was sycophantic", "sycophancy"),
+        )
+        for text, category in cases:
+            with self.subTest(category=category):
+                signal = classify_reaction_complaint(
+                    text,
+                    bot_username="thrd_ua_bot",
+                    has_recent_reaction=True,
+                    rationale_state="stored_rationale",
+                    decision_action="sent",
+                    target_fingerprint="abc123",
+                )
+
+                self.assertIsNotNone(signal)
+                self.assertEqual(category, signal.category)
+                self.assertNotIn(text, signal.sample)
+
+    def test_reaction_complaint_classifier_uses_temporal_context_for_reason_gap(self) -> None:
+        signal = classify_reaction_complaint(
+            "Aigan, why did you do that?",
+            bot_username="thrd_ua_bot",
+            has_recent_reaction=True,
+            rationale_state="stored_rationale",
+            decision_action="sent",
+            target_fingerprint="abc123",
+        )
+
+        self.assertIsNotNone(signal)
+        self.assertEqual("reaction_reasoning_gap", signal.category)
+
     def test_reaction_complaint_classifier_rejects_broad_passive_markers(self) -> None:
         cases = (
             "I support the plan and the tone sounds fine",
@@ -6447,6 +6481,8 @@ class SystemHealthTests(unittest.TestCase):
             "the building is on fire and this is not ok",
             "Aigan posted inappropriate message",
             "Aigan, the tone sounds fine",
+            "Aigan, approval is required",
+            "\u044f \u043f\u0456\u0434\u0442\u0440\u0438\u043c\u0443\u044e \u043f\u043b\u0430\u043d",
         )
         for text in cases:
             with self.subTest(text=text):
@@ -6623,6 +6659,65 @@ class SystemHealthTests(unittest.TestCase):
         self.assertIsNotNone(record)
         self.assertEqual("sent", record.action)
         self.assertEqual(5010, record.target_message_id)
+
+    def test_reaction_complaint_reply_lookup_falls_back_to_recent_sent_reaction(self) -> None:
+        self.assertIsNotNone(main.REACTION_MEMORY)
+        main.REACTION_MEMORY.record_outbound_decision(
+            chat_id=-1001,
+            target_message_id=5015,
+            target_memory_id=None,
+            item=None,
+            policy_version="outbound_reaction_emotion_policy_v1",
+            phase="pre_embedding",
+            action="sent",
+            reason_code="sent",
+            rationale="Stored sanitized rationale.",
+            emotion_class="positive_celebratory",
+            sent_spec=ReactionSpec(reaction_type="emoji", reaction_key="emoji:fire", base_emoji="\N{FIRE}"),
+        )
+        message = FakeMessage("Aigan why did you do that?", message_id=5016)
+        message.reply_to_message = SimpleNamespace(message_id=5999, from_user=FakeUser(user_id=222, username="human"))
+
+        record = main.reaction_decision_for_complaint(message)
+
+        self.assertIsNotNone(record)
+        self.assertEqual("sent", record.action)
+        self.assertEqual(5015, record.target_message_id)
+
+    def test_reaction_complaint_lookup_excludes_current_message_reaction(self) -> None:
+        self.assertIsNotNone(main.REACTION_MEMORY)
+        main.REACTION_MEMORY.record_outbound_decision(
+            chat_id=-1001,
+            target_message_id=5017,
+            target_memory_id=None,
+            item=None,
+            policy_version="outbound_reaction_emotion_policy_v1",
+            phase="pre_embedding",
+            action="sent",
+            reason_code="sent",
+            rationale="Earlier sanitized rationale.",
+            emotion_class="positive_celebratory",
+            sent_spec=ReactionSpec(reaction_type="emoji", reaction_key="emoji:fire", base_emoji="\N{FIRE}"),
+        )
+        main.REACTION_MEMORY.record_outbound_decision(
+            chat_id=-1001,
+            target_message_id=5018,
+            target_memory_id=None,
+            item=None,
+            policy_version="outbound_reaction_emotion_policy_v1",
+            phase="pre_embedding",
+            action="sent",
+            reason_code="sent",
+            rationale="Reaction to the complaint itself.",
+            emotion_class="positive_celebratory",
+            sent_spec=ReactionSpec(reaction_type="emoji", reaction_key="emoji:fire", base_emoji="\N{FIRE}"),
+        )
+
+        record = main.reaction_decision_for_complaint(FakeMessage("this looks like approval", message_id=5018))
+
+        self.assertIsNotNone(record)
+        self.assertEqual("sent", record.action)
+        self.assertEqual(5017, record.target_message_id)
 
     def test_reaction_complaint_reply_lookup_ignores_old_sent_reaction(self) -> None:
         self.assertIsNotNone(main.REACTION_MEMORY)

@@ -121,7 +121,6 @@ REACTION_REASON_TERMS = (
     "объясн",
 )
 REACTION_APPROVAL_TERMS = (
-    "approval",
     "approval of harm",
     "looks like approval",
     "looks like you approve",
@@ -132,9 +131,11 @@ REACTION_APPROVAL_TERMS = (
     "endorsing reaction",
     "supporting harm",
     "liked the idea",
-    "схвал",
-    "одобр",
-    "підтрим",
+    "виглядає як підтримка",
+    "виглядає як схвалення",
+    "похоже на одобрение",
+    "схоже на підтримку",
+    "схоже на схвалення",
 )
 REACTION_INSENSITIVE_TERMS = (
     "inappropriate",
@@ -173,6 +174,15 @@ REACTION_SYCOPHANCY_TERMS = (
     "yes man",
     "agree with everything",
     "поддаки",
+)
+NON_REACTION_BOT_OUTPUT_TERMS = (
+    "answer",
+    "message",
+    "post",
+    "posted",
+    "reply",
+    "response",
+    "said",
 )
 
 
@@ -278,7 +288,13 @@ def classify_reaction_complaint(
     has_fake_empathy_marker = has_any_marker(lowered, REACTION_FAKE_EMPATHY_TERMS)
     has_tone_marker = has_any_marker(lowered, REACTION_TONE_TERMS)
     has_sycophancy_marker = has_any_marker(lowered, REACTION_SYCOPHANCY_TERMS)
+    has_non_reaction_output_marker = has_any_marker(lowered, NON_REACTION_BOT_OUTPUT_TERMS)
     has_reaction_context = bool(has_recent_reaction or has_reaction_marker)
+    has_temporal_reaction_context = bool(has_recent_reaction and mentions_bot)
+    has_explicit_or_temporal_context = bool(has_reaction_marker or has_temporal_reaction_context)
+    temporal_context_points_to_non_reaction_output = bool(
+        has_temporal_reaction_context and not has_reaction_marker and has_non_reaction_output_marker
+    )
 
     if not (mentions_bot or has_recent_reaction):
         return None
@@ -287,15 +303,25 @@ def classify_reaction_complaint(
     if not has_reaction_context and not has_approval_marker:
         return None
 
-    if has_sycophancy_marker and has_reaction_marker:
+    if has_sycophancy_marker and has_explicit_or_temporal_context:
         category = "sycophancy"
-    elif has_fake_empathy_marker and has_reaction_marker:
+    elif has_fake_empathy_marker and has_explicit_or_temporal_context:
         category = "fake_empathy"
-    elif has_tone_marker and has_reaction_marker:
+    elif has_tone_marker and has_explicit_or_temporal_context:
         category = "tone_boundary"
-    elif has_approval_marker or (has_insensitive_marker and has_reaction_marker):
+    elif has_approval_marker and (has_reaction_marker or has_recent_reaction):
         category = "insensitive_reaction"
-    elif has_reason_marker and has_reaction_marker and rationale_state in {"missing_decision", "insufficient_rationale"}:
+    elif (
+        has_insensitive_marker
+        and has_explicit_or_temporal_context
+        and not temporal_context_points_to_non_reaction_output
+    ):
+        category = "insensitive_reaction"
+    elif (
+        has_reason_marker
+        and has_explicit_or_temporal_context
+        and (has_recent_reaction or rationale_state in {"missing_decision", "insufficient_rationale"})
+    ):
         category = "reaction_reasoning_gap"
     else:
         return None

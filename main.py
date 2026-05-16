@@ -1250,16 +1250,23 @@ def reaction_complaint_target_hash(chat_id: int, target_message_id: int | None, 
 def reaction_decision_for_complaint(message: Message) -> Any | None:
     if REACTION_MEMORY is None:
         return None
+    chat_id = int(message.chat_id)
+    current_message_id = getattr(message, "message_id", None)
     reply = getattr(message, "reply_to_message", None)
     target_message_id = getattr(reply, "message_id", None) if reply is not None else None
     if target_message_id is not None:
         record = REACTION_MEMORY.latest_outbound_decision(
-            chat_id=int(message.chat_id),
+            chat_id=chat_id,
             target_message_id=target_message_id,
             action="sent",
         )
-        return record if reaction_decision_is_recent(record) else None
-    record = REACTION_MEMORY.latest_outbound_decision(chat_id=int(message.chat_id), action="sent")
+        if reaction_decision_is_recent(record):
+            return record
+    record = REACTION_MEMORY.latest_outbound_decision(
+        chat_id=chat_id,
+        action="sent",
+        exclude_target_message_id=current_message_id,
+    )
     return record if reaction_decision_is_recent(record) else None
 
 
