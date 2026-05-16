@@ -98,11 +98,11 @@ REACTION_TERMS = (
     "posted emoji",
     "reacted",
     "реакц*",
-    "эмод",
-    "емод",
+    "эмод*",
+    "емод*",
     "смайл",
-    "огон",
-    "вогон",
+    "огон*",
+    "вогон*",
     "лайк",
     "постав*",
 )
@@ -168,15 +168,9 @@ REACTION_INSENSITIVE_TERMS = (
     "недореч*",
     "не так",
 )
-REACTION_INSENSITIVE_HINT_TERMS = (
-    "inappropriate",
-    "insensitive",
-    "wrong reaction",
-    "bad emoji",
-    "bad emoji reaction",
-    "tone deaf",
-    "неумест*",
-    "недореч*",
+BROAD_INSENSITIVE_TERMS = ("not ok", "не так")
+REACTION_INSENSITIVE_HINT_TERMS = tuple(
+    marker for marker in REACTION_INSENSITIVE_TERMS if marker not in BROAD_INSENSITIVE_TERMS
 )
 REACTION_PASSIVE_COMPLAINT_TERMS = (
     "inappropriate reaction",

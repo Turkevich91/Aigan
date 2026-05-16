@@ -6582,11 +6582,25 @@ class SystemHealthTests(unittest.TestCase):
         self.assertTrue(has_marker("\u0441\u0442\u0430\u0432\u0438\u0442\u044c \u043b\u0430\u0439\u043a", "\u043b\u0430\u0439\u043a"))
         self.assertTrue(has_marker("\u043f\u043e\u044f\u0441\u043d\u0438 \u0440\u0435\u0430\u043a\u0446\u0456\u044e", "\u0440\u0435\u0430\u043a\u0446*"))
         self.assertTrue(has_marker("\u043f\u043e\u0441\u0442\u0430\u0432\u0438\u0432", "\u043f\u043e\u0441\u0442\u0430\u0432*"))
+        self.assertTrue(has_marker("\u044d\u043c\u043e\u0434\u0437\u0438", "\u044d\u043c\u043e\u0434*"))
+        self.assertTrue(has_marker("\u0435\u043c\u043e\u0434\u0437\u0456", "\u0435\u043c\u043e\u0434*"))
+        self.assertTrue(has_marker("\u043d\u0435\u0443\u043c\u0435\u0441\u0442\u043d\u0430\u044f", "\u043d\u0435\u0443\u043c\u0435\u0441\u0442*"))
+        self.assertTrue(has_marker("\u0444\u0430\u043b\u044c\u0448\u0438\u0432\u0430 \u0435\u043c\u043f\u0430\u0442\u0456\u044f", "\u0444\u0430\u043b\u044c\u0448\u0438\u0432*"))
 
-    def test_reaction_complaint_target_label_is_not_id_hash(self) -> None:
-        self.assertEqual("linked", main.reaction_complaint_target_label(123, None))
-        self.assertEqual("linked", main.reaction_complaint_target_label(None, 456))
-        self.assertEqual("unlinked", main.reaction_complaint_target_label(None, None))
+    def test_reaction_complaint_target_fingerprint_is_keyed_and_non_raw(self) -> None:
+        with patch.dict(os.environ, {"COMPLAINT_TARGET_HASH_SALT": "unit-test-target-salt"}):
+            first = main.reaction_complaint_target_fingerprint(-1001, 123, None)
+            same = main.reaction_complaint_target_fingerprint(-1001, 123, None)
+            other = main.reaction_complaint_target_fingerprint(-1001, 124, None)
+            memory_target = main.reaction_complaint_target_fingerprint(-1001, None, 456)
+
+        self.assertRegex(first, r"^target_[a-f0-9]{16}$")
+        self.assertEqual(first, same)
+        self.assertNotEqual(first, other)
+        self.assertNotEqual(first, memory_target)
+        self.assertNotIn("123", first)
+        self.assertNotIn("-1001", first)
+        self.assertEqual("unlinked", main.reaction_complaint_target_fingerprint(-1001, None, None))
 
     def test_generic_complaint_does_not_select_reaction_health_category(self) -> None:
         signal = classify_complaint("Aigan bot bug fake empathy", bot_username="thrd_ua_bot")

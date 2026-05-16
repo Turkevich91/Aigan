@@ -1,5 +1,7 @@
 import asyncio
 import base64
+import hashlib
+import hmac
 import html
 import io
 import logging
@@ -1242,8 +1244,19 @@ def reaction_decision_is_recent(record: Any, *, max_age_seconds: int = REACTION_
     return 0 <= age_seconds <= max_age_seconds
 
 
-def reaction_complaint_target_label(target_message_id: int | None, target_memory_id: int | None) -> str:
-    return "linked" if target_message_id is not None or target_memory_id is not None else "unlinked"
+def reaction_complaint_target_fingerprint(
+    chat_id: int | str | None,
+    target_message_id: int | None,
+    target_memory_id: int | None,
+) -> str:
+    if target_message_id is None and target_memory_id is None:
+        return "unlinked"
+    salt = os.getenv("COMPLAINT_TARGET_HASH_SALT", "").strip() or CONFIG.telegram_token
+    if not salt:
+        return "linked"
+    payload = f"reaction-target-v1:{chat_id or ''}:{target_message_id or ''}:{target_memory_id or ''}"
+    digest = hmac.new(salt.encode("utf-8"), payload.encode("utf-8"), hashlib.sha256).hexdigest()[:16]
+    return f"target_{digest}"
 
 
 def reaction_decision_for_complaint(message: Message) -> Any | None:
@@ -1296,9 +1309,10 @@ def remember_self_complaint_signal(
         reply_to_bot=reply_to_bot,
     )
     reaction_record = reaction_decision_for_complaint(message) if has_reaction_hint else None
-    target_label = ""
+    target_fingerprint = ""
     if reaction_record is not None:
-        target_label = reaction_complaint_target_label(
+        target_fingerprint = reaction_complaint_target_fingerprint(
+            message.chat_id,
             getattr(reaction_record, "target_message_id", None),
             getattr(reaction_record, "target_memory_id", None),
         )
@@ -1313,7 +1327,7 @@ def remember_self_complaint_signal(
         decision_action=str(getattr(reaction_record, "action", "") or ""),
         decision_reason=str(getattr(reaction_record, "reason_code", "") or ""),
         emotion_class=str(getattr(reaction_record, "emotion_class", "") or ""),
-        target_fingerprint=target_label,
+        target_fingerprint=target_fingerprint,
     )
     if reaction_cluster is not None:
         LOGGER.info(
