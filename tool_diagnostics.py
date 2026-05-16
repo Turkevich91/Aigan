@@ -56,6 +56,9 @@ SAFE_HEALTH_FIELDS = {
     "telegram_download_available",
     "temp_dir_writable",
     "cache_version",
+    "decision_count",
+    "sent_decisions",
+    "skipped_decisions",
 }
 URL_VALUE_RE = re.compile(
     r"\b[A-Za-z][A-Za-z0-9+.-]{1,}://|www\.|"
@@ -113,6 +116,7 @@ SAFE_CATEGORY_VALUES = {
     "outbound_reaction_adapter_error",
     "prefetch_failed",
     "provider_unavailable",
+    "reaction_decision_summary_failed",
     "runner_error",
     "search_failed",
     "self_report_failed",
@@ -181,6 +185,9 @@ ROW_DETAIL_FIELDS = (
     "telegram_download_available",
     "temp_dir_writable",
     "cache_version",
+    "decision_count",
+    "sent_decisions",
+    "skipped_decisions",
 )
 
 
