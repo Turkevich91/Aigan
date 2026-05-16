@@ -667,7 +667,11 @@ class ReactionMemoryStore:
         candidate_key = safe_reaction_key(candidate_spec)
         sent_key = safe_reaction_key(sent_spec)
         clean_details = sanitize_decision_details(details or {})
-        clean_flags = [safe_code(flag) for flag in list(severity_flags)[:20] if safe_code(flag)]
+        clean_flags: list[str] = []
+        for flag in list(severity_flags)[:20]:
+            clean_flag = safe_code(flag)
+            if clean_flag:
+                clean_flags.append(clean_flag)
         with self._lock:
             cursor = self._conn.execute(
                 """

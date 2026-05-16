@@ -2307,8 +2307,9 @@ def reaction_decision_explanation_for_message(message: Message, prompt: str) -> 
         return None
     reply = getattr(message, "reply_to_message", None)
     target_message_id = getattr(reply, "message_id", None) if reply is not None else None
-    record = REACTION_MEMORY.latest_outbound_decision(chat_id=int(message.chat_id), target_message_id=target_message_id)
-    if record is None and target_message_id is None:
+    if target_message_id is not None:
+        record = REACTION_MEMORY.latest_outbound_decision(chat_id=int(message.chat_id), target_message_id=target_message_id)
+    else:
         record = REACTION_MEMORY.latest_outbound_decision(chat_id=int(message.chat_id))
     return REACTION_MEMORY.explain_outbound_decision(record)
 
