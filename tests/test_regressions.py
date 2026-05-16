@@ -3217,6 +3217,67 @@ class PersistentMemoryTests(unittest.TestCase):
         self.assertEqual(1, record.severity_flags.count("forwarded"))
         self.assertEqual(1, record.severity_flags.count("attachment:video"))
 
+    def test_outbound_reaction_forwarded_positive_text_defaults_to_no_reaction(self) -> None:
+        self.assertIsNotNone(main.REACTION_MEMORY)
+        config = main.OutboundReactionConfig(
+            enabled=True,
+            every_n_messages=1,
+            cooldown_seconds=0,
+            min_score=0.0,
+            allowed_emoji=("\N{FIRE}",),
+            use_custom_emoji=False,
+        )
+        adapter = main.OutboundReactionAdapter(config=config, reaction_memory=main.REACTION_MEMORY)
+        message = FakeMessage("great news release success", message_id=984)
+        item_id = main.MEMORY.save_message(
+            chat_id=-1001,
+            message_id=984,
+            sender_label="Tester",
+            user_id=111,
+            text=message.text,
+            forward_origin="Source Channel",
+            created_at=datetime.now(timezone.utc),
+        )
+
+        asyncio.run(adapter.on_message_ingested(message, main.MEMORY.item_by_id(item_id), "pre_embedding"))
+
+        message.bot.set_message_reaction.assert_not_awaited()
+        record = main.REACTION_MEMORY.latest_outbound_decision(chat_id=-1001, target_message_id=984)
+        self.assertIsNotNone(record)
+        self.assertEqual("skipped", record.action)
+        self.assertEqual("ambiguous_low_confidence", record.emotion_class)
+        self.assertIn("forwarded", record.severity_flags)
+
+    def test_outbound_reaction_laugh_alias_remains_positive_option(self) -> None:
+        self.assertIsNotNone(main.REACTION_MEMORY)
+        config = main.OutboundReactionConfig(
+            enabled=True,
+            every_n_messages=1,
+            cooldown_seconds=0,
+            min_score=0.0,
+            allowed_emoji=("\N{FACE WITH TEARS OF JOY}",),
+            use_custom_emoji=False,
+        )
+        adapter = main.OutboundReactionAdapter(config=config, reaction_memory=main.REACTION_MEMORY)
+        message = FakeMessage("great news success release", message_id=985)
+        item_id = main.MEMORY.save_message(
+            chat_id=-1001,
+            message_id=985,
+            sender_label="Tester",
+            user_id=111,
+            text=message.text,
+            created_at=datetime.now(timezone.utc),
+        )
+
+        asyncio.run(adapter.on_message_ingested(message, main.MEMORY.item_by_id(item_id), "pre_embedding"))
+
+        message.bot.set_message_reaction.assert_awaited_once()
+        record = main.REACTION_MEMORY.latest_outbound_decision(chat_id=-1001, target_message_id=985)
+        self.assertIsNotNone(record)
+        self.assertEqual("sent", record.action)
+        self.assertEqual("positive_celebratory", record.emotion_class)
+        self.assertEqual("emoji:u1f602", record.sent_reaction_key)
+
     def test_outbound_reaction_ambiguous_sensitive_content_skips(self) -> None:
         self.assertIsNotNone(main.REACTION_MEMORY)
         config = main.OutboundReactionConfig(

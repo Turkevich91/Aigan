@@ -24,7 +24,7 @@ TERM_WORD_RE = re.compile(r"[\w']+", re.UNICODE)
 
 
 REACTION_EMOJI_BY_EMOTION: dict[str, tuple[str, ...]] = {
-    "positive_celebratory": ("🔥", "👍", "❤️", "❤", "🎉"),
+    "positive_celebratory": ("🔥", "👍", "❤️", "❤", "🎉", "😂"),
     "grief_sympathy": ("😢", "💔", "😭"),
     "horror_shock": ("😱", "😨", "🤯"),
     "condemnation_outrage": ("😡", "🤬"),
@@ -693,7 +693,9 @@ class OutboundReactionAdapter:
         combined_content = f"{own_content} {source_content}".strip()
         flags: list[str] = []
         has_own_text = bool((item.text or "").strip())
-        has_source_context = bool((item.source_text or item.source_title or item.source_url or item.vision_summary or "").strip())
+        has_source_context = bool(
+            (item.source_text or item.source_title or item.source_url or item.vision_summary or item.forward_origin or "").strip()
+        )
         if not has_own_text and has_source_context:
             flags.append("source_only")
         if item.forward_origin:
