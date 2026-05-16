@@ -1222,11 +1222,11 @@ class ToolRuntimeTests(unittest.TestCase):
                 available=True,
                 status="ok",
                 adapter="./data/aigan.sqlite3",
-                mode="../private/file",
-                backend="example.com/path?token=secret",
+                mode="localhost:8080/private",
+                backend="x.com/path?token=secret",
             ).normalized()
         )
-        unmatched = render_capability_matrix([], query="example.com/path?token=secret")
+        unmatched = render_capability_matrix([], query="192.168.1.10:8080/path")
 
         self.assertIn("[redacted]: enabled", text)
         self.assertIn("adapter=[redacted]", text)
@@ -1235,9 +1235,9 @@ class ToolRuntimeTests(unittest.TestCase):
         self.assertIn("No capabilities matched: [redacted]", unmatched)
         self.assertNotIn("data/media/file.jpg", text)
         self.assertNotIn("./data", text)
-        self.assertNotIn("../private", text)
-        self.assertNotIn("example.com", text)
-        self.assertNotIn("example.com", unmatched)
+        self.assertNotIn("localhost", text)
+        self.assertNotIn("x.com", text)
+        self.assertNotIn("192.168", unmatched)
 
     def test_recent_tool_events_keeps_tool_failures_after_unrelated_noise(self) -> None:
         main.SYSTEM_LOG.record_event(
@@ -1305,7 +1305,7 @@ class ToolRuntimeTests(unittest.TestCase):
         self.assertEqual(1, by_name["web_image_search"].recent_warning_count)
         self.assertEqual(1, by_name["github_reporting"].recent_error_count)
 
-    def test_agent_run_error_degrades_mcp_backed_capabilities(self) -> None:
+    def test_agent_run_error_without_tool_detail_does_not_degrade_mcp_rows(self) -> None:
         main.SYSTEM_LOG.record_event(
             level="error",
             component="agent",
@@ -1319,10 +1319,27 @@ class ToolRuntimeTests(unittest.TestCase):
         )
         by_name = {item.name: item for item in rows}
 
-        self.assertEqual(1, by_name["web_search"].recent_error_count)
-        self.assertEqual(1, by_name["youtube_captions"].recent_error_count)
-        self.assertEqual("degraded", by_name["web_search"].status)
-        self.assertEqual("degraded", by_name["youtube_captions"].status)
+        self.assertEqual(0, by_name["web_search"].recent_error_count)
+        self.assertEqual(0, by_name["youtube_captions"].recent_error_count)
+        self.assertEqual("ok", by_name["web_search"].status)
+        self.assertEqual("ok", by_name["youtube_captions"].status)
+
+    def test_web_prefetch_failure_degrades_web_search(self) -> None:
+        main.SYSTEM_LOG.record_event(
+            level="error",
+            component="web",
+            event_type="prefetch_failed",
+            details={"failure_category": "prefetch_failed"},
+        )
+
+        rows = build_capability_rows(
+            {"status": "ok", "adapter_count": 0, "error_count": 0, "adapters": []},
+            events=main.recent_tool_events(),
+        )
+        row = {item.name: item for item in rows}["web_search"]
+
+        self.assertEqual(1, row.recent_error_count)
+        self.assertEqual("degraded", row.status)
 
     def test_github_reporting_row_uses_reporter_configuration(self) -> None:
         original_config = main.CONFIG
@@ -1350,6 +1367,24 @@ class ToolRuntimeTests(unittest.TestCase):
         self.assertFalse(row.configured)
         self.assertFalse(row.available)
         self.assertEqual("unconfigured", row.status)
+
+    def test_memory_capability_rows_do_not_scan_embedding_backlog(self) -> None:
+        if main.MEMORY is None:
+            self.skipTest("memory store disabled")
+        original_config = main.CONFIG
+        try:
+            main.CONFIG = replace(
+                main.CONFIG,
+                memory_vector_enabled=True,
+                memory_embedding_model="text-embedding-3-small",
+            )
+            with patch.object(main.MEMORY, "embedding_backlog_count", side_effect=AssertionError("should not scan")):
+                row = {item.name: item for item in main.memory_capability_rows()}["memory_embeddings"]
+        finally:
+            main.CONFIG = original_config
+
+        self.assertEqual("ok", row.status)
+        self.assertEqual({"dimensions": main.CONFIG.memory_embedding_dimensions}, row.details)
 
     def test_image_understanding_blank_model_is_unconfigured(self) -> None:
         original_config = main.CONFIG

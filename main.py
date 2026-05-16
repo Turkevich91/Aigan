@@ -3528,41 +3528,19 @@ def memory_capability_rows() -> list[CapabilityRow]:
             )
         )
         return rows
-    try:
-        backlog = MEMORY.embedding_backlog_count(
-            model=CONFIG.memory_embedding_model,
-            dimensions=CONFIG.memory_embedding_dimensions,
-            lookback_days=CONFIG.memory_semantic_lookback_days,
+    rows.append(
+        CapabilityRow(
+            name="memory_embeddings",
+            family="memory",
+            enabled=True,
+            configured=True,
+            available=True,
+            status="ok",
+            adapter="semantic_memory",
+            mode="embeddings",
+            details={"dimensions": CONFIG.memory_embedding_dimensions},
         )
-    except Exception:
-        rows.append(
-            CapabilityRow(
-                name="memory_embeddings",
-                family="memory",
-                enabled=True,
-                configured=True,
-                available=False,
-                status="degraded",
-                adapter="semantic_memory",
-                mode="embeddings",
-                error_count=1,
-                next_action="inspect /logs",
-            )
-        )
-    else:
-        rows.append(
-            CapabilityRow(
-                name="memory_embeddings",
-                family="memory",
-                enabled=True,
-                configured=True,
-                available=True,
-                status="ok",
-                adapter="semantic_memory",
-                mode="embeddings",
-                details={"backlog": backlog, "dimensions": CONFIG.memory_embedding_dimensions},
-            )
-        )
+    )
     return rows
 
 
@@ -3635,7 +3613,7 @@ def recent_tool_events() -> list[Any]:
     tool_components = {
         "tool_runtime",
         "agent_tool",
-        "agent",
+        "web",
         "memory_vector",
         "memory",
         "outbound_reactions",

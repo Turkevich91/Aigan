@@ -56,7 +56,10 @@ SAFE_HEALTH_FIELDS = {
     "cache_version",
 }
 URL_VALUE_RE = re.compile(
-    r"\b(?:https?|ftp|file)://|www\.|\b(?:[A-Za-z0-9-]{2,}\.)+[A-Za-z]{2,}(?::\d+)?(?:[/?#][^\s]*)?",
+    r"\b(?:https?|ftp|file)://|www\.|"
+    r"\blocalhost(?::\d+)?(?:[/?#][^\s]*)?|"
+    r"\b(?:\d{1,3}\.){3}\d{1,3}(?::\d+)?(?:[/?#][^\s]*)?|"
+    r"\b(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,}(?::\d+)?(?:[/?#][^\s]*)?",
     re.IGNORECASE,
 )
 WINDOWS_PATH_VALUE_RE = re.compile(r"(?:[A-Za-z]:\\|\\\\)")
@@ -307,7 +310,7 @@ def capability_names_for_event(event: SystemEvent, rows: dict[str, CapabilityRow
         "outbound_reactions": "outbound_reactions",
         "image_search": "web_image_search",
         "github_reporting": "github_reporting",
-        "agent": ["web_search", "youtube_captions"],
+        "web": "web_search",
         "agent_tool": "tool_runtime",
         "startup": "tool_runtime",
         "shutdown": "tool_runtime",
