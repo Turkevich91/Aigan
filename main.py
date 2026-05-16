@@ -35,7 +35,7 @@ from media_frames import FfmpegMediaFrameAdapter, MediaFrameAdapter, MediaFrameL
 from outbound_reactions import NullReactionAdapter, OutboundReactionAdapter, OutboundReactionConfig, ReactionAdapter
 from reaction_memory import ReactionAsset, ReactionMemoryStore, ReactionPreference, ReactionSpec
 from github_reporting import GitHubReporter
-from self_analysis import SelfAnalysisService, has_reaction_complaint_hint
+from self_analysis import REACTION_HEALTH_CATEGORIES, SelfAnalysisService, has_reaction_complaint_hint, safe_detail_code
 from social_memory import SocialMemoryStore, SocialObservation
 from system_log import SystemEvent, SystemLogStore, sanitize_text
 from tool_diagnostics import CapabilityRow, build_capability_rows, render_capability_matrix, render_recent_failures
@@ -3781,6 +3781,86 @@ def tool_runtime_health_text() -> str:
     return "\n".join(lines)
 
 
+def reaction_decision_summary_for_health(lookback_seconds: int | None = None) -> dict[str, Any]:
+    if REACTION_MEMORY is None:
+        return {}
+    try:
+        return REACTION_MEMORY.outbound_decision_summary(
+            lookback_seconds=lookback_seconds or CONFIG.health_report_lookback_seconds,
+            limit=5,
+        )
+    except Exception:
+        LOGGER.exception("Reaction decision summary failed")
+        system_event(
+            level="error",
+            component="outbound_reactions",
+            event_type="reaction_decision_summary_failed",
+            message="reaction_decision_summary_failed",
+            details={"failure_category": "reaction_decision_summary_failed"},
+        )
+        return {}
+
+
+def compact_counts(counts: dict[str, Any] | None, *, limit: int = 5) -> str:
+    items: list[tuple[str, int]] = []
+    for key, value in (counts or {}).items():
+        try:
+            count = max(0, int(value or 0))
+        except (TypeError, ValueError):
+            count = 0
+        if count:
+            items.append((safe_detail_code(str(key)), count))
+    if not items:
+        return "none"
+    ordered = sorted(items, key=lambda item: (-item[1], item[0]))[: max(1, int(limit))]
+    return ", ".join(f"{key}={count}" for key, count in ordered)
+
+
+def reaction_health_diagnostics_text(lookback_seconds: int | None = None) -> str:
+    lookback = lookback_seconds or CONFIG.health_report_lookback_seconds
+    summary = reaction_decision_summary_for_health(lookback)
+    action_counts = summary.get("action_counts") if isinstance(summary, dict) else {}
+    sent_count = int(action_counts.get("sent", 0) if isinstance(action_counts, dict) else 0)
+    skipped_count = int(action_counts.get("skipped", 0) if isinstance(action_counts, dict) else 0)
+    total_count = int(summary.get("decision_count", 0) if isinstance(summary, dict) else 0)
+    lines = [
+        "Reaction health:",
+        f"- decisions: total={total_count}, sent={sent_count}, skipped={skipped_count}",
+        f"- emotions: {compact_counts(summary.get('emotion_counts') if isinstance(summary, dict) else {})}",
+        f"- reasons: {compact_counts(summary.get('reason_counts') if isinstance(summary, dict) else {})}",
+    ]
+    if SYSTEM_LOG is None:
+        lines.append("- complaint temperatures: disabled")
+        return "\n".join(lines)
+    clusters = [
+        cluster
+        for cluster in SYSTEM_LOG.active_complaints(20)
+        if safe_detail_code(cluster.category) in REACTION_HEALTH_CATEGORIES
+    ]
+    if not clusters:
+        lines.append("- complaint temperatures: none")
+        return "\n".join(lines)
+    lines.append("- complaint temperatures:")
+    for cluster in clusters[:5]:
+        issue = " reported" if cluster.github_issue_url else ""
+        lines.append(f"  - {safe_detail_code(cluster.category)}={cluster.temperature}{issue}")
+    return "\n".join(lines)
+
+
+def reaction_memory_health_details() -> dict[str, int]:
+    summary = reaction_decision_summary_for_health(CONFIG.health_report_lookback_seconds)
+    if not summary:
+        return {}
+    action_counts = summary.get("action_counts") if isinstance(summary, dict) else {}
+    if not isinstance(action_counts, dict):
+        action_counts = {}
+    return {
+        "decision_count": int(summary.get("decision_count", 0) or 0),
+        "sent_decisions": int(action_counts.get("sent", 0) or 0),
+        "skipped_decisions": int(action_counts.get("skipped", 0) or 0),
+    }
+
+
 def memory_capability_rows() -> list[CapabilityRow]:
     rows = [
         CapabilityRow(
@@ -3924,6 +4004,7 @@ def configured_capability_rows() -> list[CapabilityRow]:
             available=REACTION_MEMORY is not None,
             status="ok" if REACTION_MEMORY is not None else "disabled",
             adapter="ReactionMemoryStore" if REACTION_MEMORY is not None else "null",
+            details=reaction_memory_health_details(),
         )
     )
     rows.append(
@@ -5912,7 +5993,9 @@ async def health_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         + "\n\n"
         + memory_vector_health_text()
         + "\n\n"
-        + tool_runtime_health_text(),
+        + tool_runtime_health_text()
+        + "\n\n"
+        + reaction_health_diagnostics_text(CONFIG.health_report_lookback_seconds),
     )
 
 
@@ -5983,7 +6066,7 @@ async def complaints_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if not allow_admin_command(message, "complaints"):
         await deny_admin_command(message, "complaints")
         return
-    await send_reply(message, SELF_ANALYSIS.complaints_text(10))
+    await send_reply(message, SELF_ANALYSIS.complaints_text(10) + "\n\n" + reaction_health_diagnostics_text())
 
 
 async def command_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

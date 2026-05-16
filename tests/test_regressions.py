@@ -6958,6 +6958,114 @@ class SystemHealthTests(unittest.TestCase):
 
         self.assertFalse(main.reaction_decision_is_recent(record))
 
+    def test_reaction_memory_health_details_include_sent_and_skipped_decisions(self) -> None:
+        self.assertIsNotNone(main.REACTION_MEMORY)
+        main.REACTION_MEMORY.record_outbound_decision(
+            chat_id=-1001,
+            target_message_id=5030,
+            target_memory_id=None,
+            item=None,
+            policy_version="outbound_reaction_emotion_policy_v1",
+            phase="pre_embedding",
+            action="sent",
+            reason_code="sent",
+            rationale="Stored sanitized rationale.",
+            emotion_class="positive_celebratory",
+            sent_spec=ReactionSpec(reaction_type="emoji", reaction_key="emoji:fire", base_emoji="\N{FIRE}"),
+        )
+        main.REACTION_MEMORY.record_outbound_decision(
+            chat_id=-1001,
+            target_message_id=5031,
+            target_memory_id=None,
+            item=None,
+            policy_version="outbound_reaction_emotion_policy_v1",
+            phase="pre_embedding",
+            action="skipped",
+            reason_code="empathy_preflight",
+            rationale="No reaction was sent.",
+            emotion_class="grief_sympathy",
+        )
+
+        rows = {item.name: item for item in main.configured_capability_rows()}
+
+        self.assertEqual(2, rows["reaction_memory"].details["decision_count"])
+        self.assertEqual(1, rows["reaction_memory"].details["sent_decisions"])
+        self.assertEqual(1, rows["reaction_memory"].details["skipped_decisions"])
+
+    def test_reaction_health_diagnostics_are_compact_and_sanitized(self) -> None:
+        self.assertIsNotNone(main.MEMORY)
+        self.assertIsNotNone(main.REACTION_MEMORY)
+        item_id = main.MEMORY.save_message(
+            chat_id=-1001,
+            message_id=5032,
+            sender_label="Alice Private",
+            username="alice_private",
+            text=f"raw private message payload {fake_openai_secret()}",
+            source_text="transcript raw payload",
+            content_kind="video",
+            attachment_type="video",
+            local_media_path=r"D:\private\clip.mp4",
+            vision_summary="OCR raw payload",
+            source_url="https://secret.example/path?token=abc",
+            source_title="private source title",
+            forward_origin="@private_channel",
+        )
+        item = main.MEMORY.item_by_id(item_id)
+        main.REACTION_MEMORY.record_outbound_decision(
+            chat_id=-1001,
+            target_message_id=5032,
+            target_memory_id=item_id,
+            item=item,
+            policy_version="outbound_reaction_emotion_policy_v1",
+            phase="pre_embedding",
+            action="sent",
+            reason_code="sent",
+            rationale="Stored sanitized rationale.",
+            severity_flags=("safe_positive",),
+            emotion_class="positive_celebratory",
+            confidence=0.9,
+            score=0.8,
+            sent_spec=ReactionSpec(reaction_type="emoji", reaction_key="emoji:fire", base_emoji="\N{FIRE}"),
+            details={"policy": "outbound_reaction_emotion_policy_v1"},
+        )
+        main.REACTION_MEMORY.record_outbound_decision(
+            chat_id=-1001,
+            target_message_id=5033,
+            target_memory_id=None,
+            item=None,
+            policy_version="outbound_reaction_emotion_policy_v1",
+            phase="pre_embedding",
+            action="skipped",
+            reason_code="empathy_preflight",
+            rationale="No reaction was sent.",
+            emotion_class="grief_sympathy",
+        )
+        main.SELF_ANALYSIS.record_reaction_complaint_signal(
+            text="this reaction looks like approval of raw private message payload",
+            has_recent_reaction=True,
+            decision_action="sent",
+            decision_reason="sent",
+            emotion_class="positive_celebratory",
+            rationale_state="stored_rationale",
+            target_fingerprint="target_safe123",
+        )
+
+        text = main.reaction_health_diagnostics_text()
+
+        self.assertIn("Reaction health:", text)
+        self.assertIn("total=2", text)
+        self.assertIn("sent=1", text)
+        self.assertIn("skipped=1", text)
+        self.assertIn("insensitive_reaction=1", text)
+        self.assertNotIn("raw private message payload", text)
+        self.assertNotIn("alice_private", text)
+        self.assertNotIn("Alice Private", text)
+        self.assertNotIn("D:\\private", text)
+        self.assertNotIn("https://secret.example", text)
+        self.assertNotIn(fake_openai_secret(), text)
+        self.assertNotIn("OCR raw payload", text)
+        self.assertNotIn("transcript raw payload", text)
+
     def test_reaction_reasoning_gap_records_when_challenged_without_decision(self) -> None:
         message = FakeMessage("Aigan why did you put that reaction?", message_id=5004)
         message.reply_to_message = SimpleNamespace(message_id=5999, from_user=FakeUser(user_id=222, username="human"))
@@ -6977,8 +7085,28 @@ class SystemHealthTests(unittest.TestCase):
         asyncio.run(main.health_command(SimpleNamespace(effective_message=non_admin_message), SimpleNamespace()))
 
         self.assertIn("Status:", admin_message.reply_calls[0]["text"])
+        self.assertIn("Reaction health:", admin_message.reply_calls[0]["text"])
         self.assertTrue(non_admin_message.reply_calls)
         self.assertNotIn("Status:", non_admin_message.reply_calls[0]["text"])
+
+    def test_complaints_command_includes_reaction_health_summary(self) -> None:
+        main.SELF_ANALYSIS.record_reaction_complaint_signal(
+            text="this reaction looks like approval",
+            has_recent_reaction=True,
+            decision_action="sent",
+            decision_reason="sent",
+            emotion_class="positive_celebratory",
+            rationale_state="stored_rationale",
+            target_fingerprint="target_safe456",
+        )
+        message = FakeMessage("/complaints")
+
+        asyncio.run(main.complaints_command(SimpleNamespace(effective_message=message), SimpleNamespace()))
+
+        reply = message.reply_calls[0]["text"]
+        self.assertIn("Active complaint temperatures:", reply)
+        self.assertIn("Reaction health:", reply)
+        self.assertIn("insensitive_reaction", reply)
 
     def test_selfcheck_uses_sanitized_context(self) -> None:
         main.SYSTEM_LOG.record_event(

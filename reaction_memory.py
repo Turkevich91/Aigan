@@ -6,7 +6,7 @@ import re
 import sqlite3
 import threading
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from memory import MemoryItem, MemoryStore
@@ -755,6 +755,57 @@ class ReactionMemoryStore:
                 tuple(params),
             ).fetchone()
         return self._row_to_decision(row) if row is not None else None
+
+    def outbound_decision_summary(self, *, lookback_seconds: int = 21600, limit: int = 5) -> dict[str, object]:
+        cutoff = datetime.now(timezone.utc) - timedelta(seconds=max(1, int(lookback_seconds)))
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT *
+                FROM outbound_reaction_decisions
+                WHERE created_at >= ?
+                ORDER BY datetime(created_at) DESC, id DESC
+                LIMIT 500
+                """,
+                (self._format_datetime(cutoff),),
+            ).fetchall()
+        decisions = [self._row_to_decision(row) for row in rows]
+        action_counts: dict[str, int] = {}
+        reason_counts: dict[str, int] = {}
+        emotion_counts: dict[str, int] = {}
+        recent: list[dict[str, object]] = []
+        for record in decisions:
+            action = safe_code(record.action, "unknown")
+            reason = safe_code(record.reason_code, "unknown")
+            emotion = safe_code(record.emotion_class, "unclassified")
+            action_counts[action] = action_counts.get(action, 0) + 1
+            reason_counts[reason] = reason_counts.get(reason, 0) + 1
+            emotion_counts[emotion] = emotion_counts.get(emotion, 0) + 1
+            if len(recent) < max(1, min(int(limit), 10)):
+                recent.append(
+                    {
+                        "created_at": record.created_at,
+                        "action": action,
+                        "reason": reason,
+                        "emotion": emotion,
+                        "confidence": round(max(0.0, min(float(record.confidence or 0.0), 1.0)), 3),
+                        "candidate_class": safe_code(record.candidate_reaction_class, ""),
+                        "sent": safe_code(record.sent_reaction_key, ""),
+                        "severity_flags": [safe_code(flag, "flag") for flag in record.severity_flags[:6]],
+                        "has_text": record.has_text,
+                        "has_source_text": record.has_source_text,
+                        "has_vision_summary": record.has_vision_summary,
+                        "has_forward_origin": record.has_forward_origin,
+                    }
+                )
+        return {
+            "lookback_seconds": max(1, int(lookback_seconds)),
+            "decision_count": len(decisions),
+            "action_counts": dict(sorted(action_counts.items())),
+            "reason_counts": dict(sorted(reason_counts.items())),
+            "emotion_counts": dict(sorted(emotion_counts.items())),
+            "recent": recent,
+        }
 
     def explain_outbound_decision(self, record: ReactionDecisionRecord | None) -> str:
         if record is None:

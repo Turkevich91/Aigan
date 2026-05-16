@@ -1,5 +1,11 @@
 # Aigan Changelog
 
+## 2026-05-16 - Reaction diagnostics and health
+
+- Added compact `Reaction health` summaries to admin diagnostics with outbound decision counts, emotion/reason counts, and reaction complaint temperatures.
+- Surfaced bounded reaction-memory sent/skipped decision counts in `/tool_health reactions`.
+- Added regressions proving reaction diagnostics stay compact and do not expose raw message text, usernames, paths, source URLs, OCR/frame text, transcripts, or token-like values.
+
 ## 2026-05-16 - Reaction misfire self-analysis
 
 - Added reaction-specific complaint classification for insensitive reactions, rationale gaps, tone boundaries, fake empathy, and sycophancy.
