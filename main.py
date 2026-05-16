@@ -3546,6 +3546,28 @@ def memory_capability_rows() -> list[CapabilityRow]:
 
 def configured_capability_rows() -> list[CapabilityRow]:
     rows = memory_capability_rows()
+    youtube_audio_fallback_enabled = _env_bool("YOUTUBE_AUDIO_FALLBACK", False)
+    youtube_transcription_model = os.getenv("YOUTUBE_TRANSCRIPTION_MODEL", "gpt-4o-mini-transcribe").strip()
+    youtube_audio_fallback_configured = youtube_audio_fallback_enabled and bool(youtube_transcription_model)
+    rows.append(
+        CapabilityRow(
+            name="stt_openai",
+            family="stt",
+            enabled=youtube_audio_fallback_enabled,
+            configured=youtube_audio_fallback_configured,
+            available=youtube_audio_fallback_configured,
+            status=(
+                "ok"
+                if youtube_audio_fallback_configured
+                else ("unconfigured" if youtube_audio_fallback_enabled else "disabled")
+            ),
+            adapter="youtube_audio_fallback",
+            mode="youtube_audio_fallback",
+            backend=youtube_transcription_model,
+            details={"max_duration_seconds": int(os.getenv("YOUTUBE_MAX_DURATION_SECONDS", "1200"))},
+            next_action="check configuration" if youtube_audio_fallback_enabled and not youtube_transcription_model else "",
+        )
+    )
     rows.append(
         CapabilityRow(
             name="system_log",

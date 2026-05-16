@@ -77,6 +77,41 @@ RELATIVE_PATH_VALUE_RE = re.compile(
 )
 TOKEN_VALUE_RE = re.compile(r"\b(?:gh[pousr]_|github_pat_|xox[baprs]-)[A-Za-z0-9_-]{8,}", re.IGNORECASE)
 SAFE_CATEGORY_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_.:-]{0,79}$")
+SAFE_CATEGORY_VALUES = {
+    "cleanup_failed",
+    "decode_failed",
+    "download_failed",
+    "freeform",
+    "no_valid_image",
+    "prefetch_failed",
+    "provider_unavailable",
+    "runner_error",
+    "search_failed",
+    "self_report_failed",
+    "timeout",
+    "tool_operation_failed",
+}
+SAFE_CATEGORY_PREFIXES = (
+    "adapter_",
+    "caption_",
+    "decode_",
+    "download_",
+    "ffmpeg_",
+    "github_",
+    "image_",
+    "memory_",
+    "ocr_",
+    "openai_",
+    "provider_",
+    "runtime_",
+    "stt_",
+    "telegram_",
+    "tool_",
+    "transcript_",
+    "vision_",
+    "web_",
+    "yt_dlp_",
+)
 SAFE_DOTTED_CATEGORY_PREFIXES = (
     "adapter.",
     "caption.",
@@ -99,6 +134,14 @@ SAFE_DOTTED_CATEGORY_PREFIXES = (
     "yt_dlp.",
 )
 ROW_DETAIL_FIELDS = ("adapter_count", "backlog", "dimensions", "max_bytes")
+
+
+def is_safe_category_code(text: str) -> bool:
+    if text in SAFE_CATEGORY_VALUES:
+        return True
+    if "." in text:
+        return text.startswith(SAFE_DOTTED_CATEGORY_PREFIXES)
+    return text.startswith(SAFE_CATEGORY_PREFIXES)
 
 
 @dataclass
@@ -170,8 +213,6 @@ def safe_failure_category_label(value: Any, limit: int = 80) -> str:
         return ""
     if text == "[redacted]":
         return text
-    if "." in text and SAFE_CATEGORY_RE.fullmatch(text) and not text.startswith(SAFE_DOTTED_CATEGORY_PREFIXES):
-        return "[redacted]"
     if (
         CATEGORY_URL_VALUE_RE.search(text)
         or WINDOWS_PATH_VALUE_RE.search(text)
@@ -180,9 +221,11 @@ def safe_failure_category_label(value: Any, limit: int = 80) -> str:
         or TOKEN_VALUE_RE.search(text)
     ):
         return "[redacted]"
-    if SAFE_CATEGORY_RE.fullmatch(text):
+    if not SAFE_CATEGORY_RE.fullmatch(text):
+        return "freeform"
+    if is_safe_category_code(text):
         return text
-    return "freeform"
+    return "[redacted]"
 
 
 def normalize_status(status: Any, enabled: bool = False) -> str:

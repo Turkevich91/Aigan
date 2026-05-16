@@ -1050,6 +1050,26 @@ class ToolRuntimeTests(unittest.TestCase):
             self.assertIn("[redacted]", text)
             store.close()
 
+    def test_tool_diagnostics_redacts_unknown_single_token_failure_category(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = SystemLogStore(Path(tmpdir) / "events.sqlite3", retention_days=14)
+            store.record_event(
+                level="warning",
+                component="tool_runtime",
+                event_type="tool_operation_failed",
+                details={"tool": "media_transcript", "failure_category": "opaqueSecret12345"},
+            )
+
+            rows = build_capability_rows(
+                {"status": "ok", "adapter_count": 0, "error_count": 0, "adapters": []},
+                events=store.events_since(21600, "warning", 20),
+            )
+            text = render_recent_failures(rows)
+
+            self.assertIn("[redacted]", text)
+            self.assertNotIn("opaqueSecret12345", text)
+            store.close()
+
     def test_tool_diagnostics_counts_error_event_once(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             store = SystemLogStore(Path(tmpdir) / "events.sqlite3", retention_days=14)
@@ -1437,6 +1457,40 @@ class ToolRuntimeTests(unittest.TestCase):
             row = {item.name: item for item in main.memory_capability_rows()}["memory_embeddings"]
         finally:
             main.CONFIG = original_config
+
+        self.assertTrue(row.enabled)
+        self.assertFalse(row.configured)
+        self.assertFalse(row.available)
+        self.assertEqual("unconfigured", row.status)
+
+    def test_stt_openai_row_reflects_youtube_audio_fallback(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "YOUTUBE_AUDIO_FALLBACK": "true",
+                "YOUTUBE_TRANSCRIPTION_MODEL": "gpt-4o-mini-transcribe",
+                "YOUTUBE_MAX_DURATION_SECONDS": "60",
+            },
+        ):
+            row = {item.name: item for item in main.configured_capability_rows()}["stt_openai"]
+
+        self.assertTrue(row.enabled)
+        self.assertTrue(row.configured)
+        self.assertTrue(row.available)
+        self.assertEqual("ok", row.status)
+        self.assertEqual("youtube_audio_fallback", row.adapter)
+        self.assertEqual("gpt-4o-mini-transcribe", row.backend)
+        self.assertEqual({"max_duration_seconds": 60}, row.details)
+
+    def test_stt_openai_row_requires_youtube_transcription_model(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "YOUTUBE_AUDIO_FALLBACK": "true",
+                "YOUTUBE_TRANSCRIPTION_MODEL": "",
+            },
+        ):
+            row = {item.name: item for item in main.configured_capability_rows()}["stt_openai"]
 
         self.assertTrue(row.enabled)
         self.assertFalse(row.configured)
