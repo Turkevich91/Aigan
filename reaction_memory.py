@@ -724,6 +724,7 @@ class ReactionMemoryStore:
         chat_id: int,
         target_message_id: int | None = None,
         target_memory_id: int | None = None,
+        action: str | None = None,
     ) -> ReactionDecisionRecord | None:
         conditions = ["chat_id = ?"]
         params: list[object] = [int(chat_id)]
@@ -733,6 +734,9 @@ class ReactionMemoryStore:
         if target_memory_id is not None:
             conditions.append("target_memory_id = ?")
             params.append(int(target_memory_id))
+        if action is not None:
+            conditions.append("action = ?")
+            params.append(safe_code(action))
         with self._lock:
             row = self._conn.execute(
                 f"""

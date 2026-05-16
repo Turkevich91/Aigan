@@ -1253,8 +1253,13 @@ def reaction_decision_for_complaint(message: Message) -> Any | None:
     reply = getattr(message, "reply_to_message", None)
     target_message_id = getattr(reply, "message_id", None) if reply is not None else None
     if target_message_id is not None:
-        return REACTION_MEMORY.latest_outbound_decision(chat_id=int(message.chat_id), target_message_id=target_message_id)
-    record = REACTION_MEMORY.latest_outbound_decision(chat_id=int(message.chat_id))
+        record = REACTION_MEMORY.latest_outbound_decision(
+            chat_id=int(message.chat_id),
+            target_message_id=target_message_id,
+            action="sent",
+        )
+        return record if reaction_decision_is_recent(record) else None
+    record = REACTION_MEMORY.latest_outbound_decision(chat_id=int(message.chat_id), action="sent")
     return record if reaction_decision_is_recent(record) else None
 
 

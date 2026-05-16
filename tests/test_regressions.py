@@ -6349,6 +6349,8 @@ class SystemHealthTests(unittest.TestCase):
             main.MEMORY.clear_all()
         if main.SOCIAL_MEMORY is not None:
             main.SOCIAL_MEMORY.clear_all()
+        if main.REACTION_MEMORY is not None:
+            main.REACTION_MEMORY.clear_all()
         main.pending_requests.clear()
         main.passive_contexts.clear()
         main.last_user_call.clear()
@@ -6417,6 +6419,51 @@ class SystemHealthTests(unittest.TestCase):
 
         self.assertIsNotNone(signal)
         self.assertEqual("reaction_reasoning_gap", signal.category)
+
+    def test_reaction_complaint_classifier_detects_health_categories(self) -> None:
+        cases = (
+            ("Aigan this reaction feels like fake empathy", "fake_empathy"),
+            ("Aigan that reaction crossed a tone boundary", "tone_boundary"),
+            ("Aigan that reaction is sycophancy", "sycophancy"),
+        )
+        for text, category in cases:
+            with self.subTest(category=category):
+                signal = classify_reaction_complaint(
+                    text,
+                    bot_username="thrd_ua_bot",
+                    rationale_state="stored_rationale",
+                    decision_action="sent",
+                    target_fingerprint="abc123",
+                )
+
+                self.assertIsNotNone(signal)
+                self.assertEqual(category, signal.category)
+                self.assertNotIn(text, signal.sample)
+
+    def test_reaction_complaint_classifier_rejects_broad_passive_markers(self) -> None:
+        signal = classify_reaction_complaint(
+            "I support the plan and the tone sounds fine",
+            has_recent_reaction=True,
+            rationale_state="stored_rationale",
+            decision_action="sent",
+        )
+
+        self.assertIsNone(signal)
+
+    def test_reaction_complaint_classifier_does_not_match_like_inside_dislike(self) -> None:
+        signal = classify_reaction_complaint(
+            "Aigan why did you dislike that?",
+            bot_username="thrd_ua_bot",
+            rationale_state="missing_decision",
+        )
+
+        self.assertIsNone(signal)
+
+    def test_generic_complaint_does_not_select_reaction_health_category(self) -> None:
+        signal = classify_complaint("Aigan bot bug fake empathy", bot_username="thrd_ua_bot")
+
+        self.assertIsNotNone(signal)
+        self.assertEqual("general", signal.category)
 
     def test_complaint_temperature_reports_at_threshold(self) -> None:
         class FakeReporter:
@@ -6532,6 +6579,67 @@ class SystemHealthTests(unittest.TestCase):
         self.assertEqual([], message.reply_calls)
         clusters = main.SYSTEM_LOG.active_complaints(3)
         self.assertTrue(any(cluster.category == "insensitive_reaction" for cluster in clusters))
+
+    def test_reaction_complaint_lookup_ignores_recent_skips_after_sent_reaction(self) -> None:
+        self.assertIsNotNone(main.REACTION_MEMORY)
+        main.REACTION_MEMORY.record_outbound_decision(
+            chat_id=-1001,
+            target_message_id=5010,
+            target_memory_id=None,
+            item=None,
+            policy_version="outbound_reaction_emotion_policy_v1",
+            phase="pre_embedding",
+            action="sent",
+            reason_code="sent",
+            rationale="Stored sanitized rationale.",
+            emotion_class="positive_celebratory",
+            sent_spec=ReactionSpec(reaction_type="emoji", reaction_key="emoji:fire", base_emoji="\N{FIRE}"),
+        )
+        main.REACTION_MEMORY.record_outbound_decision(
+            chat_id=-1001,
+            target_message_id=5011,
+            target_memory_id=None,
+            item=None,
+            policy_version="outbound_reaction_emotion_policy_v1",
+            phase="pre_embedding",
+            action="skipped",
+            reason_code="sensitive",
+            rationale="No reaction was sent.",
+            emotion_class="grief_sympathy",
+        )
+
+        record = main.reaction_decision_for_complaint(FakeMessage("this looks like approval", message_id=5012))
+
+        self.assertIsNotNone(record)
+        self.assertEqual("sent", record.action)
+        self.assertEqual(5010, record.target_message_id)
+
+    def test_reaction_complaint_reply_lookup_ignores_old_sent_reaction(self) -> None:
+        self.assertIsNotNone(main.REACTION_MEMORY)
+        record_id = main.REACTION_MEMORY.record_outbound_decision(
+            chat_id=-1001,
+            target_message_id=5013,
+            target_memory_id=None,
+            item=None,
+            policy_version="outbound_reaction_emotion_policy_v1",
+            phase="pre_embedding",
+            action="sent",
+            reason_code="sent",
+            rationale="Stored sanitized rationale.",
+            emotion_class="positive_celebratory",
+            sent_spec=ReactionSpec(reaction_type="emoji", reaction_key="emoji:fire", base_emoji="\N{FIRE}"),
+        )
+        old_created_at = (datetime.now(timezone.utc) - timedelta(days=3)).isoformat(timespec="seconds")
+        with main.REACTION_MEMORY._lock:
+            main.REACTION_MEMORY._conn.execute(
+                "UPDATE outbound_reaction_decisions SET created_at = ? WHERE id = ?",
+                (old_created_at, record_id),
+            )
+            main.REACTION_MEMORY._conn.commit()
+        message = FakeMessage("Aigan why did you put that reaction?", message_id=5014)
+        message.reply_to_message = SimpleNamespace(message_id=5013, from_user=FakeUser(user_id=222, username="human"))
+
+        self.assertIsNone(main.reaction_decision_for_complaint(message))
 
     def test_reaction_reasoning_gap_records_when_challenged_without_decision(self) -> None:
         message = FakeMessage("Aigan why did you put that reaction?", message_id=5004)

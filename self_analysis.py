@@ -74,11 +74,6 @@ COMPLAINT_WORDS = {
     "не так",
 }
 CATEGORY_PATTERNS = [
-    ("insensitive_reaction", ("insensitive_reaction", "inappropriate reaction", "approval of harm")),
-    ("reaction_reasoning_gap", ("reaction_reasoning_gap", "missing reaction rationale")),
-    ("fake_empathy", ("fake_empathy", "fake empathy")),
-    ("tone_boundary", ("tone_boundary", "tone boundary")),
-    ("sycophancy", ("sycophancy", "yes-man", "yes man")),
     ("web_search", ("web", "веб", "search", "пошук", "поиск", "джерел", "источник", "source")),
     ("image", ("image", "vision", "картин", "фото", "зображ", "мем", "альбом")),
     ("memory_context", ("memory", "пам", "контекст", "context", "забув", "забыл")),
@@ -93,7 +88,6 @@ REACTION_TERMS = (
     "emote",
     "smile",
     "smiley",
-    "like",
     "fire",
     "thumbs up",
     "put that",
@@ -128,9 +122,11 @@ REACTION_APPROVAL_TERMS = (
     "approval",
     "approve",
     "approved",
-    "support",
     "endors",
     "looks like approval",
+    "looks like support",
+    "looks like endorsement",
+    "supporting harm",
     "liked the idea",
     "схвал",
     "одобр",
@@ -163,12 +159,26 @@ REACTION_TONE_TERMS = (
     "меж",
 )
 REACTION_SYCOPHANCY_TERMS = (
+    "sycophancy",
     "sycoph",
     "yes-man",
     "yes man",
     "agree with everything",
     "поддаки",
 )
+
+
+def has_marker(lowered: str, marker: str) -> bool:
+    clean_marker = marker.casefold().strip()
+    if not clean_marker:
+        return False
+    if re.fullmatch(r"[a-z0-9_-]+", clean_marker):
+        return re.search(rf"(?<![a-z0-9_-]){re.escape(clean_marker)}(?![a-z0-9_-])", lowered) is not None
+    return clean_marker in lowered
+
+
+def has_any_marker(lowered: str, markers: tuple[str, ...] | set[str]) -> bool:
+    return any(has_marker(lowered, marker) for marker in markers)
 
 
 def classify_complaint(
@@ -186,7 +196,7 @@ def classify_complaint(
         bot_markers.add(bot_username.casefold().lstrip("@"))
         bot_markers.add("@" + bot_username.casefold().lstrip("@"))
 
-    mentions_bot = reply_to_bot or any(marker in lowered for marker in bot_markers)
+    mentions_bot = reply_to_bot or has_any_marker(lowered, bot_markers)
     has_complaint = any(marker in lowered for marker in COMPLAINT_WORDS)
     if not (mentions_bot and has_complaint):
         return None
@@ -223,17 +233,19 @@ def classify_reaction_complaint(
         bot_markers.add(bot_username.casefold().lstrip("@"))
         bot_markers.add("@" + bot_username.casefold().lstrip("@"))
 
-    mentions_bot = reply_to_bot or any(marker in lowered for marker in bot_markers)
-    has_reaction_marker = any(marker in lowered for marker in REACTION_TERMS)
-    has_reason_marker = any(marker in lowered for marker in REACTION_REASON_TERMS)
-    has_approval_marker = any(marker in lowered for marker in REACTION_APPROVAL_TERMS)
-    has_insensitive_marker = any(marker in lowered for marker in REACTION_INSENSITIVE_TERMS)
-    has_fake_empathy_marker = any(marker in lowered for marker in REACTION_FAKE_EMPATHY_TERMS)
-    has_tone_marker = any(marker in lowered for marker in REACTION_TONE_TERMS)
-    has_sycophancy_marker = any(marker in lowered for marker in REACTION_SYCOPHANCY_TERMS)
+    mentions_bot = reply_to_bot or has_any_marker(lowered, bot_markers)
+    has_reaction_marker = has_any_marker(lowered, REACTION_TERMS)
+    has_reason_marker = has_any_marker(lowered, REACTION_REASON_TERMS)
+    has_approval_marker = has_any_marker(lowered, REACTION_APPROVAL_TERMS)
+    has_insensitive_marker = has_any_marker(lowered, REACTION_INSENSITIVE_TERMS)
+    has_fake_empathy_marker = has_any_marker(lowered, REACTION_FAKE_EMPATHY_TERMS)
+    has_tone_marker = has_any_marker(lowered, REACTION_TONE_TERMS)
+    has_sycophancy_marker = has_any_marker(lowered, REACTION_SYCOPHANCY_TERMS)
     has_reaction_context = bool(has_recent_reaction or has_reaction_marker)
 
     if not (mentions_bot or has_recent_reaction):
+        return None
+    if not mentions_bot and not (has_reaction_marker or has_approval_marker or has_insensitive_marker):
         return None
     if not has_reaction_context and not has_approval_marker:
         return None
@@ -249,6 +261,8 @@ def classify_reaction_complaint(
     elif has_reason_marker and rationale_state in {"missing_decision", "insufficient_rationale"}:
         category = "reaction_reasoning_gap"
     else:
+        return None
+    if category not in REACTION_HEALTH_CATEGORIES:
         return None
 
     context_bits = [
