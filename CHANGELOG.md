@@ -1,5 +1,11 @@
 # Aigan Changelog
 
+## 2026-05-15 - Transcript memory integration plan
+
+- Added a tool research note for future transcript memory writes.
+- Documented source-only transcript storage so media transcripts stay searchable without polluting `/stat` or `/character`.
+- Captured future tests for transcript metadata, dedupe, truncation, recall, and embedding failure isolation.
+
 ## 2026-05-15 - Local STT VPS benchmark spike
 
 - Added a benchmark/spike note for CPU-only local STT on the current deployment class.
