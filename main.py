@@ -1,6 +1,5 @@
 import asyncio
 import base64
-import hashlib
 import html
 import io
 import logging

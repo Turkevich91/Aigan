@@ -122,7 +122,13 @@ from mcp_servers import web
 from reaction_memory import ReactionSpec
 from scripts import import_telegram_export
 from scripts.import_telegram_export import ImportOptions
-from self_analysis import SelfAnalysisService, classify_complaint, classify_reaction_complaint, has_marker
+from self_analysis import (
+    SelfAnalysisService,
+    classify_complaint,
+    classify_reaction_complaint,
+    has_marker,
+    has_reaction_complaint_hint,
+)
 from system_log import SystemEvent, SystemLogStore, redact_secrets
 from tool_diagnostics import (
     CapabilityRow,
@@ -6528,6 +6534,8 @@ class SystemHealthTests(unittest.TestCase):
             "Aigan, your response was fake empathy",
             "I had a bad reaction to dinner",
             "Aigan, I had a bad reaction to dinner",
+            "Aigan, I had a bad reaction to dinner and it was not ok",
+            "Aigan, why did you put that message?",
             "\u044f \u043f\u0456\u0434\u0442\u0440\u0438\u043c\u0443\u044e \u043f\u043b\u0430\u043d",
             "Aigan, \u0431\u0435\u0442\u043e\u043d is solid",
         )
@@ -6560,6 +6568,13 @@ class SystemHealthTests(unittest.TestCase):
         )
 
         self.assertIsNone(signal)
+
+    def test_reaction_complaint_hint_detects_specific_insensitive_phrases(self) -> None:
+        self.assertTrue(has_reaction_complaint_hint("Aigan, that was insensitive", bot_username="thrd_ua_bot"))
+        self.assertTrue(has_reaction_complaint_hint("this reaction is inappropriate"))
+        self.assertFalse(
+            has_reaction_complaint_hint("I had a bad reaction to dinner and it was not ok")
+        )
 
     def test_marker_matching_uses_unicode_boundaries(self) -> None:
         self.assertFalse(has_marker("\u0434\u0438\u0437\u043b\u0430\u0439\u043a", "\u043b\u0430\u0439\u043a"))

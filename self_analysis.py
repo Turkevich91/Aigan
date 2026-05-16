@@ -94,10 +94,6 @@ REACTION_TERMS = (
     "fire emoji",
     "fire reaction",
     "thumbs up",
-    "put that",
-    "put this",
-    "set that",
-    "set this",
     "posted reaction",
     "posted emoji",
     "reacted",
@@ -168,12 +164,26 @@ REACTION_INSENSITIVE_TERMS = (
     "bad emoji reaction",
     "tone deaf",
     "not ok",
-    "неумест",
-    "недореч",
+    "неумест*",
+    "недореч*",
     "не так",
+)
+REACTION_INSENSITIVE_HINT_TERMS = (
+    "inappropriate",
+    "insensitive",
+    "wrong reaction",
+    "bad emoji",
+    "bad emoji reaction",
+    "tone deaf",
+    "неумест*",
+    "недореч*",
 )
 REACTION_PASSIVE_COMPLAINT_TERMS = (
     "inappropriate reaction",
+    "reaction is inappropriate",
+    "reaction was inappropriate",
+    "that reaction is inappropriate",
+    "this reaction is inappropriate",
     "explain that reaction",
     "explain this reaction",
     "explain your reaction",
@@ -191,7 +201,7 @@ REACTION_FAKE_EMPATHY_TERMS = (
     "fake empathy",
     "performative empathy",
     "pretend empathy",
-    "фальшив",
+    "фальшив*",
 )
 REACTION_TONE_TERMS = (
     "tone boundary",
@@ -213,7 +223,7 @@ REACTION_SYCOPHANCY_TERMS = (
     "yes-man",
     "yes man",
     "agree with everything",
-    "поддаки",
+    "поддаки*",
 )
 NON_REACTION_BOT_OUTPUT_TERMS = (
     "answer",
@@ -223,6 +233,34 @@ NON_REACTION_BOT_OUTPUT_TERMS = (
     "reply",
     "response",
     "said",
+    "відповідь",
+    "ответ",
+    "повідомлення",
+    "сообщение",
+)
+PERSONAL_REACTION_CONTEXT_TERMS = (
+    "bad reaction to",
+    "had a reaction to",
+    "my reaction to",
+    "reaction to dinner",
+    "reaction to food",
+    "reaction to medication",
+    "reaction to medicine",
+    "reaction to treatment",
+    "reaction to vaccine",
+    "allergic reaction",
+)
+BOT_REACTION_OUTPUT_TERMS = (
+    "bot reaction",
+    "your reaction",
+    "this reaction",
+    "that reaction",
+    "emoji",
+    "emote",
+    "fire reaction",
+    "posted reaction",
+    "posted emoji",
+    "reacted",
 )
 
 
@@ -270,6 +308,7 @@ def has_reaction_complaint_hint(
         or has_any_marker(lowered, REACTION_FAKE_EMPATHY_TERMS)
         or has_any_marker(lowered, REACTION_TONE_TERMS)
         or has_any_marker(lowered, REACTION_SYCOPHANCY_TERMS)
+        or has_any_marker(lowered, REACTION_INSENSITIVE_HINT_TERMS)
         or has_any_marker(lowered, REACTION_REASON_CHALLENGE_TERMS)
     )
 
@@ -337,6 +376,8 @@ def classify_reaction_complaint(
     has_tone_marker = has_any_marker(lowered, REACTION_TONE_TERMS)
     has_sycophancy_marker = has_any_marker(lowered, REACTION_SYCOPHANCY_TERMS)
     has_non_reaction_output_marker = has_any_marker(lowered, NON_REACTION_BOT_OUTPUT_TERMS)
+    has_personal_reaction_context = has_any_marker(lowered, PERSONAL_REACTION_CONTEXT_TERMS)
+    has_bot_reaction_output_context = has_any_marker(lowered, BOT_REACTION_OUTPUT_TERMS)
     has_reaction_context = bool(has_recent_reaction or has_reaction_marker)
     has_temporal_reaction_context = bool(has_recent_reaction and mentions_bot)
     has_explicit_or_temporal_context = bool(has_reaction_marker or has_temporal_reaction_context)
@@ -362,6 +403,8 @@ def classify_reaction_complaint(
     ):
         return None
     if not has_reaction_context and not has_approval_marker:
+        return None
+    if has_personal_reaction_context and not has_bot_reaction_output_context:
         return None
 
     if has_sycophancy_marker and has_reaction_category_context:
