@@ -289,6 +289,8 @@ class ReactionMemoryStore:
                 ON outbound_reaction_decisions(chat_id, action, created_at, id);
             CREATE INDEX IF NOT EXISTS idx_outbound_reaction_decisions_memory
                 ON outbound_reaction_decisions(target_memory_id, created_at, id);
+            CREATE INDEX IF NOT EXISTS idx_outbound_reaction_decisions_created
+                ON outbound_reaction_decisions(created_at DESC, id DESC);
             """
         )
         self._conn.commit()
@@ -758,52 +760,93 @@ class ReactionMemoryStore:
 
     def outbound_decision_summary(self, *, lookback_seconds: int = 21600, limit: int = 5) -> dict[str, object]:
         cutoff = datetime.now(timezone.utc) - timedelta(seconds=max(1, int(lookback_seconds)))
+        cutoff_text = self._format_datetime(cutoff)
+        recent_limit = max(1, min(int(limit), 10))
         with self._lock:
+            total_row = self._conn.execute(
+                """
+                SELECT COUNT(*) AS decision_count
+                FROM outbound_reaction_decisions
+                WHERE created_at >= ?
+                """,
+                (cutoff_text,),
+            ).fetchone()
+            action_rows = self._conn.execute(
+                """
+                SELECT action AS value, COUNT(*) AS count
+                FROM outbound_reaction_decisions
+                WHERE created_at >= ?
+                GROUP BY action
+                """,
+                (cutoff_text,),
+            ).fetchall()
+            reason_rows = self._conn.execute(
+                """
+                SELECT reason_code AS value, COUNT(*) AS count
+                FROM outbound_reaction_decisions
+                WHERE created_at >= ?
+                GROUP BY reason_code
+                """,
+                (cutoff_text,),
+            ).fetchall()
+            emotion_rows = self._conn.execute(
+                """
+                SELECT emotion_class AS value, COUNT(*) AS count
+                FROM outbound_reaction_decisions
+                WHERE created_at >= ?
+                GROUP BY emotion_class
+                """,
+                (cutoff_text,),
+            ).fetchall()
             rows = self._conn.execute(
                 """
                 SELECT *
                 FROM outbound_reaction_decisions
                 WHERE created_at >= ?
-                ORDER BY datetime(created_at) DESC, id DESC
-                LIMIT 500
+                ORDER BY created_at DESC, id DESC
+                LIMIT ?
                 """,
-                (self._format_datetime(cutoff),),
+                (cutoff_text, recent_limit),
             ).fetchall()
         decisions = [self._row_to_decision(row) for row in rows]
-        action_counts: dict[str, int] = {}
-        reason_counts: dict[str, int] = {}
-        emotion_counts: dict[str, int] = {}
+
+        def merge_counts(rows: list[sqlite3.Row], *, default: str) -> dict[str, int]:
+            counts: dict[str, int] = {}
+            for row in rows:
+                key = safe_code(row["value"], default)
+                counts[key] = counts.get(key, 0) + int(row["count"] or 0)
+            return dict(sorted(counts.items()))
+
+        action_counts = merge_counts(action_rows, default="unknown")
+        reason_counts = merge_counts(reason_rows, default="unknown")
+        emotion_counts = merge_counts(emotion_rows, default="unclassified")
         recent: list[dict[str, object]] = []
         for record in decisions:
             action = safe_code(record.action, "unknown")
             reason = safe_code(record.reason_code, "unknown")
             emotion = safe_code(record.emotion_class, "unclassified")
-            action_counts[action] = action_counts.get(action, 0) + 1
-            reason_counts[reason] = reason_counts.get(reason, 0) + 1
-            emotion_counts[emotion] = emotion_counts.get(emotion, 0) + 1
-            if len(recent) < max(1, min(int(limit), 10)):
-                recent.append(
-                    {
-                        "created_at": record.created_at,
-                        "action": action,
-                        "reason": reason,
-                        "emotion": emotion,
-                        "confidence": round(max(0.0, min(float(record.confidence or 0.0), 1.0)), 3),
-                        "candidate_class": safe_code(record.candidate_reaction_class, ""),
-                        "sent": safe_code(record.sent_reaction_key, ""),
-                        "severity_flags": [safe_code(flag, "flag") for flag in record.severity_flags[:6]],
-                        "has_text": record.has_text,
-                        "has_source_text": record.has_source_text,
-                        "has_vision_summary": record.has_vision_summary,
-                        "has_forward_origin": record.has_forward_origin,
-                    }
-                )
+            recent.append(
+                {
+                    "created_at": record.created_at,
+                    "action": action,
+                    "reason": reason,
+                    "emotion": emotion,
+                    "confidence": round(max(0.0, min(float(record.confidence or 0.0), 1.0)), 3),
+                    "candidate_class": safe_code(record.candidate_reaction_class, ""),
+                    "sent": safe_code(record.sent_reaction_key, ""),
+                    "severity_flags": [safe_code(flag, "flag") for flag in record.severity_flags[:6]],
+                    "has_text": record.has_text,
+                    "has_source_text": record.has_source_text,
+                    "has_vision_summary": record.has_vision_summary,
+                    "has_forward_origin": record.has_forward_origin,
+                }
+            )
         return {
             "lookback_seconds": max(1, int(lookback_seconds)),
-            "decision_count": len(decisions),
-            "action_counts": dict(sorted(action_counts.items())),
-            "reason_counts": dict(sorted(reason_counts.items())),
-            "emotion_counts": dict(sorted(emotion_counts.items())),
+            "decision_count": int(total_row["decision_count"] if total_row is not None else 0),
+            "action_counts": action_counts,
+            "reason_counts": reason_counts,
+            "emotion_counts": emotion_counts,
             "recent": recent,
         }
 

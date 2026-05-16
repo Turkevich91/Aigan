@@ -6992,6 +6992,69 @@ class SystemHealthTests(unittest.TestCase):
         self.assertEqual(1, rows["reaction_memory"].details["sent_decisions"])
         self.assertEqual(1, rows["reaction_memory"].details["skipped_decisions"])
 
+    def test_reaction_memory_health_counts_are_not_recent_row_limited(self) -> None:
+        self.assertIsNotNone(main.REACTION_MEMORY)
+        created_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        values = []
+        for idx in range(505):
+            action = "sent" if idx % 2 == 0 else "skipped"
+            reason = "sent" if action == "sent" else "empathy_preflight"
+            emotion = "positive_celebratory" if action == "sent" else "grief_sympathy"
+            values.append(
+                (
+                    created_at,
+                    -1001,
+                    5100 + idx,
+                    None,
+                    "outbound_reaction_emotion_policy_v1",
+                    "pre_embedding",
+                    action,
+                    reason,
+                    "Stored sanitized rationale.",
+                    "",
+                    "",
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    "[]",
+                    emotion,
+                    0.8,
+                    None,
+                    "",
+                    "",
+                    "emoji:fire" if action == "sent" else "",
+                    None,
+                    "{}",
+                )
+            )
+        with main.REACTION_MEMORY._lock:
+            main.REACTION_MEMORY._conn.executemany(
+                """
+                INSERT INTO outbound_reaction_decisions (
+                    created_at, chat_id, target_message_id, target_memory_id,
+                    policy_version, phase, action, reason_code, rationale,
+                    content_kind, attachment_type, has_text, has_source_text,
+                    has_source_title, has_source_url, has_vision_summary,
+                    has_forward_origin, severity_flags_json, emotion_class,
+                    confidence, score, candidate_reaction_key,
+                    candidate_reaction_class, sent_reaction_key,
+                    reaction_asset_id, details_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                values,
+            )
+            main.REACTION_MEMORY._conn.commit()
+
+        summary = main.REACTION_MEMORY.outbound_decision_summary(limit=3)
+
+        self.assertEqual(505, summary["decision_count"])
+        self.assertEqual(253, summary["action_counts"]["sent"])
+        self.assertEqual(252, summary["action_counts"]["skipped"])
+        self.assertEqual(3, len(summary["recent"]))
+
     def test_reaction_health_diagnostics_are_compact_and_sanitized(self) -> None:
         self.assertIsNotNone(main.MEMORY)
         self.assertIsNotNone(main.REACTION_MEMORY)
