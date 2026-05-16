@@ -73,8 +73,11 @@ Fixture:
 Benchmark environment:
 
 - Date: 2026-05-16.
-- Runtime: local workstation, not the deployment VPS and not a Docker
+- Runtime: sanitized local workstation, not the deployment VPS and not a Docker
   production-like benchmark.
+- OS: Windows 11 Pro.
+- Logical CPUs: 24.
+- RAM: about 95 GiB.
 - Python: 3.12.13 through `uv`.
 - `ffmpeg`/`ffprobe`: 8.1.
 - PySceneDetect: 0.7.
@@ -84,10 +87,9 @@ Benchmark environment:
   OpenCV 38 MiB, and OpenCV headless 38 MiB, plus smaller PySceneDetect CLI
   dependencies. These are package archive observations, not installed disk size
   measurements.
-- Local CPU/RAM were not recorded in this public note because this was a
-  directional tool-shape spike, not a deployment capacity benchmark. The future
-  adapter implementation should still get a VPS smoke test after local and
-  Docker tests are green.
+- Process-level peak RSS was sampled from the command process tree. It is good
+  enough for a directional comparison, but it is still not a Docker or VPS
+  capacity benchmark.
 
 Warm dependency check:
 
@@ -150,12 +152,22 @@ report frames_read, selected_count, duplicates_skipped, elapsed_ms, tracemalloc_
 
 Results:
 
-| Method | Command shape | Wall time | Frames output | Duplicate/quality signal | Dependency footprint | Memory note |
-| --- | --- | ---: | ---: | --- | --- | --- |
-| `ffprobe` metadata | stream duration, fps, size, frame count | n/a | n/a | Correctly reported 10.0s, 640x360, 24 fps, 240 frames. | Existing FFmpeg binary; no Python packages. | Process RSS was not measured. |
-| `ffmpeg` interval sampling | `fps=1,scale=320:-1` | 66.3 ms | 10 | Represents five scenes but produces duplicate frames inside unchanged scenes. | Existing FFmpeg binary; no Python packages. | Process RSS was not measured. |
-| PySceneDetect | `detect-content list-scenes save-images --num-images 1 --width 320` | 749.1 ms | 5 | Detected four cuts and produced five middle-scene frames plus a CSV. | PySceneDetect plus OpenCV backend; warm `uv` fetch included OpenCV wheels and NumPy. | Process RSS was not measured. |
-| OpenCV diff/dedupe | sample every 0.5s, resize, grayscale `absdiff`, Laplacian blur, luma | 1052.6 ms process wall; 52.8 ms inner loop | 5 | Selected 5 of 20 sampled candidates and skipped 15 near-duplicates. | `opencv-python-headless` plus NumPy. | Python `tracemalloc` peak was about 1.8 MB, but this excludes native OpenCV/FFmpeg allocations and must not be treated as RSS. |
+| Method | Command shape | Wall time | CPU time | Peak RSS | Frames output | Duplicate/quality signal | Dependency footprint |
+| --- | --- | ---: | ---: | ---: | ---: | --- | --- |
+| `ffprobe` metadata | stream duration, fps, size, frame count | n/a | n/a | n/a | n/a | Correctly reported 10.0s, 640x360, 24 fps, 240 frames. | Existing FFmpeg binary; no Python packages. |
+| `ffmpeg` interval sampling | `fps=1,scale=320:-1` | 82.0 ms | 0.047s | 44.9 MB | 10 | Represents five scenes but produces duplicate frames inside unchanged scenes. | Existing FFmpeg binary; no Python packages. |
+| PySceneDetect | `detect-content list-scenes save-images --num-images 1 --width 320` | 798.6 ms | 0.750s | 83.8 MB | 5 | Detected four cuts and produced five middle-scene frames plus a CSV. | PySceneDetect plus OpenCV backend; warm `uv` fetch included OpenCV wheels and NumPy. |
+| OpenCV diff/dedupe | sample every 0.5s, resize, grayscale `absdiff`, Laplacian blur, luma | 260.5 ms process wall; 80.3 ms inner loop | 0.328s | 66.4 MB | 5 | Selected 5 of 20 sampled candidates and skipped 15 near-duplicates. | `opencv-python-headless` plus NumPy. |
+
+Memory caveat:
+
+- Peak RSS was sampled from the local process tree, including native allocations
+  visible to the OS sampler.
+- The OpenCV probe also reported Python `tracemalloc` peak near 1.8 MB, but that
+  excludes native OpenCV/FFmpeg allocations and is not used as the memory
+  comparison metric.
+- The numbers are useful for candidate comparison on a tiny synthetic clip. They
+  do not replace Docker or VPS smoke validation for implementation issue `#48`.
 
 Interpretation:
 
@@ -168,9 +180,10 @@ Interpretation:
   PySceneDetect or interval sampling.
 - The adapter should suppress or sanitize CLI progress/noise before writing
   system-log events.
-- This spike records wall-clock behavior and qualitative dependency footprint.
-  It does not prove VPS memory suitability; implementation issue `#48` should
-  add process-level RSS measurement during local/Docker/VPS validation.
+- This spike records wall-clock behavior, CPU time, directional process RSS, and
+  qualitative dependency footprint. Implementation issue `#48` should repeat
+  the same measurement shape during local/Docker/VPS validation before enabling
+  any production route.
 
 ## Recommended V1 Stack
 
@@ -209,8 +222,16 @@ Default recommendation for implementation issue `#48`:
 Suggested production caps for v1:
 
 - Default max duration: 90 seconds for explicit requests.
-- Hard duration cap: 180 seconds unless an operator explicitly raises it.
+- Hard duration cap: 180 seconds.
 - Default max input bytes: 50 MB before local processing.
+- Hard input byte cap: 100 MB before local processing. Telegram or downloader
+  layers may impose stricter caps, and the adapter must honor the stricter
+  upstream limit.
+- Hard input resolution cap: reject streams above 3840x2160, above 8.3
+  megapixels, or with either dimension above 4096 px before frame extraction.
+- Working decode/selection resolution: downscale candidate frames to at most
+  1280 px on the long side; use 320-512 px thumbnails for scene selection and
+  duplicate scoring.
 - Candidate frame cap before dedupe: 24.
 - Vision frame cap after dedupe: 3-8.
 - Thumbnail width for scene selection: 320-512 px.
