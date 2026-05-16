@@ -76,6 +76,7 @@ Benchmark environment:
 - Runtime: sanitized local workstation, not the deployment VPS and not a Docker
   production-like benchmark.
 - OS: Windows 11 Pro.
+- Shell: PowerShell with `uv` invoking Python 3.12.
 - Logical CPUs: 24.
 - RAM: about 95 GiB.
 - Python: 3.12.13 through `uv`.
@@ -101,53 +102,98 @@ uv run --python 3.12 --with scenedetect --with opencv-python-headless \
 Sanitized benchmark recipe:
 
 ```text
-set -euo pipefail
-TEMP_ROOT="$(mktemp -d)"
-trap 'rm -rf "$TEMP_ROOT"' EXIT INT TERM
-VIDEO="$TEMP_ROOT/synthetic-scenes.mp4"
-mkdir -p "$TEMP_ROOT/ffmpeg-sample" "$TEMP_ROOT/scenedetect" "$TEMP_ROOT/opencv-diff"
+$tempRoot = Join-Path ([IO.Path]::GetTempPath()) ("aigan-keyframe-spike-" + [guid]::NewGuid().ToString("N"))
+$video = Join-Path $tempRoot "synthetic-scenes.mp4"
+$ffmpegDir = Join-Path $tempRoot "ffmpeg-sample"
+$sceneDir = Join-Path $tempRoot "scenedetect"
+$opencvDir = Join-Path $tempRoot "opencv-diff"
 
-ffmpeg -hide_banner -loglevel error -y \
-  -f lavfi -i "testsrc2=size=640x360:rate=24:duration=2" \
-  -f lavfi -i "smptebars=size=640x360:rate=24:duration=2" \
-  -f lavfi -i "color=c=black:size=640x360:rate=24:duration=2" \
-  -f lavfi -i "testsrc=size=640x360:rate=24:duration=2" \
-  -f lavfi -i "color=c=white:size=640x360:rate=24:duration=2" \
-  -filter_complex "[0:v][1:v][2:v][3:v][4:v]concat=n=5:v=1:a=0,format=yuv420p[v]" \
-  -map "[v]" -c:v libx264 -preset veryfast -crf 23 "$VIDEO"
+try {
+  New-Item -ItemType Directory -Force -Path $ffmpegDir, $sceneDir, $opencvDir | Out-Null
 
-ffprobe -v error -select_streams v:0 \
-  -show_entries stream=width,height,avg_frame_rate,duration,nb_frames \
-  -of json "$VIDEO"
+  ffmpeg -hide_banner -loglevel error -y `
+    -f lavfi -i "testsrc2=size=640x360:rate=24:duration=2" `
+    -f lavfi -i "smptebars=size=640x360:rate=24:duration=2" `
+    -f lavfi -i "color=c=black:size=640x360:rate=24:duration=2" `
+    -f lavfi -i "testsrc=size=640x360:rate=24:duration=2" `
+    -f lavfi -i "color=c=white:size=640x360:rate=24:duration=2" `
+    -filter_complex "[0:v][1:v][2:v][3:v][4:v]concat=n=5:v=1:a=0,format=yuv420p[v]" `
+    -map "[v]" -c:v libx264 -preset veryfast -crf 23 $video
 
-ffmpeg -hide_banner -loglevel error -y -i "$VIDEO" \
-  -vf "fps=1,scale=320:-1:flags=lanczos" \
-  "$TEMP_ROOT/ffmpeg-sample/frame_%03d.jpg"
+  ffprobe -v error -select_streams v:0 `
+    -show_entries stream=width,height,avg_frame_rate,duration,nb_frames `
+    -of json $video
 
-uv run --python 3.12 --with scenedetect --with opencv-python-headless \
-  scenedetect -i "$VIDEO" -o "$TEMP_ROOT/scenedetect" \
-  detect-content list-scenes save-images --num-images 1 --width 320
+  ffmpeg -hide_banner -loglevel error -y -i $video `
+    -vf "fps=1,scale=320:-1:flags=lanczos" `
+    (Join-Path $ffmpegDir "frame_%03d.jpg")
 
-uv run --python 3.12 --with opencv-python-headless python opencv_diff_probe.py \
-  "$VIDEO" "$TEMP_ROOT/opencv-diff"
+  uv run --python 3.12 --with scenedetect --with opencv-python-headless `
+    scenedetect -i $video -o $sceneDir `
+    detect-content list-scenes save-images --num-images 1 --width 320
+
+  $opencvProbe = @'
+import cv2
+import json
+import os
+import sys
+import time
+import tracemalloc
+import numpy as np
+
+video_path, output_dir = sys.argv[1], sys.argv[2]
+os.makedirs(output_dir, exist_ok=True)
+cap = cv2.VideoCapture(video_path)
+fps = cap.get(cv2.CAP_PROP_FPS) or 24.0
+sample_every = max(1, int(round(fps * 0.5)))
+selected = []
+duplicates = 0
+last_gray = None
+idx = 0
+start = time.perf_counter()
+tracemalloc.start()
+while True:
+    ok, frame = cap.read()
+    if not ok:
+        break
+    if idx % sample_every == 0:
+        h, w = frame.shape[:2]
+        new_w = 320
+        new_h = max(1, int(round(h * (new_w / w))))
+        small = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
+        gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+        blur = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+        luma = float(gray.mean())
+        diff = 999.0 if last_gray is None else float(np.mean(cv2.absdiff(gray, last_gray)))
+        if last_gray is None or diff >= 12.0:
+            out_path = os.path.join(output_dir, f"frame_{len(selected) + 1:03d}.jpg")
+            cv2.imwrite(out_path, small, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+            selected.append({"frame": idx, "time_s": round(idx / fps, 3), "diff": round(diff, 2), "blur": round(blur, 2), "luma": round(luma, 2)})
+            last_gray = gray
+        else:
+            duplicates += 1
+    idx += 1
+cap.release()
+current, peak = tracemalloc.get_traced_memory()
+tracemalloc.stop()
+elapsed_ms = round((time.perf_counter() - start) * 1000, 1)
+print(json.dumps({"frames_read": idx, "selected_count": len(selected), "duplicates_skipped": duplicates, "elapsed_ms": elapsed_ms, "peak_tracemalloc_kb": round(peak / 1024, 1)}, sort_keys=True))
+'@
+
+  $opencvProbe | uv run --python 3.12 --with opencv-python-headless python - $video $opencvDir
+}
+finally {
+  Remove-Item -LiteralPath $tempRoot -Recurse -Force -ErrorAction SilentlyContinue
+}
 ```
 
-OpenCV probe logic:
+Measurement wrapper:
 
 ```text
-open video with cv2.VideoCapture
-fps = capture fps or 24
-sample_every = round(fps * 0.5)
-for each sampled frame:
-  resize to width 320
-  convert to grayscale
-  blur = variance(Laplacian(gray))
-  luma = mean(gray)
-  diff = mean(absdiff(gray, previous_selected_gray))
-  keep first frame or frames with diff >= 12.0
-  write kept frame as jpg quality 85
-  otherwise increment duplicate counter
-report frames_read, selected_count, duplicates_skipped, elapsed_ms, tracemalloc_peak
+Each timed command was launched from Python and sampled with psutil:
+  - wall time: time.perf_counter()
+  - CPU time: sum(user + system) for the command process tree
+  - peak RSS: max(sum(memory_info().rss) for the command process tree)
 ```
 
 Results:
