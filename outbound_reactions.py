@@ -20,6 +20,7 @@ EventCallback = Callable[..., None]
 ValueProvider = Callable[[], int | str | None]
 DECISION_POLICY_VERSION = "outbound_reaction_decision_v1"
 EMOTION_POLICY_VERSION = "outbound_reaction_emotion_policy_v1"
+TERM_WORD_RE = re.compile(r"[\w']+", re.UNICODE)
 
 
 REACTION_EMOJI_BY_EMOTION: dict[str, tuple[str, ...]] = {
@@ -142,6 +143,16 @@ CONDEMNATION_TERMS = (
     "преступ",
     "угроз",
 )
+
+STEM_TERMS = {
+    "celebrat",
+    "congrat",
+    "occup",
+}
+
+BENIGN_TERM_CONTEXTS: dict[str, tuple[str, ...]] = {
+    "attack": ("attack surface",),
+}
 
 AMBIGUOUS_TERMS = (
     "alleged",
@@ -630,7 +641,7 @@ class OutboundReactionAdapter:
                 action=action,
                 reason_code=reason_code,
                 rationale=rationale,
-                severity_flags=(*self._decision_feature_flags(item), *severity_flags),
+                severity_flags=self._merge_severity_flags(self._decision_feature_flags(item), severity_flags),
                 emotion_class=emotion_class,
                 confidence=confidence,
                 score=score,
@@ -677,7 +688,9 @@ class OutboundReactionAdapter:
         return policy.rationale
 
     def _classify_emotion_policy(self, item: MemoryItem, score: float) -> EmotionPolicyDecision:
-        content = self._content_for_scoring(item).casefold()
+        own_content = (item.text or "").casefold()
+        source_content = self._source_context_for_policy(item).casefold()
+        combined_content = f"{own_content} {source_content}".strip()
         flags: list[str] = []
         has_own_text = bool((item.text or "").strip())
         has_source_context = bool((item.source_text or item.source_title or item.source_url or item.vision_summary or "").strip())
@@ -696,7 +709,7 @@ class OutboundReactionAdapter:
                 rationale="Skipped because media context was incomplete and the reaction could be misread.",
                 severity_flags=tuple(flags + ["incomplete_media_context"]),
             )
-        if self._has_any(content, SARCASM_MEME_TERMS):
+        if self._has_any(combined_content, SARCASM_MEME_TERMS):
             return EmotionPolicyDecision(
                 emotion_class="ambiguous_sensitive",
                 confidence=0.35,
@@ -706,13 +719,27 @@ class OutboundReactionAdapter:
                 severity_flags=tuple(flags + ["sarcasm_or_meme"]),
             )
 
-        grief = self._hit_count(content, GRIEF_TERMS)
-        horror = self._hit_count(content, HORROR_TERMS)
-        condemnation = self._hit_count(content, CONDEMNATION_TERMS)
-        ambiguous = self._hit_count(content, AMBIGUOUS_TERMS)
-        positive = self._hit_count(content, POSITIVE_TERMS)
+        own_grief = self._hit_count(own_content, GRIEF_TERMS)
+        own_horror = self._hit_count(own_content, HORROR_TERMS)
+        own_condemnation = self._hit_count(own_content, CONDEMNATION_TERMS)
+        own_ambiguous = self._hit_count(own_content, AMBIGUOUS_TERMS)
+        own_positive = self._hit_count(own_content, POSITIVE_TERMS)
+        source_grief = self._hit_count(source_content, GRIEF_TERMS)
+        source_horror = self._hit_count(source_content, HORROR_TERMS)
+        source_condemnation = self._hit_count(source_content, CONDEMNATION_TERMS)
+        source_ambiguous = self._hit_count(source_content, AMBIGUOUS_TERMS)
+        source_sensitive = source_grief + source_horror + source_condemnation
+        if not has_own_text and source_sensitive:
+            flags.append("source_sensitive")
+        # Source, URL, and vision summaries are untrusted context: they can add caution
+        # after direct-chat text establishes a class, but they cannot drive a reaction.
+        grief = own_grief + (min(source_grief, 1) if own_grief else 0)
+        horror = own_horror + (min(source_horror, 1) if own_horror else 0)
+        condemnation = own_condemnation + (min(source_condemnation, 1) if own_condemnation else 0)
+        ambiguous = own_ambiguous + source_ambiguous
+        positive = own_positive
         sensitive = grief + horror + condemnation
-        source_penalty = 0.08 if "source_only" in flags else 0.0
+        source_penalty = 0.08 if has_source_context else 0.0
 
         if sensitive and ambiguous:
             return EmotionPolicyDecision(
@@ -785,7 +812,7 @@ class OutboundReactionAdapter:
             allow_reaction=False,
             reason_code="emotion_low_confidence",
             rationale="Skipped because the emotion policy did not find a safe high-confidence reaction class.",
-            severity_flags=tuple(flags + ["low_confidence"]),
+            severity_flags=self._merge_severity_flags(flags, ("low_confidence",)),
         )
 
     def _emotion_decision(self, emotion_class: str, confidence: float, rationale: str, flags: list[str]) -> EmotionPolicyDecision:
@@ -798,16 +825,56 @@ class OutboundReactionAdapter:
             allow_reaction=allow,
             reason_code=reason,
             rationale=rationale if allow else f"Skipped because {emotion_class} confidence was below the policy threshold.",
-            severity_flags=tuple(flags),
+            severity_flags=self._merge_severity_flags(flags),
         )
 
     @staticmethod
     def _hit_count(content: str, terms: tuple[str, ...]) -> int:
-        return sum(1 for term in terms if term and term in content)
+        if not content:
+            return 0
+        normalized = content.casefold()
+        tokens = TERM_WORD_RE.findall(normalized)
+        return sum(1 for term in terms if OutboundReactionAdapter._term_matches(normalized, tokens, term))
 
     @staticmethod
     def _has_any(content: str, terms: tuple[str, ...]) -> bool:
-        return any(term and term in content for term in terms)
+        return OutboundReactionAdapter._hit_count(content, terms) > 0
+
+    @staticmethod
+    def _term_matches(content: str, tokens: list[str], term: str) -> bool:
+        normalized = term.casefold().strip()
+        if not normalized:
+            return False
+        benign_phrases = BENIGN_TERM_CONTEXTS.get(normalized, ())
+        if benign_phrases:
+            for phrase in benign_phrases:
+                content = re.sub(rf"(?<!\w){re.escape(phrase)}(?!\w)", " ", content)
+            tokens = TERM_WORD_RE.findall(content)
+        if " " in normalized:
+            return re.search(rf"(?<!\w){re.escape(normalized)}(?!\w)", content) is not None
+        if normalized in STEM_TERMS or not normalized.isascii():
+            return any(token.startswith(normalized) for token in tokens)
+        return normalized in tokens
+
+    @staticmethod
+    def _merge_severity_flags(*flag_groups: tuple[str, ...] | list[str]) -> tuple[str, ...]:
+        merged: list[str] = []
+        seen: set[str] = set()
+        for flags in flag_groups:
+            for flag in flags:
+                if flag and flag not in seen:
+                    seen.add(flag)
+                    merged.append(flag)
+        return tuple(merged)
+
+    def _source_context_for_policy(self, item: MemoryItem) -> str:
+        values = [
+            item.source_title,
+            item.source_text,
+            item.vision_summary,
+            item.source_url,
+        ]
+        return " ".join(value for value in values if value)
 
     def _content_for_scoring(self, item: MemoryItem) -> str:
         values = [
