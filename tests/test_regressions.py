@@ -1070,6 +1070,30 @@ class ToolRuntimeTests(unittest.TestCase):
             self.assertNotIn("opaqueSecret12345", text)
             store.close()
 
+    def test_tool_diagnostics_redacts_prefixed_token_like_failure_category(self) -> None:
+        rows = build_capability_rows(
+            {"status": "ok", "adapter_count": 0, "error_count": 0, "adapters": []},
+            events=[
+                SystemEvent(
+                    id=1,
+                    created_at="2026-01-01T00:00:00+00:00",
+                    level="warning",
+                    component="web",
+                    event_type="prefetch_failed",
+                    chat_id=None,
+                    user_id=None,
+                    route="",
+                    duration_ms=None,
+                    message="",
+                    details={"failure_category": "openai_api_key_shadow"},
+                )
+            ],
+        )
+        row = {item.name: item for item in rows}["web_search"]
+
+        self.assertIn("[redacted]", row.recent_failure_categories)
+        self.assertNotIn("openai_api_key_shadow", row.recent_failure_categories)
+
     def test_tool_diagnostics_counts_error_event_once(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             store = SystemLogStore(Path(tmpdir) / "events.sqlite3", retention_days=14)
@@ -1127,6 +1151,56 @@ class ToolRuntimeTests(unittest.TestCase):
 
         self.assertEqual("degraded", row.status)
         self.assertEqual("degraded", render_capability_matrix(rows).splitlines()[1].replace("Overall: ", ""))
+
+    def test_tool_diagnostics_invalid_adapter_counts_do_not_raise(self) -> None:
+        rows = build_capability_rows(
+            {
+                "status": "ok",
+                "adapter_count": "not-a-number",
+                "error_count": "also-bad",
+                "adapters": [
+                    {
+                        "name": "media_transcript",
+                        "enabled": True,
+                        "status": "ok",
+                        "adapter": "media",
+                        "warning_count": "not-a-number",
+                        "error_count": "also-bad",
+                    }
+                ],
+            }
+        )
+        by_name = {item.name: item for item in rows}
+
+        self.assertEqual(0, by_name["tool_runtime"].error_count)
+        self.assertEqual({"adapter_count": 0}, by_name["tool_runtime"].details)
+        self.assertEqual(0, by_name["media_transcript"].warning_count)
+        self.assertEqual(0, by_name["media_transcript"].error_count)
+
+    def test_tool_diagnostics_ignores_success_warning_events(self) -> None:
+        rows = build_capability_rows(
+            {"status": "ok", "adapter_count": 0, "error_count": 0, "adapters": []},
+            events=[
+                SystemEvent(
+                    id=1,
+                    created_at="2026-01-01T00:00:00+00:00",
+                    level="warning",
+                    component="github_reporting",
+                    event_type="self_report_created",
+                    chat_id=None,
+                    user_id=None,
+                    route="",
+                    duration_ms=None,
+                    message="",
+                    details={},
+                )
+            ],
+        )
+        row = {item.name: item for item in rows}["github_reporting"]
+
+        self.assertEqual("disabled", row.status)
+        self.assertEqual(0, row.recent_warning_count)
+        self.assertEqual("Recent tool failures\n- none", render_recent_failures(rows))
 
     def test_tool_diagnostics_runtime_warning_event_does_not_double_count_adapter_error(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1528,6 +1602,23 @@ class ToolRuntimeTests(unittest.TestCase):
                 "YOUTUBE_AUDIO_FALLBACK": "true",
                 "YOUTUBE_TRANSCRIPTION_MODEL": "gpt-4o-mini-transcribe",
                 "YOUTUBE_MAX_DURATION_SECONDS": "not-a-number",
+            },
+        ):
+            row = {item.name: item for item in main.configured_capability_rows()}["stt_openai"]
+
+        self.assertTrue(row.enabled)
+        self.assertFalse(row.configured)
+        self.assertFalse(row.available)
+        self.assertEqual("unconfigured", row.status)
+        self.assertEqual({}, row.details)
+
+    def test_stt_openai_row_requires_positive_youtube_max_duration(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "YOUTUBE_AUDIO_FALLBACK": "true",
+                "YOUTUBE_TRANSCRIPTION_MODEL": "gpt-4o-mini-transcribe",
+                "YOUTUBE_MAX_DURATION_SECONDS": "0",
             },
         ):
             row = {item.name: item for item in main.configured_capability_rows()}["stt_openai"]

@@ -3555,7 +3555,10 @@ def configured_capability_rows() -> list[CapabilityRow]:
     except ValueError:
         youtube_max_duration = None
     youtube_audio_fallback_configured = (
-        youtube_audio_fallback_enabled and bool(youtube_transcription_model) and youtube_max_duration is not None
+        youtube_audio_fallback_enabled
+        and bool(youtube_transcription_model)
+        and youtube_max_duration is not None
+        and youtube_max_duration > 0
     )
     rows.append(
         CapabilityRow(
@@ -3572,10 +3575,11 @@ def configured_capability_rows() -> list[CapabilityRow]:
             adapter="youtube_audio_fallback",
             mode="youtube_audio_fallback",
             backend=youtube_transcription_model,
-            details={"max_duration_seconds": youtube_max_duration} if youtube_max_duration is not None else {},
+            details={"max_duration_seconds": youtube_max_duration} if youtube_max_duration and youtube_max_duration > 0 else {},
             next_action=(
                 "check configuration"
-                if youtube_audio_fallback_enabled and (not youtube_transcription_model or youtube_max_duration is None)
+                if youtube_audio_fallback_enabled
+                and (not youtube_transcription_model or youtube_max_duration is None or youtube_max_duration <= 0)
                 else ""
             ),
         )

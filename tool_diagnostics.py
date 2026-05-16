@@ -77,6 +77,17 @@ RELATIVE_PATH_VALUE_RE = re.compile(
 )
 TOKEN_VALUE_RE = re.compile(r"\b(?:gh[pousr]_|github_pat_|xox[baprs]-)[A-Za-z0-9_-]{8,}", re.IGNORECASE)
 SAFE_CATEGORY_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_.:-]{0,79}$")
+SAFE_PREFIXED_CATEGORY_RE = re.compile(r"^[a-z]+(?:_[a-z]+){1,5}$")
+UNSAFE_CATEGORY_PARTS = (
+    "api_key",
+    "apikey",
+    "bearer",
+    "cookie",
+    "credential",
+    "password",
+    "secret",
+    "token",
+)
 SAFE_CATEGORY_VALUES = {
     "cleanup_failed",
     "decode_failed",
@@ -116,15 +127,28 @@ SAFE_DOTTED_CATEGORY_VALUES = {
     "provider.timeout",
     "yt_dlp.unavailable",
 }
+FAILURE_EVENT_TYPES = SAFE_CATEGORY_VALUES - {"freeform"} | {
+    "run_error",
+    "tool_operation_failed",
+}
 ROW_DETAIL_FIELDS = ("adapter_count", "backlog", "dimensions", "max_bytes")
 
 
+def safe_nonnegative_int(value: Any) -> int:
+    try:
+        return max(0, int(value or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
 def is_safe_category_code(text: str) -> bool:
+    if any(part in text.casefold() for part in UNSAFE_CATEGORY_PARTS):
+        return False
     if text in SAFE_CATEGORY_VALUES:
         return True
     if "." in text:
         return text in SAFE_DOTTED_CATEGORY_VALUES
-    return text.startswith(SAFE_CATEGORY_PREFIXES)
+    return SAFE_PREFIXED_CATEGORY_RE.fullmatch(text) is not None and text.startswith(SAFE_CATEGORY_PREFIXES)
 
 
 @dataclass
@@ -153,10 +177,10 @@ class CapabilityRow:
         self.adapter = safe_display_label(self.adapter, 80)
         self.mode = safe_display_label(self.mode, 80)
         self.backend = safe_display_label(self.backend, 80)
-        self.error_count = max(0, int(self.error_count or 0))
-        self.warning_count = max(0, int(self.warning_count or 0))
-        self.recent_error_count = max(0, int(self.recent_error_count or 0))
-        self.recent_warning_count = max(0, int(self.recent_warning_count or 0))
+        self.error_count = safe_nonnegative_int(self.error_count)
+        self.warning_count = safe_nonnegative_int(self.warning_count)
+        self.recent_error_count = safe_nonnegative_int(self.recent_error_count)
+        self.recent_warning_count = safe_nonnegative_int(self.recent_warning_count)
         if self.status == "ok" and (
             self.error_count or self.warning_count or self.recent_error_count or self.recent_warning_count
         ):
@@ -275,8 +299,8 @@ def adapter_row(item: dict[str, Any]) -> CapabilityRow:
         adapter=safe_display_label(item.get("adapter") or "", 80),
         mode=safe_display_label(item.get("mode") or "", 80),
         backend=safe_display_label(item.get("backend") or "", 80),
-        error_count=int(item.get("error_count", 0) or 0),
-        warning_count=int(item.get("warning_count", 0) or 0),
+        error_count=safe_nonnegative_int(item.get("error_count")),
+        warning_count=safe_nonnegative_int(item.get("warning_count")),
         details=details,
     ).normalized()
 
@@ -325,8 +349,8 @@ def build_capability_rows(
         available=True,
         status=normalize_status(summary.get("status"), True),
         adapter="runtime",
-        error_count=int(summary.get("error_count", 0) or 0),
-        details={"adapter_count": int(summary.get("adapter_count", 0) or 0)},
+        error_count=safe_nonnegative_int(summary.get("error_count")),
+        details={"adapter_count": safe_nonnegative_int(summary.get("adapter_count"))},
     ).normalized()
     for item in summary.get("adapters", []) or []:
         row = adapter_row(dict(item or {}))
@@ -338,6 +362,8 @@ def build_capability_rows(
 def apply_event_failures(rows: dict[str, CapabilityRow], events: Iterable[SystemEvent]) -> None:
     for event in events:
         if event.level not in {"warning", "error", "critical"}:
+            continue
+        if not is_failure_event(event):
             continue
         row_names = capability_names_for_event(event, rows)
         if not row_names:
@@ -393,6 +419,15 @@ def capability_names_for_event(event: SystemEvent, rows: dict[str, CapabilityRow
 
 def is_runtime_error_event_already_counted(event: SystemEvent, row: CapabilityRow) -> bool:
     return event.component == "tool_runtime" and event.event_type == "tool_operation_failed" and row.error_count > 0
+
+
+def is_failure_event(event: SystemEvent) -> bool:
+    if event.level in {"error", "critical"}:
+        return True
+    details = event.details if isinstance(event.details, dict) else {}
+    if any(details.get(key) for key in ("failure_category", "exception_type")):
+        return True
+    return event.event_type in FAILURE_EVENT_TYPES or event.event_type.endswith("_failed")
 
 
 def failure_category_for_event(event: SystemEvent) -> str:
