@@ -27,6 +27,7 @@ from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandl
 
 from mcp_servers.web import fetch_binary_url, search_image_candidates, search_web
 from memory import EmbeddingCandidate, MemoryItem, MemoryStore, SemanticMemoryResult
+from media_frames import FfmpegMediaFrameAdapter, MediaFrameAdapter, MediaFrameLimits, NullMediaFrameAdapter
 from outbound_reactions import NullReactionAdapter, OutboundReactionAdapter, OutboundReactionConfig, ReactionAdapter
 from reaction_memory import ReactionAsset, ReactionMemoryStore, ReactionPreference, ReactionSpec
 from github_reporting import GitHubReporter
@@ -172,6 +173,16 @@ class Config:
     memory_recall_intent_threshold: float
     memory_recall_intent_ambiguous_threshold: float
     web_image_search_enabled: bool
+    media_frame_extraction_enabled: bool
+    media_frame_ffmpeg_path: str
+    media_frame_ffprobe_path: str
+    media_frame_max_duration_seconds: int
+    media_frame_max_bytes: int
+    media_frame_candidate_count: int
+    media_frame_selected_count: int
+    media_frame_max_selected_count: int
+    media_frame_output_width: int
+    media_frame_timeout_seconds: int
     system_log_enabled: bool
     system_log_retention_days: int
     health_report_enabled: bool
@@ -303,6 +314,16 @@ class Config:
                 os.getenv("MEMORY_RECALL_INTENT_AMBIGUOUS_THRESHOLD", "0.48")
             ),
             web_image_search_enabled=_env_bool("WEB_IMAGE_SEARCH_ENABLED", True),
+            media_frame_extraction_enabled=_env_bool("MEDIA_FRAME_EXTRACTION_ENABLED", False),
+            media_frame_ffmpeg_path=os.getenv("MEDIA_FRAME_FFMPEG_PATH", "ffmpeg").strip() or "ffmpeg",
+            media_frame_ffprobe_path=os.getenv("MEDIA_FRAME_FFPROBE_PATH", "ffprobe").strip() or "ffprobe",
+            media_frame_max_duration_seconds=int(os.getenv("MEDIA_FRAME_MAX_DURATION_SECONDS", "90")),
+            media_frame_max_bytes=int(os.getenv("MEDIA_FRAME_MAX_BYTES", "50000000")),
+            media_frame_candidate_count=int(os.getenv("MEDIA_FRAME_CANDIDATE_COUNT", "24")),
+            media_frame_selected_count=int(os.getenv("MEDIA_FRAME_SELECTED_COUNT", "5")),
+            media_frame_max_selected_count=int(os.getenv("MEDIA_FRAME_MAX_SELECTED_COUNT", "8")),
+            media_frame_output_width=int(os.getenv("MEDIA_FRAME_OUTPUT_WIDTH", "512")),
+            media_frame_timeout_seconds=int(os.getenv("MEDIA_FRAME_TIMEOUT_SECONDS", "30")),
             system_log_enabled=_env_bool("SYSTEM_LOG_ENABLED", True),
             system_log_retention_days=int(os.getenv("SYSTEM_LOG_RETENTION_DAYS", "14")),
             health_report_enabled=_env_bool("HEALTH_REPORT_ENABLED", False),
@@ -410,6 +431,32 @@ def build_reaction_adapter() -> ReactionAdapter:
 
 
 REACTION_ADAPTER: ReactionAdapter = build_reaction_adapter()
+
+
+def build_media_frame_adapter() -> MediaFrameAdapter:
+    if not CONFIG.media_frame_extraction_enabled:
+        return NullMediaFrameAdapter()
+    try:
+        return FfmpegMediaFrameAdapter(
+            enabled=True,
+            ffmpeg_path=CONFIG.media_frame_ffmpeg_path,
+            ffprobe_path=CONFIG.media_frame_ffprobe_path,
+            limits=MediaFrameLimits(
+                max_duration_seconds=CONFIG.media_frame_max_duration_seconds,
+                max_bytes=CONFIG.media_frame_max_bytes,
+                candidate_frame_count=CONFIG.media_frame_candidate_count,
+                selected_frame_count=CONFIG.media_frame_selected_count,
+                max_selected_frame_count=CONFIG.media_frame_max_selected_count,
+                output_width=CONFIG.media_frame_output_width,
+                timeout_seconds=CONFIG.media_frame_timeout_seconds,
+            ),
+        )
+    except Exception:
+        LOGGER.warning("Failed to initialize media frame adapter; using null adapter", exc_info=True)
+        return NullMediaFrameAdapter()
+
+
+MEDIA_FRAME_ADAPTER: MediaFrameAdapter = build_media_frame_adapter()
 TOOL_RUNTIME = ToolRuntime()
 
 
@@ -428,6 +475,23 @@ def runtime_reaction_adapter() -> ReactionAdapter:
 
 
 set_reaction_adapter(REACTION_ADAPTER)
+
+
+def set_media_frame_adapter(adapter: MediaFrameAdapter) -> MediaFrameAdapter:
+    global MEDIA_FRAME_ADAPTER
+    MEDIA_FRAME_ADAPTER = adapter
+    TOOL_RUNTIME.register("media_frames", adapter)
+    return adapter
+
+
+def runtime_media_frame_adapter() -> MediaFrameAdapter:
+    adapter = TOOL_RUNTIME.get("media_frames")
+    if adapter is None:
+        return set_media_frame_adapter(MEDIA_FRAME_ADAPTER)
+    return cast(MediaFrameAdapter, adapter)
+
+
+set_media_frame_adapter(MEDIA_FRAME_ADAPTER)
 GITHUB_REPORTER = GitHubReporter(
     enabled=CONFIG.github_reporting_enabled,
     token=CONFIG.github_token,
