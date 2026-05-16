@@ -2884,6 +2884,155 @@ class PersistentMemoryTests(unittest.TestCase):
         self.assertEqual("bot", rows[0]["actor_kind"])
         self.assertEqual("thrd_ua_bot", rows[0]["actor_username"])
 
+    def test_outbound_reaction_records_sanitized_sent_decision(self) -> None:
+        self.assertIsNotNone(main.REACTION_MEMORY)
+        config = main.OutboundReactionConfig(
+            enabled=True,
+            every_n_messages=1,
+            cooldown_seconds=0,
+            min_score=0.0,
+            allowed_emoji=("\N{FIRE}",),
+            use_custom_emoji=False,
+        )
+        adapter = main.OutboundReactionAdapter(config=config, reaction_memory=main.REACTION_MEMORY)
+        message = FakeMessage(
+            "release update with enough context and number 170",
+            message_id=971,
+        )
+        item_id = main.MEMORY.save_message(
+            chat_id=-1001,
+            message_id=971,
+            sender_label="Tester",
+            user_id=111,
+            text=message.text,
+            source_text="raw source contains token_like_value and private user wording",
+            source_title="Forwarded source",
+            source_url="https://example.invalid/private?token=secret",
+            content_kind="video",
+            attachment_type="video",
+            vision_summary="visual summary exists",
+            forward_origin="hidden forward origin",
+            created_at=datetime.now(timezone.utc),
+        )
+
+        asyncio.run(adapter.on_message_ingested(message, main.MEMORY.item_by_id(item_id), "pre_embedding"))
+
+        record = main.REACTION_MEMORY.latest_outbound_decision(chat_id=-1001, target_message_id=971)
+        self.assertIsNotNone(record)
+        self.assertEqual("sent", record.action)
+        self.assertEqual("emoji:u1f525", record.sent_reaction_key)
+        self.assertEqual("positive_or_celebratory", record.candidate_reaction_class)
+        self.assertTrue(record.has_source_text)
+        self.assertTrue(record.has_vision_summary)
+        self.assertTrue(record.has_forward_origin)
+        self.assertIn("source_context", record.severity_flags)
+        self.assertIn("attachment:video", record.severity_flags)
+        explanation = main.REACTION_MEMORY.explain_outbound_decision(record)
+        self.assertIn("Stored outbound reaction decision", explanation)
+        self.assertNotIn("token_like_value", explanation)
+        self.assertNotIn("private user wording", explanation)
+        self.assertNotIn("example.invalid", explanation)
+        self.assertNotIn("hidden forward origin", explanation)
+
+    def test_outbound_reaction_records_score_skip_decision(self) -> None:
+        self.assertIsNotNone(main.REACTION_MEMORY)
+        config = main.OutboundReactionConfig(
+            enabled=True,
+            every_n_messages=1,
+            cooldown_seconds=0,
+            min_score=0.99,
+            allowed_emoji=("\N{FIRE}",),
+            use_custom_emoji=False,
+        )
+        adapter = main.OutboundReactionAdapter(config=config, reaction_memory=main.REACTION_MEMORY)
+        message = FakeMessage("short but valid release context 170", message_id=972)
+        item_id = main.MEMORY.save_message(
+            chat_id=-1001,
+            message_id=972,
+            sender_label="Tester",
+            user_id=111,
+            text=message.text,
+            created_at=datetime.now(timezone.utc),
+        )
+
+        asyncio.run(adapter.on_message_ingested(message, main.MEMORY.item_by_id(item_id), "pre_embedding"))
+
+        message.bot.set_message_reaction.assert_not_awaited()
+        record = main.REACTION_MEMORY.latest_outbound_decision(chat_id=-1001, target_message_id=972)
+        self.assertIsNotNone(record)
+        self.assertEqual("skipped", record.action)
+        self.assertEqual("score_below_min", record.reason_code)
+        self.assertIsNotNone(record.score)
+
+    def test_outbound_reaction_skips_when_rationale_is_missing(self) -> None:
+        self.assertIsNotNone(main.REACTION_MEMORY)
+        config = main.OutboundReactionConfig(
+            enabled=True,
+            every_n_messages=1,
+            cooldown_seconds=0,
+            min_score=0.0,
+            allowed_emoji=("\N{FIRE}",),
+            use_custom_emoji=False,
+        )
+        adapter = main.OutboundReactionAdapter(config=config, reaction_memory=main.REACTION_MEMORY)
+        adapter._send_attempt_rationale = lambda _item, _score: ""
+        message = FakeMessage("release update with enough context and number 170", message_id=975)
+        item_id = main.MEMORY.save_message(
+            chat_id=-1001,
+            message_id=975,
+            sender_label="Tester",
+            user_id=111,
+            text=message.text,
+            created_at=datetime.now(timezone.utc),
+        )
+
+        asyncio.run(adapter.on_message_ingested(message, main.MEMORY.item_by_id(item_id), "pre_embedding"))
+
+        message.bot.set_message_reaction.assert_not_awaited()
+        record = main.REACTION_MEMORY.latest_outbound_decision(chat_id=-1001, target_message_id=975)
+        self.assertIsNotNone(record)
+        self.assertEqual("skipped", record.action)
+        self.assertEqual("insufficient_rationale", record.reason_code)
+
+    def test_reaction_explanation_prompt_uses_stored_decision(self) -> None:
+        self.assertIsNotNone(main.REACTION_MEMORY)
+        target = FakeMessage("stored target", message_id=973)
+        item_id = main.MEMORY.save_message(
+            chat_id=-1001,
+            message_id=973,
+            sender_label="Tester",
+            user_id=111,
+            text=target.text,
+            created_at=datetime.now(timezone.utc),
+        )
+        item = main.MEMORY.item_by_id(item_id)
+        main.REACTION_MEMORY.record_outbound_decision(
+            chat_id=-1001,
+            target_message_id=973,
+            target_memory_id=item_id,
+            item=item,
+            policy_version="outbound_reaction_decision_v1",
+            phase="pre_embedding",
+            action="skipped",
+            reason_code="insufficient_rationale",
+            rationale="Skipped because the stored reasoning was insufficient for a safe public reaction.",
+            severity_flags=("source_context",),
+            emotion_class="ambiguous",
+            confidence=0.2,
+            score=0.4,
+        )
+        question = FakeMessage("why did you put that reaction?", message_id=974)
+        question.reply_to_message = target
+
+        asyncio.run(main.handle_prompt(question, SimpleNamespace(), "why did you put that reaction?"))
+
+        self.assertEqual(1, len(question.reply_calls))
+        reply = question.reply_calls[0]["text"]
+        self.assertIn("Stored outbound reaction decision", reply)
+        self.assertIn("insufficient_rationale", reply)
+        self.assertIn("ambiguous", reply)
+        self.assertIn("Skipped because the stored reasoning was insufficient", reply)
+
     def test_user_messages_filter_by_user_and_limit(self) -> None:
         base = datetime.now(timezone.utc)
         for index in range(105):

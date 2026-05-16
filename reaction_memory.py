@@ -65,6 +65,37 @@ class ReactionPreference:
     last_seen_at: str
 
 
+@dataclass(frozen=True)
+class ReactionDecisionRecord:
+    id: int
+    created_at: str
+    chat_id: int
+    target_message_id: int | None
+    target_memory_id: int | None
+    policy_version: str
+    phase: str
+    action: str
+    reason_code: str
+    rationale: str
+    content_kind: str
+    attachment_type: str
+    has_text: bool
+    has_source_text: bool
+    has_source_title: bool
+    has_source_url: bool
+    has_vision_summary: bool
+    has_forward_origin: bool
+    severity_flags: tuple[str, ...]
+    emotion_class: str
+    confidence: float
+    score: float | None
+    candidate_reaction_key: str
+    candidate_reaction_class: str
+    sent_reaction_key: str
+    reaction_asset_id: int | None
+    details: dict[str, object]
+
+
 def utc_now_text() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
@@ -78,6 +109,25 @@ def clip_text(text: str, limit: int = 120) -> str:
     if len(value) <= limit:
         return value
     return value[: max(0, limit - 1)].rstrip() + "..."
+
+
+def safe_code(value: str, default: str = "unknown", limit: int = 64) -> str:
+    text = re.sub(r"[^a-zA-Z0-9_.:-]+", "_", str(value or "").strip().lower()).strip("_")
+    if not text:
+        return default
+    return text[:limit]
+
+
+def safe_reaction_key(spec: ReactionSpec | None) -> str:
+    if spec is None:
+        return ""
+    if spec.reaction_type == "emoji":
+        emoji = spec.base_emoji or spec.reaction_key.split(":", 1)[-1]
+        codepoints = "_".join(f"u{ord(char):04x}" for char in emoji if char.strip())
+        return f"emoji:{codepoints}" if codepoints else "emoji"
+    if spec.reaction_type == "custom_emoji":
+        return "custom_emoji"
+    return safe_code(spec.reaction_type or spec.reaction_key, "reaction")
 
 
 def item_topic_hint(item: MemoryItem | None, limit: int = 90) -> str:
@@ -203,6 +253,40 @@ class ReactionMemoryStore:
             );
             CREATE INDEX IF NOT EXISTS idx_chat_reaction_semantics_chat
                 ON chat_reaction_semantics(chat_id, use_count, last_seen_at);
+
+            CREATE TABLE IF NOT EXISTS outbound_reaction_decisions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at TEXT NOT NULL,
+                chat_id INTEGER NOT NULL,
+                target_message_id INTEGER,
+                target_memory_id INTEGER REFERENCES messages(id) ON DELETE SET NULL,
+                policy_version TEXT NOT NULL DEFAULT '',
+                phase TEXT NOT NULL DEFAULT '',
+                action TEXT NOT NULL DEFAULT '',
+                reason_code TEXT NOT NULL DEFAULT '',
+                rationale TEXT NOT NULL DEFAULT '',
+                content_kind TEXT NOT NULL DEFAULT '',
+                attachment_type TEXT NOT NULL DEFAULT '',
+                has_text INTEGER NOT NULL DEFAULT 0,
+                has_source_text INTEGER NOT NULL DEFAULT 0,
+                has_source_title INTEGER NOT NULL DEFAULT 0,
+                has_source_url INTEGER NOT NULL DEFAULT 0,
+                has_vision_summary INTEGER NOT NULL DEFAULT 0,
+                has_forward_origin INTEGER NOT NULL DEFAULT 0,
+                severity_flags_json TEXT NOT NULL DEFAULT '[]',
+                emotion_class TEXT NOT NULL DEFAULT '',
+                confidence REAL NOT NULL DEFAULT 0,
+                score REAL,
+                candidate_reaction_key TEXT NOT NULL DEFAULT '',
+                candidate_reaction_class TEXT NOT NULL DEFAULT '',
+                sent_reaction_key TEXT NOT NULL DEFAULT '',
+                reaction_asset_id INTEGER REFERENCES reaction_assets(id) ON DELETE SET NULL,
+                details_json TEXT NOT NULL DEFAULT '{}'
+            );
+            CREATE INDEX IF NOT EXISTS idx_outbound_reaction_decisions_target
+                ON outbound_reaction_decisions(chat_id, target_message_id, created_at, id);
+            CREATE INDEX IF NOT EXISTS idx_outbound_reaction_decisions_memory
+                ON outbound_reaction_decisions(target_memory_id, created_at, id);
             """
         )
         self._conn.commit()
@@ -213,6 +297,7 @@ class ReactionMemoryStore:
             self._conn.execute("DELETE FROM message_reaction_counts")
             self._conn.execute("DELETE FROM message_reactions")
             self._conn.execute("DELETE FROM message_reaction_events")
+            self._conn.execute("DELETE FROM outbound_reaction_decisions")
             self._conn.execute("DELETE FROM reaction_assets")
             self._conn.commit()
 
@@ -556,6 +641,125 @@ class ReactionMemoryStore:
             self._conn.commit()
         return True
 
+    def record_outbound_decision(
+        self,
+        *,
+        chat_id: int,
+        target_message_id: int | None,
+        target_memory_id: int | None,
+        item: MemoryItem | None,
+        policy_version: str,
+        phase: str,
+        action: str,
+        reason_code: str,
+        rationale: str,
+        severity_flags: list[str] | tuple[str, ...] = (),
+        emotion_class: str = "unclassified",
+        confidence: float = 0.0,
+        score: float | None = None,
+        candidate_spec: ReactionSpec | None = None,
+        candidate_reaction_class: str = "",
+        sent_spec: ReactionSpec | None = None,
+        details: dict[str, object] | None = None,
+    ) -> int:
+        now = utc_now_text()
+        asset_id = self.get_or_create_asset(sent_spec) if sent_spec is not None else None
+        candidate_key = safe_reaction_key(candidate_spec)
+        sent_key = safe_reaction_key(sent_spec)
+        clean_details = sanitize_decision_details(details or {})
+        clean_flags = [safe_code(flag) for flag in list(severity_flags)[:20] if safe_code(flag)]
+        with self._lock:
+            cursor = self._conn.execute(
+                """
+                INSERT INTO outbound_reaction_decisions (
+                    created_at, chat_id, target_message_id, target_memory_id,
+                    policy_version, phase, action, reason_code, rationale,
+                    content_kind, attachment_type, has_text, has_source_text,
+                    has_source_title, has_source_url, has_vision_summary,
+                    has_forward_origin, severity_flags_json, emotion_class,
+                    confidence, score, candidate_reaction_key,
+                    candidate_reaction_class, sent_reaction_key,
+                    reaction_asset_id, details_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    now,
+                    int(chat_id),
+                    target_message_id,
+                    target_memory_id,
+                    safe_code(policy_version, "outbound_reaction_decision_v1"),
+                    safe_code(phase, "unknown"),
+                    safe_code(action),
+                    safe_code(reason_code),
+                    clip_text(rationale, 240),
+                    safe_code(getattr(item, "content_kind", "") if item is not None else ""),
+                    safe_code(getattr(item, "attachment_type", "") if item is not None else ""),
+                    1 if item is not None and bool((item.text or "").strip()) else 0,
+                    1 if item is not None and bool((item.source_text or "").strip()) else 0,
+                    1 if item is not None and bool((item.source_title or "").strip()) else 0,
+                    1 if item is not None and bool((item.source_url or "").strip()) else 0,
+                    1 if item is not None and bool((item.vision_summary or "").strip()) else 0,
+                    1 if item is not None and bool((item.forward_origin or "").strip()) else 0,
+                    json.dumps(clean_flags, ensure_ascii=False),
+                    safe_code(emotion_class, "unclassified"),
+                    max(0.0, min(float(confidence or 0.0), 1.0)),
+                    None if score is None else max(0.0, min(float(score), 1.0)),
+                    candidate_key,
+                    safe_code(candidate_reaction_class, ""),
+                    sent_key,
+                    asset_id,
+                    json.dumps(clean_details, ensure_ascii=False, sort_keys=True),
+                ),
+            )
+            self._conn.commit()
+            return int(cursor.lastrowid)
+
+    def latest_outbound_decision(
+        self,
+        *,
+        chat_id: int,
+        target_message_id: int | None = None,
+        target_memory_id: int | None = None,
+    ) -> ReactionDecisionRecord | None:
+        conditions = ["chat_id = ?"]
+        params: list[object] = [int(chat_id)]
+        if target_message_id is not None:
+            conditions.append("target_message_id = ?")
+            params.append(int(target_message_id))
+        if target_memory_id is not None:
+            conditions.append("target_memory_id = ?")
+            params.append(int(target_memory_id))
+        with self._lock:
+            row = self._conn.execute(
+                f"""
+                SELECT *
+                FROM outbound_reaction_decisions
+                WHERE {" AND ".join(conditions)}
+                ORDER BY datetime(created_at) DESC, id DESC
+                LIMIT 1
+                """,
+                tuple(params),
+            ).fetchone()
+        return self._row_to_decision(row) if row is not None else None
+
+    def explain_outbound_decision(self, record: ReactionDecisionRecord | None) -> str:
+        if record is None:
+            return "I do not have a stored reaction decision for that target, so I should not invent a reason."
+        target = f"message_id={record.target_message_id}" if record.target_message_id is not None else "the recent target"
+        score = f", score={record.score:.3f}" if record.score is not None else ""
+        candidate = f", candidate={record.candidate_reaction_key}" if record.candidate_reaction_key else ""
+        sent = f", sent={record.sent_reaction_key}" if record.sent_reaction_key else ""
+        flags = ", ".join(record.severity_flags) if record.severity_flags else "none"
+        return (
+            "Stored outbound reaction decision: "
+            f"target={target}; action={record.action}; reason={record.reason_code}; "
+            f"emotion={record.emotion_class}; confidence={record.confidence:.2f}{score}{candidate}{sent}; "
+            f"features=content_kind:{record.content_kind or 'unknown'}, attachment:{record.attachment_type or 'none'}, "
+            f"source_text={record.has_source_text}, vision_summary={record.has_vision_summary}, "
+            f"forwarded={record.has_forward_origin}, severity_flags={flags}. "
+            f"Rationale: {record.rationale}"
+        )
+
     def upsert_chat_semantics(
         self,
         *,
@@ -722,6 +926,10 @@ class ReactionMemoryStore:
                     "UPDATE message_reaction_counts SET target_memory_id = ? WHERE chat_id = ? AND target_message_id = ?",
                     (item.id, chat_id, item.message_id),
                 )
+                self._conn.execute(
+                    "UPDATE outbound_reaction_decisions SET target_memory_id = ? WHERE chat_id = ? AND target_message_id = ?",
+                    (item.id, chat_id, item.message_id),
+                )
                 updated += 1
             self._conn.commit()
         return updated
@@ -832,3 +1040,60 @@ class ReactionMemoryStore:
             created_at=str(row["created_at"] or ""),
             updated_at=str(row["updated_at"] or ""),
         )
+
+    @staticmethod
+    def _row_to_decision(row: sqlite3.Row) -> ReactionDecisionRecord:
+        try:
+            flags = tuple(str(item) for item in json.loads(row["severity_flags_json"] or "[]") if str(item))
+        except Exception:
+            flags = ()
+        try:
+            details = json.loads(row["details_json"] or "{}")
+            if not isinstance(details, dict):
+                details = {}
+        except Exception:
+            details = {}
+        return ReactionDecisionRecord(
+            id=int(row["id"]),
+            created_at=str(row["created_at"] or ""),
+            chat_id=int(row["chat_id"]),
+            target_message_id=row["target_message_id"],
+            target_memory_id=row["target_memory_id"],
+            policy_version=str(row["policy_version"] or ""),
+            phase=str(row["phase"] or ""),
+            action=str(row["action"] or ""),
+            reason_code=str(row["reason_code"] or ""),
+            rationale=str(row["rationale"] or ""),
+            content_kind=str(row["content_kind"] or ""),
+            attachment_type=str(row["attachment_type"] or ""),
+            has_text=bool(row["has_text"]),
+            has_source_text=bool(row["has_source_text"]),
+            has_source_title=bool(row["has_source_title"]),
+            has_source_url=bool(row["has_source_url"]),
+            has_vision_summary=bool(row["has_vision_summary"]),
+            has_forward_origin=bool(row["has_forward_origin"]),
+            severity_flags=flags,
+            emotion_class=str(row["emotion_class"] or ""),
+            confidence=float(row["confidence"] or 0),
+            score=None if row["score"] is None else float(row["score"]),
+            candidate_reaction_key=str(row["candidate_reaction_key"] or ""),
+            candidate_reaction_class=str(row["candidate_reaction_class"] or ""),
+            sent_reaction_key=str(row["sent_reaction_key"] or ""),
+            reaction_asset_id=row["reaction_asset_id"],
+            details=details,
+        )
+
+
+def sanitize_decision_details(details: dict[str, object]) -> dict[str, object]:
+    clean: dict[str, object] = {}
+    for key, value in list(details.items())[:20]:
+        clean_key = safe_code(str(key), "detail", 64)
+        if isinstance(value, (bool, int, float)) or value is None:
+            clean[clean_key] = value
+        elif isinstance(value, str):
+            clean[clean_key] = safe_code(value, "", 96)
+        elif isinstance(value, (list, tuple, set)):
+            clean[clean_key] = [safe_code(str(item), "", 64) for item in list(value)[:20]]
+        else:
+            clean[clean_key] = safe_code(type(value).__name__, "object", 64)
+    return clean
