@@ -31,6 +31,12 @@ from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandl
 
 from mcp_servers.web import fetch_binary_url, search_image_candidates, search_web
 from memory import EmbeddingCandidate, MemoryItem, MemoryStore, SemanticMemoryResult
+from media_acquisition import (
+    MediaAcquisitionAdapter,
+    MediaAcquisitionLimits,
+    NullMediaAcquisitionAdapter,
+    YtDlpMediaAcquisitionAdapter,
+)
 from media_frames import FfmpegMediaFrameAdapter, MediaFrameAdapter, MediaFrameLimits, MediaFrameRequest, MediaFrameResult, NullMediaFrameAdapter
 from outbound_reactions import NullReactionAdapter, OutboundReactionAdapter, OutboundReactionConfig, ReactionAdapter
 from reaction_memory import ReactionAsset, ReactionMemoryStore, ReactionPreference, ReactionSpec
@@ -197,6 +203,10 @@ class Config:
     media_frame_max_selected_count: int
     media_frame_output_width: int
     media_frame_timeout_seconds: int
+    media_acquisition_enabled: bool
+    media_acquisition_max_duration_seconds: int
+    media_acquisition_max_download_bytes: int
+    media_acquisition_socket_timeout_seconds: int
     system_log_enabled: bool
     system_log_retention_days: int
     health_report_enabled: bool
@@ -338,6 +348,10 @@ class Config:
             media_frame_max_selected_count=int(os.getenv("MEDIA_FRAME_MAX_SELECTED_COUNT", "8")),
             media_frame_output_width=int(os.getenv("MEDIA_FRAME_OUTPUT_WIDTH", "512")),
             media_frame_timeout_seconds=int(os.getenv("MEDIA_FRAME_TIMEOUT_SECONDS", "30")),
+            media_acquisition_enabled=_env_bool("MEDIA_ACQUISITION_ENABLED", False),
+            media_acquisition_max_duration_seconds=int(os.getenv("MEDIA_ACQUISITION_MAX_DURATION_SECONDS", "180")),
+            media_acquisition_max_download_bytes=int(os.getenv("MEDIA_ACQUISITION_MAX_DOWNLOAD_BYTES", "50000000")),
+            media_acquisition_socket_timeout_seconds=int(os.getenv("MEDIA_ACQUISITION_SOCKET_TIMEOUT_SECONDS", "12")),
             system_log_enabled=_env_bool("SYSTEM_LOG_ENABLED", True),
             system_log_retention_days=int(os.getenv("SYSTEM_LOG_RETENTION_DAYS", "14")),
             health_report_enabled=_env_bool("HEALTH_REPORT_ENABLED", False),
@@ -470,7 +484,25 @@ def build_media_frame_adapter() -> MediaFrameAdapter:
         return NullMediaFrameAdapter()
 
 
+def build_media_acquisition_adapter() -> MediaAcquisitionAdapter:
+    if not CONFIG.media_acquisition_enabled:
+        return NullMediaAcquisitionAdapter()
+    try:
+        return YtDlpMediaAcquisitionAdapter(
+            enabled=True,
+            limits=MediaAcquisitionLimits(
+                max_duration_seconds=CONFIG.media_acquisition_max_duration_seconds,
+                max_download_bytes=CONFIG.media_acquisition_max_download_bytes,
+                socket_timeout_seconds=CONFIG.media_acquisition_socket_timeout_seconds,
+            ),
+        )
+    except Exception:
+        LOGGER.warning("Failed to initialize media acquisition adapter; using null adapter", exc_info=True)
+        return NullMediaAcquisitionAdapter()
+
+
 MEDIA_FRAME_ADAPTER: MediaFrameAdapter = build_media_frame_adapter()
+MEDIA_ACQUISITION_ADAPTER: MediaAcquisitionAdapter = build_media_acquisition_adapter()
 TOOL_RUNTIME = ToolRuntime()
 
 
@@ -506,6 +538,23 @@ def runtime_media_frame_adapter() -> MediaFrameAdapter:
 
 
 set_media_frame_adapter(MEDIA_FRAME_ADAPTER)
+
+
+def set_media_acquisition_adapter(adapter: MediaAcquisitionAdapter) -> MediaAcquisitionAdapter:
+    global MEDIA_ACQUISITION_ADAPTER
+    MEDIA_ACQUISITION_ADAPTER = adapter
+    TOOL_RUNTIME.register("media_acquisition", adapter)
+    return adapter
+
+
+def runtime_media_acquisition_adapter() -> MediaAcquisitionAdapter:
+    adapter = TOOL_RUNTIME.get("media_acquisition")
+    if adapter is None:
+        return set_media_acquisition_adapter(MEDIA_ACQUISITION_ADAPTER)
+    return cast(MediaAcquisitionAdapter, adapter)
+
+
+set_media_acquisition_adapter(MEDIA_ACQUISITION_ADAPTER)
 GITHUB_REPORTER = GitHubReporter(
     enabled=CONFIG.github_reporting_enabled,
     token=CONFIG.github_token,

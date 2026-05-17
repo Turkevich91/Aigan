@@ -206,7 +206,7 @@ For web image requests such as `покажи картинку ...` or `знай�
 To backfill older chat history, export the chat from Telegram Desktop as either HTML or JSON and import it into the same SQLite memory. HTML export directories such as `ChatExport_2026-05-13` are supported directly; no manual conversion is needed. Keep exports in `imports/`; that folder is ignored by git.
 
 ```bash
-cd ~/Projects/aigan
+cd path/to/aigan
 mkdir -p imports
 # Put Telegram Desktop export directory or result.json under imports/.
 
@@ -267,6 +267,8 @@ Each tool family should provide a small adapter with:
 Tool failures must not block message persistence, embeddings, memory recall, `/stat`, `/character`, Telegram routing, or normal replies. Tool outputs that are later saved to memory must be stored as source context, not as user-authored text.
 
 The media frame extraction adapter is registered as `media_frames` and is disabled by default. When `MEDIA_FRAME_EXTRACTION_ENABLED=true`, explicit Telegram video/animation/video-document routes can use bounded ffprobe/ffmpeg frame extraction for visual summaries. These summaries are saved only as source-context vision summaries, not user-authored text, and do not enable TikTok/Instagram support or passive group handling.
+
+The public media acquisition boundary is registered as `media_acquisition` and is disabled by default. When `MEDIA_ACQUISITION_ENABLED=true`, it may use a metadata-only `yt-dlp` probe for explicit future media-context routes. It records only stable platform/backend/capability fields and sanitized failure categories such as `unsupported_url`, `auth_or_rate_limited`, `challenge_required`, `duration_limit`, or `metadata_failed`; it must not log raw media URLs, provider stderr, source text, transcripts, frame OCR, usernames, tokens, or local paths.
 
 Universal media plans should keep the same ladder: captions first, optional audio transcription second, optional visual-frame summary only for explicit transcriptless cases, and a structured unavailable result when the media cannot be handled safely.
 
