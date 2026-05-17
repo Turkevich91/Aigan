@@ -100,6 +100,10 @@ os.environ["OUTBOUND_REACTION_MIN_SCORE"] = "0.72"
 os.environ["OUTBOUND_REACTION_ALLOWED_EMOJI"] = "fire,eyes,thumbs_up,thinking,laugh,sad,broken_heart,shock,fear,angry"
 os.environ["OUTBOUND_REACTION_USE_CUSTOM_EMOJI"] = "true"
 os.environ["OUTBOUND_REACTION_BIG"] = "false"
+os.environ["MEDIA_ACQUISITION_ENABLED"] = "false"
+os.environ["MEDIA_ACQUISITION_MAX_DURATION_SECONDS"] = "180"
+os.environ["MEDIA_ACQUISITION_MAX_DOWNLOAD_BYTES"] = "50000000"
+os.environ["MEDIA_ACQUISITION_SOCKET_TIMEOUT_SECONDS"] = "12"
 
 import httpx
 from telegram import InputMediaPhoto, ReactionTypeCustomEmoji, ReactionTypeEmoji
@@ -108,6 +112,13 @@ from telegram.error import BadRequest
 
 import main
 from outbound_reactions import EmotionPolicyDecision
+from media_acquisition import (
+    MediaAcquisitionLimits,
+    MediaAcquisitionRequest,
+    NullMediaAcquisitionAdapter,
+    YtDlpMediaAcquisitionAdapter,
+    categorize_yt_dlp_exception,
+)
 from media_frames import (
     CommandOutput,
     FfmpegMediaFrameAdapter,
@@ -907,6 +918,166 @@ class ToolRuntimeTests(unittest.TestCase):
         self.assertEqual("disabled", media_frames["status"])
         self.assertFalse(media_frames["enabled"])
         self.assertIn("media_frames", main.tool_runtime_health_text())
+
+    def test_main_tool_runtime_health_includes_disabled_media_acquisition(self) -> None:
+        health = main.TOOL_RUNTIME.health_summary()
+        media_acquisition = next(item for item in health["adapters"] if item["name"] == "media_acquisition")
+
+        self.assertEqual("disabled", media_acquisition["status"])
+        self.assertFalse(media_acquisition["enabled"])
+        self.assertIn("media_acquisition", main.tool_runtime_health_text())
+
+    def test_null_media_acquisition_adapter_returns_disabled_sanitized_result(self) -> None:
+        adapter = NullMediaAcquisitionAdapter()
+        request = MediaAcquisitionRequest(url="https://media.example/video?id=1&token=secret-token")
+
+        result = adapter.probe_metadata(request)
+        health = adapter.health_summary()
+        public_text = json.dumps(result.public_dict(), ensure_ascii=False)
+
+        self.assertFalse(result.ok)
+        self.assertEqual("disabled", result.failure_category)
+        self.assertEqual("disabled", health["status"])
+        self.assertFalse(health["available"])
+        self.assertNotIn("secret-token", public_text)
+        self.assertNotIn("media.example/video", public_text)
+
+    def test_yt_dlp_media_acquisition_probe_is_metadata_only_and_sanitized(self) -> None:
+        captured: dict[str, object] = {}
+
+        class FakeYdl:
+            def __init__(self, options):
+                captured["options"] = options
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return None
+
+            def extract_info(self, url, download=False):
+                captured["url"] = url
+                captured["download"] = download
+                return {
+                    "extractor_key": "TikTok",
+                    "duration": 42,
+                    "formats": [{"format_id": "low"}, {"format_id": "high"}],
+                    "subtitles": {},
+                    "automatic_captions": {},
+                }
+
+        adapter = YtDlpMediaAcquisitionAdapter(
+            limits=MediaAcquisitionLimits(max_duration_seconds=60, socket_timeout_seconds=3),
+            ydl_factory=lambda options: FakeYdl(options),
+        )
+
+        result = adapter.probe_metadata(
+            MediaAcquisitionRequest(url="https://media.example/video?id=1&token=secret-token", route="field_probe")
+        )
+        public_text = json.dumps(result.public_dict(), ensure_ascii=False)
+
+        self.assertTrue(result.ok)
+        self.assertEqual("yt_dlp", result.backend)
+        self.assertEqual("other", result.platform)
+        self.assertEqual("tiktok", result.metadata["extractor"])
+        self.assertEqual(2, result.metadata["format_count"])
+        self.assertFalse(result.metadata["has_subtitles"])
+        self.assertFalse(result.metadata["has_auto_captions"])
+        self.assertIs(False, captured["download"])
+        self.assertIs(True, captured["options"]["skip_download"])
+        self.assertEqual(3, captured["options"]["socket_timeout"])
+        self.assertNotIn("secret-token", public_text)
+        self.assertNotIn("media.example/video", public_text)
+
+    def test_yt_dlp_media_acquisition_failure_is_low_cardinality_and_sanitized(self) -> None:
+        class FakeYdl:
+            def __init__(self, options):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return None
+
+            def extract_info(self, url, download=False):
+                raise RuntimeError(
+                    f"Login required for https://media.example/video?token=secret-token private-cache {fake_openai_secret()}"
+                )
+
+        adapter = YtDlpMediaAcquisitionAdapter(ydl_factory=lambda options: FakeYdl(options))
+
+        result = adapter.probe_metadata(MediaAcquisitionRequest(url="https://media.example/video?token=secret-token"))
+        public_text = json.dumps(result.public_dict(), ensure_ascii=False)
+
+        self.assertFalse(result.ok)
+        self.assertEqual("auth_or_rate_limited", result.failure_category)
+        self.assertEqual("auth_or_rate_limited", adapter.health_summary()["last_failure_category"])
+        self.assertIn("login", result.user_message.casefold())
+        self.assertNotIn("secret-token", public_text)
+        self.assertNotIn(fake_openai_secret(), public_text)
+        self.assertNotIn("private-cache", public_text)
+        self.assertNotIn("media.example/video", public_text)
+
+    def test_yt_dlp_media_acquisition_duration_limit_uses_sanitized_diagnostics(self) -> None:
+        class FakeYdl:
+            def __init__(self, options):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return None
+
+            def extract_info(self, url, download=False):
+                return {"extractor_key": "Generic", "duration": 240, "formats": [{"format_id": "video"}]}
+
+        adapter = YtDlpMediaAcquisitionAdapter(
+            limits=MediaAcquisitionLimits(max_duration_seconds=60),
+            ydl_factory=lambda options: FakeYdl(options),
+        )
+
+        result = adapter.probe_metadata(MediaAcquisitionRequest(url="https://media.example/video?token=secret-token"))
+        public_text = json.dumps(result.public_dict(), ensure_ascii=False)
+
+        self.assertFalse(result.ok)
+        self.assertEqual("duration_limit", result.failure_category)
+        self.assertEqual(60, result.diagnostics["max_duration_seconds"])
+        self.assertEqual(240, result.diagnostics["duration_seconds"])
+        self.assertNotIn("secret-token", public_text)
+        self.assertNotIn("media.example/video", public_text)
+
+    def test_media_acquisition_event_maps_to_diagnostics_row(self) -> None:
+        rows = build_capability_rows(
+            {"status": "ok", "adapter_count": 0, "adapters": []},
+            events=[
+                SystemEvent(
+                    id=1,
+                    created_at="2026-01-01T00:00:00+00:00",
+                    level="warning",
+                    component="media_acquisition",
+                    event_type="metadata_failed",
+                    chat_id=None,
+                    user_id=None,
+                    route="",
+                    duration_ms=None,
+                    message="safe",
+                    details={"failure_category": "auth_or_rate_limited"},
+                )
+            ],
+        )
+        by_name = {row.name: row for row in rows}
+
+        self.assertIn("media_acquisition", by_name)
+        self.assertIn("auth_or_rate_limited", by_name["media_acquisition"].recent_failure_categories)
+
+    def test_yt_dlp_exception_categories_are_stable_codes(self) -> None:
+        self.assertEqual("unsupported_url", categorize_yt_dlp_exception(RuntimeError("Unsupported URL")))
+        self.assertEqual("challenge_required", categorize_yt_dlp_exception(RuntimeError("captcha challenge")))
+        self.assertEqual("auth_or_rate_limited", categorize_yt_dlp_exception(RuntimeError("login required")))
+        self.assertEqual("private_or_drm", categorize_yt_dlp_exception(RuntimeError("DRM protected")))
+        self.assertEqual("metadata_failed", categorize_yt_dlp_exception(RuntimeError("unable to extract metadata")))
 
     def test_null_media_frame_adapter_returns_disabled_unavailable_result(self) -> None:
         adapter = NullMediaFrameAdapter()
