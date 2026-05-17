@@ -105,6 +105,7 @@ SAFE_CATEGORY_VALUES = {
     "duration_too_long",
     "download_failed",
     "embedding_failed",
+    "file_too_large",
     "freeform",
     "health_report_failed",
     "input_missing",

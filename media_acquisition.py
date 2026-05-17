@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import ipaddress
+import socket
 from dataclasses import dataclass, field
 from typing import Any, Callable, Protocol
 from urllib.parse import urlparse
@@ -218,8 +219,9 @@ class YtDlpMediaAcquisitionAdapter:
         )
 
     def health_summary(self) -> dict[str, Any]:
-        configured = True
-        available = self.enabled and yt_dlp_available()
+        dependency_available = self.ydl_factory is not None or yt_dlp_available()
+        configured = self.enabled and dependency_available
+        available = self.enabled and dependency_available
         if not self.enabled:
             status = "disabled"
         elif not available:
@@ -239,7 +241,7 @@ class YtDlpMediaAcquisitionAdapter:
             "error_count": self.error_count,
             "warning_count": self.warning_count,
             "backend": "yt_dlp",
-            "yt_dlp_available": yt_dlp_available(),
+            "yt_dlp_available": dependency_available,
             "max_duration_seconds": self.limits.max_duration_seconds,
             "max_download_bytes": self.limits.max_download_bytes,
         }
@@ -329,15 +331,37 @@ def validate_public_media_url(value: str) -> str:
     if parsed.username or parsed.password:
         return "unsupported_url"
     host = (parsed.hostname or "").strip().lower()
-    if not host or host in {"localhost", "localhost.localdomain"}:
+    if not host or host in {"localhost", "localhost.localdomain", "metadata.google.internal"}:
         return "unsupported_url"
     try:
         address = ipaddress.ip_address(host.strip("[]"))
     except ValueError:
+        try:
+            infos = socket.getaddrinfo(host, None)
+        except OSError:
+            return "unsupported_url"
+        for info in infos:
+            try:
+                address = ipaddress.ip_address(info[4][0])
+            except (ValueError, IndexError, TypeError):
+                return "unsupported_url"
+            if is_private_network_address(address):
+                return "unsupported_url"
         return ""
-    if address.is_private or address.is_loopback or address.is_link_local or address.is_reserved:
+    if is_private_network_address(address):
         return "unsupported_url"
     return ""
+
+
+def is_private_network_address(address: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    return (
+        address.is_private
+        or address.is_loopback
+        or address.is_link_local
+        or address.is_reserved
+        or address.is_multicast
+        or address.is_unspecified
+    )
 
 
 def platform_from_url(value: str) -> str:
@@ -359,12 +383,12 @@ def categorize_yt_dlp_exception(exc: Exception) -> str:
         return "unsupported_url"
     if "challenge" in text or "captcha" in text or "please wait" in text:
         return "challenge_required"
-    if "login" in text or "authentication" in text or "private" in text or "not comfortable" in text:
+    if "drm" in text or "private" in text or "protected" in text:
+        return "private_or_drm"
+    if "login" in text or "authentication" in text or "not comfortable" in text:
         return "auth_or_rate_limited"
     if "rate" in text or "too many requests" in text or "429" in text:
         return "auth_or_rate_limited"
-    if "drm" in text:
-        return "private_or_drm"
     if "timed out" in text or "timeout" in text:
         return "metadata_failed"
     if "unable to download webpage" in text or "download" in text:

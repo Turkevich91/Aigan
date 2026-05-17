@@ -971,9 +971,11 @@ class ToolRuntimeTests(unittest.TestCase):
             ydl_factory=lambda options: FakeYdl(options),
         )
 
-        result = adapter.probe_metadata(
-            MediaAcquisitionRequest(url="https://media.example/video?id=1&token=secret-token", route="field_probe")
-        )
+        public_dns = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 0))]
+        with patch("media_acquisition.socket.getaddrinfo", return_value=public_dns):
+            result = adapter.probe_metadata(
+                MediaAcquisitionRequest(url="https://media.example/video?id=1&token=secret-token", route="field_probe")
+            )
         public_text = json.dumps(result.public_dict(), ensure_ascii=False)
 
         self.assertTrue(result.ok)
@@ -1002,12 +1004,14 @@ class ToolRuntimeTests(unittest.TestCase):
 
             def extract_info(self, url, download=False):
                 raise RuntimeError(
-                    f"Login required for https://media.example/video?token=secret-token private-cache {fake_openai_secret()}"
+                    f"Login required for https://media.example/video?token=secret-token cache-note {fake_openai_secret()}"
                 )
 
         adapter = YtDlpMediaAcquisitionAdapter(ydl_factory=lambda options: FakeYdl(options))
 
-        result = adapter.probe_metadata(MediaAcquisitionRequest(url="https://media.example/video?token=secret-token"))
+        public_dns = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 0))]
+        with patch("media_acquisition.socket.getaddrinfo", return_value=public_dns):
+            result = adapter.probe_metadata(MediaAcquisitionRequest(url="https://media.example/video?token=secret-token"))
         public_text = json.dumps(result.public_dict(), ensure_ascii=False)
 
         self.assertFalse(result.ok)
@@ -1016,7 +1020,7 @@ class ToolRuntimeTests(unittest.TestCase):
         self.assertIn("login", result.user_message.casefold())
         self.assertNotIn("secret-token", public_text)
         self.assertNotIn(fake_openai_secret(), public_text)
-        self.assertNotIn("private-cache", public_text)
+        self.assertNotIn("cache-note", public_text)
         self.assertNotIn("media.example/video", public_text)
 
     def test_yt_dlp_media_acquisition_duration_limit_uses_sanitized_diagnostics(self) -> None:
@@ -1038,7 +1042,9 @@ class ToolRuntimeTests(unittest.TestCase):
             ydl_factory=lambda options: FakeYdl(options),
         )
 
-        result = adapter.probe_metadata(MediaAcquisitionRequest(url="https://media.example/video?token=secret-token"))
+        public_dns = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 0))]
+        with patch("media_acquisition.socket.getaddrinfo", return_value=public_dns):
+            result = adapter.probe_metadata(MediaAcquisitionRequest(url="https://media.example/video?token=secret-token"))
         public_text = json.dumps(result.public_dict(), ensure_ascii=False)
 
         self.assertFalse(result.ok)
@@ -1076,8 +1082,61 @@ class ToolRuntimeTests(unittest.TestCase):
         self.assertEqual("unsupported_url", categorize_yt_dlp_exception(RuntimeError("Unsupported URL")))
         self.assertEqual("challenge_required", categorize_yt_dlp_exception(RuntimeError("captcha challenge")))
         self.assertEqual("auth_or_rate_limited", categorize_yt_dlp_exception(RuntimeError("login required")))
+        self.assertEqual("private_or_drm", categorize_yt_dlp_exception(RuntimeError("This video is private")))
         self.assertEqual("private_or_drm", categorize_yt_dlp_exception(RuntimeError("DRM protected")))
         self.assertEqual("metadata_failed", categorize_yt_dlp_exception(RuntimeError("unable to extract metadata")))
+
+    def test_media_acquisition_rejects_private_dns_targets(self) -> None:
+        adapter = YtDlpMediaAcquisitionAdapter(ydl_factory=lambda options: object())
+
+        private_dns = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", 0))]
+        with patch("media_acquisition.socket.getaddrinfo", return_value=private_dns):
+            result = adapter.probe_metadata(MediaAcquisitionRequest(url="https://media.example/video"))
+
+        self.assertFalse(result.ok)
+        self.assertEqual("unsupported_url", result.failure_category)
+
+    def test_media_acquisition_rejects_metadata_host_without_dns(self) -> None:
+        adapter = YtDlpMediaAcquisitionAdapter(ydl_factory=lambda options: object())
+
+        result = adapter.probe_metadata(MediaAcquisitionRequest(url="https://metadata.google.internal/video"))
+
+        self.assertFalse(result.ok)
+        self.assertEqual("unsupported_url", result.failure_category)
+
+    def test_media_acquisition_health_counts_injected_backend_available(self) -> None:
+        adapter = YtDlpMediaAcquisitionAdapter(ydl_factory=lambda options: object())
+
+        with patch("media_acquisition.yt_dlp_available", return_value=False):
+            health = adapter.health_summary()
+
+        self.assertEqual("ok", health["status"])
+        self.assertTrue(health["available"])
+        self.assertTrue(health["configured"])
+        self.assertTrue(health["yt_dlp_available"])
+
+    def test_media_acquisition_file_too_large_category_is_renderable(self) -> None:
+        rows = build_capability_rows(
+            {"status": "ok", "adapter_count": 0, "adapters": []},
+            events=[
+                SystemEvent(
+                    id=2,
+                    created_at="2026-01-01T00:00:00+00:00",
+                    level="warning",
+                    component="media_acquisition",
+                    event_type="file_too_large",
+                    chat_id=None,
+                    user_id=None,
+                    route="",
+                    duration_ms=None,
+                    message="safe",
+                    details={"failure_category": "file_too_large"},
+                )
+            ],
+        )
+        by_name = {row.name: row for row in rows}
+
+        self.assertIn("file_too_large", by_name["media_acquisition"].recent_failure_categories)
 
     def test_null_media_frame_adapter_returns_disabled_unavailable_result(self) -> None:
         adapter = NullMediaFrameAdapter()
