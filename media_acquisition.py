@@ -229,11 +229,14 @@ class YtDlpMediaAcquisitionAdapter:
         )
 
     def health_summary(self) -> dict[str, Any]:
-        dependency_available = self.ydl_factory is not None or yt_dlp_available()
-        configured = self.enabled and dependency_available
-        available = self.enabled and dependency_available
+        dependency_available = yt_dlp_available()
+        backend_available = self.ydl_factory is not None or dependency_available
+        configured = self.enabled and backend_available
+        available = self.enabled and backend_available
         if not self.enabled:
             status = "disabled"
+        elif not configured:
+            status = "unconfigured"
         elif not available:
             status = "unavailable"
         elif self.error_count:
@@ -251,6 +254,7 @@ class YtDlpMediaAcquisitionAdapter:
             "error_count": self.error_count,
             "warning_count": self.warning_count,
             "backend": "yt_dlp",
+            "backend_available": backend_available,
             "yt_dlp_available": dependency_available,
             "max_duration_seconds": self.limits.max_duration_seconds,
             "max_download_bytes": self.limits.max_download_bytes,
@@ -379,15 +383,19 @@ def is_private_network_address(address: ipaddress.IPv4Address | ipaddress.IPv6Ad
 
 def platform_from_url(value: str) -> str:
     host = (urlparse(str(value or "").strip()).hostname or "").lower()
-    if host.endswith("tiktok.com") or host.endswith("tiktokv.com") or host.endswith("tiktokcdn.com"):
+    if any(host_matches_domain(host, domain) for domain in ("tiktok.com", "tiktokv.com", "tiktokcdn.com")):
         return "tiktok"
-    if host.endswith("youtube.com") or host.endswith("youtu.be"):
+    if any(host_matches_domain(host, domain) for domain in ("youtube.com", "youtu.be")):
         return "youtube"
-    if host.endswith("instagram.com"):
+    if host_matches_domain(host, "instagram.com"):
         return "instagram"
     if host:
         return "other"
     return "unknown"
+
+
+def host_matches_domain(host: str, domain: str) -> bool:
+    return host == domain or host.endswith(f".{domain}")
 
 
 def categorize_yt_dlp_exception(exc: Exception) -> str:

@@ -1140,6 +1140,15 @@ class ToolRuntimeTests(unittest.TestCase):
         self.assertFalse(result.ok)
         self.assertEqual("unsupported_url", result.failure_category)
 
+    def test_media_acquisition_rejects_suffix_lookalike_platform_hosts_before_dns(self) -> None:
+        adapter = YtDlpMediaAcquisitionAdapter(ydl_factory=lambda options: object())
+
+        with patch("media_acquisition.socket.getaddrinfo", side_effect=AssertionError("dns should not run")):
+            result = adapter.probe_metadata(MediaAcquisitionRequest(url="https://evil-tiktok.com/video"))
+
+        self.assertFalse(result.ok)
+        self.assertEqual("unsupported_url", result.failure_category)
+
     def test_media_acquisition_rejects_metadata_host_without_dns(self) -> None:
         adapter = YtDlpMediaAcquisitionAdapter(ydl_factory=lambda options: object())
 
@@ -1157,7 +1166,20 @@ class ToolRuntimeTests(unittest.TestCase):
         self.assertEqual("ok", health["status"])
         self.assertTrue(health["available"])
         self.assertTrue(health["configured"])
-        self.assertTrue(health["yt_dlp_available"])
+        self.assertTrue(health["backend_available"])
+        self.assertFalse(health["yt_dlp_available"])
+
+    def test_media_acquisition_health_reports_unconfigured_when_dependency_missing(self) -> None:
+        adapter = YtDlpMediaAcquisitionAdapter()
+
+        with patch("media_acquisition.yt_dlp_available", return_value=False):
+            health = adapter.health_summary()
+
+        self.assertEqual("unconfigured", health["status"])
+        self.assertFalse(health["available"])
+        self.assertFalse(health["configured"])
+        self.assertFalse(health["backend_available"])
+        self.assertFalse(health["yt_dlp_available"])
 
     def test_media_acquisition_file_too_large_category_is_renderable(self) -> None:
         rows = build_capability_rows(
