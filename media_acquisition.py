@@ -82,7 +82,7 @@ class MediaAcquisitionResult:
             backend=safe_code_label(backend, default="none"),
             platform=safe_platform(platform),
             failure_category=category,
-            user_message=sanitize_text(user_message_for_failure(category) if not user_message else user_message, 180),
+            user_message=sanitize_text(user_message_for_failure(category), 180),
             diagnostics=sanitize_public_mapping(diagnostics or {}),
         )
 
@@ -231,14 +231,12 @@ class YtDlpMediaAcquisitionAdapter:
     def health_summary(self) -> dict[str, Any]:
         dependency_available = yt_dlp_available()
         backend_available = self.ydl_factory is not None or dependency_available
-        configured = self.enabled and backend_available
-        available = self.enabled and backend_available
+        configured = self.enabled
+        available = configured and backend_available
         if not self.enabled:
             status = "disabled"
-        elif not configured:
+        elif not backend_available:
             status = "unconfigured"
-        elif not available:
-            status = "unavailable"
         elif self.error_count:
             status = "degraded"
         else:

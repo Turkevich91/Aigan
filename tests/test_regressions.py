@@ -115,6 +115,7 @@ from outbound_reactions import EmotionPolicyDecision
 from media_acquisition import (
     MediaAcquisitionLimits,
     MediaAcquisitionRequest,
+    MediaAcquisitionResult,
     NullMediaAcquisitionAdapter,
     YtDlpMediaAcquisitionAdapter,
     categorize_yt_dlp_exception,
@@ -942,6 +943,19 @@ class ToolRuntimeTests(unittest.TestCase):
         self.assertNotIn("secret-token", public_text)
         self.assertNotIn("media.example/video", public_text)
 
+    def test_media_acquisition_unavailable_result_uses_fixed_public_message(self) -> None:
+        result = MediaAcquisitionResult.unavailable(
+            failure_category="metadata_failed",
+            backend="yt_dlp",
+            platform="tiktok",
+            user_message="provider failed for https://www.tiktok.com/video/123?token=secret-token",
+        )
+        public_text = json.dumps(result.public_dict(), ensure_ascii=False)
+
+        self.assertEqual("I could not read media metadata safely.", result.user_message)
+        self.assertNotIn("secret-token", public_text)
+        self.assertNotIn("www.tiktok.com/video", public_text)
+
     def test_yt_dlp_media_acquisition_probe_is_metadata_only_and_sanitized(self) -> None:
         captured: dict[str, object] = {}
 
@@ -1177,7 +1191,7 @@ class ToolRuntimeTests(unittest.TestCase):
 
         self.assertEqual("unconfigured", health["status"])
         self.assertFalse(health["available"])
-        self.assertFalse(health["configured"])
+        self.assertTrue(health["configured"])
         self.assertFalse(health["backend_available"])
         self.assertFalse(health["yt_dlp_available"])
 
