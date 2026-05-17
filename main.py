@@ -3827,7 +3827,11 @@ def reaction_health_diagnostics_text(lookback_seconds: int | None = None) -> str
         "Reaction health:",
         f"- decisions: total={total_count}, sent={sent_count}, skipped={skipped_count}",
         f"- emotions: {compact_counts(summary.get('emotion_counts') if isinstance(summary, dict) else {})}",
+        f"- candidates: {compact_counts(summary.get('candidate_class_counts') if isinstance(summary, dict) else {})}",
         f"- reasons: {compact_counts(summary.get('reason_counts') if isinstance(summary, dict) else {})}",
+        f"- score bands: {compact_counts(summary.get('score_band_counts') if isinstance(summary, dict) else {})}",
+        f"- context: {compact_counts(summary.get('context_counts') if isinstance(summary, dict) else {})}",
+        f"- shadow model gate: {compact_counts(summary.get('shadow_model_gate_counts') if isinstance(summary, dict) else {})}",
     ]
     if SYSTEM_LOG is None:
         lines.append("- complaint temperatures: disabled")

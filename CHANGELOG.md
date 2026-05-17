@@ -1,5 +1,11 @@
 # Aigan Changelog
 
+## 2026-05-16 - Reaction shadow eval diagnostics
+
+- Added shadow/eval counters to outbound reaction decision summaries: score bands, context flags, candidate emotion classes, and future model-call gate buckets.
+- Surfaced the new counters in compact `Reaction health` admin diagnostics without changing outbound reaction behavior or adding LLM calls.
+- Added regressions for model-candidate, incomplete-context, and deterministic-gate buckets using sanitized decision records only.
+
 ## 2026-05-16 - Reaction diagnostics and health
 
 - Added compact `Reaction health` summaries to admin diagnostics with outbound decision counts, emotion/reason counts, and reaction complaint temperatures.

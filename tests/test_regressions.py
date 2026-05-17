@@ -7055,6 +7055,87 @@ class SystemHealthTests(unittest.TestCase):
         self.assertEqual(252, summary["action_counts"]["skipped"])
         self.assertEqual(3, len(summary["recent"]))
 
+    def test_outbound_decision_summary_includes_shadow_eval_metrics(self) -> None:
+        self.assertIsNotNone(main.MEMORY)
+        self.assertIsNotNone(main.REACTION_MEMORY)
+        positive_id = main.MEMORY.save_message(
+            chat_id=-1001,
+            message_id=5030,
+            sender_label="Tester",
+            user_id=111,
+            text="great milestone release with enough direct context",
+            created_at=datetime.now(timezone.utc),
+        )
+        positive_item = main.MEMORY.item_by_id(positive_id)
+        video_id = main.MEMORY.save_message(
+            chat_id=-1001,
+            message_id=5031,
+            sender_label="Tester",
+            user_id=111,
+            text="",
+            content_kind="attachment",
+            attachment_type="video",
+            created_at=datetime.now(timezone.utc),
+        )
+        video_item = main.MEMORY.item_by_id(video_id)
+        main.REACTION_MEMORY.record_outbound_decision(
+            chat_id=-1001,
+            target_message_id=5030,
+            target_memory_id=positive_id,
+            item=positive_item,
+            policy_version="outbound_reaction_emotion_policy_v1",
+            phase="pre_embedding",
+            action="sent",
+            reason_code="sent",
+            rationale="Stored sanitized rationale.",
+            severity_flags=("safe_positive",),
+            emotion_class="positive_celebratory",
+            confidence=0.91,
+            score=0.86,
+            candidate_reaction_class="positive_celebratory",
+            sent_spec=ReactionSpec(reaction_type="emoji", reaction_key="emoji:fire", base_emoji="\N{FIRE}"),
+        )
+        main.REACTION_MEMORY.record_outbound_decision(
+            chat_id=-1001,
+            target_message_id=5031,
+            target_memory_id=video_id,
+            item=video_item,
+            policy_version="outbound_reaction_emotion_policy_v1",
+            phase="pre_embedding",
+            action="skipped",
+            reason_code="emotion_incomplete_media_context",
+            rationale="Skipped because media context was incomplete.",
+            severity_flags=("incomplete_media_context",),
+            emotion_class="ambiguous_sensitive",
+            confidence=0.25,
+            score=0.82,
+        )
+        main.REACTION_MEMORY.record_outbound_decision(
+            chat_id=-1001,
+            target_message_id=5032,
+            target_memory_id=None,
+            item=None,
+            policy_version="outbound_reaction_emotion_policy_v1",
+            phase="pre_embedding",
+            action="skipped",
+            reason_code="rate_gate",
+            rationale="Skipped by deterministic rate gate.",
+        )
+
+        summary = main.REACTION_MEMORY.outbound_decision_summary(limit=2)
+
+        self.assertEqual(3, summary["decision_count"])
+        self.assertEqual(1, summary["candidate_class_counts"]["positive_celebratory"])
+        self.assertEqual(2, summary["score_band_counts"]["score_gte_0_8"])
+        self.assertEqual(1, summary["score_band_counts"]["unscored"])
+        self.assertEqual(1, summary["context_counts"]["direct_text"])
+        self.assertEqual(1, summary["context_counts"]["video_context"])
+        self.assertEqual(1, summary["context_counts"]["incomplete_media_context"])
+        self.assertEqual(1, summary["shadow_model_gate_counts"]["model_candidate"])
+        self.assertEqual(1, summary["shadow_model_gate_counts"]["context_incomplete"])
+        self.assertEqual(1, summary["shadow_model_gate_counts"]["blocked_by_gate"])
+        self.assertEqual(2, len(summary["recent"]))
+
     def test_reaction_health_diagnostics_are_compact_and_sanitized(self) -> None:
         self.assertIsNotNone(main.MEMORY)
         self.assertIsNotNone(main.REACTION_MEMORY)
@@ -7119,6 +7200,10 @@ class SystemHealthTests(unittest.TestCase):
         self.assertIn("total=2", text)
         self.assertIn("sent=1", text)
         self.assertIn("skipped=1", text)
+        self.assertIn("score bands:", text)
+        self.assertIn("context:", text)
+        self.assertIn("shadow model gate:", text)
+        self.assertIn("model_candidate=1", text)
         self.assertIn("insensitive_reaction=1", text)
         self.assertNotIn("raw private message payload", text)
         self.assertNotIn("alice_private", text)
