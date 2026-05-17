@@ -8,3 +8,7 @@ imports/
 .env.*
 !.env.example
 .env.local
+AGENTS.local.md
+backups/
+*.backup
+*.bak-*
