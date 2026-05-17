@@ -988,6 +988,7 @@ class ToolRuntimeTests(unittest.TestCase):
         self.assertIs(False, captured["download"])
         self.assertIs(True, captured["options"]["skip_download"])
         self.assertEqual(3, captured["options"]["socket_timeout"])
+        self.assertEqual(50_000_000, captured["options"]["max_filesize"])
         self.assertNotIn("secret-token", public_text)
         self.assertNotIn("www.tiktok.com/video", public_text)
 
@@ -1054,6 +1055,38 @@ class ToolRuntimeTests(unittest.TestCase):
         self.assertNotIn("secret-token", public_text)
         self.assertNotIn("www.tiktok.com/video", public_text)
 
+    def test_yt_dlp_media_acquisition_file_size_limit_uses_sanitized_diagnostics(self) -> None:
+        class FakeYdl:
+            def __init__(self, options):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return None
+
+            def extract_info(self, url, download=False):
+                return {
+                    "extractor_key": "TikTok",
+                    "duration": 30,
+                    "formats": [{"format_id": "video", "filesize_approx": 2_000_000}],
+                }
+
+        adapter = YtDlpMediaAcquisitionAdapter(
+            limits=MediaAcquisitionLimits(max_download_bytes=1_000_000),
+            ydl_factory=lambda options: FakeYdl(options),
+        )
+        public_dns = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 0))]
+
+        with patch("media_acquisition.socket.getaddrinfo", return_value=public_dns):
+            result = adapter.probe_metadata(MediaAcquisitionRequest(url="https://www.tiktok.com/video/123"))
+
+        self.assertFalse(result.ok)
+        self.assertEqual("file_too_large", result.failure_category)
+        self.assertEqual(1_000_000, result.diagnostics["max_download_bytes"])
+        self.assertEqual(2_000_000, result.diagnostics["file_size_bytes"])
+
     def test_media_acquisition_event_maps_to_diagnostics_row(self) -> None:
         rows = build_capability_rows(
             {"status": "ok", "adapter_count": 0, "adapters": []},
@@ -1084,6 +1117,7 @@ class ToolRuntimeTests(unittest.TestCase):
         self.assertEqual("auth_or_rate_limited", categorize_yt_dlp_exception(RuntimeError("login required")))
         self.assertEqual("private_or_drm", categorize_yt_dlp_exception(RuntimeError("This video is private")))
         self.assertEqual("private_or_drm", categorize_yt_dlp_exception(RuntimeError("DRM protected")))
+        self.assertEqual("timeout", categorize_yt_dlp_exception(RuntimeError("request timed out")))
         self.assertEqual("metadata_failed", categorize_yt_dlp_exception(RuntimeError("unable to extract metadata")))
 
     def test_media_acquisition_rejects_private_dns_targets(self) -> None:

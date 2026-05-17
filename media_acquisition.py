@@ -24,6 +24,7 @@ MEDIA_ACQUISITION_FAILURE_CATEGORIES = {
     "extractor_unavailable",
     "private_or_drm",
     "cleanup_failed",
+    "timeout",
     "unexpected_error",
 }
 
@@ -186,6 +187,15 @@ class YtDlpMediaAcquisitionAdapter:
             )
         if not isinstance(info, dict) or not info:
             return self._failure(request, "metadata_failed", backend="yt_dlp", platform=platform)
+        file_size = max_known_file_size(info)
+        if file_size and file_size > limits.max_download_bytes:
+            return self._failure(
+                request,
+                "file_too_large",
+                backend="yt_dlp",
+                platform=platform,
+                diagnostics={"max_download_bytes": limits.max_download_bytes, "file_size_bytes": file_size},
+            )
         duration = safe_nonnegative_int(info.get("duration"))
         if duration and duration > limits.max_duration_seconds:
             return self._failure(
@@ -317,6 +327,7 @@ def options_for_probe(limits: MediaAcquisitionLimits) -> dict[str, Any]:
         "noplaylist": True,
         "skip_download": True,
         "socket_timeout": limits.socket_timeout_seconds,
+        "max_filesize": limits.max_download_bytes,
         "retries": 0,
         "fragment_retries": 0,
         "extractor_retries": 0,
@@ -392,7 +403,7 @@ def categorize_yt_dlp_exception(exc: Exception) -> str:
     if "rate" in text or "too many requests" in text or "429" in text:
         return "auth_or_rate_limited"
     if "timed out" in text or "timeout" in text:
-        return "metadata_failed"
+        return "timeout"
     if "unable to download webpage" in text or "download" in text:
         return "metadata_failed"
     if "unable to extract" in text or "extract" in text:
@@ -409,6 +420,19 @@ def safe_nonnegative_int(value: Any) -> int:
         return max(0, int(value or 0))
     except (TypeError, ValueError):
         return 0
+
+
+def max_known_file_size(info: dict[str, Any]) -> int:
+    sizes = [
+        safe_nonnegative_int(info.get("filesize")),
+        safe_nonnegative_int(info.get("filesize_approx")),
+    ]
+    formats = info.get("formats") if isinstance(info.get("formats"), list) else []
+    for item in formats:
+        if isinstance(item, dict):
+            sizes.append(safe_nonnegative_int(item.get("filesize")))
+            sizes.append(safe_nonnegative_int(item.get("filesize_approx")))
+    return max(sizes or [0])
 
 
 def safe_code_label(value: Any, *, default: str) -> str:
@@ -458,5 +482,6 @@ def user_message_for_failure(category: str) -> str:
         "extractor_unavailable": "The media extractor is unavailable.",
         "private_or_drm": "This media appears private, protected, or DRM-restricted.",
         "cleanup_failed": "Media acquisition cleanup failed.",
+        "timeout": "Media acquisition timed out.",
     }
     return messages.get(category, "Media acquisition failed.")
