@@ -333,6 +333,8 @@ def validate_public_media_url(value: str) -> str:
     host = (parsed.hostname or "").strip().lower()
     if not host or host in {"localhost", "localhost.localdomain", "metadata.google.internal"}:
         return "unsupported_url"
+    if platform_from_url(parsed.geturl()) not in {"tiktok", "youtube", "instagram"}:
+        return "unsupported_url"
     try:
         address = ipaddress.ip_address(host.strip("[]"))
     except ValueError:

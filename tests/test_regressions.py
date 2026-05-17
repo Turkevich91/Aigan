@@ -974,13 +974,13 @@ class ToolRuntimeTests(unittest.TestCase):
         public_dns = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 0))]
         with patch("media_acquisition.socket.getaddrinfo", return_value=public_dns):
             result = adapter.probe_metadata(
-                MediaAcquisitionRequest(url="https://media.example/video?id=1&token=secret-token", route="field_probe")
+                MediaAcquisitionRequest(url="https://www.tiktok.com/video/123?token=secret-token", route="field_probe")
             )
         public_text = json.dumps(result.public_dict(), ensure_ascii=False)
 
         self.assertTrue(result.ok)
         self.assertEqual("yt_dlp", result.backend)
-        self.assertEqual("other", result.platform)
+        self.assertEqual("tiktok", result.platform)
         self.assertEqual("tiktok", result.metadata["extractor"])
         self.assertEqual(2, result.metadata["format_count"])
         self.assertFalse(result.metadata["has_subtitles"])
@@ -989,7 +989,7 @@ class ToolRuntimeTests(unittest.TestCase):
         self.assertIs(True, captured["options"]["skip_download"])
         self.assertEqual(3, captured["options"]["socket_timeout"])
         self.assertNotIn("secret-token", public_text)
-        self.assertNotIn("media.example/video", public_text)
+        self.assertNotIn("www.tiktok.com/video", public_text)
 
     def test_yt_dlp_media_acquisition_failure_is_low_cardinality_and_sanitized(self) -> None:
         class FakeYdl:
@@ -1011,7 +1011,7 @@ class ToolRuntimeTests(unittest.TestCase):
 
         public_dns = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 0))]
         with patch("media_acquisition.socket.getaddrinfo", return_value=public_dns):
-            result = adapter.probe_metadata(MediaAcquisitionRequest(url="https://media.example/video?token=secret-token"))
+            result = adapter.probe_metadata(MediaAcquisitionRequest(url="https://www.tiktok.com/video/123?token=secret-token"))
         public_text = json.dumps(result.public_dict(), ensure_ascii=False)
 
         self.assertFalse(result.ok)
@@ -1021,7 +1021,7 @@ class ToolRuntimeTests(unittest.TestCase):
         self.assertNotIn("secret-token", public_text)
         self.assertNotIn(fake_openai_secret(), public_text)
         self.assertNotIn("cache-note", public_text)
-        self.assertNotIn("media.example/video", public_text)
+        self.assertNotIn("www.tiktok.com/video", public_text)
 
     def test_yt_dlp_media_acquisition_duration_limit_uses_sanitized_diagnostics(self) -> None:
         class FakeYdl:
@@ -1044,7 +1044,7 @@ class ToolRuntimeTests(unittest.TestCase):
 
         public_dns = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 0))]
         with patch("media_acquisition.socket.getaddrinfo", return_value=public_dns):
-            result = adapter.probe_metadata(MediaAcquisitionRequest(url="https://media.example/video?token=secret-token"))
+            result = adapter.probe_metadata(MediaAcquisitionRequest(url="https://www.tiktok.com/video/123?token=secret-token"))
         public_text = json.dumps(result.public_dict(), ensure_ascii=False)
 
         self.assertFalse(result.ok)
@@ -1052,7 +1052,7 @@ class ToolRuntimeTests(unittest.TestCase):
         self.assertEqual(60, result.diagnostics["max_duration_seconds"])
         self.assertEqual(240, result.diagnostics["duration_seconds"])
         self.assertNotIn("secret-token", public_text)
-        self.assertNotIn("media.example/video", public_text)
+        self.assertNotIn("www.tiktok.com/video", public_text)
 
     def test_media_acquisition_event_maps_to_diagnostics_row(self) -> None:
         rows = build_capability_rows(
@@ -1091,6 +1091,16 @@ class ToolRuntimeTests(unittest.TestCase):
 
         private_dns = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", 0))]
         with patch("media_acquisition.socket.getaddrinfo", return_value=private_dns):
+            result = adapter.probe_metadata(MediaAcquisitionRequest(url="https://www.tiktok.com/video/123"))
+
+        self.assertFalse(result.ok)
+        self.assertEqual("unsupported_url", result.failure_category)
+
+    def test_media_acquisition_rejects_unknown_public_platform_hosts(self) -> None:
+        adapter = YtDlpMediaAcquisitionAdapter(ydl_factory=lambda options: object())
+        public_dns = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 0))]
+
+        with patch("media_acquisition.socket.getaddrinfo", return_value=public_dns):
             result = adapter.probe_metadata(MediaAcquisitionRequest(url="https://media.example/video"))
 
         self.assertFalse(result.ok)
