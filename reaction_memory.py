@@ -118,6 +118,24 @@ def safe_code(value: str, default: str = "unknown", limit: int = 64) -> str:
     return text[:limit]
 
 
+REACTION_SHADOW_MODEL_SCORE_MIN = 0.75
+REACTION_SHADOW_BLOCKING_REASONS = (
+    "missing_memory_item",
+    "bot_or_missing_message_id",
+    "unsupported_chat_type",
+    "missing_or_bot_sender",
+    "command",
+    "bot_trigger",
+    "bot_mention",
+    "reply_to_bot",
+    "unsupported_attachment",
+    "insufficient_content",
+    "empty_content",
+    "rate_gate",
+    "cooldown",
+)
+
+
 def safe_reaction_key(spec: ReactionSpec | None) -> str:
     if spec is None:
         return ""
@@ -798,6 +816,75 @@ class ReactionMemoryStore:
                 """,
                 (cutoff_text,),
             ).fetchall()
+            candidate_rows = self._conn.execute(
+                """
+                SELECT candidate_reaction_class AS value, COUNT(*) AS count
+                FROM outbound_reaction_decisions
+                WHERE created_at >= ? AND candidate_reaction_class != ''
+                GROUP BY candidate_reaction_class
+                """,
+                (cutoff_text,),
+            ).fetchall()
+            score_band_rows = self._conn.execute(
+                """
+                SELECT
+                    CASE
+                        WHEN score IS NULL THEN 'unscored'
+                        WHEN score < 0.4 THEN 'score_lt_0_4'
+                        WHEN score < 0.6 THEN 'score_0_4_0_6'
+                        WHEN score < 0.8 THEN 'score_0_6_0_8'
+                        ELSE 'score_gte_0_8'
+                    END AS value,
+                    COUNT(*) AS count
+                FROM outbound_reaction_decisions
+                WHERE created_at >= ?
+                GROUP BY value
+                """,
+                (cutoff_text,),
+            ).fetchall()
+            context_row = self._conn.execute(
+                """
+                SELECT
+                    SUM(CASE WHEN has_text = 1 THEN 1 ELSE 0 END) AS direct_text,
+                    SUM(CASE WHEN has_source_text = 1 OR has_source_title = 1 OR has_source_url = 1 THEN 1 ELSE 0 END) AS source_context,
+                    SUM(CASE WHEN has_source_text = 1 THEN 1 ELSE 0 END) AS source_text,
+                    SUM(CASE WHEN has_source_url = 1 THEN 1 ELSE 0 END) AS source_url,
+                    SUM(CASE WHEN has_vision_summary = 1 THEN 1 ELSE 0 END) AS vision_summary,
+                    SUM(CASE WHEN has_forward_origin = 1 THEN 1 ELSE 0 END) AS forwarded,
+                    SUM(CASE WHEN content_kind = 'image' OR attachment_type = 'photo' THEN 1 ELSE 0 END) AS image_context,
+                    SUM(CASE WHEN attachment_type IN ('video', 'animation') THEN 1 ELSE 0 END) AS video_context,
+                    SUM(
+                        CASE
+                            WHEN reason_code LIKE '%incomplete_media_context%'
+                                OR severity_flags_json LIKE '%incomplete_media_context%'
+                            THEN 1 ELSE 0
+                        END
+                    ) AS incomplete_media_context
+                FROM outbound_reaction_decisions
+                WHERE created_at >= ?
+                """,
+                (cutoff_text,),
+            ).fetchone()
+            blocking_placeholders = ",".join("?" for _ in REACTION_SHADOW_BLOCKING_REASONS)
+            shadow_gate_rows = self._conn.execute(
+                f"""
+                SELECT
+                    CASE
+                        WHEN score IS NULL OR reason_code IN ({blocking_placeholders}) THEN 'blocked_by_gate'
+                        WHEN reason_code LIKE '%incomplete_media_context%'
+                            OR severity_flags_json LIKE '%incomplete_media_context%'
+                            THEN 'context_incomplete'
+                        WHEN score < ? THEN 'below_shadow_score'
+                        WHEN has_text = 0 AND has_source_text = 0 AND has_vision_summary = 0 THEN 'context_missing'
+                        ELSE 'model_candidate'
+                    END AS value,
+                    COUNT(*) AS count
+                FROM outbound_reaction_decisions
+                WHERE created_at >= ?
+                GROUP BY value
+                """,
+                (*REACTION_SHADOW_BLOCKING_REASONS, REACTION_SHADOW_MODEL_SCORE_MIN, cutoff_text),
+            ).fetchall()
             rows = self._conn.execute(
                 """
                 SELECT *
@@ -820,6 +907,15 @@ class ReactionMemoryStore:
         action_counts = merge_counts(action_rows, default="unknown")
         reason_counts = merge_counts(reason_rows, default="unknown")
         emotion_counts = merge_counts(emotion_rows, default="unclassified")
+        candidate_class_counts = merge_counts(candidate_rows, default="unclassified")
+        score_band_counts = merge_counts(score_band_rows, default="unscored")
+        shadow_model_gate_counts = merge_counts(shadow_gate_rows, default="unknown")
+        context_counts: dict[str, int] = {}
+        if context_row is not None:
+            for key in context_row.keys():
+                count = int(context_row[key] or 0)
+                if count:
+                    context_counts[safe_code(key, "context")] = count
         recent: list[dict[str, object]] = []
         for record in decisions:
             action = safe_code(record.action, "unknown")
@@ -847,6 +943,10 @@ class ReactionMemoryStore:
             "action_counts": action_counts,
             "reason_counts": reason_counts,
             "emotion_counts": emotion_counts,
+            "candidate_class_counts": candidate_class_counts,
+            "score_band_counts": score_band_counts,
+            "context_counts": dict(sorted(context_counts.items())),
+            "shadow_model_gate_counts": shadow_model_gate_counts,
             "recent": recent,
         }
 
