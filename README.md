@@ -182,6 +182,10 @@ MEMORY_EMBEDDING_MODEL=text-embedding-3-small
 MEMORY_EMBEDDING_DIMENSIONS=512
 MEMORY_SEMANTIC_LOOKBACK_DAYS=30
 MEMORY_SEMANTIC_TOP_K=6
+MEMORY_RECALL_TOP_K=12
+MEMORY_RECALL_CONTEXT_BEFORE=2
+MEMORY_RECALL_CONTEXT_AFTER=2
+MEMORY_CONTEXT_CHAR_BUDGET=9000
 MEMORY_EMBEDDING_BATCH_SIZE=64
 MEMORY_VECTOR_BACKFILL_ON_START=true
 MEMORY_VECTOR_BACKFILL_LIMIT=1000
@@ -198,6 +202,8 @@ SOCIAL_PROFILE_RETENTION_DAYS=180
 `MEMORY_RETENTION_DAYS` deletes older rows and cached media. `MEMORY_IMAGE_SUMMARY_LIMIT` limits how many recent unsummarized images can be lazily sent to vision for one answer.
 
 Semantic memory adds a local SQLite hybrid index: FTS5 for keyword fallback plus OpenAI embeddings for meaning-based retrieval over the retained lookback window. It is only used after explicit bot invocation, never for ordinary group chatter. `/memory_search query` is admin-only and shows the retrieved snippets without asking the main model to answer; aliases `/память`, `/памʼять`, and `/пошук_памяті` call the same hybrid search. The command automatically uses embeddings when indexed, always attempts FTS fallback, and reports `embeddings_used`, fallback status, and per-result sources. Natural prompts that semantically ask for old chat context, such as `@bot що ми казали про Pragmata?` or `@bot а про 170 тис в казино ми щось обговорювали?`, route to the same recall backend automatically. `MEMORY_RECALL_INTENT_THRESHOLD` and `MEMORY_RECALL_INTENT_AMBIGUOUS_THRESHOLD` control that intent detector. Recall search also runs exact rescue with numeric terms such as `170`, `5к`, `4070`, or `$250`, and excludes the current prompt so it does not become its own top memory result.
+
+For recall answers, `MEMORY_RECALL_TOP_K` keeps the initial semantic/FTS anchors small, then Aigan expands each anchor with `MEMORY_RECALL_CONTEXT_BEFORE` and `MEMORY_RECALL_CONTEXT_AFTER` neighboring stored messages plus reply-chain evidence. `MEMORY_CONTEXT_CHAR_BUDGET` caps each prompt memory block and drops lower-priority old context before current/reference context. The admin-only `/context_window` and `/memory_context` commands show configured limits, selected block counts, duplicate estimates, embedding backlog, and recent prompt sizes without raw chat text, usernames, URLs, transcripts, OCR/frame text, paths, or secrets.
 
 The bot can only remember messages Telegram delivered to it after memory is enabled. It cannot fetch arbitrary older group history. If a forwarded post contains a real `photo` or image `document`, the bot can cache and analyze it. If Telegram only shows a client-side link preview and does not deliver the image file, Aigan keeps the text/link and may fetch public page images, but it cannot inspect a private preview that was never sent through Bot API.
 

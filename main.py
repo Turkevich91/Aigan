@@ -18,7 +18,7 @@ from datetime import datetime, timezone
 from functools import lru_cache
 from itertools import count
 from pathlib import Path
-from typing import Any, Sequence, cast
+from typing import AbstractSet, Any, Sequence, cast
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from agents import Agent, ModelSettings, RunHooks, Runner
@@ -187,6 +187,10 @@ class Config:
     memory_embedding_dimensions: int
     memory_semantic_lookback_days: int
     memory_semantic_top_k: int
+    memory_recall_top_k: int
+    memory_recall_context_before: int
+    memory_recall_context_after: int
+    memory_context_char_budget: int
     memory_embedding_batch_size: int
     memory_vector_backfill_on_start: bool
     memory_vector_backfill_limit: int
@@ -330,6 +334,10 @@ class Config:
             memory_embedding_dimensions=int(os.getenv("MEMORY_EMBEDDING_DIMENSIONS", "512")),
             memory_semantic_lookback_days=int(os.getenv("MEMORY_SEMANTIC_LOOKBACK_DAYS", "30")),
             memory_semantic_top_k=int(os.getenv("MEMORY_SEMANTIC_TOP_K", "6")),
+            memory_recall_top_k=max(1, int(os.getenv("MEMORY_RECALL_TOP_K", "12"))),
+            memory_recall_context_before=max(0, int(os.getenv("MEMORY_RECALL_CONTEXT_BEFORE", "2"))),
+            memory_recall_context_after=max(0, int(os.getenv("MEMORY_RECALL_CONTEXT_AFTER", "2"))),
+            memory_context_char_budget=max(0, int(os.getenv("MEMORY_CONTEXT_CHAR_BUDGET", "9000"))),
             memory_embedding_batch_size=int(os.getenv("MEMORY_EMBEDDING_BATCH_SIZE", "64")),
             memory_vector_backfill_on_start=_env_bool("MEMORY_VECTOR_BACKFILL_ON_START", True),
             memory_vector_backfill_limit=int(os.getenv("MEMORY_VECTOR_BACKFILL_LIMIT", "1000")),
@@ -579,6 +587,7 @@ pending_requests: dict[tuple[int, int], dict[str, Any]] = {}
 pending_token_counter = count(1)
 chat_generation_locks: dict[int, asyncio.Lock] = {}
 recent_chat_answers: dict[int, deque[Any]] = defaultdict(lambda: deque(maxlen=12))
+last_context_diagnostics: dict[int, "MemoryContextDiagnostics"] = {}
 embedding_queue: asyncio.Queue[int] | None = None
 last_embedding_error = ""
 last_embedding_at = ""
@@ -1006,6 +1015,40 @@ class MemorySearchOutcome:
     returned: int = 0
     embedding_error: str = ""
     topic_terms: tuple[str, ...] = ()
+
+
+@dataclass
+class MemoryContextState:
+    seen_item_ids: set[int]
+    seen_chat_message_keys: set[tuple[int, int]]
+    seen_payload_hashes: set[str]
+    duplicate_count: int = 0
+    dropped_for_budget: int = 0
+
+
+@dataclass(frozen=True)
+class MemoryContextDiagnostics:
+    chat_id: int
+    route: str
+    prompt_chars: int
+    recent_items: int
+    expanded_items: int
+    semantic_items: int
+    recalled_items: int
+    duplicate_items: int
+    budget_dropped_items: int
+    memory_context_chars: int
+    expanded_context_chars: int
+    semantic_context_chars: int
+    recalled_context_chars: int
+    created_at: str
+
+
+@dataclass(frozen=True)
+class MemoryContextCompilationStats:
+    duplicate_items: int
+    budget_dropped_items: int
+    selected_item_ids: frozenset[int]
 
 
 @dataclass(frozen=True)
@@ -2869,38 +2912,136 @@ def format_passive_context(chat_id: int) -> str:
     return "\n".join(items)
 
 
+def new_memory_context_state() -> MemoryContextState:
+    return MemoryContextState(seen_item_ids=set(), seen_chat_message_keys=set(), seen_payload_hashes=set())
+
+
+def normalized_memory_payload(item: MemoryItem) -> str:
+    evidence_parts = [
+        part
+        for part in (
+            item.text,
+            item.source_text,
+            item.source_title,
+            item.source_url,
+            item.forward_origin,
+            f"reply_to:{item.reply_to_message_id}" if item.reply_to_message_id is not None else "",
+            item.vision_summary,
+        )
+        if part
+    ]
+    payload = " ".join(evidence_parts)
+    normalized = re.sub(r"\s+", " ", payload.casefold()).strip()
+    if normalized:
+        return normalized
+    return f"item:{item.chat_id}:{item.message_id or item.id}:{item.content_kind}:{item.attachment_type}"
+
+
+def memory_payload_hash(item: MemoryItem) -> str:
+    payload = normalized_memory_payload(item)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def select_unique_memory_items(
+    items: Sequence[MemoryItem],
+    state: MemoryContextState | None = None,
+    *,
+    include_bot: bool = True,
+) -> list[MemoryItem]:
+    state = state or new_memory_context_state()
+    selected: list[MemoryItem] = []
+    for item in items:
+        if item.is_bot and not include_bot:
+            continue
+        chat_message_key = (item.chat_id, int(item.message_id)) if item.message_id is not None else None
+        payload_hash = memory_payload_hash(item)
+        if (
+            item.id in state.seen_item_ids
+            or (chat_message_key is not None and chat_message_key in state.seen_chat_message_keys)
+            or payload_hash in state.seen_payload_hashes
+        ):
+            state.duplicate_count += 1
+            continue
+        state.seen_item_ids.add(item.id)
+        if chat_message_key is not None:
+            state.seen_chat_message_keys.add(chat_message_key)
+        state.seen_payload_hashes.add(payload_hash)
+        selected.append(item)
+    return selected
+
+
+def forget_memory_item_from_context_state(item: MemoryItem, state: MemoryContextState | None) -> None:
+    if state is None:
+        return
+    state.seen_item_ids.discard(item.id)
+    if item.message_id is not None:
+        state.seen_chat_message_keys.discard((item.chat_id, int(item.message_id)))
+    state.seen_payload_hashes.discard(memory_payload_hash(item))
+
+
+def format_memory_item_line(item: MemoryItem) -> str:
+    self_marker = " (previous Aigan message; prior Aigan output; not source evidence)" if item.is_bot else ""
+    prefix = f"- [{item.created_at}] {item.sender_label}{self_marker}"
+    parts: list[str] = []
+    if item.text:
+        parts.append(clip_text(item.text, 900))
+    if item.source_text:
+        parts.append("shared_source_text=" + clip_text(item.source_text, 900))
+    if item.reply_to_message_id is not None:
+        parts.append(f"reply_to_message_id={item.reply_to_message_id}")
+    if item.forward_origin:
+        parts.append(f"source={clip_text(item.forward_origin, 200)}")
+    if item.source_title:
+        parts.append(f"source_title={clip_text(item.source_title, 200)}")
+    if item.source_url:
+        parts.append(f"source_url={clip_text(item.source_url, 300)}")
+    if item.content_kind == "image":
+        if item.vision_summary:
+            parts.append("image_summary=" + clip_text(item.vision_summary, 900))
+        elif item.local_media_path:
+            parts.append("[image cached, not summarized yet]")
+        else:
+            parts.append("[image/preview was referenced, but no image file was delivered]")
+    elif item.attachment_type and item.content_kind != "text":
+        parts.append(f"[attachment: {clip_text(item.attachment_type, 120)}]")
+    return prefix + ": " + (" | ".join(parts) if parts else "(no visible text)")
+
+
+def trim_memory_items_to_budget(
+    items: list[MemoryItem],
+    budget_chars: int,
+    state: MemoryContextState | None = None,
+) -> list[MemoryItem]:
+    if budget_chars <= 0 or not items:
+        return items
+    selected_reversed: list[MemoryItem] = []
+    used = 0
+    dropped = 0
+    for item in reversed(items):
+        line_len = len(format_memory_item_line(item)) + 1
+        if used + line_len > budget_chars:
+            dropped += 1
+            forget_memory_item_from_context_state(item, state)
+            continue
+        selected_reversed.append(item)
+        used += line_len
+    if state is not None:
+        state.dropped_for_budget += dropped
+    return list(reversed(selected_reversed))
+
+
+def estimate_recent_memory_duplicate_count(chat_id: int, limit: int) -> int:
+    if MEMORY is None:
+        return 0
+    state = new_memory_context_state()
+    select_unique_memory_items(MEMORY.latest(chat_id, max(1, int(limit))), state)
+    return state.duplicate_count
+
+
 def format_memory_items(items: list[MemoryItem]) -> str:
     if not items:
         return "(no persistent memory yet)"
-
-    lines: list[str] = []
-    for item in items:
-        self_marker = " (previous Aigan message)" if item.is_bot else ""
-        prefix = f"- [{item.created_at}] {item.sender_label}{self_marker}"
-        parts: list[str] = []
-        if item.text:
-            parts.append(clip_text(item.text, 900))
-        if item.source_text:
-            parts.append("shared_source_text=" + clip_text(item.source_text, 900))
-        if item.reply_to_message_id is not None:
-            parts.append(f"reply_to_message_id={item.reply_to_message_id}")
-        if item.forward_origin:
-            parts.append(f"source={item.forward_origin}")
-        if item.source_title:
-            parts.append(f"source_title={clip_text(item.source_title, 200)}")
-        if item.source_url:
-            parts.append(f"source_url={item.source_url}")
-        if item.content_kind == "image":
-            if item.vision_summary:
-                parts.append("image_summary=" + clip_text(item.vision_summary, 900))
-            elif item.local_media_path:
-                parts.append("[image cached, not summarized yet]")
-            else:
-                parts.append("[image/preview was referenced, but no image file was delivered]")
-        elif item.attachment_type and item.content_kind != "text":
-            parts.append(f"[attachment: {item.attachment_type}]")
-        lines.append(prefix + ": " + (" | ".join(parts) if parts else "(no visible text)"))
-    return "\n".join(lines)
+    return "\n".join(format_memory_item_line(item) for item in items)
 
 
 def format_memory_context(chat_id: int, limit: int | None = None) -> str:
@@ -2944,10 +3085,15 @@ def expanded_followup_memory_items(message: Message) -> list[MemoryItem]:
     return unique_memory_items(latest + chain)
 
 
-def format_expanded_followup_memory_context(message: Message) -> tuple[str, int]:
+def format_expanded_followup_memory_context(
+    message: Message,
+    state: MemoryContextState | None = None,
+) -> tuple[str, int]:
     if MEMORY is None:
         return "(persistent memory disabled)", 0
-    items = expanded_followup_memory_items(message)
+    state = state or new_memory_context_state()
+    items = select_unique_memory_items(expanded_followup_memory_items(message), state)
+    items = trim_memory_items_to_budget(items, CONFIG.memory_context_char_budget, state)
     return format_memory_items(items), len(items)
 
 
@@ -3223,20 +3369,38 @@ Stored message context:
         enqueue_memory_embedding(item.id)
 
 
-async def prepare_memory_context(message: Message, prompt: str, force_images: bool = False) -> str:
+async def prepare_memory_context(
+    message: Message,
+    prompt: str,
+    force_images: bool = False,
+    state: MemoryContextState | None = None,
+) -> str:
     if MEMORY is None:
         return "(persistent memory disabled)"
     if should_summarize_memory_images(message, prompt, force=force_images):
         await ensure_recent_image_summaries(message.chat_id, force=force_images)
-    return format_memory_context(message.chat_id, CONFIG.memory_context_messages)
+    state = state or new_memory_context_state()
+    items = select_unique_memory_items(MEMORY.latest(message.chat_id, CONFIG.memory_context_messages), state)
+    items = trim_memory_items_to_budget(items, CONFIG.memory_context_char_budget, state)
+    return format_memory_items(items)
 
 
-async def prepare_agent_memory_context(message: Message, prompt: str, route: str) -> tuple[str, str | None]:
-    memory_context = await prepare_memory_context(message, prompt)
+async def prepare_agent_memory_context(
+    message: Message,
+    prompt: str,
+    route: str,
+    state: MemoryContextState | None = None,
+) -> tuple[str, str | None, MemoryContextCompilationStats]:
+    state = state or new_memory_context_state()
+    memory_context = await prepare_memory_context(message, prompt, state=state)
     if not should_expand_memory_for_prompt(route, prompt):
-        return memory_context, None
+        return memory_context, None, MemoryContextCompilationStats(
+            duplicate_items=state.duplicate_count,
+            budget_dropped_items=state.dropped_for_budget,
+            selected_item_ids=frozenset(state.seen_item_ids),
+        )
 
-    expanded_context, included_count = format_expanded_followup_memory_context(message)
+    expanded_context, included_count = format_expanded_followup_memory_context(message, state)
     system_event(
         component="memory",
         event_type="memory_context_expanded",
@@ -3248,10 +3412,16 @@ async def prepare_agent_memory_context(message: Message, prompt: str, route: str
             "expanded_limit": CONFIG.memory_followup_context_messages,
             "thread_depth": CONFIG.memory_thread_context_depth,
             "included_items": included_count,
+            "duplicate_items": state.duplicate_count,
+            "budget_dropped_items": state.dropped_for_budget,
             "prompt_words": len(meaningful_followup_words(prompt)),
         },
     )
-    return memory_context, expanded_context
+    return memory_context, expanded_context, MemoryContextCompilationStats(
+        duplicate_items=state.duplicate_count,
+        budget_dropped_items=state.dropped_for_budget,
+        selected_item_ids=frozenset(state.seen_item_ids),
+    )
 
 
 def memory_vector_available() -> bool:
@@ -3446,6 +3616,17 @@ def extract_memory_topic_terms(query: str) -> list[str]:
     cleaned = URL_TOKEN_RE.sub(" ", query or "")
     cleaned = MENTION_TOKEN_RE.sub(" ", cleaned)
     cleaned = SLASH_COMMAND_TOKEN_RE.sub(" ", cleaned)
+    boilerplate_terms = {
+        "author",
+        "message",
+        "origin",
+        "replied",
+        "reply",
+        "telegram",
+        "selected",
+        "quote",
+        "context",
+    }
     candidates: list[str] = []
     patterns = [
         r"(?:про|щодо|стосовно|на тему|about|regarding)\s+(.+?)(?:[.?!\n]|$)",
@@ -3463,7 +3644,9 @@ def extract_memory_topic_terms(query: str) -> list[str]:
     meaningful = [
         token
         for token in WORD_RE.findall(cleaned)
-        if len(token) >= 3 and token.casefold() not in technical_stat_stop_words()
+        if len(token) >= 3
+        and token.casefold() not in technical_stat_stop_words()
+        and token.casefold() not in boilerplate_terms
     ]
     if 1 <= len(meaningful) <= 4:
         candidates.append(" ".join(meaningful))
@@ -3472,6 +3655,8 @@ def extract_memory_topic_terms(query: str) -> list[str]:
     seen: set[str] = set()
     for candidate in candidates:
         key = candidate.casefold()
+        if key in boilerplate_terms:
+            continue
         if key not in seen:
             seen.add(key)
             unique.append(candidate)
@@ -3553,6 +3738,105 @@ def format_semantic_memory_results(results: list[SemanticMemoryResult]) -> str:
     return "\n".join(lines)
 
 
+def source_linked_recall_items(
+    results: list[SemanticMemoryResult],
+    message: Message,
+    state: MemoryContextState | None = None,
+) -> tuple[list[MemoryItem], int]:
+    if MEMORY is None or not results:
+        return [], 0
+    state = state or new_memory_context_state()
+    selected: list[MemoryItem] = []
+    anchor_count = 0
+    for result in results:
+        item = result.item
+        if item.message_id is not None:
+            chain = MEMORY.reply_chain(message.chat_id, item.message_id, CONFIG.memory_thread_context_depth)
+        else:
+            chain = []
+        window = MEMORY.context_window_around_item(
+            message.chat_id,
+            item.id,
+            before=CONFIG.memory_recall_context_before,
+            after=CONFIG.memory_recall_context_after,
+        )
+        candidates = [
+            candidate
+            for candidate in chain + window
+            if candidate.message_id != message.message_id and not is_bot_invocation_memory_item(candidate)
+        ]
+        unique = select_unique_memory_items(candidates, state)
+        if unique:
+            anchor_count += 1
+            selected.extend(unique)
+    budget = CONFIG.memory_context_char_budget
+    selected = trim_memory_items_to_budget(selected, budget, state)
+    return selected, anchor_count
+
+
+def format_source_linked_recall_results(
+    results: list[SemanticMemoryResult],
+    message: Message,
+    state: MemoryContextState | None = None,
+) -> str:
+    if not results:
+        return "(no semantic memory matches)"
+    items, anchor_count = source_linked_recall_items(results, message, state)
+    if not items:
+        if state is not None:
+            return "(no semantic memory matches)"
+        return format_semantic_memory_results(results)
+    header = [
+        "Source-linked recalled memory:",
+        f"- anchors: {anchor_count}",
+        f"- context_before: {CONFIG.memory_recall_context_before}",
+        f"- context_after: {CONFIG.memory_recall_context_after}",
+        "- evidence window:",
+    ]
+    return "\n".join(header + [format_memory_items(items)])
+
+
+def context_block_item_count(text: str | None) -> int:
+    if not text:
+        return 0
+    return sum(1 for line in text.splitlines() if line.startswith("- ["))
+
+
+def remember_context_diagnostics(
+    chat_id: int,
+    *,
+    route: str,
+    prompt_chars: int,
+    memory_context: str | None,
+    expanded_memory_context: str | None,
+    semantic_memory_context: str | None,
+    recalled_memory_context: str | None,
+    compilation_stats: MemoryContextCompilationStats | None = None,
+) -> None:
+    duplicate_count = (
+        compilation_stats.duplicate_items
+        if compilation_stats is not None
+        else estimate_recent_memory_duplicate_count(chat_id, CONFIG.memory_context_messages)
+    )
+    dropped_count = compilation_stats.budget_dropped_items if compilation_stats is not None else 0
+    last_context_diagnostics[int(chat_id)] = MemoryContextDiagnostics(
+        chat_id=int(chat_id),
+        route=route,
+        prompt_chars=max(0, int(prompt_chars)),
+        recent_items=context_block_item_count(memory_context),
+        expanded_items=context_block_item_count(expanded_memory_context),
+        semantic_items=context_block_item_count(semantic_memory_context),
+        recalled_items=context_block_item_count(recalled_memory_context),
+        duplicate_items=duplicate_count,
+        budget_dropped_items=dropped_count,
+        memory_context_chars=len(memory_context or ""),
+        expanded_context_chars=len(expanded_memory_context or ""),
+        semantic_context_chars=len(semantic_memory_context or ""),
+        recalled_context_chars=len(recalled_memory_context or ""),
+        created_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+    )
+
+
 def format_memory_search_outcome(outcome: MemorySearchOutcome) -> str:
     status = [
         "Hybrid semantic memory search:",
@@ -3602,7 +3886,7 @@ async def semantic_memory_search_outcome(
     started = time.monotonic()
     source_limit = CONFIG.memory_semantic_top_k
     if route == "memory_recall":
-        source_limit = max(CONFIG.memory_semantic_top_k * 4, CONFIG.memory_semantic_top_k)
+        source_limit = max(CONFIG.memory_recall_top_k, CONFIG.memory_semantic_top_k)
     search_queries = []
     seen_queries: set[str] = set()
     for candidate in (query, *extra_queries):
@@ -3694,7 +3978,8 @@ async def semantic_memory_search_outcome(
         exclude_message_id=exclude_message_id,
         exclude_bot_invocations=route == "memory_recall",
     )
-    results = merge_semantic_results(keyword_results + semantic_results + fts_results, CONFIG.memory_semantic_top_k)
+    return_limit = CONFIG.memory_recall_top_k if route == "memory_recall" else CONFIG.memory_semantic_top_k
+    results = merge_semantic_results(keyword_results + semantic_results + fts_results, return_limit)
     system_event(
         component="memory_vector",
         event_type="semantic_search",
@@ -3727,17 +4012,35 @@ async def semantic_memory_search_outcome(
     )
 
 
-async def prepare_semantic_memory_context(message: Message, prompt: str, route: str) -> str | None:
+async def prepare_semantic_memory_context(
+    message: Message,
+    prompt: str,
+    route: str,
+    exclude_item_ids: AbstractSet[int] | None = None,
+) -> str | None:
     if not should_use_semantic_memory(route):
         return None
     query = semantic_memory_query(message, prompt)
     if not query:
         return "(no semantic memory query)"
     results = await semantic_memory_results_for_query(message, query, route=route)
+    if MEMORY is not None and route != "memory_recall":
+        if exclude_item_ids is not None:
+            excluded_ids = set(exclude_item_ids)
+            results = [result for result in results if result.item.id not in excluded_ids]
+        else:
+            recent_ids = {item.id for item in MEMORY.latest(message.chat_id, CONFIG.memory_context_messages)}
+            non_recent_results = [result for result in results if result.item.id not in recent_ids]
+            if non_recent_results:
+                results = non_recent_results
     return format_semantic_memory_results(results)
 
 
-def format_recalled_memory_outcome(outcome: MemorySearchOutcome) -> str:
+def format_recalled_memory_outcome(
+    outcome: MemorySearchOutcome,
+    message: Message | None = None,
+    state: MemoryContextState | None = None,
+) -> str:
     if not outcome.results:
         details = [
             "(no recalled memory matches)",
@@ -3746,6 +4049,8 @@ def format_recalled_memory_outcome(outcome: MemorySearchOutcome) -> str:
         if outcome.topic_terms:
             details.append("Query terms: " + ", ".join(outcome.topic_terms[:8]))
         return "\n".join(details)
+    if message is not None:
+        return format_source_linked_recall_results(outcome.results, message, state)
     return format_semantic_memory_results(outcome.results)
 
 
@@ -3753,6 +4058,7 @@ async def prepare_recalled_memory_context(
     message: Message,
     prompt: str,
     recall_intent: MemoryRecallIntent | None,
+    state: MemoryContextState | None = None,
 ) -> str:
     query = (recall_intent.query if recall_intent else "") or clean_memory_recall_query(prompt) or prompt
     variants = memory_recall_query_variants(prompt, query)
@@ -3780,7 +4086,7 @@ async def prepare_recalled_memory_context(
             "keyword_results": outcome.keyword_results,
         },
     )
-    return format_recalled_memory_outcome(outcome)
+    return format_recalled_memory_outcome(outcome, message, state)
 
 
 def memory_vector_health_text() -> str:
@@ -3811,6 +4117,72 @@ def memory_vector_health_text() -> str:
             f"- last_error: {error}",
         ]
     )
+
+
+def context_window_diagnostics_text(chat_id: int) -> str:
+    lines = [
+        "Working-memory diagnostics:",
+        f"- memory_store: {'enabled' if MEMORY is not None else 'disabled'}",
+        f"- recent_limit: {CONFIG.memory_context_messages}",
+        f"- followup_limit: {CONFIG.memory_followup_context_messages}",
+        f"- thread_depth: {CONFIG.memory_thread_context_depth}",
+        f"- semantic_top_k: {CONFIG.memory_semantic_top_k}",
+        f"- recall_top_k: {CONFIG.memory_recall_top_k}",
+        f"- recall_context: before={CONFIG.memory_recall_context_before}, after={CONFIG.memory_recall_context_after}",
+        f"- context_char_budget: {CONFIG.memory_context_char_budget}",
+    ]
+    if MEMORY is None:
+        return "\n".join(lines)
+
+    lines.append(f"- retained_chat_rows: {MEMORY.chat_message_count(chat_id)}")
+    lines.append(f"- recent_duplicate_estimate: {estimate_recent_memory_duplicate_count(chat_id, CONFIG.memory_context_messages)}")
+    if memory_vector_available():
+        try:
+            indexed = MEMORY.embedding_index_count(
+                chat_id=chat_id,
+                model=CONFIG.memory_embedding_model,
+                dimensions=CONFIG.memory_embedding_dimensions,
+                lookback_days=CONFIG.memory_semantic_lookback_days,
+            )
+            backlog = MEMORY.embedding_backlog_count(
+                model=CONFIG.memory_embedding_model,
+                dimensions=CONFIG.memory_embedding_dimensions,
+                lookback_days=CONFIG.memory_semantic_lookback_days,
+            )
+        except Exception:
+            indexed = -1
+            backlog = -1
+        lines.extend(
+            [
+                f"- embedding_indexed: {indexed}",
+                f"- embedding_backlog: {backlog}",
+            ]
+        )
+    else:
+        lines.append("- embeddings: disabled")
+
+    last = last_context_diagnostics.get(int(chat_id))
+    if last is None:
+        lines.append("- last_prompt: none since process start")
+        return "\n".join(lines)
+    lines.extend(
+        [
+            "- last_prompt:",
+            f"  - route: {safe_detail_code(last.route)}",
+            f"  - prompt_chars: {last.prompt_chars}",
+            f"  - recent_items: {last.recent_items}",
+            f"  - expanded_items: {last.expanded_items}",
+            f"  - semantic_items: {last.semantic_items}",
+            f"  - recalled_items: {last.recalled_items}",
+            f"  - duplicate_items: {last.duplicate_items}",
+            f"  - budget_dropped_items: {last.budget_dropped_items}",
+            f"  - memory_chars: {last.memory_context_chars}",
+            f"  - expanded_chars: {last.expanded_context_chars}",
+            f"  - semantic_chars: {last.semantic_context_chars}",
+            f"  - recalled_chars: {last.recalled_context_chars}",
+        ]
+    )
+    return "\n".join(lines)
 
 
 def tool_runtime_health_text() -> str:
@@ -5165,6 +5537,15 @@ def allow_admin_command(message: Message, command_name: str) -> bool:
     return allow_command(message, command_name) and is_admin_user(message)
 
 
+def command_name_from_message(message: Message, default: str) -> str:
+    text = (message.text or "").strip()
+    if not text.startswith("/"):
+        return default
+    token = text.split(maxsplit=1)[0].lstrip("/")
+    command = token.split("@", 1)[0].casefold()
+    return LOCALIZED_COMMAND_ALIASES.get(command, command) or default
+
+
 def command_args_from_text(text: str | None) -> str:
     if not text:
         return ""
@@ -5820,6 +6201,17 @@ async def memory_search_command(update: Update, context: ContextTypes.DEFAULT_TY
     await send_reply(message, format_memory_search_outcome(outcome))
 
 
+async def context_window_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    if message is None:
+        return
+    command_name = command_name_from_message(message, "context_window")
+    if not allow_admin_command(message, command_name):
+        await deny_admin_command(message, command_name)
+        return
+    await send_reply(message, context_window_diagnostics_text(message.chat_id))
+
+
 async def interests_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.effective_message
     if message is None:
@@ -6177,6 +6569,8 @@ async def localized_command_alias(update: Update, context: ContextTypes.DEFAULT_
         await complaints_command(update, context)
     elif command == "memory_search":
         await memory_search_command(update, context)
+    elif command == "context_window":
+        await context_window_command(update, context)
     elif command == "interests":
         await interests_command(update, context)
     elif command == "interest_evidence":
@@ -6523,13 +6917,29 @@ async def handle_prompt_generation(
         user_id = message.from_user.id if message.from_user else "unknown"
         LOGGER.info("Reference context attached chat_id=%s user_id=%s", message.chat_id, user_id)
     web_context = await maybe_prefetch_web_context(message, prompt, route)
-    memory_context, expanded_memory_context = await prepare_agent_memory_context(message, prompt, route)
     recalled_memory_context = None
     semantic_memory_context = None
     if route == "memory_recall":
-        recalled_memory_context = await prepare_recalled_memory_context(message, prompt, recall_intent)
+        recall_state = new_memory_context_state()
+        recalled_memory_context = await prepare_recalled_memory_context(message, prompt, recall_intent, recall_state)
+        memory_context, expanded_memory_context, memory_context_stats = await prepare_agent_memory_context(
+            message,
+            prompt,
+            route,
+            state=recall_state,
+        )
     else:
-        semantic_memory_context = await prepare_semantic_memory_context(message, prompt, route)
+        memory_context, expanded_memory_context, memory_context_stats = await prepare_agent_memory_context(
+            message,
+            prompt,
+            route,
+        )
+        semantic_memory_context = await prepare_semantic_memory_context(
+            message,
+            prompt,
+            route,
+            exclude_item_ids=memory_context_stats.selected_item_ids,
+        )
     agent_input = build_agent_input(
         message,
         prompt,
@@ -6539,6 +6949,16 @@ async def handle_prompt_generation(
         recalled_memory_context=recalled_memory_context,
         web_context=web_context,
         route=route,
+    )
+    remember_context_diagnostics(
+        message.chat_id,
+        route=route,
+        prompt_chars=len(agent_input),
+        memory_context=memory_context,
+        expanded_memory_context=expanded_memory_context,
+        semantic_memory_context=semantic_memory_context,
+        recalled_memory_context=recalled_memory_context,
+        compilation_stats=memory_context_stats,
     )
 
     try:
@@ -7418,6 +7838,7 @@ def main() -> None:
     application.add_handler(CommandHandler(["logs"], logs_command))
     application.add_handler(CommandHandler(["selfcheck"], selfcheck_command))
     application.add_handler(CommandHandler(["complaints"], complaints_command))
+    application.add_handler(CommandHandler(["context_window", "memory_context"], context_window_command))
     application.add_handler(CommandHandler(["memory_search"], memory_search_command))
     application.add_handler(CommandHandler(["interests", "likes"], interests_command))
     application.add_handler(CommandHandler(["interest_evidence"], interest_evidence_command))

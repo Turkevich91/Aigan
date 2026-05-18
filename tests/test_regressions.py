@@ -129,7 +129,7 @@ from media_frames import (
     MediaFrameResult,
     NullMediaFrameAdapter,
 )
-from memory import MemoryStore
+from memory import MemoryStore, SemanticMemoryResult
 from mcp_servers import web
 from reaction_memory import ReactionSpec
 from scripts import import_telegram_export
@@ -413,7 +413,21 @@ class PendingFlowTests(unittest.TestCase):
         return (
             patch.object(main, "classify_request_with_intent", new=AsyncMock(return_value=("normal", None))),
             patch.object(main, "maybe_prefetch_web_context", new=AsyncMock(return_value=None)),
-            patch.object(main, "prepare_agent_memory_context", new=AsyncMock(return_value=("(memory)", "(not active)"))),
+            patch.object(
+                main,
+                "prepare_agent_memory_context",
+                new=AsyncMock(
+                    return_value=(
+                        "(memory)",
+                        "(not active)",
+                        main.MemoryContextCompilationStats(
+                            duplicate_items=0,
+                            budget_dropped_items=0,
+                            selected_item_ids=frozenset(),
+                        ),
+                    )
+                ),
+            ),
             patch.object(main, "prepare_semantic_memory_context", new=AsyncMock(return_value=None)),
             patch.object(main, "run_agent", new=run_agent),
         )
@@ -2819,6 +2833,7 @@ class PersistentMemoryTests(unittest.TestCase):
         main.last_proactive_personal_ping.clear()
         main.chat_generation_locks.clear()
         main.recent_chat_answers.clear()
+        main.last_context_diagnostics.clear()
         main.embedding_queue = None
         main.set_reaction_adapter(main.NullReactionAdapter())
         main.TOOL_RUNTIME.clear_error_counts()
@@ -2834,6 +2849,7 @@ class PersistentMemoryTests(unittest.TestCase):
             main.REACTION_MEMORY.clear_all()
         main.chat_generation_locks.clear()
         main.recent_chat_answers.clear()
+        main.last_context_diagnostics.clear()
         main.embedding_queue = None
         main.set_reaction_adapter(main.NullReactionAdapter())
         main.TOOL_RUNTIME.clear_error_counts()
@@ -4090,7 +4106,7 @@ class PersistentMemoryTests(unittest.TestCase):
             )
         message = FakeMessage("@thrd_ua_bot дай огляд", message_id=100)
 
-        memory_context, expanded_context = asyncio.run(main.prepare_agent_memory_context(message, "дай огляд", "normal"))
+        memory_context, expanded_context, _ = asyncio.run(main.prepare_agent_memory_context(message, "дай огляд", "normal"))
 
         self.assertNotIn("old topic anchor", memory_context)
         self.assertIsNone(expanded_context)
@@ -4114,7 +4130,7 @@ class PersistentMemoryTests(unittest.TestCase):
             )
         message = FakeMessage("@thrd_ua_bot скільки?", message_id=100)
 
-        memory_context, expanded_context = asyncio.run(main.prepare_agent_memory_context(message, "скільки?", "normal"))
+        memory_context, expanded_context, _ = asyncio.run(main.prepare_agent_memory_context(message, "скільки?", "normal"))
         agent_input = main.build_agent_input(
             message,
             "скільки?",
@@ -4156,7 +4172,7 @@ class PersistentMemoryTests(unittest.TestCase):
         message = FakeMessage("@thrd_ua_bot скільки?", message_id=200)
         message.reply_to_message = FakeMessage("reply-chain child asks how much", message_id=2)
 
-        memory_context, expanded_context = asyncio.run(main.prepare_agent_memory_context(message, "скільки?", "normal"))
+        memory_context, expanded_context, _ = asyncio.run(main.prepare_agent_memory_context(message, "скільки?", "normal"))
 
         self.assertNotIn("reply-chain parent says the amount", memory_context)
         self.assertIn("reply-chain parent says the amount", expanded_context)
@@ -4164,7 +4180,7 @@ class PersistentMemoryTests(unittest.TestCase):
     def test_translation_route_does_not_use_expanded_followup_memory(self) -> None:
         message = FakeMessage("@thrd_ua_bot переклади українською", message_id=300)
 
-        _, expanded_context = asyncio.run(
+        _, expanded_context, _ = asyncio.run(
             main.prepare_agent_memory_context(message, "переклади українською", "translate_reference")
         )
 
@@ -4194,6 +4210,354 @@ class PersistentMemoryTests(unittest.TestCase):
 
         events = main.SYSTEM_LOG.latest_events(5)
         self.assertTrue(any(event.event_type == "memory_context_expanded" for event in events))
+
+    def test_expanded_followup_context_dedupes_normal_recent_memory(self) -> None:
+        base = datetime.now(timezone.utc)
+        for index in range(15):
+            main.MEMORY.save_message(
+                chat_id=-1001,
+                message_id=index + 1,
+                sender_label="Tester",
+                text=f"recent unique topic {index}",
+                created_at=base + timedelta(seconds=index),
+            )
+        message = FakeMessage("@thrd_ua_bot how many?", message_id=100)
+
+        memory_context, expanded_context, _ = asyncio.run(main.prepare_agent_memory_context(message, "how many?", "normal"))
+
+        self.assertIn("recent unique topic 14", memory_context)
+        self.assertNotIn("recent unique topic 14", expanded_context)
+        self.assertIn("recent unique topic 4", expanded_context)
+
+    def test_memory_context_dedupes_repeated_payloads(self) -> None:
+        base = datetime.now(timezone.utc)
+        main.MEMORY.save_message(
+            chat_id=-1001,
+            message_id=1,
+            sender_label="Alpha",
+            text="same compact fact repeated",
+            created_at=base,
+        )
+        main.MEMORY.save_message(
+            chat_id=-1001,
+            message_id=2,
+            sender_label="Beta",
+            text="same compact fact repeated",
+            created_at=base + timedelta(seconds=1),
+        )
+        message = FakeMessage("@thrd_ua_bot overview", message_id=3)
+
+        memory_context, _, _ = asyncio.run(main.prepare_agent_memory_context(message, "overview", "normal"))
+
+        self.assertEqual(1, memory_context.count("same compact fact repeated"))
+
+    def test_memory_context_keeps_same_text_with_different_source_links(self) -> None:
+        base = datetime.now(timezone.utc)
+        main.MEMORY.save_message(
+            chat_id=-1001,
+            message_id=1,
+            sender_label="Alpha",
+            text="same text with different evidence",
+            forward_origin="Source Alpha",
+            created_at=base,
+        )
+        main.MEMORY.save_message(
+            chat_id=-1001,
+            message_id=2,
+            sender_label="Beta",
+            text="same text with different evidence",
+            forward_origin="Source Beta",
+            created_at=base + timedelta(seconds=1),
+        )
+        message = FakeMessage("@thrd_ua_bot overview", message_id=3)
+
+        memory_context, _, _ = asyncio.run(main.prepare_agent_memory_context(message, "overview", "normal"))
+
+        self.assertEqual(2, memory_context.count("same text with different evidence"))
+        self.assertIn("Source Alpha", memory_context)
+        self.assertIn("Source Beta", memory_context)
+
+    def test_memory_context_keeps_distinct_empty_non_text_items(self) -> None:
+        base = datetime.now(timezone.utc)
+        main.MEMORY.save_message(
+            chat_id=-1001,
+            message_id=1,
+            sender_label="Alpha",
+            content_kind="image",
+            attachment_type="photo",
+            created_at=base,
+        )
+        main.MEMORY.save_message(
+            chat_id=-1001,
+            message_id=2,
+            sender_label="Beta",
+            content_kind="image",
+            attachment_type="photo",
+            created_at=base + timedelta(seconds=1),
+        )
+        message = FakeMessage("@thrd_ua_bot overview", message_id=3)
+
+        memory_context, _, _ = asyncio.run(main.prepare_agent_memory_context(message, "overview", "normal"))
+
+        self.assertIn("Alpha", memory_context)
+        self.assertIn("Beta", memory_context)
+        self.assertEqual(2, memory_context.count("[image/preview was referenced, but no image file was delivered]"))
+
+    def test_semantic_context_excludes_compiled_memory_items(self) -> None:
+        base = datetime.now(timezone.utc)
+        selected_id = main.MEMORY.save_message(
+            chat_id=-1001,
+            message_id=1,
+            sender_label="Recent",
+            text="recent compiled fact already in prompt",
+            created_at=base,
+        )
+        older_id = main.MEMORY.save_message(
+            chat_id=-1001,
+            message_id=2,
+            sender_label="Older",
+            text="older semantic-only fact should remain",
+            created_at=base - timedelta(days=1),
+        )
+        selected_item = main.MEMORY.item_by_id(selected_id)
+        older_item = main.MEMORY.item_by_id(older_id)
+        message = FakeMessage("@thrd_ua_bot overview", message_id=3)
+
+        with patch.object(
+            main,
+            "semantic_memory_results_for_query",
+            new=AsyncMock(
+                return_value=[
+                    SemanticMemoryResult(selected_item, "recent compiled fact already in prompt", 0.9, "semantic"),
+                    SemanticMemoryResult(older_item, "older semantic-only fact should remain", 0.8, "semantic"),
+                ]
+            ),
+        ):
+            context = asyncio.run(
+                main.prepare_semantic_memory_context(
+                    message,
+                    "overview",
+                    "normal",
+                    exclude_item_ids=frozenset({selected_id}),
+                )
+            )
+
+        self.assertNotIn("recent compiled fact already in prompt", context)
+        self.assertIn("older semantic-only fact should remain", context)
+
+    def test_semantic_context_returns_empty_when_all_results_already_compiled(self) -> None:
+        item_id = main.MEMORY.save_message(
+            chat_id=-1001,
+            message_id=1,
+            sender_label="Recent",
+            text="recent compiled fact only",
+            created_at=datetime.now(timezone.utc),
+        )
+        item = main.MEMORY.item_by_id(item_id)
+        message = FakeMessage("@thrd_ua_bot overview", message_id=2)
+
+        with patch.object(
+            main,
+            "semantic_memory_results_for_query",
+            new=AsyncMock(return_value=[SemanticMemoryResult(item, "recent compiled fact only", 0.9, "semantic")]),
+        ):
+            context = asyncio.run(
+                main.prepare_semantic_memory_context(
+                    message,
+                    "overview",
+                    "normal",
+                    exclude_item_ids=frozenset({item_id}),
+                )
+            )
+
+        self.assertEqual("(no semantic memory matches)", context)
+
+    def test_memory_context_budget_preserves_newest_items(self) -> None:
+        original = main.CONFIG
+        main.CONFIG = replace(original, memory_context_char_budget=240)
+        try:
+            base = datetime.now(timezone.utc)
+            old_id = main.MEMORY.save_message(
+                chat_id=-1001,
+                message_id=1,
+                sender_label="Old",
+                text="old low priority " + ("x" * 500),
+                created_at=base,
+            )
+            new_id = main.MEMORY.save_message(
+                chat_id=-1001,
+                message_id=2,
+                sender_label="New",
+                text="newest fact survives budget",
+                created_at=base + timedelta(seconds=1),
+            )
+            message = FakeMessage("@thrd_ua_bot дай огляд", message_id=3)
+
+            memory_context, _, stats = asyncio.run(main.prepare_agent_memory_context(message, "дай огляд", "normal"))
+
+            self.assertIn("newest fact survives budget", memory_context)
+            self.assertNotIn("old low priority", memory_context)
+            self.assertGreaterEqual(stats.budget_dropped_items, 1)
+            self.assertNotIn(old_id, stats.selected_item_ids)
+            self.assertIn(new_id, stats.selected_item_ids)
+        finally:
+            main.CONFIG = original
+
+    def test_recalled_memory_expands_anchor_with_source_window(self) -> None:
+        original = main.CONFIG
+        main.CONFIG = replace(original, memory_recall_context_before=1, memory_recall_context_after=1, memory_recall_top_k=3)
+        try:
+            base = datetime.now(timezone.utc) - timedelta(days=1)
+            main.MEMORY.save_message(
+                chat_id=-1001,
+                message_id=201,
+                sender_label="Alpha",
+                text="setup context before the gpu deal",
+                created_at=base,
+            )
+            anchor_id = main.MEMORY.save_message(
+                chat_id=-1001,
+                message_id=202,
+                sender_label="Beta",
+                text="RTX 4070 deal was mentioned as two hundred fifty dollars",
+                created_at=base + timedelta(seconds=1),
+            )
+            main.MEMORY.save_message(
+                chat_id=-1001,
+                message_id=203,
+                sender_label="Gamma",
+                text="followup context after the gpu deal",
+                created_at=base + timedelta(seconds=2),
+            )
+            anchor = main.MEMORY.item_by_id(anchor_id)
+            main.MEMORY.upsert_embedding(
+                message_id=anchor_id,
+                chat_id=-1001,
+                model=main.CONFIG.memory_embedding_model,
+                dimensions=4,
+                content_hash=MemoryStore.content_hash(MemoryStore.searchable_text_for_item(anchor)),
+                embedding=[1.0, 0.0, 0.0, 0.0],
+            )
+            message = FakeMessage("@thrd_ua_bot нагадай про 4070", message_id=204)
+            intent = main.MemoryRecallIntent(True, confidence=0.9, query="4070 deal", reason="test")
+
+            with patch.object(main, "create_embeddings", new=AsyncMock(return_value=[[1.0, 0.0, 0.0, 0.0]])):
+                context = asyncio.run(main.prepare_recalled_memory_context(message, "нагадай про 4070", intent))
+
+            self.assertIn("Source-linked recalled memory", context)
+            self.assertIn("setup context before the gpu deal", context)
+            self.assertIn("RTX 4070 deal", context)
+            self.assertIn("followup context after the gpu deal", context)
+        finally:
+            main.CONFIG = original
+
+    def test_recalled_memory_dedupes_against_compiled_recent_context(self) -> None:
+        base = datetime.now(timezone.utc)
+        item_id = main.MEMORY.save_message(
+            chat_id=-1001,
+            message_id=221,
+            sender_label="Recent",
+            text="recent recall anchor already compiled",
+            created_at=base,
+        )
+        item = main.MEMORY.item_by_id(item_id)
+        state = main.new_memory_context_state()
+        main.select_unique_memory_items([item], state)
+        message = FakeMessage("@thrd_ua_bot remind me", message_id=222)
+
+        with patch.object(
+            main,
+            "semantic_memory_search_outcome",
+            new=AsyncMock(
+                return_value=main.MemorySearchOutcome(
+                    results=[SemanticMemoryResult(item, "recent recall anchor already compiled", 0.9, "semantic")],
+                    returned=1,
+                )
+            ),
+        ):
+            context = asyncio.run(
+                main.prepare_recalled_memory_context(
+                    message,
+                    "remind me",
+                    main.MemoryRecallIntent(True, confidence=0.9, query="recent recall"),
+                    state,
+                )
+            )
+
+        self.assertNotIn("recent recall anchor already compiled", context)
+
+    def test_context_window_command_is_admin_only_and_sanitized(self) -> None:
+        main.MEMORY.save_message(
+            chat_id=-1001,
+            message_id=301,
+            sender_label="Sensitive User (@private, id=123)",
+            text="private text with https://example.invalid/path and private marker",
+            created_at=datetime.now(timezone.utc),
+        )
+        non_admin = FakeMessage("/context_window", message_id=302)
+        non_admin.from_user = FakeUser(user_id=999, username="notadmin")
+        admin = FakeMessage("/context_window", message_id=303)
+        main.last_context_diagnostics[-1001] = main.MemoryContextDiagnostics(
+            chat_id=-1001,
+            route="memory_recall",
+            prompt_chars=1234,
+            recent_items=2,
+            expanded_items=3,
+            semantic_items=1,
+            recalled_items=4,
+            duplicate_items=5,
+            budget_dropped_items=6,
+            memory_context_chars=200,
+            expanded_context_chars=300,
+            semantic_context_chars=100,
+            recalled_context_chars=400,
+            created_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        )
+
+        asyncio.run(main.context_window_command(SimpleNamespace(effective_message=non_admin), SimpleNamespace()))
+        asyncio.run(main.context_window_command(SimpleNamespace(effective_message=admin), SimpleNamespace()))
+
+        self.assertIn("тільки адмінам", non_admin.reply_calls[0]["text"])
+        reply = admin.reply_calls[0]["text"]
+        self.assertIn("Working-memory diagnostics", reply)
+        self.assertIn("prompt_chars: 1234", reply)
+        self.assertIn("duplicate_items: 5", reply)
+        self.assertIn("budget_dropped_items: 6", reply)
+        self.assertNotIn("private text", reply)
+        self.assertNotIn("example.invalid", reply)
+        self.assertNotIn("private marker", reply)
+
+    def test_context_window_alias_uses_invoked_command_name_for_admin_gate(self) -> None:
+        message = FakeMessage("/memory_context@thrd_ua_bot", message_id=304)
+        message.from_user = FakeUser(user_id=999, username="notadmin")
+
+        with patch.object(main, "allow_admin_command", return_value=False) as allow:
+            with patch.object(main, "deny_admin_command", new=AsyncMock()) as deny:
+                asyncio.run(main.context_window_command(SimpleNamespace(effective_message=message), SimpleNamespace()))
+
+        allow.assert_called_once()
+        self.assertEqual("memory_context", allow.call_args.args[1])
+        deny.assert_awaited_once()
+        self.assertEqual("memory_context", deny.await_args.args[1])
+
+    def test_context_window_duplicate_estimate_uses_recent_limit(self) -> None:
+        original = main.CONFIG
+        main.CONFIG = replace(original, memory_context_messages=7, memory_followup_context_messages=40)
+        try:
+            with patch.object(main, "estimate_recent_memory_duplicate_count", return_value=2) as estimate:
+                with patch.object(main, "memory_vector_available", return_value=False):
+                    reply = main.context_window_diagnostics_text(-1001)
+
+            estimate.assert_called_once_with(-1001, 7)
+            self.assertIn("recent_duplicate_estimate: 2", reply)
+        finally:
+            main.CONFIG = original
+
+    def test_memory_recall_top_k_honors_explicit_lower_value(self) -> None:
+        with patch.dict(os.environ, {"MEMORY_SEMANTIC_TOP_K": "6", "MEMORY_RECALL_TOP_K": "2"}):
+            config = main.Config.from_env()
+
+        self.assertEqual(2, config.memory_recall_top_k)
 
     def test_idle_proactive_skips_recent_user_activity_without_model_call(self) -> None:
         original = main.CONFIG
@@ -4987,11 +5351,16 @@ class PersistentMemoryTests(unittest.TestCase):
 
         agent_input = run_agent.await_args.args[0]
         self.assertIn("Request route: memory_recall", agent_input)
+        recent_block = agent_input.split("Untrusted persistent recent chat memory.", 1)[1].split(
+            "Untrusted expanded recent chat memory",
+            1,
+        )[0]
         recalled_block = agent_input.split("Untrusted recalled long-term memory.", 1)[1].split(
             "Untrusted current web search results.",
             1,
         )[0]
         self.assertIn("поштарка проїбала в казино 170 тис", recalled_block)
+        self.assertNotIn("поштарка проїбала в казино 170 тис", recent_block)
         self.assertNotIn("@thrd_ua_bot нагадай", recalled_block)
 
     def test_recall_exact_rescue_searches_source_text_and_numbers(self) -> None:
