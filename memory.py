@@ -310,6 +310,70 @@ class MemoryStore:
             ).fetchall()
         return [self._row_to_item(row) for row in rows]
 
+    def chat_message_count(self, chat_id: int) -> int:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT COUNT(*) AS count FROM messages WHERE chat_id = ?",
+                (chat_id,),
+            ).fetchone()
+        return int(row["count"] or 0) if row is not None else 0
+
+    def context_window_around_item(
+        self,
+        chat_id: int,
+        item_id: int,
+        *,
+        before: int = 2,
+        after: int = 2,
+    ) -> list[MemoryItem]:
+        with self._lock:
+            anchor = self._conn.execute(
+                "SELECT * FROM messages WHERE chat_id = ? AND id = ? LIMIT 1",
+                (chat_id, int(item_id)),
+            ).fetchone()
+            if anchor is None:
+                return []
+            before_rows = self._conn.execute(
+                """
+                SELECT * FROM messages
+                WHERE chat_id = ?
+                  AND (
+                    datetime(created_at) < datetime(?)
+                    OR (datetime(created_at) = datetime(?) AND id < ?)
+                  )
+                ORDER BY datetime(created_at) DESC, id DESC
+                LIMIT ?
+                """,
+                (
+                    chat_id,
+                    anchor["created_at"],
+                    anchor["created_at"],
+                    int(item_id),
+                    max(0, int(before)),
+                ),
+            ).fetchall()
+            after_rows = self._conn.execute(
+                """
+                SELECT * FROM messages
+                WHERE chat_id = ?
+                  AND (
+                    datetime(created_at) > datetime(?)
+                    OR (datetime(created_at) = datetime(?) AND id > ?)
+                  )
+                ORDER BY datetime(created_at) ASC, id ASC
+                LIMIT ?
+                """,
+                (
+                    chat_id,
+                    anchor["created_at"],
+                    anchor["created_at"],
+                    int(item_id),
+                    max(0, int(after)),
+                ),
+            ).fetchall()
+        rows = list(reversed(before_rows)) + [anchor] + list(after_rows)
+        return [self._row_to_item(row) for row in rows]
+
     def latest_user_message(self, chat_id: int) -> MemoryItem | None:
         with self._lock:
             row = self._conn.execute(

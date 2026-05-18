@@ -2819,6 +2819,7 @@ class PersistentMemoryTests(unittest.TestCase):
         main.last_proactive_personal_ping.clear()
         main.chat_generation_locks.clear()
         main.recent_chat_answers.clear()
+        main.last_context_diagnostics.clear()
         main.embedding_queue = None
         main.set_reaction_adapter(main.NullReactionAdapter())
         main.TOOL_RUNTIME.clear_error_counts()
@@ -2834,6 +2835,7 @@ class PersistentMemoryTests(unittest.TestCase):
             main.REACTION_MEMORY.clear_all()
         main.chat_generation_locks.clear()
         main.recent_chat_answers.clear()
+        main.last_context_diagnostics.clear()
         main.embedding_queue = None
         main.set_reaction_adapter(main.NullReactionAdapter())
         main.TOOL_RUNTIME.clear_error_counts()
@@ -4194,6 +4196,161 @@ class PersistentMemoryTests(unittest.TestCase):
 
         events = main.SYSTEM_LOG.latest_events(5)
         self.assertTrue(any(event.event_type == "memory_context_expanded" for event in events))
+
+    def test_expanded_followup_context_dedupes_normal_recent_memory(self) -> None:
+        base = datetime.now(timezone.utc)
+        for index in range(15):
+            main.MEMORY.save_message(
+                chat_id=-1001,
+                message_id=index + 1,
+                sender_label="Tester",
+                text=f"recent unique topic {index}",
+                created_at=base + timedelta(seconds=index),
+            )
+        message = FakeMessage("@thrd_ua_bot how many?", message_id=100)
+
+        memory_context, expanded_context = asyncio.run(main.prepare_agent_memory_context(message, "how many?", "normal"))
+
+        self.assertIn("recent unique topic 14", memory_context)
+        self.assertNotIn("recent unique topic 14", expanded_context)
+        self.assertIn("recent unique topic 4", expanded_context)
+
+    def test_memory_context_dedupes_repeated_payloads(self) -> None:
+        base = datetime.now(timezone.utc)
+        main.MEMORY.save_message(
+            chat_id=-1001,
+            message_id=1,
+            sender_label="Alpha",
+            text="same compact fact repeated",
+            created_at=base,
+        )
+        main.MEMORY.save_message(
+            chat_id=-1001,
+            message_id=2,
+            sender_label="Beta",
+            text="same compact fact repeated",
+            created_at=base + timedelta(seconds=1),
+        )
+        message = FakeMessage("@thrd_ua_bot overview", message_id=3)
+
+        memory_context, _ = asyncio.run(main.prepare_agent_memory_context(message, "overview", "normal"))
+
+        self.assertEqual(1, memory_context.count("same compact fact repeated"))
+
+    def test_memory_context_budget_preserves_newest_items(self) -> None:
+        original = main.CONFIG
+        main.CONFIG = replace(original, memory_context_char_budget=240)
+        try:
+            base = datetime.now(timezone.utc)
+            main.MEMORY.save_message(
+                chat_id=-1001,
+                message_id=1,
+                sender_label="Old",
+                text="old low priority " + ("x" * 500),
+                created_at=base,
+            )
+            main.MEMORY.save_message(
+                chat_id=-1001,
+                message_id=2,
+                sender_label="New",
+                text="newest fact survives budget",
+                created_at=base + timedelta(seconds=1),
+            )
+            message = FakeMessage("@thrd_ua_bot Ð´Ð°Ð¹ Ð¾Ð³Ð»ÑÐ´", message_id=3)
+
+            memory_context, _ = asyncio.run(main.prepare_agent_memory_context(message, "Ð´Ð°Ð¹ Ð¾Ð³Ð»ÑÐ´", "normal"))
+
+            self.assertIn("newest fact survives budget", memory_context)
+            self.assertNotIn("old low priority", memory_context)
+        finally:
+            main.CONFIG = original
+
+    def test_recalled_memory_expands_anchor_with_source_window(self) -> None:
+        original = main.CONFIG
+        main.CONFIG = replace(original, memory_recall_context_before=1, memory_recall_context_after=1, memory_recall_top_k=3)
+        try:
+            base = datetime.now(timezone.utc) - timedelta(days=1)
+            main.MEMORY.save_message(
+                chat_id=-1001,
+                message_id=201,
+                sender_label="Alpha",
+                text="setup context before the gpu deal",
+                created_at=base,
+            )
+            anchor_id = main.MEMORY.save_message(
+                chat_id=-1001,
+                message_id=202,
+                sender_label="Beta",
+                text="RTX 4070 deal was mentioned as two hundred fifty dollars",
+                created_at=base + timedelta(seconds=1),
+            )
+            main.MEMORY.save_message(
+                chat_id=-1001,
+                message_id=203,
+                sender_label="Gamma",
+                text="followup context after the gpu deal",
+                created_at=base + timedelta(seconds=2),
+            )
+            anchor = main.MEMORY.item_by_id(anchor_id)
+            main.MEMORY.upsert_embedding(
+                message_id=anchor_id,
+                chat_id=-1001,
+                model=main.CONFIG.memory_embedding_model,
+                dimensions=4,
+                content_hash=MemoryStore.content_hash(MemoryStore.searchable_text_for_item(anchor)),
+                embedding=[1.0, 0.0, 0.0, 0.0],
+            )
+            message = FakeMessage("@thrd_ua_bot Ð½Ð°Ð³Ð°Ð´Ð°Ð¹ Ð¿Ñ€Ð¾ 4070", message_id=204)
+            intent = main.MemoryRecallIntent(True, confidence=0.9, query="4070 deal", reason="test")
+
+            with patch.object(main, "create_embeddings", new=AsyncMock(return_value=[[1.0, 0.0, 0.0, 0.0]])):
+                context = asyncio.run(main.prepare_recalled_memory_context(message, "Ð½Ð°Ð³Ð°Ð´Ð°Ð¹ Ð¿Ñ€Ð¾ 4070", intent))
+
+            self.assertIn("Source-linked recalled memory", context)
+            self.assertIn("setup context before the gpu deal", context)
+            self.assertIn("RTX 4070 deal", context)
+            self.assertIn("followup context after the gpu deal", context)
+        finally:
+            main.CONFIG = original
+
+    def test_context_window_command_is_admin_only_and_sanitized(self) -> None:
+        main.MEMORY.save_message(
+            chat_id=-1001,
+            message_id=301,
+            sender_label="Sensitive User (@private, id=123)",
+            text="private text with https://example.invalid/path and private marker",
+            created_at=datetime.now(timezone.utc),
+        )
+        non_admin = FakeMessage("/context_window", message_id=302)
+        non_admin.from_user = FakeUser(user_id=999, username="notadmin")
+        admin = FakeMessage("/context_window", message_id=303)
+        main.last_context_diagnostics[-1001] = main.MemoryContextDiagnostics(
+            chat_id=-1001,
+            route="memory_recall",
+            prompt_chars=1234,
+            recent_items=2,
+            expanded_items=3,
+            semantic_items=1,
+            recalled_items=4,
+            duplicate_items=5,
+            budget_dropped_items=0,
+            memory_context_chars=200,
+            expanded_context_chars=300,
+            semantic_context_chars=100,
+            recalled_context_chars=400,
+            created_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        )
+
+        asyncio.run(main.context_window_command(SimpleNamespace(effective_message=non_admin), SimpleNamespace()))
+        asyncio.run(main.context_window_command(SimpleNamespace(effective_message=admin), SimpleNamespace()))
+
+        self.assertIn("тільки адмінам", non_admin.reply_calls[0]["text"])
+        reply = admin.reply_calls[0]["text"]
+        self.assertIn("Working-memory diagnostics", reply)
+        self.assertIn("prompt_chars: 1234", reply)
+        self.assertNotIn("private text", reply)
+        self.assertNotIn("example.invalid", reply)
+        self.assertNotIn("private marker", reply)
 
     def test_idle_proactive_skips_recent_user_activity_without_model_call(self) -> None:
         original = main.CONFIG

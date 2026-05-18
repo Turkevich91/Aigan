@@ -1,5 +1,11 @@
 # Aigan Changelog
 
+## 2026-05-18 - Working-memory context compiler
+
+- Added source-linked recall expansion so semantic/FTS hits become evidence windows with neighboring messages and reply-chain context.
+- Added prompt-memory dedupe and char budgets to reduce repeated recent/semantic/reply-chain blocks and mark prior bot output as non-evidence.
+- Added admin-only `/context_window` and `/memory_context` diagnostics with sanitized prompt-memory counts, limits, duplicate estimates, and embedding backlog state.
+
 ## 2026-05-16 - Reaction shadow eval diagnostics
 
 - Added shadow/eval counters to outbound reaction decision summaries: score bands, context flags, candidate emotion classes, and future model-call gate buckets.
