@@ -334,10 +334,7 @@ class Config:
             memory_embedding_dimensions=int(os.getenv("MEMORY_EMBEDDING_DIMENSIONS", "512")),
             memory_semantic_lookback_days=int(os.getenv("MEMORY_SEMANTIC_LOOKBACK_DAYS", "30")),
             memory_semantic_top_k=int(os.getenv("MEMORY_SEMANTIC_TOP_K", "6")),
-            memory_recall_top_k=max(
-                int(os.getenv("MEMORY_RECALL_TOP_K", "12")),
-                int(os.getenv("MEMORY_SEMANTIC_TOP_K", "6")),
-            ),
+            memory_recall_top_k=max(1, int(os.getenv("MEMORY_RECALL_TOP_K", "12"))),
             memory_recall_context_before=max(0, int(os.getenv("MEMORY_RECALL_CONTEXT_BEFORE", "2"))),
             memory_recall_context_after=max(0, int(os.getenv("MEMORY_RECALL_CONTEXT_AFTER", "2"))),
             memory_context_char_budget=max(0, int(os.getenv("MEMORY_CONTEXT_CHAR_BUDGET", "9000"))),
@@ -4138,7 +4135,7 @@ def context_window_diagnostics_text(chat_id: int) -> str:
         return "\n".join(lines)
 
     lines.append(f"- retained_chat_rows: {MEMORY.chat_message_count(chat_id)}")
-    lines.append(f"- recent_duplicate_estimate: {estimate_recent_memory_duplicate_count(chat_id, CONFIG.memory_followup_context_messages)}")
+    lines.append(f"- recent_duplicate_estimate: {estimate_recent_memory_duplicate_count(chat_id, CONFIG.memory_context_messages)}")
     if memory_vector_available():
         try:
             indexed = MEMORY.embedding_index_count(
@@ -5540,6 +5537,15 @@ def allow_admin_command(message: Message, command_name: str) -> bool:
     return allow_command(message, command_name) and is_admin_user(message)
 
 
+def command_name_from_message(message: Message, default: str) -> str:
+    text = (message.text or "").strip()
+    if not text.startswith("/"):
+        return default
+    token = text.split(maxsplit=1)[0].lstrip("/")
+    command = token.split("@", 1)[0].casefold()
+    return LOCALIZED_COMMAND_ALIASES.get(command, command) or default
+
+
 def command_args_from_text(text: str | None) -> str:
     if not text:
         return ""
@@ -6199,8 +6205,9 @@ async def context_window_command(update: Update, context: ContextTypes.DEFAULT_T
     message = update.effective_message
     if message is None:
         return
-    if not allow_admin_command(message, "context_window"):
-        await deny_admin_command(message, "context_window")
+    command_name = command_name_from_message(message, "context_window")
+    if not allow_admin_command(message, command_name):
+        await deny_admin_command(message, command_name)
         return
     await send_reply(message, context_window_diagnostics_text(message.chat_id))
 

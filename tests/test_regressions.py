@@ -4527,6 +4527,38 @@ class PersistentMemoryTests(unittest.TestCase):
         self.assertNotIn("example.invalid", reply)
         self.assertNotIn("private marker", reply)
 
+    def test_context_window_alias_uses_invoked_command_name_for_admin_gate(self) -> None:
+        message = FakeMessage("/memory_context@thrd_ua_bot", message_id=304)
+        message.from_user = FakeUser(user_id=999, username="notadmin")
+
+        with patch.object(main, "allow_admin_command", return_value=False) as allow:
+            with patch.object(main, "deny_admin_command", new=AsyncMock()) as deny:
+                asyncio.run(main.context_window_command(SimpleNamespace(effective_message=message), SimpleNamespace()))
+
+        allow.assert_called_once()
+        self.assertEqual("memory_context", allow.call_args.args[1])
+        deny.assert_awaited_once()
+        self.assertEqual("memory_context", deny.await_args.args[1])
+
+    def test_context_window_duplicate_estimate_uses_recent_limit(self) -> None:
+        original = main.CONFIG
+        main.CONFIG = replace(original, memory_context_messages=7, memory_followup_context_messages=40)
+        try:
+            with patch.object(main, "estimate_recent_memory_duplicate_count", return_value=2) as estimate:
+                with patch.object(main, "memory_vector_available", return_value=False):
+                    reply = main.context_window_diagnostics_text(-1001)
+
+            estimate.assert_called_once_with(-1001, 7)
+            self.assertIn("recent_duplicate_estimate: 2", reply)
+        finally:
+            main.CONFIG = original
+
+    def test_memory_recall_top_k_honors_explicit_lower_value(self) -> None:
+        with patch.dict(os.environ, {"MEMORY_SEMANTIC_TOP_K": "6", "MEMORY_RECALL_TOP_K": "2"}):
+            config = main.Config.from_env()
+
+        self.assertEqual(2, config.memory_recall_top_k)
+
     def test_idle_proactive_skips_recent_user_activity_without_model_call(self) -> None:
         original = main.CONFIG
         main.CONFIG = replace(
