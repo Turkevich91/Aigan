@@ -18,7 +18,7 @@ from datetime import datetime, timezone
 from functools import lru_cache
 from itertools import count
 from pathlib import Path
-from typing import Any, Sequence, cast
+from typing import AbstractSet, Any, Sequence, cast
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from agents import Agent, ModelSettings, RunHooks, Runner
@@ -590,7 +590,7 @@ pending_requests: dict[tuple[int, int], dict[str, Any]] = {}
 pending_token_counter = count(1)
 chat_generation_locks: dict[int, asyncio.Lock] = {}
 recent_chat_answers: dict[int, deque[Any]] = defaultdict(lambda: deque(maxlen=12))
-last_context_diagnostics: dict[int, MemoryContextDiagnostics] = {}
+last_context_diagnostics: dict[int, "MemoryContextDiagnostics"] = {}
 embedding_queue: asyncio.Queue[int] | None = None
 last_embedding_error = ""
 last_embedding_at = ""
@@ -1045,6 +1045,13 @@ class MemoryContextDiagnostics:
     semantic_context_chars: int
     recalled_context_chars: int
     created_at: str
+
+
+@dataclass(frozen=True)
+class MemoryContextCompilationStats:
+    duplicate_items: int
+    budget_dropped_items: int
+    selected_item_ids: frozenset[int]
 
 
 @dataclass(frozen=True)
@@ -2974,11 +2981,11 @@ def format_memory_item_line(item: MemoryItem) -> str:
     if item.reply_to_message_id is not None:
         parts.append(f"reply_to_message_id={item.reply_to_message_id}")
     if item.forward_origin:
-        parts.append(f"source={item.forward_origin}")
+        parts.append(f"source={clip_text(item.forward_origin, 200)}")
     if item.source_title:
         parts.append(f"source_title={clip_text(item.source_title, 200)}")
     if item.source_url:
-        parts.append(f"source_url={item.source_url}")
+        parts.append(f"source_url={clip_text(item.source_url, 300)}")
     if item.content_kind == "image":
         if item.vision_summary:
             parts.append("image_summary=" + clip_text(item.vision_summary, 900))
@@ -2987,7 +2994,7 @@ def format_memory_item_line(item: MemoryItem) -> str:
         else:
             parts.append("[image/preview was referenced, but no image file was delivered]")
     elif item.attachment_type and item.content_kind != "text":
-        parts.append(f"[attachment: {item.attachment_type}]")
+        parts.append(f"[attachment: {clip_text(item.attachment_type, 120)}]")
     return prefix + ": " + (" | ".join(parts) if parts else "(no visible text)")
 
 
@@ -3003,7 +3010,7 @@ def trim_memory_items_to_budget(
     dropped = 0
     for item in reversed(items):
         line_len = len(format_memory_item_line(item)) + 1
-        if selected_reversed and used + line_len > budget_chars:
+        if used + line_len > budget_chars:
             dropped += 1
             continue
         selected_reversed.append(item)
@@ -3368,11 +3375,19 @@ async def prepare_memory_context(
     return format_memory_items(items)
 
 
-async def prepare_agent_memory_context(message: Message, prompt: str, route: str) -> tuple[str, str | None]:
+async def prepare_agent_memory_context(
+    message: Message,
+    prompt: str,
+    route: str,
+) -> tuple[str, str | None, MemoryContextCompilationStats]:
     state = new_memory_context_state()
     memory_context = await prepare_memory_context(message, prompt, state=state)
     if not should_expand_memory_for_prompt(route, prompt):
-        return memory_context, None
+        return memory_context, None, MemoryContextCompilationStats(
+            duplicate_items=state.duplicate_count,
+            budget_dropped_items=state.dropped_for_budget,
+            selected_item_ids=frozenset(state.seen_item_ids),
+        )
 
     expanded_context, included_count = format_expanded_followup_memory_context(message, state)
     system_event(
@@ -3391,7 +3406,11 @@ async def prepare_agent_memory_context(message: Message, prompt: str, route: str
             "prompt_words": len(meaningful_followup_words(prompt)),
         },
     )
-    return memory_context, expanded_context
+    return memory_context, expanded_context, MemoryContextCompilationStats(
+        duplicate_items=state.duplicate_count,
+        budget_dropped_items=state.dropped_for_budget,
+        selected_item_ids=frozenset(state.seen_item_ids),
+    )
 
 
 def memory_vector_available() -> bool:
@@ -3771,8 +3790,14 @@ def remember_context_diagnostics(
     expanded_memory_context: str | None,
     semantic_memory_context: str | None,
     recalled_memory_context: str | None,
+    compilation_stats: MemoryContextCompilationStats | None = None,
 ) -> None:
-    duplicate_estimate = estimate_recent_memory_duplicate_count(chat_id, CONFIG.memory_followup_context_messages)
+    duplicate_count = (
+        compilation_stats.duplicate_items
+        if compilation_stats is not None
+        else estimate_recent_memory_duplicate_count(chat_id, CONFIG.memory_followup_context_messages)
+    )
+    dropped_count = compilation_stats.budget_dropped_items if compilation_stats is not None else 0
     last_context_diagnostics[int(chat_id)] = MemoryContextDiagnostics(
         chat_id=int(chat_id),
         route=route,
@@ -3781,8 +3806,8 @@ def remember_context_diagnostics(
         expanded_items=context_block_item_count(expanded_memory_context),
         semantic_items=context_block_item_count(semantic_memory_context),
         recalled_items=context_block_item_count(recalled_memory_context),
-        duplicate_items=duplicate_estimate,
-        budget_dropped_items=0,
+        duplicate_items=duplicate_count,
+        budget_dropped_items=dropped_count,
         memory_context_chars=len(memory_context or ""),
         expanded_context_chars=len(expanded_memory_context or ""),
         semantic_context_chars=len(semantic_memory_context or ""),
@@ -3966,7 +3991,12 @@ async def semantic_memory_search_outcome(
     )
 
 
-async def prepare_semantic_memory_context(message: Message, prompt: str, route: str) -> str | None:
+async def prepare_semantic_memory_context(
+    message: Message,
+    prompt: str,
+    route: str,
+    exclude_item_ids: AbstractSet[int] | None = None,
+) -> str | None:
     if not should_use_semantic_memory(route):
         return None
     query = semantic_memory_query(message, prompt)
@@ -3974,10 +4004,12 @@ async def prepare_semantic_memory_context(message: Message, prompt: str, route: 
         return "(no semantic memory query)"
     results = await semantic_memory_results_for_query(message, query, route=route)
     if MEMORY is not None and route != "memory_recall":
-        recent_ids = {item.id for item in MEMORY.latest(message.chat_id, CONFIG.memory_context_messages)}
-        non_recent_results = [result for result in results if result.item.id not in recent_ids]
-        if non_recent_results:
-            results = non_recent_results
+        excluded_ids = set(exclude_item_ids or ())
+        if not excluded_ids:
+            excluded_ids = {item.id for item in MEMORY.latest(message.chat_id, CONFIG.memory_context_messages)}
+        non_excluded_results = [result for result in results if result.item.id not in excluded_ids]
+        if non_excluded_results:
+            results = non_excluded_results
     return format_semantic_memory_results(results)
 
 
@@ -4114,7 +4146,8 @@ def context_window_diagnostics_text(chat_id: int) -> str:
             f"  - expanded_items: {last.expanded_items}",
             f"  - semantic_items: {last.semantic_items}",
             f"  - recalled_items: {last.recalled_items}",
-            f"  - duplicate_estimate: {last.duplicate_items}",
+            f"  - duplicate_items: {last.duplicate_items}",
+            f"  - budget_dropped_items: {last.budget_dropped_items}",
             f"  - memory_chars: {last.memory_context_chars}",
             f"  - expanded_chars: {last.expanded_context_chars}",
             f"  - semantic_chars: {last.semantic_context_chars}",
@@ -6846,13 +6879,22 @@ async def handle_prompt_generation(
         user_id = message.from_user.id if message.from_user else "unknown"
         LOGGER.info("Reference context attached chat_id=%s user_id=%s", message.chat_id, user_id)
     web_context = await maybe_prefetch_web_context(message, prompt, route)
-    memory_context, expanded_memory_context = await prepare_agent_memory_context(message, prompt, route)
+    memory_context, expanded_memory_context, memory_context_stats = await prepare_agent_memory_context(
+        message,
+        prompt,
+        route,
+    )
     recalled_memory_context = None
     semantic_memory_context = None
     if route == "memory_recall":
         recalled_memory_context = await prepare_recalled_memory_context(message, prompt, recall_intent)
     else:
-        semantic_memory_context = await prepare_semantic_memory_context(message, prompt, route)
+        semantic_memory_context = await prepare_semantic_memory_context(
+            message,
+            prompt,
+            route,
+            exclude_item_ids=memory_context_stats.selected_item_ids,
+        )
     agent_input = build_agent_input(
         message,
         prompt,
@@ -6871,6 +6913,7 @@ async def handle_prompt_generation(
         expanded_memory_context=expanded_memory_context,
         semantic_memory_context=semantic_memory_context,
         recalled_memory_context=recalled_memory_context,
+        compilation_stats=memory_context_stats,
     )
 
     try:

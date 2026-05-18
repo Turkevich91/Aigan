@@ -129,7 +129,7 @@ from media_frames import (
     MediaFrameResult,
     NullMediaFrameAdapter,
 )
-from memory import MemoryStore
+from memory import MemoryStore, SemanticMemoryResult
 from mcp_servers import web
 from reaction_memory import ReactionSpec
 from scripts import import_telegram_export
@@ -413,7 +413,21 @@ class PendingFlowTests(unittest.TestCase):
         return (
             patch.object(main, "classify_request_with_intent", new=AsyncMock(return_value=("normal", None))),
             patch.object(main, "maybe_prefetch_web_context", new=AsyncMock(return_value=None)),
-            patch.object(main, "prepare_agent_memory_context", new=AsyncMock(return_value=("(memory)", "(not active)"))),
+            patch.object(
+                main,
+                "prepare_agent_memory_context",
+                new=AsyncMock(
+                    return_value=(
+                        "(memory)",
+                        "(not active)",
+                        main.MemoryContextCompilationStats(
+                            duplicate_items=0,
+                            budget_dropped_items=0,
+                            selected_item_ids=frozenset(),
+                        ),
+                    )
+                ),
+            ),
             patch.object(main, "prepare_semantic_memory_context", new=AsyncMock(return_value=None)),
             patch.object(main, "run_agent", new=run_agent),
         )
@@ -4092,7 +4106,7 @@ class PersistentMemoryTests(unittest.TestCase):
             )
         message = FakeMessage("@thrd_ua_bot дай огляд", message_id=100)
 
-        memory_context, expanded_context = asyncio.run(main.prepare_agent_memory_context(message, "дай огляд", "normal"))
+        memory_context, expanded_context, _ = asyncio.run(main.prepare_agent_memory_context(message, "дай огляд", "normal"))
 
         self.assertNotIn("old topic anchor", memory_context)
         self.assertIsNone(expanded_context)
@@ -4116,7 +4130,7 @@ class PersistentMemoryTests(unittest.TestCase):
             )
         message = FakeMessage("@thrd_ua_bot скільки?", message_id=100)
 
-        memory_context, expanded_context = asyncio.run(main.prepare_agent_memory_context(message, "скільки?", "normal"))
+        memory_context, expanded_context, _ = asyncio.run(main.prepare_agent_memory_context(message, "скільки?", "normal"))
         agent_input = main.build_agent_input(
             message,
             "скільки?",
@@ -4158,7 +4172,7 @@ class PersistentMemoryTests(unittest.TestCase):
         message = FakeMessage("@thrd_ua_bot скільки?", message_id=200)
         message.reply_to_message = FakeMessage("reply-chain child asks how much", message_id=2)
 
-        memory_context, expanded_context = asyncio.run(main.prepare_agent_memory_context(message, "скільки?", "normal"))
+        memory_context, expanded_context, _ = asyncio.run(main.prepare_agent_memory_context(message, "скільки?", "normal"))
 
         self.assertNotIn("reply-chain parent says the amount", memory_context)
         self.assertIn("reply-chain parent says the amount", expanded_context)
@@ -4166,7 +4180,7 @@ class PersistentMemoryTests(unittest.TestCase):
     def test_translation_route_does_not_use_expanded_followup_memory(self) -> None:
         message = FakeMessage("@thrd_ua_bot переклади українською", message_id=300)
 
-        _, expanded_context = asyncio.run(
+        _, expanded_context, _ = asyncio.run(
             main.prepare_agent_memory_context(message, "переклади українською", "translate_reference")
         )
 
@@ -4209,7 +4223,7 @@ class PersistentMemoryTests(unittest.TestCase):
             )
         message = FakeMessage("@thrd_ua_bot how many?", message_id=100)
 
-        memory_context, expanded_context = asyncio.run(main.prepare_agent_memory_context(message, "how many?", "normal"))
+        memory_context, expanded_context, _ = asyncio.run(main.prepare_agent_memory_context(message, "how many?", "normal"))
 
         self.assertIn("recent unique topic 14", memory_context)
         self.assertNotIn("recent unique topic 14", expanded_context)
@@ -4233,9 +4247,51 @@ class PersistentMemoryTests(unittest.TestCase):
         )
         message = FakeMessage("@thrd_ua_bot overview", message_id=3)
 
-        memory_context, _ = asyncio.run(main.prepare_agent_memory_context(message, "overview", "normal"))
+        memory_context, _, _ = asyncio.run(main.prepare_agent_memory_context(message, "overview", "normal"))
 
         self.assertEqual(1, memory_context.count("same compact fact repeated"))
+
+    def test_semantic_context_excludes_compiled_memory_items(self) -> None:
+        base = datetime.now(timezone.utc)
+        selected_id = main.MEMORY.save_message(
+            chat_id=-1001,
+            message_id=1,
+            sender_label="Recent",
+            text="recent compiled fact already in prompt",
+            created_at=base,
+        )
+        older_id = main.MEMORY.save_message(
+            chat_id=-1001,
+            message_id=2,
+            sender_label="Older",
+            text="older semantic-only fact should remain",
+            created_at=base - timedelta(days=1),
+        )
+        selected_item = main.MEMORY.item_by_id(selected_id)
+        older_item = main.MEMORY.item_by_id(older_id)
+        message = FakeMessage("@thrd_ua_bot overview", message_id=3)
+
+        with patch.object(
+            main,
+            "semantic_memory_results_for_query",
+            new=AsyncMock(
+                return_value=[
+                    SemanticMemoryResult(selected_item, "recent compiled fact already in prompt", 0.9, "semantic"),
+                    SemanticMemoryResult(older_item, "older semantic-only fact should remain", 0.8, "semantic"),
+                ]
+            ),
+        ):
+            context = asyncio.run(
+                main.prepare_semantic_memory_context(
+                    message,
+                    "overview",
+                    "normal",
+                    exclude_item_ids=frozenset({selected_id}),
+                )
+            )
+
+        self.assertNotIn("recent compiled fact already in prompt", context)
+        self.assertIn("older semantic-only fact should remain", context)
 
     def test_memory_context_budget_preserves_newest_items(self) -> None:
         original = main.CONFIG
@@ -4256,12 +4312,13 @@ class PersistentMemoryTests(unittest.TestCase):
                 text="newest fact survives budget",
                 created_at=base + timedelta(seconds=1),
             )
-            message = FakeMessage("@thrd_ua_bot Ð´Ð°Ð¹ Ð¾Ð³Ð»ÑÐ´", message_id=3)
+            message = FakeMessage("@thrd_ua_bot дай огляд", message_id=3)
 
-            memory_context, _ = asyncio.run(main.prepare_agent_memory_context(message, "Ð´Ð°Ð¹ Ð¾Ð³Ð»ÑÐ´", "normal"))
+            memory_context, _, stats = asyncio.run(main.prepare_agent_memory_context(message, "дай огляд", "normal"))
 
             self.assertIn("newest fact survives budget", memory_context)
             self.assertNotIn("old low priority", memory_context)
+            self.assertGreaterEqual(stats.budget_dropped_items, 1)
         finally:
             main.CONFIG = original
 
@@ -4300,11 +4357,11 @@ class PersistentMemoryTests(unittest.TestCase):
                 content_hash=MemoryStore.content_hash(MemoryStore.searchable_text_for_item(anchor)),
                 embedding=[1.0, 0.0, 0.0, 0.0],
             )
-            message = FakeMessage("@thrd_ua_bot Ð½Ð°Ð³Ð°Ð´Ð°Ð¹ Ð¿Ñ€Ð¾ 4070", message_id=204)
+            message = FakeMessage("@thrd_ua_bot нагадай про 4070", message_id=204)
             intent = main.MemoryRecallIntent(True, confidence=0.9, query="4070 deal", reason="test")
 
             with patch.object(main, "create_embeddings", new=AsyncMock(return_value=[[1.0, 0.0, 0.0, 0.0]])):
-                context = asyncio.run(main.prepare_recalled_memory_context(message, "Ð½Ð°Ð³Ð°Ð´Ð°Ð¹ Ð¿Ñ€Ð¾ 4070", intent))
+                context = asyncio.run(main.prepare_recalled_memory_context(message, "нагадай про 4070", intent))
 
             self.assertIn("Source-linked recalled memory", context)
             self.assertIn("setup context before the gpu deal", context)
@@ -4333,7 +4390,7 @@ class PersistentMemoryTests(unittest.TestCase):
             semantic_items=1,
             recalled_items=4,
             duplicate_items=5,
-            budget_dropped_items=0,
+            budget_dropped_items=6,
             memory_context_chars=200,
             expanded_context_chars=300,
             semantic_context_chars=100,
@@ -4348,6 +4405,8 @@ class PersistentMemoryTests(unittest.TestCase):
         reply = admin.reply_calls[0]["text"]
         self.assertIn("Working-memory diagnostics", reply)
         self.assertIn("prompt_chars: 1234", reply)
+        self.assertIn("duplicate_items: 5", reply)
+        self.assertIn("budget_dropped_items: 6", reply)
         self.assertNotIn("private text", reply)
         self.assertNotIn("example.invalid", reply)
         self.assertNotIn("private marker", reply)
