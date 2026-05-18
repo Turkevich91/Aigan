@@ -338,10 +338,10 @@ class MemoryStore:
                 SELECT * FROM messages
                 WHERE chat_id = ?
                   AND (
-                    datetime(created_at) < datetime(?)
-                    OR (datetime(created_at) = datetime(?) AND id < ?)
+                    created_at < ?
+                    OR (created_at = ? AND id < ?)
                   )
-                ORDER BY datetime(created_at) DESC, id DESC
+                ORDER BY created_at DESC, id DESC
                 LIMIT ?
                 """,
                 (
@@ -357,10 +357,10 @@ class MemoryStore:
                 SELECT * FROM messages
                 WHERE chat_id = ?
                   AND (
-                    datetime(created_at) > datetime(?)
-                    OR (datetime(created_at) = datetime(?) AND id > ?)
+                    created_at > ?
+                    OR (created_at = ? AND id > ?)
                   )
-                ORDER BY datetime(created_at) ASC, id ASC
+                ORDER BY created_at ASC, id ASC
                 LIMIT ?
                 """,
                 (

@@ -2970,6 +2970,15 @@ def select_unique_memory_items(
     return selected
 
 
+def forget_memory_item_from_context_state(item: MemoryItem, state: MemoryContextState | None) -> None:
+    if state is None:
+        return
+    state.seen_item_ids.discard(item.id)
+    if item.message_id is not None:
+        state.seen_chat_message_keys.discard((item.chat_id, int(item.message_id)))
+    state.seen_payload_hashes.discard(memory_payload_hash(item))
+
+
 def format_memory_item_line(item: MemoryItem) -> str:
     self_marker = " (previous Aigan message; prior Aigan output; not source evidence)" if item.is_bot else ""
     prefix = f"- [{item.created_at}] {item.sender_label}{self_marker}"
@@ -3012,6 +3021,7 @@ def trim_memory_items_to_budget(
         line_len = len(format_memory_item_line(item)) + 1
         if used + line_len > budget_chars:
             dropped += 1
+            forget_memory_item_from_context_state(item, state)
             continue
         selected_reversed.append(item)
         used += line_len
@@ -4004,12 +4014,14 @@ async def prepare_semantic_memory_context(
         return "(no semantic memory query)"
     results = await semantic_memory_results_for_query(message, query, route=route)
     if MEMORY is not None and route != "memory_recall":
-        excluded_ids = set(exclude_item_ids or ())
-        if not excluded_ids:
-            excluded_ids = {item.id for item in MEMORY.latest(message.chat_id, CONFIG.memory_context_messages)}
-        non_excluded_results = [result for result in results if result.item.id not in excluded_ids]
-        if non_excluded_results:
-            results = non_excluded_results
+        if exclude_item_ids is not None:
+            excluded_ids = set(exclude_item_ids)
+            results = [result for result in results if result.item.id not in excluded_ids]
+        else:
+            recent_ids = {item.id for item in MEMORY.latest(message.chat_id, CONFIG.memory_context_messages)}
+            non_recent_results = [result for result in results if result.item.id not in recent_ids]
+            if non_recent_results:
+                results = non_recent_results
     return format_semantic_memory_results(results)
 
 

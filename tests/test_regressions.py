@@ -4293,19 +4293,46 @@ class PersistentMemoryTests(unittest.TestCase):
         self.assertNotIn("recent compiled fact already in prompt", context)
         self.assertIn("older semantic-only fact should remain", context)
 
+    def test_semantic_context_returns_empty_when_all_results_already_compiled(self) -> None:
+        item_id = main.MEMORY.save_message(
+            chat_id=-1001,
+            message_id=1,
+            sender_label="Recent",
+            text="recent compiled fact only",
+            created_at=datetime.now(timezone.utc),
+        )
+        item = main.MEMORY.item_by_id(item_id)
+        message = FakeMessage("@thrd_ua_bot overview", message_id=2)
+
+        with patch.object(
+            main,
+            "semantic_memory_results_for_query",
+            new=AsyncMock(return_value=[SemanticMemoryResult(item, "recent compiled fact only", 0.9, "semantic")]),
+        ):
+            context = asyncio.run(
+                main.prepare_semantic_memory_context(
+                    message,
+                    "overview",
+                    "normal",
+                    exclude_item_ids=frozenset({item_id}),
+                )
+            )
+
+        self.assertEqual("(no semantic memory matches)", context)
+
     def test_memory_context_budget_preserves_newest_items(self) -> None:
         original = main.CONFIG
         main.CONFIG = replace(original, memory_context_char_budget=240)
         try:
             base = datetime.now(timezone.utc)
-            main.MEMORY.save_message(
+            old_id = main.MEMORY.save_message(
                 chat_id=-1001,
                 message_id=1,
                 sender_label="Old",
                 text="old low priority " + ("x" * 500),
                 created_at=base,
             )
-            main.MEMORY.save_message(
+            new_id = main.MEMORY.save_message(
                 chat_id=-1001,
                 message_id=2,
                 sender_label="New",
@@ -4319,6 +4346,8 @@ class PersistentMemoryTests(unittest.TestCase):
             self.assertIn("newest fact survives budget", memory_context)
             self.assertNotIn("old low priority", memory_context)
             self.assertGreaterEqual(stats.budget_dropped_items, 1)
+            self.assertNotIn(old_id, stats.selected_item_ids)
+            self.assertIn(new_id, stats.selected_item_ids)
         finally:
             main.CONFIG = original
 
