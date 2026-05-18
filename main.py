@@ -2920,7 +2920,7 @@ def new_memory_context_state() -> MemoryContextState:
 
 
 def normalized_memory_payload(item: MemoryItem) -> str:
-    payload = " ".join(
+    evidence_parts = [
         part
         for part in (
             item.text,
@@ -2930,17 +2930,18 @@ def normalized_memory_payload(item: MemoryItem) -> str:
             item.forward_origin,
             f"reply_to:{item.reply_to_message_id}" if item.reply_to_message_id is not None else "",
             item.vision_summary,
-            item.attachment_type,
         )
         if part
-    )
-    return re.sub(r"\s+", " ", payload.casefold()).strip()
+    ]
+    payload = " ".join(evidence_parts)
+    normalized = re.sub(r"\s+", " ", payload.casefold()).strip()
+    if normalized:
+        return normalized
+    return f"item:{item.chat_id}:{item.message_id or item.id}:{item.content_kind}:{item.attachment_type}"
 
 
 def memory_payload_hash(item: MemoryItem) -> str:
     payload = normalized_memory_payload(item)
-    if not payload:
-        payload = f"empty:{item.chat_id}:{item.message_id or item.id}:{item.content_kind}:{item.attachment_type}"
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
@@ -3818,7 +3819,7 @@ def remember_context_diagnostics(
     duplicate_count = (
         compilation_stats.duplicate_items
         if compilation_stats is not None
-        else estimate_recent_memory_duplicate_count(chat_id, CONFIG.memory_followup_context_messages)
+        else estimate_recent_memory_duplicate_count(chat_id, CONFIG.memory_context_messages)
     )
     dropped_count = compilation_stats.budget_dropped_items if compilation_stats is not None else 0
     last_context_diagnostics[int(chat_id)] = MemoryContextDiagnostics(

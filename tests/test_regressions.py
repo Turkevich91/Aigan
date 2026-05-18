@@ -4277,6 +4277,32 @@ class PersistentMemoryTests(unittest.TestCase):
         self.assertIn("Source Alpha", memory_context)
         self.assertIn("Source Beta", memory_context)
 
+    def test_memory_context_keeps_distinct_empty_non_text_items(self) -> None:
+        base = datetime.now(timezone.utc)
+        main.MEMORY.save_message(
+            chat_id=-1001,
+            message_id=1,
+            sender_label="Alpha",
+            content_kind="image",
+            attachment_type="photo",
+            created_at=base,
+        )
+        main.MEMORY.save_message(
+            chat_id=-1001,
+            message_id=2,
+            sender_label="Beta",
+            content_kind="image",
+            attachment_type="photo",
+            created_at=base + timedelta(seconds=1),
+        )
+        message = FakeMessage("@thrd_ua_bot overview", message_id=3)
+
+        memory_context, _, _ = asyncio.run(main.prepare_agent_memory_context(message, "overview", "normal"))
+
+        self.assertIn("Alpha", memory_context)
+        self.assertIn("Beta", memory_context)
+        self.assertEqual(2, memory_context.count("[image/preview was referenced, but no image file was delivered]"))
+
     def test_semantic_context_excludes_compiled_memory_items(self) -> None:
         base = datetime.now(timezone.utc)
         selected_id = main.MEMORY.save_message(
