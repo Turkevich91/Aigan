@@ -2927,6 +2927,8 @@ def normalized_memory_payload(item: MemoryItem) -> str:
             item.source_text,
             item.source_title,
             item.source_url,
+            item.forward_origin,
+            f"reply_to:{item.reply_to_message_id}" if item.reply_to_message_id is not None else "",
             item.vision_summary,
             item.attachment_type,
         )
@@ -3389,8 +3391,9 @@ async def prepare_agent_memory_context(
     message: Message,
     prompt: str,
     route: str,
+    state: MemoryContextState | None = None,
 ) -> tuple[str, str | None, MemoryContextCompilationStats]:
-    state = new_memory_context_state()
+    state = state or new_memory_context_state()
     memory_context = await prepare_memory_context(message, prompt, state=state)
     if not should_expand_memory_for_prompt(route, prompt):
         return memory_context, None, MemoryContextCompilationStats(
@@ -3737,10 +3740,14 @@ def format_semantic_memory_results(results: list[SemanticMemoryResult]) -> str:
     return "\n".join(lines)
 
 
-def source_linked_recall_items(results: list[SemanticMemoryResult], message: Message) -> tuple[list[MemoryItem], int]:
+def source_linked_recall_items(
+    results: list[SemanticMemoryResult],
+    message: Message,
+    state: MemoryContextState | None = None,
+) -> tuple[list[MemoryItem], int]:
     if MEMORY is None or not results:
         return [], 0
-    state = new_memory_context_state()
+    state = state or new_memory_context_state()
     selected: list[MemoryItem] = []
     anchor_count = 0
     for result in results:
@@ -3769,11 +3776,17 @@ def source_linked_recall_items(results: list[SemanticMemoryResult], message: Mes
     return selected, anchor_count
 
 
-def format_source_linked_recall_results(results: list[SemanticMemoryResult], message: Message) -> str:
+def format_source_linked_recall_results(
+    results: list[SemanticMemoryResult],
+    message: Message,
+    state: MemoryContextState | None = None,
+) -> str:
     if not results:
         return "(no semantic memory matches)"
-    items, anchor_count = source_linked_recall_items(results, message)
+    items, anchor_count = source_linked_recall_items(results, message, state)
     if not items:
+        if state is not None:
+            return "(no semantic memory matches)"
         return format_semantic_memory_results(results)
     header = [
         "Source-linked recalled memory:",
@@ -4025,7 +4038,11 @@ async def prepare_semantic_memory_context(
     return format_semantic_memory_results(results)
 
 
-def format_recalled_memory_outcome(outcome: MemorySearchOutcome, message: Message | None = None) -> str:
+def format_recalled_memory_outcome(
+    outcome: MemorySearchOutcome,
+    message: Message | None = None,
+    state: MemoryContextState | None = None,
+) -> str:
     if not outcome.results:
         details = [
             "(no recalled memory matches)",
@@ -4035,7 +4052,7 @@ def format_recalled_memory_outcome(outcome: MemorySearchOutcome, message: Messag
             details.append("Query terms: " + ", ".join(outcome.topic_terms[:8]))
         return "\n".join(details)
     if message is not None:
-        return format_source_linked_recall_results(outcome.results, message)
+        return format_source_linked_recall_results(outcome.results, message, state)
     return format_semantic_memory_results(outcome.results)
 
 
@@ -4043,6 +4060,7 @@ async def prepare_recalled_memory_context(
     message: Message,
     prompt: str,
     recall_intent: MemoryRecallIntent | None,
+    state: MemoryContextState | None = None,
 ) -> str:
     query = (recall_intent.query if recall_intent else "") or clean_memory_recall_query(prompt) or prompt
     variants = memory_recall_query_variants(prompt, query)
@@ -4070,7 +4088,7 @@ async def prepare_recalled_memory_context(
             "keyword_results": outcome.keyword_results,
         },
     )
-    return format_recalled_memory_outcome(outcome, message)
+    return format_recalled_memory_outcome(outcome, message, state)
 
 
 def memory_vector_health_text() -> str:
@@ -6891,16 +6909,23 @@ async def handle_prompt_generation(
         user_id = message.from_user.id if message.from_user else "unknown"
         LOGGER.info("Reference context attached chat_id=%s user_id=%s", message.chat_id, user_id)
     web_context = await maybe_prefetch_web_context(message, prompt, route)
-    memory_context, expanded_memory_context, memory_context_stats = await prepare_agent_memory_context(
-        message,
-        prompt,
-        route,
-    )
     recalled_memory_context = None
     semantic_memory_context = None
     if route == "memory_recall":
-        recalled_memory_context = await prepare_recalled_memory_context(message, prompt, recall_intent)
+        recall_state = new_memory_context_state()
+        recalled_memory_context = await prepare_recalled_memory_context(message, prompt, recall_intent, recall_state)
+        memory_context, expanded_memory_context, memory_context_stats = await prepare_agent_memory_context(
+            message,
+            prompt,
+            route,
+            state=recall_state,
+        )
     else:
+        memory_context, expanded_memory_context, memory_context_stats = await prepare_agent_memory_context(
+            message,
+            prompt,
+            route,
+        )
         semantic_memory_context = await prepare_semantic_memory_context(
             message,
             prompt,

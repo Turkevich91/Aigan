@@ -4251,6 +4251,32 @@ class PersistentMemoryTests(unittest.TestCase):
 
         self.assertEqual(1, memory_context.count("same compact fact repeated"))
 
+    def test_memory_context_keeps_same_text_with_different_source_links(self) -> None:
+        base = datetime.now(timezone.utc)
+        main.MEMORY.save_message(
+            chat_id=-1001,
+            message_id=1,
+            sender_label="Alpha",
+            text="same text with different evidence",
+            forward_origin="Source Alpha",
+            created_at=base,
+        )
+        main.MEMORY.save_message(
+            chat_id=-1001,
+            message_id=2,
+            sender_label="Beta",
+            text="same text with different evidence",
+            forward_origin="Source Beta",
+            created_at=base + timedelta(seconds=1),
+        )
+        message = FakeMessage("@thrd_ua_bot overview", message_id=3)
+
+        memory_context, _, _ = asyncio.run(main.prepare_agent_memory_context(message, "overview", "normal"))
+
+        self.assertEqual(2, memory_context.count("same text with different evidence"))
+        self.assertIn("Source Alpha", memory_context)
+        self.assertIn("Source Beta", memory_context)
+
     def test_semantic_context_excludes_compiled_memory_items(self) -> None:
         base = datetime.now(timezone.utc)
         selected_id = main.MEMORY.save_message(
@@ -4398,6 +4424,41 @@ class PersistentMemoryTests(unittest.TestCase):
             self.assertIn("followup context after the gpu deal", context)
         finally:
             main.CONFIG = original
+
+    def test_recalled_memory_dedupes_against_compiled_recent_context(self) -> None:
+        base = datetime.now(timezone.utc)
+        item_id = main.MEMORY.save_message(
+            chat_id=-1001,
+            message_id=221,
+            sender_label="Recent",
+            text="recent recall anchor already compiled",
+            created_at=base,
+        )
+        item = main.MEMORY.item_by_id(item_id)
+        state = main.new_memory_context_state()
+        main.select_unique_memory_items([item], state)
+        message = FakeMessage("@thrd_ua_bot remind me", message_id=222)
+
+        with patch.object(
+            main,
+            "semantic_memory_search_outcome",
+            new=AsyncMock(
+                return_value=main.MemorySearchOutcome(
+                    results=[SemanticMemoryResult(item, "recent recall anchor already compiled", 0.9, "semantic")],
+                    returned=1,
+                )
+            ),
+        ):
+            context = asyncio.run(
+                main.prepare_recalled_memory_context(
+                    message,
+                    "remind me",
+                    main.MemoryRecallIntent(True, confidence=0.9, query="recent recall"),
+                    state,
+                )
+            )
+
+        self.assertNotIn("recent recall anchor already compiled", context)
 
     def test_context_window_command_is_admin_only_and_sanitized(self) -> None:
         main.MEMORY.save_message(
@@ -5232,11 +5293,16 @@ class PersistentMemoryTests(unittest.TestCase):
 
         agent_input = run_agent.await_args.args[0]
         self.assertIn("Request route: memory_recall", agent_input)
+        recent_block = agent_input.split("Untrusted persistent recent chat memory.", 1)[1].split(
+            "Untrusted expanded recent chat memory",
+            1,
+        )[0]
         recalled_block = agent_input.split("Untrusted recalled long-term memory.", 1)[1].split(
             "Untrusted current web search results.",
             1,
         )[0]
         self.assertIn("поштарка проїбала в казино 170 тис", recalled_block)
+        self.assertNotIn("поштарка проїбала в казино 170 тис", recent_block)
         self.assertNotIn("@thrd_ua_bot нагадай", recalled_block)
 
     def test_recall_exact_rescue_searches_source_text_and_numbers(self) -> None:
