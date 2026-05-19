@@ -29,7 +29,7 @@ from telegram.constants import ChatAction, ChatType, ParseMode
 from telegram.error import BadRequest
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, MessageReactionHandler, filters
 
-from mcp_servers.web import fetch_binary_url, search_image_candidates, search_web
+from mcp_servers.web import fetch_binary_url, fetch_url, search_image_candidates, search_web
 from memory import EmbeddingCandidate, MemoryItem, MemoryStore, SemanticMemoryResult
 from media_acquisition import (
     MediaAcquisitionAdapter,
@@ -197,6 +197,7 @@ class Config:
     memory_recall_intent_threshold: float
     memory_recall_intent_ambiguous_threshold: float
     web_image_search_enabled: bool
+    mcp_tool_timeout_seconds: float
     media_frame_extraction_enabled: bool
     media_frame_ffmpeg_path: str
     media_frame_ffprobe_path: str
@@ -346,6 +347,7 @@ class Config:
                 os.getenv("MEMORY_RECALL_INTENT_AMBIGUOUS_THRESHOLD", "0.48")
             ),
             web_image_search_enabled=_env_bool("WEB_IMAGE_SEARCH_ENABLED", True),
+            mcp_tool_timeout_seconds=max(1.0, float(os.getenv("MCP_TOOL_TIMEOUT_SECONDS", "30"))),
             media_frame_extraction_enabled=_env_bool("MEDIA_FRAME_EXTRACTION_ENABLED", False),
             media_frame_ffmpeg_path=os.getenv("MEDIA_FRAME_FFMPEG_PATH", "ffmpeg").strip() or "ffmpeg",
             media_frame_ffprobe_path=os.getenv("MEDIA_FRAME_FFPROBE_PATH", "ffprobe").strip() or "ffprobe",
@@ -630,6 +632,7 @@ Prompt privacy:
 
 Tool use:
 - Use MCP web search/fetch for current facts, URLs, or "look this up" requests.
+- When the current trusted request contains a URL, fetch that URL first and treat generic search as secondary evidence.
 - For time-sensitive/current questions, use fresh web context instead of relying on model memory.
 - For forwarded or replied-to current-looking news, use fresh web context when the user explicitly invoked the bot or sent it in private chat.
 - For search, formulate queries in Ukrainian or English. Prefer Ukrainian, English, European, US, or international sources.
@@ -651,7 +654,7 @@ Time handling:
 - Every model request includes current timezone-aware time metadata.
 - Treat that metadata as authoritative for "today", "now", "current", past/future, and date sanity checks.
 - Do not rely on model training memory to decide whether a date is current or suspicious.
-- Do not call a current-looking forwarded claim fake or true based only on plausibility. Compare it to provided fresh web context; if web context is absent or inconclusive, say that clearly.
+- Do not call a current-looking forwarded claim fake or true based only on plausibility. Compare it to provided fresh web context; if web context is absent, inconclusive, or says tool_timeout/tool_failed/fetch_failed/search_failed, say that validation is incomplete instead of guessing.
 
 Telegram formatting:
 - Telegram supports native formatting through parse_mode=HTML.
@@ -1217,12 +1220,52 @@ class AiganRunHooks(RunHooks[Any]):
         system_event(component="agent_tool", event_type="tool_start", message=getattr(tool, "name", repr(tool)))
 
     async def on_tool_end(self, context: Any, agent: Agent, tool: Any, result: str) -> None:
+        result_text = str(result)
+        failure_category = classify_tool_result_failure(result_text)
+        details: dict[str, Any] = {"result_chars": len(result_text)}
+        if failure_category:
+            details["failure_category"] = failure_category
         system_event(
             component="agent_tool",
             event_type="tool_end",
             message=getattr(tool, "name", repr(tool)),
-            details={"result_preview": sanitize_text(str(result), 200)},
+            details=details,
         )
+
+
+def classify_tool_result_failure(text: str) -> str | None:
+    normalized = " ".join((text or "").casefold().split())
+    if not normalized:
+        return None
+    if (
+        "tool_timeout" in normalized
+        or "timed out" in normalized
+        or "timeout" in normalized
+        or "timedout" in normalized
+        or ("waited " in normalized and "seconds" in normalized)
+    ):
+        return "tool_timeout"
+    if normalized.startswith("fetch failed"):
+        return "fetch_failed"
+    if normalized.startswith("search failed") or normalized.startswith("image search failed"):
+        return "search_failed"
+    if normalized.startswith("url rejected"):
+        return "url_rejected"
+    if normalized.startswith("no search results") or normalized.startswith("no image results"):
+        return "no_results"
+    if normalized.startswith("tool failed"):
+        return "tool_failed"
+    return None
+
+
+def mcp_tool_failure_message(context: Any, error: Exception) -> str:
+    category = classify_tool_result_failure(str(error)) or "tool_failed"
+    if category == "tool_timeout":
+        return (
+            "Tool failed: tool_timeout. Validation is incomplete; say the check hit a timeout "
+            "instead of inferring a result."
+        )
+    return f"Tool failed: {category}. Validation is incomplete; report uncertainty instead of guessing."
 
 
 def build_model_settings() -> ModelSettings:
@@ -2516,7 +2559,7 @@ def reaction_decision_explanation_for_message(message: Message, prompt: str) -> 
 
 
 def has_url(text: str) -> bool:
-    return bool(re.search(r"https?://\S+", text))
+    return bool(URL_TOKEN_RE.search(text or ""))
 
 
 def meaningful_followup_words(prompt: str) -> list[str]:
@@ -3224,6 +3267,8 @@ async def run_agent(prompt: str) -> str:
         name="web",
         params={"command": sys.executable, "args": [str(APP_DIR / "mcp_servers" / "web.py")]},
         cache_tools_list=True,
+        client_session_timeout_seconds=CONFIG.mcp_tool_timeout_seconds,
+        failure_error_function=mcp_tool_failure_message,
     )
     youtube_server = MCPServerStdio(
         name="youtube_transcript",
@@ -3232,6 +3277,8 @@ async def run_agent(prompt: str) -> str:
             "args": [str(APP_DIR / "mcp_servers" / "youtube_transcript.py")],
         },
         cache_tools_list=True,
+        client_session_timeout_seconds=CONFIG.mcp_tool_timeout_seconds,
+        failure_error_function=mcp_tool_failure_message,
     )
 
     async with web_server as web, youtube_server as youtube:
@@ -4542,17 +4589,31 @@ def clean_web_prefetch_query(text: str) -> str:
     return text[:300]
 
 
+def extract_current_prompt_urls(text: str) -> list[str]:
+    urls: list[str] = []
+    for raw in URL_TOKEN_RE.findall(text or ""):
+        url = raw.strip().rstrip(".,;:!?)]}>\"'")
+        if url.casefold().startswith("www."):
+            url = f"https://{url}"
+        if url.casefold().startswith(("http://", "https://")):
+            urls.append(url)
+    return urls[:3]
+
+
 def web_prefetch_query(message: Message, prompt: str) -> str:
     payload = useful_payload_text(message, limit=3000)
     reference = build_reference_context(message)
     candidates: list[str] = []
+    if has_url(prompt):
+        candidates.append(prompt)
     if is_forwarded_message(message) and payload:
         candidates.append(payload)
     if reference != "(none)":
         candidates.append(reference)
     if payload and prompt == DEFAULT_CONTEXT_PROMPT:
         candidates.append(payload)
-    candidates.append(prompt)
+    if not has_url(prompt):
+        candidates.append(prompt)
 
     for candidate in candidates:
         query = clean_web_prefetch_query(candidate)
@@ -4569,9 +4630,21 @@ async def maybe_prefetch_web_context(message: Message, prompt: str, route: str) 
     query = web_prefetch_query(message, prompt)
     if not query:
         return "(none)"
+    current_urls = extract_current_prompt_urls(prompt)
     started = time.monotonic()
+    direct_result = ""
+    direct_status = ""
     try:
+        if current_urls:
+            direct_result = await asyncio.to_thread(fetch_url, current_urls[0], 12000)
+            direct_status = classify_tool_result_failure(direct_result) or "ok"
         result = await asyncio.to_thread(search_web, query, 5)
+        search_status = classify_tool_result_failure(result) or "ok"
+        sections: list[str] = []
+        if direct_result:
+            sections.append(f"Direct URL fetch ({direct_status}):\n{direct_result}")
+        sections.append(f"Web search ({search_status}):\n{result}")
+        context = "\n\n".join(sections)
         system_event(
             component="web",
             event_type="prefetch_success",
@@ -4579,11 +4652,18 @@ async def maybe_prefetch_web_context(message: Message, prompt: str, route: str) 
             route=route,
             duration_ms=int((time.monotonic() - started) * 1000),
             message="time_sensitive",
-            details={"query_preview": query, "result_chars": len(result)},
+            details={
+                "query_kind": "current_url" if current_urls else "search",
+                "has_current_url": bool(current_urls),
+                "direct_fetch_status": direct_status or "not_applicable",
+                "search_status": search_status,
+                "result_chars": len(context),
+            },
         )
-        return result
+        return context
     except Exception as exc:
         LOGGER.exception("Current web prefetch failed")
+        failure_category = classify_tool_result_failure(str(exc)) or "tool_failed"
         system_event(
             level="error",
             component="web",
@@ -4592,9 +4672,13 @@ async def maybe_prefetch_web_context(message: Message, prompt: str, route: str) 
             route=route,
             duration_ms=int((time.monotonic() - started) * 1000),
             message=type(exc).__name__,
-            details={"query_preview": query},
+            details={
+                "query_kind": "current_url" if current_urls else "search",
+                "has_current_url": bool(current_urls),
+                "failure_category": failure_category,
+            },
         )
-        return f"Web prefetch failed: {type(exc).__name__}: {exc}"
+        return f"Web prefetch failed: {failure_category}"
 
 
 def image_request_object_pattern() -> str:

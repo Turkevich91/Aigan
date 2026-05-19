@@ -79,6 +79,8 @@ os.environ["MEMORY_VECTOR_BACKFILL_ON_START"] = "false"
 os.environ["MEMORY_VECTOR_BACKFILL_LIMIT"] = "10"
 os.environ["MEMORY_RECALL_INTENT_THRESHOLD"] = "0.62"
 os.environ["MEMORY_RECALL_INTENT_AMBIGUOUS_THRESHOLD"] = "0.48"
+os.environ["MCP_TOOL_TIMEOUT_SECONDS"] = "30"
+os.environ["WEB_SEARCH_TIMEOUT_SECONDS"] = "15"
 os.environ["SYSTEM_LOG_ENABLED"] = "true"
 os.environ["SYSTEM_LOG_RETENTION_DAYS"] = "14"
 os.environ["GITHUB_REPORTING_ENABLED"] = "false"
@@ -560,8 +562,7 @@ class WebSafetyTests(unittest.TestCase):
             with patch.object(web.httpx, "Client", RedirectClient):
                 result = web.fetch_url("http://example.com/start")
 
-        self.assertIn("Fetch failed: ValueError", result)
-        self.assertIn("local/private", result)
+        self.assertEqual("Fetch failed: url_rejected", result)
 
     def test_image_search_filters_unsafe_hosts(self) -> None:
         class FakeDDGS:
@@ -587,6 +588,54 @@ class WebSafetyTests(unittest.TestCase):
         self.assertEqual(1, len(results))
         self.assertEqual("ok", results[0]["title"])
 
+    def test_web_search_and_image_search_use_configured_ddgs_timeout(self) -> None:
+        captured_timeouts: list[float] = []
+
+        class FakeDDGS:
+            def __init__(self, *args, **kwargs) -> None:
+                captured_timeouts.append(kwargs["timeout"])
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb) -> None:
+                return None
+
+            def text(self, query: str, max_results: int, region: str):
+                return [{"title": "ok", "href": "https://example.com/page", "body": "body"}]
+
+            def images(self, query: str, max_results: int, region: str):
+                return [{"title": "ok", "image": "https://example.com/image.jpg", "url": "https://example.com/page"}]
+
+        with patch.dict(os.environ, {"WEB_SEARCH_TIMEOUT_SECONDS": "17"}):
+            with patch.object(web, "DDGS", FakeDDGS):
+                self.assertIn("https://example.com/page", web.search_web("query"))
+                with patch.object(web.socket, "getaddrinfo", side_effect=self.fake_getaddrinfo):
+                    images = web.search_image_candidates("query")
+
+        self.assertEqual([17.0, 17.0], captured_timeouts)
+        self.assertEqual("ok", images[0]["title"])
+
+    def test_web_search_timeout_renders_stable_failure_category(self) -> None:
+        class TimeoutDDGS:
+            def __init__(self, *args, **kwargs) -> None:
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb) -> None:
+                return None
+
+            def text(self, query: str, max_results: int, region: str):
+                raise TimeoutError("timed out fetching https://example.com/private")
+
+        with patch.object(web, "DDGS", TimeoutDDGS):
+            result = web.search_web("query")
+
+        self.assertEqual("Search failed: tool_timeout", result)
+        self.assertNotIn("example.com", result)
+
 
 class TimeContextTests(unittest.TestCase):
     def test_time_metadata_includes_configured_timezone_and_utc(self) -> None:
@@ -601,6 +650,54 @@ class TimeContextTests(unittest.TestCase):
 
         self.assertTrue(wrapped.startswith("Current time metadata:\n"))
         self.assertIn("Trusted request body", wrapped)
+
+    def test_run_agent_configures_mcp_timeout_and_failure_formatter(self) -> None:
+        server_kwargs: list[dict[str, object]] = []
+
+        class FakeMCPServer:
+            def __init__(self, *args, **kwargs) -> None:
+                server_kwargs.append(kwargs)
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb) -> None:
+                return None
+
+        original_config = main.CONFIG
+        try:
+            main.CONFIG = replace(main.CONFIG, mcp_tool_timeout_seconds=42.0)
+            with patch.object(main, "MCPServerStdio", FakeMCPServer):
+                with patch.object(main, "make_agent", return_value="agent"):
+                    with patch.object(main.Runner, "run", new=AsyncMock(return_value=SimpleNamespace(final_output="ok"))):
+                        self.assertEqual("ok", asyncio.run(main.run_agent("prompt")))
+        finally:
+            main.CONFIG = original_config
+
+        self.assertEqual(2, len(server_kwargs))
+        for kwargs in server_kwargs:
+            self.assertEqual(42.0, kwargs["client_session_timeout_seconds"])
+            self.assertIs(main.mcp_tool_failure_message, kwargs["failure_error_function"])
+
+    def test_mcp_failure_message_classifies_timeout_without_raw_error(self) -> None:
+        message = main.mcp_tool_failure_message(None, RuntimeError("Timed out opening https://example.com/private"))
+
+        self.assertIn("tool_timeout", message)
+        self.assertIn("incomplete", message)
+        self.assertNotIn("example.com", message)
+
+    def test_agent_tool_end_logs_counts_and_category_not_raw_result(self) -> None:
+        hook = main.AiganRunHooks()
+        result = "Fetch failed: tool_timeout for https://example.com/private"
+
+        asyncio.run(hook.on_tool_end(None, SimpleNamespace(name="agent"), SimpleNamespace(name="fetch_url"), result))
+
+        latest = main.SYSTEM_LOG.latest_events(1)[0]
+        self.assertEqual("agent_tool", latest.component)
+        self.assertEqual("tool_end", latest.event_type)
+        self.assertEqual(len(result), latest.details["result_chars"])
+        self.assertEqual("tool_timeout", latest.details["failure_category"])
+        self.assertNotIn("result_preview", latest.details)
 
 
 class TelegramFormattingTests(unittest.TestCase):
@@ -6409,6 +6506,47 @@ class PersistentMemoryTests(unittest.TestCase):
         search_web.assert_called_once()
         self.assertIn("Петер Мадяр", search_web.call_args.args[0])
         self.assertIn("Request route: time_sensitive", run_agent.await_args.args[0])
+
+    def test_current_prompt_url_wins_over_replied_context_for_prefetch(self) -> None:
+        replied = FakeMessage("reply context should not win", message_id=90)
+        prompt = "check https://github.com/vedalai"
+        message = FakeMessage(prompt, message_id=91)
+        message.reply_to_message = replied
+
+        query = main.web_prefetch_query(message, prompt)
+
+        self.assertIn("https://github.com/vedalai", query)
+        self.assertNotIn("reply context should not win", query)
+
+    def test_url_prefetch_fetches_direct_page_before_secondary_search(self) -> None:
+        prompt = "check https://github.com/vedalai"
+        message = FakeMessage(prompt, message_id=92)
+
+        with patch.object(main, "fetch_url", return_value="direct page evidence") as fetch_url:
+            with patch.object(main, "search_web", return_value="secondary search evidence") as search_web:
+                context = asyncio.run(main.maybe_prefetch_web_context(message, prompt, "time_sensitive"))
+
+        fetch_url.assert_called_once_with("https://github.com/vedalai", 12000)
+        search_web.assert_called_once()
+        self.assertIn("https://github.com/vedalai", search_web.call_args.args[0])
+        self.assertLess(context.index("Direct URL fetch (ok)"), context.index("Web search (ok)"))
+        self.assertIn("direct page evidence", context)
+        self.assertIn("secondary search evidence", context)
+        latest = main.SYSTEM_LOG.latest_events(1)[0]
+        self.assertEqual("prefetch_success", latest.event_type)
+        self.assertEqual("current_url", latest.details["query_kind"])
+        self.assertNotIn("query_preview", latest.details)
+
+    def test_url_prefetch_marks_direct_timeout_as_incomplete_evidence(self) -> None:
+        prompt = "check https://github.com/vedalai"
+        message = FakeMessage(prompt, message_id=93)
+
+        with patch.object(main, "fetch_url", return_value="Fetch failed: tool_timeout"):
+            with patch.object(main, "search_web", return_value="secondary search evidence"):
+                context = asyncio.run(main.maybe_prefetch_web_context(message, prompt, "time_sensitive"))
+
+        self.assertIn("Direct URL fetch (tool_timeout)", context)
+        self.assertIn("Web search (ok)", context)
 
     def test_group_ordinary_current_claim_stays_silent_without_trigger(self) -> None:
         message = FakeMessage("Петер Мадяр офіційно став прем’єр-міністром Угорщини.", message_id=83)

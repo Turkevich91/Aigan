@@ -177,6 +177,8 @@ MEMORY_RETENTION_DAYS=30
 MEMORY_IMAGE_SUMMARY_LIMIT=3
 MEMORY_EAGER_IMAGE_SUMMARY=false
 WEB_IMAGE_SEARCH_ENABLED=true
+WEB_SEARCH_TIMEOUT_SECONDS=15
+MCP_TOOL_TIMEOUT_SECONDS=30
 MEMORY_VECTOR_ENABLED=true
 MEMORY_EMBEDDING_MODEL=text-embedding-3-small
 MEMORY_EMBEDDING_DIMENSIONS=512
@@ -199,7 +201,7 @@ SOCIAL_PROFILE_RETENTION_DAYS=180
 
 `MEMORY_CONTEXT_MESSAGES` controls how many recent delivered messages are added to normal model requests. For explicit short follow-ups such as `@bot скільки?`, `що?`, or `how many?`, Aigan also injects up to `MEMORY_FOLLOWUP_CONTEXT_MESSAGES` recent messages plus reply-chain parents up to `MEMORY_THREAD_CONTEXT_DEPTH`. If the referent is still unclear, it should ask one concise clarification instead of guessing. This expanded retrieval only runs after an explicit bot invocation, private DM, reply-to-bot, or pending consume; ordinary group chatter stays passive memory only.
 
-`MEMORY_RETENTION_DAYS` deletes older rows and cached media. `MEMORY_IMAGE_SUMMARY_LIMIT` limits how many recent unsummarized images can be lazily sent to vision for one answer.
+`MEMORY_RETENTION_DAYS` deletes older rows and cached media. `MEMORY_IMAGE_SUMMARY_LIMIT` limits how many recent unsummarized images can be lazily sent to vision for one answer. `WEB_SEARCH_TIMEOUT_SECONDS` controls DDGS web/image search network timeout, while `MCP_TOOL_TIMEOUT_SECONDS` controls the Agents SDK MCP session timeout for web and YouTube tools. For explicit URL checks, Aigan should fetch the current URL first, use search as secondary evidence, and report timeout/fetch/search failures as incomplete validation instead of guessing.
 
 Semantic memory adds a local SQLite hybrid index: FTS5 for keyword fallback plus OpenAI embeddings for meaning-based retrieval over the retained lookback window. It is only used after explicit bot invocation, never for ordinary group chatter. `/memory_search query` is admin-only and shows the retrieved snippets without asking the main model to answer; aliases `/память`, `/памʼять`, and `/пошук_памяті` call the same hybrid search. The command automatically uses embeddings when indexed, always attempts FTS fallback, and reports `embeddings_used`, fallback status, and per-result sources. Natural prompts that semantically ask for old chat context, such as `@bot що ми казали про Pragmata?` or `@bot а про 170 тис в казино ми щось обговорювали?`, route to the same recall backend automatically. `MEMORY_RECALL_INTENT_THRESHOLD` and `MEMORY_RECALL_INTENT_AMBIGUOUS_THRESHOLD` control that intent detector. Recall search also runs exact rescue with numeric terms such as `170`, `5к`, `4070`, or `$250`, and excludes the current prompt so it does not become its own top memory result.
 

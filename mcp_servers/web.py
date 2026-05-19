@@ -1,4 +1,5 @@
 import ipaddress
+import os
 import socket
 from urllib.parse import urljoin, urlparse
 
@@ -10,6 +11,7 @@ from mcp.server.fastmcp import FastMCP
 
 mcp = FastMCP("aigan-web")
 MAX_REDIRECTS = 5
+DEFAULT_WEB_SEARCH_TIMEOUT_SECONDS = 15.0
 
 BLOCKED_RUSSIAN_HOSTS = {
     "dzen.ru",
@@ -35,6 +37,26 @@ def _is_blocked_russian_host(host: str | None) -> bool:
     if host.endswith(".ru") or host.endswith(".su"):
         return True
     return any(host == blocked or host.endswith(f".{blocked}") for blocked in BLOCKED_RUSSIAN_HOSTS)
+
+
+def _web_search_timeout_seconds() -> float:
+    try:
+        return max(1.0, float(os.getenv("WEB_SEARCH_TIMEOUT_SECONDS", str(DEFAULT_WEB_SEARCH_TIMEOUT_SECONDS))))
+    except ValueError:
+        return DEFAULT_WEB_SEARCH_TIMEOUT_SECONDS
+
+
+def _failure_category(exc: Exception) -> str:
+    text = str(exc).casefold()
+    if isinstance(exc, (TimeoutError, socket.timeout, httpx.TimeoutException)) or "timeout" in text or "timed out" in text:
+        return "tool_timeout"
+    if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code in {401, 403, 429}:
+        return "auth_or_rate_limited"
+    if isinstance(exc, ValueError):
+        return "url_rejected"
+    if isinstance(exc, (httpx.ConnectError, httpx.NetworkError, socket.gaierror)):
+        return "network_error"
+    return "tool_failed"
 
 
 def _safe_url(url: str) -> str:
@@ -104,7 +126,7 @@ def search_image_candidates(query: str, max_results: int = 5, region: str = "ua-
     max_results = max(1, min(int(max_results), 8))
     region = (region or "ua-uk").strip()
 
-    with DDGS(timeout=12) as ddgs:
+    with DDGS(timeout=_web_search_timeout_seconds()) as ddgs:
         raw_results = list(ddgs.images(query, max_results=max_results * 4, region=region))
 
     results: list[dict[str, str]] = []
@@ -157,10 +179,10 @@ def search_web(query: str, max_results: int = 5, region: str = "ua-uk") -> str:
     region = (region or "ua-uk").strip()
 
     try:
-        with DDGS(timeout=12) as ddgs:
+        with DDGS(timeout=_web_search_timeout_seconds()) as ddgs:
             raw_results = list(ddgs.text(query, max_results=max_results * 3, region=region))
     except Exception as exc:
-        return f"Search failed: {type(exc).__name__}: {exc}"
+        return f"Search failed: {_failure_category(exc)}"
 
     results = []
     for item in raw_results:
@@ -190,7 +212,7 @@ def search_images(query: str, max_results: int = 5, region: str = "ua-uk") -> st
     try:
         results = search_image_candidates(query, max_results=max_results, region=region)
     except Exception as exc:
-        return f"Image search failed: {type(exc).__name__}: {exc}"
+        return f"Image search failed: {_failure_category(exc)}"
 
     if not results:
         return "No image results after filtering Russian/private hosts."
@@ -228,9 +250,9 @@ def fetch_url(url: str, limit_chars: int = 12000) -> str:
                 return _clean_html(response.text, limit_chars)
             if content_type.startswith("text/") or "json" in content_type:
                 return response.text[:limit_chars]
-            return f"Fetched {safe_url}, but content-type is not text: {content_type or 'unknown'}"
+            return f"Fetched URL, but content-type is not text: {content_type or 'unknown'}"
     except Exception as exc:
-        return f"Fetch failed: {type(exc).__name__}: {exc}"
+        return f"Fetch failed: {_failure_category(exc)}"
 
 
 if __name__ == "__main__":
