@@ -1670,6 +1670,19 @@ def has_supported_visual_media(message: Message) -> bool:
     return visual_media_source_from_context(message) is not None
 
 
+def referenced_media_available(message: Message) -> bool:
+    for source in (
+        getattr(message, "reply_to_message", None),
+        getattr(message, "external_reply", None),
+        getattr(message, "quote", None),
+    ):
+        if source is None:
+            continue
+        if image_file_ref_from(source) is not None or visual_media_file_ref_from(source) is not None:
+            return True
+    return False
+
+
 def image_suffix_for_mime(mime_type: str) -> str:
     mapping = {
         "image/jpeg": ".jpg",
@@ -4813,7 +4826,7 @@ def extract_current_prompt_urls(text: str) -> list[str]:
 
 MEDIA_CONTEXT_PLATFORMS = {"tiktok", "youtube", "instagram"}
 MEDIA_CONTEXT_RECENT_CANDIDATES = 8
-MEDIA_CONTEXT_HINTS = (
+EXPLICIT_MEDIA_CONTEXT_HINTS = (
     "video",
     "clip",
     "short",
@@ -4832,6 +4845,9 @@ MEDIA_CONTEXT_HINTS = (
     "рілс",
     "рилс",
     "шортс",
+)
+MEDIA_CONTEXT_HINTS = (
+    *EXPLICIT_MEDIA_CONTEXT_HINTS,
     "що тут",
     "что тут",
     "підсумуй",
@@ -4875,6 +4891,12 @@ def has_media_context_hint(prompt: str) -> bool:
     prompt_without_urls = re.sub(r"\b(?:https?://|www\.)\S+", " ", prompt or "", flags=re.IGNORECASE)
     lowered = prompt_without_urls.casefold()
     return any(hint in lowered for hint in MEDIA_CONTEXT_HINTS)
+
+
+def has_explicit_media_context_hint(prompt: str) -> bool:
+    prompt_without_urls = re.sub(r"\b(?:https?://|www\.)\S+", " ", prompt or "", flags=re.IGNORECASE)
+    lowered = prompt_without_urls.casefold()
+    return any(hint in lowered for hint in EXPLICIT_MEDIA_CONTEXT_HINTS)
 
 
 def has_media_reference_hint(prompt: str) -> bool:
@@ -5276,10 +5298,12 @@ def has_unresolved_public_media_context_intent(
     intent = resolved_intent if resolved_intent is not None else resolve_public_media_context_intent(message, prompt)
     if intent.active:
         return False
-    if has_supported_image(message) or has_supported_visual_media(message):
+    if has_supported_image(message) or has_supported_visual_media(message) or referenced_media_available(message):
         return False
     has_reference = build_reference_context(message) != "(none)"
     if has_media_reference_hint(prompt):
+        return True
+    if has_explicit_media_context_hint(prompt):
         return True
     if has_media_context_hint(prompt) and not has_reference:
         return True

@@ -2474,6 +2474,38 @@ class ToolRuntimeTests(unittest.TestCase):
         self.assertTrue(message.reply_calls)
         self.assertIn("\u043f\u043e\u0441\u0438\u043b\u0430\u043d\u043d\u044f", message.reply_calls[-1]["text"])
 
+    def test_explicit_media_question_replying_to_text_fails_closed(self) -> None:
+        main.last_user_call.clear()
+        main.last_chat_call.clear()
+        main.recent_chat_answers.clear()
+        main.passive_contexts.clear()
+        if main.MEMORY is not None:
+            main.MEMORY.clear_all()
+        message = FakeMessage("@thrd_ua_bot what is this video?", message_id=1538)
+        message.entities = [SimpleNamespace(type=MessageEntity.MENTION, offset=0, length=len("@thrd_ua_bot"))]
+        message.reply_to_message = FakeMessage("ordinary text-only reference", message_id=1537)
+        context = SimpleNamespace(bot=SimpleNamespace(username="thrd_ua_bot", id=999, send_chat_action=AsyncMock()))
+
+        self.assertEqual("media_context_unresolved", main.classify_request(message, "what is this video?"))
+        with patch.object(main, "run_agent", new=AsyncMock(side_effect=AssertionError("normal agent should not run"))):
+            asyncio.run(main.text_message(SimpleNamespace(effective_message=message), context))
+
+        self.assertTrue(message.reply_calls)
+        self.assertIn("\u043f\u043e\u0441\u0438\u043b\u0430\u043d\u043d\u044f", message.reply_calls[-1]["text"])
+
+    def test_generic_context_question_replying_to_text_stays_normal(self) -> None:
+        message = FakeMessage("@thrd_ua_bot explain this", message_id=1539)
+        message.reply_to_message = FakeMessage("ordinary text-only reference", message_id=1538)
+
+        self.assertEqual("normal", main.classify_request(message, "explain this"))
+
+    def test_explicit_media_question_with_referenced_video_is_not_missing_referent(self) -> None:
+        message = FakeMessage("@thrd_ua_bot what is this video?", message_id=1540)
+        message.reply_to_message = FakeMessage("", message_id=1539)
+        message.reply_to_message.video = FakeVideo(data=b"fake-video-bytes")
+
+        self.assertFalse(main.has_unresolved_public_media_context_intent(message, "what is this video?"))
+
     def test_current_link_preview_beats_recent_memory_media_url(self) -> None:
         old_memory = main.MEMORY
         temp_dir = tempfile.TemporaryDirectory()
