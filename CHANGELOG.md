@@ -6,6 +6,8 @@
 - Reused the existing `media_acquisition` safety boundary before answering and kept ordinary group URL messages passive.
 - Returned grounded YouTube transcript answers when the current transcript path can help, or honest metadata-only/unavailable responses without promising TikTok/Instagram reliability.
 - Added bounded temporary public-media acquisition for supported links so explicit transcriptless requests can reuse `media_frames` and vision summaries when download, frame extraction, and cleanup all pass.
+- Resolved bare private media URLs and explicit reply/follow-up questions against current, replied, quoted, and recent passive media-link context instead of falling through to generic web fallback.
+- Resolved explicit link-preview prompts and portrait/vertical public-media format selection while keeping unrelated time-sensitive prompts out of recent-media recall.
 
 ## 2026-05-19 - Telegram activity presence
 

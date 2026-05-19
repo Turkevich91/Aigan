@@ -2525,7 +2525,7 @@ def classify_request(message: Message, prompt: str) -> str:
         return "translate_reference"
     if is_internet_image_request(prompt, has_reference=has_reference):
         return "internet_image_send"
-    if is_public_media_context_request(prompt):
+    if resolve_public_media_context_intent(message, prompt).active:
         return "media_context"
     if is_time_sensitive_request(time_sensitive_signal_text(message, prompt)):
         return "time_sensitive"
@@ -2538,7 +2538,7 @@ async def classify_request_with_intent(message: Message, prompt: str) -> tuple[s
         return "translate_reference", None
     if is_internet_image_request(prompt, has_reference=has_reference):
         return "internet_image_send", None
-    if is_public_media_context_request(prompt):
+    if resolve_public_media_context_intent(message, prompt).active:
         return "media_context", None
 
     recall_intent = await detect_memory_recall_intent(message, prompt)
@@ -4804,6 +4804,7 @@ def extract_current_prompt_urls(text: str) -> list[str]:
 
 
 MEDIA_CONTEXT_PLATFORMS = {"tiktok", "youtube", "instagram"}
+MEDIA_CONTEXT_RECENT_CANDIDATES = 8
 MEDIA_CONTEXT_HINTS = (
     "video",
     "clip",
@@ -4820,6 +4821,8 @@ MEDIA_CONTEXT_HINTS = (
     "ролик",
     "кліп",
     "клип",
+    "рілс",
+    "рилс",
     "шортс",
     "що тут",
     "что тут",
@@ -4827,6 +4830,27 @@ MEDIA_CONTEXT_HINTS = (
     "суммариз",
     "summarize",
 )
+MEDIA_REFERENCE_HINTS = (
+    "ссылка",
+    "ссылке",
+    "ссылку",
+    "посилання",
+    "лінк",
+    "линк",
+)
+MEDIA_REFERENCE_TOKEN_HINTS = ("link", "url")
+
+
+@dataclass(frozen=True)
+class PublicMediaContextIntent:
+    url: str = ""
+    platform: str = ""
+    url_source: str = ""
+    intent_mode: str = ""
+
+    @property
+    def active(self) -> bool:
+        return bool(self.url)
 
 
 def has_media_context_hint(prompt: str) -> bool:
@@ -4835,16 +4859,142 @@ def has_media_context_hint(prompt: str) -> bool:
     return any(hint in lowered for hint in MEDIA_CONTEXT_HINTS)
 
 
-def public_media_context_url_from_prompt(prompt: str) -> str:
-    urls = extract_current_prompt_urls(prompt)
-    if not urls:
-        return ""
-    if not has_media_context_hint(prompt):
-        return ""
-    for url in urls:
+def has_media_reference_hint(prompt: str) -> bool:
+    prompt_without_urls = re.sub(r"\b(?:https?://|www\.)\S+", " ", prompt or "", flags=re.IGNORECASE)
+    lowered = prompt_without_urls.casefold()
+    return any(hint in lowered for hint in MEDIA_REFERENCE_HINTS) or any(
+        re.search(rf"\b{re.escape(hint)}\b", lowered) for hint in MEDIA_REFERENCE_TOKEN_HINTS
+    )
+
+
+def public_media_url_from_text(value: Any) -> str:
+    text = str(value or "")
+    for url in extract_current_prompt_urls(text):
         if platform_from_url(url) in MEDIA_CONTEXT_PLATFORMS:
             return canonical_public_media_context_url(url)
     return ""
+
+
+def link_preview_url_from(value: Any) -> str:
+    preview = getattr(value, "link_preview_options", None)
+    url = getattr(preview, "url", "") if preview is not None else ""
+    return str(url or "").strip()
+
+
+def media_context_prompt_without_urls(prompt: str) -> str:
+    cleaned = URL_TOKEN_RE.sub(" ", prompt or "")
+    cleaned = MENTION_TOKEN_RE.sub(" ", cleaned)
+    cleaned = SLASH_COMMAND_TOKEN_RE.sub(" ", cleaned)
+    return " ".join(cleaned.split())
+
+
+def is_bare_media_url_prompt(prompt: str) -> bool:
+    return bool(public_media_url_from_text(prompt)) and not meaningful_followup_words(media_context_prompt_without_urls(prompt))
+
+
+def has_reference_media_context_intent(prompt: str) -> bool:
+    return has_media_context_hint(prompt) or has_media_reference_hint(prompt) or is_short_followup_prompt(prompt)
+
+
+def memory_item_public_media_url(item: MemoryItem) -> str:
+    fields = (
+        item.text,
+        item.source_text,
+        item.source_url,
+        item.vision_summary,
+    )
+    for field in fields:
+        url = public_media_url_from_text(field)
+        if url:
+            return url
+    return ""
+
+
+def public_media_url_candidates(message: Message, prompt: str) -> list[tuple[str, str]]:
+    candidates: list[tuple[str, str]] = [
+        ("current_prompt", prompt or ""),
+        ("current_payload", useful_payload_text(message, limit=3000)),
+        ("current_link_preview", link_preview_url_from(message)),
+    ]
+
+    quote = getattr(message, "quote", None)
+    quote_text = getattr(quote, "text", "") if quote is not None else ""
+    if quote_text:
+        candidates.append(("quote", quote_text))
+
+    replied = getattr(message, "reply_to_message", None)
+    if replied is not None:
+        candidates.extend(
+            (
+                ("reply_reference", message_content(replied, limit=3000)),
+                ("reply_link_preview", link_preview_url_from(replied)),
+            )
+        )
+
+    external_reply = getattr(message, "external_reply", None)
+    if external_reply is not None:
+        candidates.extend(
+            (
+                ("external_reply", getattr(external_reply, "text", "") or getattr(external_reply, "caption", "")),
+                ("external_link_preview", link_preview_url_from(external_reply)),
+            )
+        )
+
+    if has_reference_media_context_intent(prompt):
+        for item in stored_reply_chain_items(message):
+            url = memory_item_public_media_url(item)
+            if url:
+                candidates.append(("reply_chain_memory", url))
+        if MEMORY is not None:
+            for item in MEMORY.latest(message.chat_id, MEDIA_CONTEXT_RECENT_CANDIDATES):
+                url = memory_item_public_media_url(item)
+                if url:
+                    candidates.append(("recent_memory", url))
+        for item in reversed(list(passive_contexts[message.chat_id])[-MEDIA_CONTEXT_RECENT_CANDIDATES:]):
+            candidates.append(("recent_context", item))
+
+    return candidates
+
+
+def resolve_public_media_context_intent(message: Message, prompt: str) -> PublicMediaContextIntent:
+    current_url = public_media_url_from_text(prompt)
+    if current_url:
+        intent_mode = "target_summary" if is_bare_media_url_prompt(prompt) or has_media_context_hint(prompt) else "supporting_context"
+        return PublicMediaContextIntent(
+            url=current_url,
+            platform=platform_from_url(current_url),
+            url_source="current_prompt",
+            intent_mode=intent_mode,
+        )
+
+    prompt_allows_reference = has_reference_media_context_intent(prompt)
+    for source, text in public_media_url_candidates(message, prompt):
+        if source == "current_prompt":
+            continue
+        url = public_media_url_from_text(text)
+        if not url:
+            continue
+        if source in {"current_payload", "current_link_preview"}:
+            if message.chat.type == ChatType.PRIVATE or is_bare_media_url_prompt(text) or prompt_allows_reference:
+                return PublicMediaContextIntent(
+                    url=url,
+                    platform=platform_from_url(url),
+                    url_source=source,
+                    intent_mode="target_summary",
+                )
+            continue
+        if prompt_allows_reference:
+            return PublicMediaContextIntent(
+                url=url,
+                platform=platform_from_url(url),
+                url_source=source,
+                intent_mode="target_summary" if has_media_context_hint(prompt) or is_short_followup_prompt(prompt) else "supporting_context",
+            )
+    return PublicMediaContextIntent()
+
+
+def public_media_context_url_from_prompt(prompt: str) -> str:
+    return public_media_url_from_text(prompt)
 
 
 def is_public_media_context_request(prompt: str) -> bool:
@@ -5203,14 +5353,15 @@ async def handle_public_media_context_prompt(
     context: ContextTypes.DEFAULT_TYPE,
     prompt: str,
 ) -> bool:
-    url = public_media_context_url_from_prompt(prompt)
-    if not url:
+    intent = resolve_public_media_context_intent(message, prompt)
+    if not intent.active:
         return False
+    url = intent.url
 
     presence = activity_presence_for_message(message, bot=context.bot, action=ChatAction.TYPING)
     await presence.start()
     started = time.monotonic()
-    platform = platform_from_url(url)
+    platform = intent.platform or platform_from_url(url)
     context_result = media_context_from_acquisition(
         MediaAcquisitionResult.unavailable(
             failure_category="unexpected_error",
@@ -5307,7 +5458,11 @@ async def handle_public_media_context_prompt(
         route="media_context",
         duration_ms=int((time.monotonic() - started) * 1000),
         message=context_result.state,
-        details=media_context_event_details(context_result),
+        details={
+            **media_context_event_details(context_result),
+            "url_source": safe_detail_code(intent.url_source or "unknown"),
+            "intent_mode": safe_detail_code(intent.intent_mode or "target_summary"),
+        },
     )
     histories[message.chat_id].append(f"Aigan: {response[:500]}")
     remember_observed_message(message, label=f"{user_label(message)} (public media context request)")
@@ -7536,14 +7691,16 @@ async def handle_prompt(
         return
 
     has_current_payload = has_current_context_payload(message)
+    has_public_media_context = resolve_public_media_context_intent(message, prompt).active
 
-    if allow_pending_wait and not has_current_payload and should_wait_for_followup_context(message, prompt):
+    if allow_pending_wait and not has_current_payload and not has_public_media_context and should_wait_for_followup_context(message, prompt):
         await start_pending_debounce(message, context, prompt, "followup_context")
         return
 
     if (
         allow_pending_wait
         and not has_current_payload
+        and not has_public_media_context
         and not has_supported_image(message)
         and build_reference_context(message) == "(none)"
         and is_image_request(prompt)
@@ -7554,6 +7711,7 @@ async def handle_prompt(
     if (
         allow_pending_wait
         and not has_current_payload
+        and not has_public_media_context
         and build_reference_context(message) == "(none)"
         and is_context_dependent_request(prompt)
         and not has_url(prompt)
