@@ -24,12 +24,10 @@ class ActivityPresenceSettings:
     draft_delay_seconds: float = 2.5
 
 
-def activity_action_for_route(route: str) -> str:
-    route = (route or "").strip().casefold()
-    if route in {"internet_image_send"}:
-        return TELEGRAM_ACTION_TYPING
-    if route in {"normal", "time_sensitive", "memory_recall", "translate_reference", "visual_media_summary"}:
-        return TELEGRAM_ACTION_TYPING
+def activity_action_for_route(_route: str) -> str:
+    # Telegram has no native "searching", "remembering", or "analyzing media" status.
+    # Current long-running text/tool routes therefore share typing; senders switch
+    # to upload_* only at the point they are actually about to upload media.
     return TELEGRAM_ACTION_TYPING
 
 
