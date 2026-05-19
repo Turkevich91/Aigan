@@ -5001,24 +5001,31 @@ async def handle_public_media_context_prompt(
     await presence.start()
     started = time.monotonic()
     platform = platform_from_url(url)
-    acquisition_result = await TOOL_RUNTIME.safe_call(
-        "media_acquisition",
-        "probe_metadata",
-        lambda: asyncio.to_thread(
-            runtime_media_acquisition_adapter().probe_metadata,
-            MediaAcquisitionRequest(url=url, route="public_media_context"),
-        ),
-        default=MediaAcquisitionResult.unavailable(
+    context_result = media_context_from_acquisition(
+        MediaAcquisitionResult.unavailable(
             failure_category="unexpected_error",
             backend="media_acquisition",
             platform=platform,
-        ),
-        event_context={"telegram_message": message, "route": "media_context"},
-        details={"stage": "metadata", "platform": platform},
+        )
     )
-    context_result = media_context_from_acquisition(acquisition_result)
     response = ""
     try:
+        acquisition_result = await TOOL_RUNTIME.safe_call(
+            "media_acquisition",
+            "probe_metadata",
+            lambda: asyncio.to_thread(
+                runtime_media_acquisition_adapter().probe_metadata,
+                MediaAcquisitionRequest(url=url, route="public_media_context"),
+            ),
+            default=MediaAcquisitionResult.unavailable(
+                failure_category="unexpected_error",
+                backend="media_acquisition",
+                platform=platform,
+            ),
+            event_context={"telegram_message": message, "route": "media_context"},
+            details={"stage": "metadata", "platform": platform},
+        )
+        context_result = media_context_from_acquisition(acquisition_result)
         if context_result.ok and context_result.platform == "youtube":
             agent_prompt = build_youtube_media_context_prompt(
                 user_prompt=prompt,
@@ -5027,8 +5034,8 @@ async def handle_public_media_context_prompt(
             )
             try:
                 response = await asyncio.wait_for(run_agent(agent_prompt), timeout=120)
-            except Exception:
-                LOGGER.exception("YouTube media context agent path failed")
+            except Exception as exc:
+                LOGGER.warning("YouTube media context agent path failed: %s", type(exc).__name__)
                 system_event(
                     level="warning",
                     component="media_context",
@@ -5037,7 +5044,7 @@ async def handle_public_media_context_prompt(
                     route="media_context",
                     duration_ms=int((time.monotonic() - started) * 1000),
                     message="youtube_agent_failed",
-                    details={**media_context_event_details(context_result), "failure_category": "provider_failed"},
+                    details={**media_context_event_details(context_result), "failure_category": "unexpected_error"},
                 )
                 response = public_media_context_response(context_result)
         else:
