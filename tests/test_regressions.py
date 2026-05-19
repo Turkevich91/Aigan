@@ -108,7 +108,7 @@ os.environ["MEDIA_ACQUISITION_MAX_DOWNLOAD_BYTES"] = "50000000"
 os.environ["MEDIA_ACQUISITION_SOCKET_TIMEOUT_SECONDS"] = "12"
 
 import httpx
-from telegram import InputMediaPhoto, ReactionTypeCustomEmoji, ReactionTypeEmoji
+from telegram import InputMediaPhoto, MessageEntity, ReactionTypeCustomEmoji, ReactionTypeEmoji
 from telegram.constants import ChatType, ParseMode
 from telegram.error import BadRequest
 
@@ -185,6 +185,7 @@ class FakeMessage:
     ) -> None:
         self.text = text
         self.caption = None
+        self.caption_entities = None
         self.chat_id = chat_id
         self.message_id = message_id
         self.date = datetime.now(timezone.utc)
@@ -196,6 +197,8 @@ class FakeMessage:
         self.external_reply = None
         self.quote = None
         self.entities = None
+        self.link_preview_options = None
+        self.api_kwargs = {}
         self.reply_calls = []
         self.photo_calls = []
         self.photo_failures = 0
@@ -224,6 +227,9 @@ class FakeMessage:
 
     def get_bot(self):
         return self.bot
+
+    def parse_entity(self, entity):
+        return self.text[getattr(entity, "offset", 0) : getattr(entity, "offset", 0) + getattr(entity, "length", 0)]
 
 
 class FakeTelegramFile:
@@ -2353,6 +2359,120 @@ class ToolRuntimeTests(unittest.TestCase):
         self.assertTrue(intent.active)
         self.assertEqual("current_link_preview", intent.url_source)
         self.assertEqual("target_summary", intent.intent_mode)
+
+    def test_current_text_link_entity_url_routes_to_media_context(self) -> None:
+        message = FakeMessage("@thrd_ua_bot preview card", message_id=1531)
+        message.entities = [
+            SimpleNamespace(type=MessageEntity.TEXT_LINK, url="https://vt.tiktok.com/ZSXENTITY/", offset=13, length=7)
+        ]
+
+        intent = main.resolve_public_media_context_intent(message, "what is this video?")
+
+        self.assertTrue(intent.active)
+        self.assertEqual("current_entity_url", intent.url_source)
+        self.assertIn("ZSXENTITY", intent.url)
+
+    def test_caption_url_entity_routes_to_media_context(self) -> None:
+        url = "https://vt.tiktok.com/ZSXCAPTION/"
+        message = FakeMessage("", chat_type=ChatType.PRIVATE, message_id=1532)
+        message.caption = f"watch {url}"
+        message.caption_entities = [SimpleNamespace(type=MessageEntity.URL, offset=6, length=len(url))]
+
+        intent = main.resolve_public_media_context_intent(message, "summarize this video")
+
+        self.assertTrue(intent.active)
+        self.assertEqual("current_entity_url", intent.url_source)
+        self.assertIn("ZSXCAPTION", intent.url)
+
+    def test_external_reply_text_link_beats_recent_memory_url(self) -> None:
+        old_memory = main.MEMORY
+        temp_dir = tempfile.TemporaryDirectory()
+        store = MemoryStore(Path(temp_dir.name) / "memory.sqlite3", retention_days=30)
+        main.MEMORY = store
+        main.passive_contexts.clear()
+        try:
+            store.save_message(
+                chat_id=-1001,
+                message_id=1533,
+                created_at=datetime.now(timezone.utc) - timedelta(minutes=1),
+                is_bot=False,
+                text="https://vt.tiktok.com/ZSXRECENT/",
+            )
+            message = FakeMessage("@thrd_ua_bot what is this video?", message_id=1534)
+            message.external_reply = SimpleNamespace(
+                text="preview",
+                caption=None,
+                entities=[
+                    SimpleNamespace(type=MessageEntity.TEXT_LINK, url="https://vt.tiktok.com/ZSXEXTERNAL/", offset=0, length=7)
+                ],
+                caption_entities=None,
+                link_preview_options=None,
+                api_kwargs={},
+            )
+
+            intent = main.resolve_public_media_context_intent(message, "what is this video?")
+        finally:
+            main.MEMORY = old_memory
+            store.close()
+            temp_dir.cleanup()
+
+        self.assertTrue(intent.active)
+        self.assertEqual("external_entity_url", intent.url_source)
+        self.assertIn("ZSXEXTERNAL", intent.url)
+
+    def test_hidden_public_media_url_is_persisted_for_current_memory_lookup(self) -> None:
+        old_memory = main.MEMORY
+        temp_dir = tempfile.TemporaryDirectory()
+        store = MemoryStore(Path(temp_dir.name) / "memory.sqlite3", retention_days=30)
+        main.MEMORY = store
+        try:
+            original = FakeMessage("preview card", message_id=1535)
+            original.entities = [
+                SimpleNamespace(type=MessageEntity.TEXT_LINK, url="https://vt.tiktok.com/ZSXHIDDEN/", offset=0, length=7)
+            ]
+            main.save_memory_message(original)
+            stored = store.message_by_message_id(original.chat_id, original.message_id)
+            self.assertIsNotNone(stored)
+            self.assertIn("ZSXHIDDEN", stored.source_url)
+
+            followup = FakeMessage("@thrd_ua_bot what is this link?", message_id=1535)
+            intent = main.resolve_public_media_context_intent(followup, "what is this link?")
+        finally:
+            main.MEMORY = old_memory
+            store.close()
+            temp_dir.cleanup()
+
+        self.assertTrue(intent.active)
+        self.assertEqual("current_memory", intent.url_source)
+        self.assertIn("ZSXHIDDEN", intent.url)
+
+    def test_api_kwargs_link_preview_url_routes_to_media_context(self) -> None:
+        message = FakeMessage("@thrd_ua_bot what is this video?", message_id=1536)
+        message.api_kwargs = {"link_preview_options": {"url": "https://vt.tiktok.com/ZSXAPIKWARGS/"}}
+
+        intent = main.resolve_public_media_context_intent(message, "what is this video?")
+
+        self.assertTrue(intent.active)
+        self.assertEqual("current_link_preview", intent.url_source)
+        self.assertIn("ZSXAPIKWARGS", intent.url)
+
+    def test_missing_media_referent_fails_closed_without_normal_agent(self) -> None:
+        main.last_user_call.clear()
+        main.last_chat_call.clear()
+        main.recent_chat_answers.clear()
+        main.passive_contexts.clear()
+        if main.MEMORY is not None:
+            main.MEMORY.clear_all()
+        message = FakeMessage("@thrd_ua_bot \u043f\u0440\u043e \u0449\u043e \u0442\u0443\u0442?", message_id=1537)
+        message.entities = [SimpleNamespace(type=MessageEntity.MENTION, offset=0, length=len("@thrd_ua_bot"))]
+        main.passive_contexts[message.chat_id].append("Human: unrelated ordinary chat context")
+        context = SimpleNamespace(bot=SimpleNamespace(username="thrd_ua_bot", id=999, send_chat_action=AsyncMock()))
+
+        with patch.object(main, "run_agent", new=AsyncMock(side_effect=AssertionError("normal agent should not run"))):
+            asyncio.run(main.text_message(SimpleNamespace(effective_message=message), context))
+
+        self.assertTrue(message.reply_calls)
+        self.assertIn("\u043f\u043e\u0441\u0438\u043b\u0430\u043d\u043d\u044f", message.reply_calls[-1]["text"])
 
     def test_current_link_preview_beats_recent_memory_media_url(self) -> None:
         old_memory = main.MEMORY
