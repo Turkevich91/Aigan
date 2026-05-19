@@ -1233,6 +1233,28 @@ class AiganRunHooks(RunHooks[Any]):
         )
 
 
+TOOL_FAILURE_CATEGORIES = {
+    "auth_or_rate_limited",
+    "fetch_failed",
+    "network_error",
+    "no_results",
+    "search_failed",
+    "tool_failed",
+    "tool_timeout",
+    "url_rejected",
+}
+
+
+def prefixed_tool_failure_category(normalized: str, prefix: str, fallback: str) -> str | None:
+    if not normalized.startswith(prefix):
+        return None
+    suffix = normalized.removeprefix(prefix).strip()
+    category = re.sub(r"[^a-z0-9_.-]", "", suffix.split(maxsplit=1)[0]) if suffix else ""
+    if category in TOOL_FAILURE_CATEGORIES:
+        return category
+    return fallback
+
+
 def classify_tool_result_failure(text: str) -> str | None:
     normalized = " ".join((text or "").casefold().split())
     if not normalized:
@@ -1245,6 +1267,15 @@ def classify_tool_result_failure(text: str) -> str | None:
         or ("waited " in normalized and "seconds" in normalized)
     ):
         return "tool_timeout"
+    for prefix, fallback in (
+        ("fetch failed:", "fetch_failed"),
+        ("search failed:", "search_failed"),
+        ("image search failed:", "search_failed"),
+        ("tool failed:", "tool_failed"),
+    ):
+        category = prefixed_tool_failure_category(normalized, prefix, fallback)
+        if category:
+            return category
     if normalized.startswith("fetch failed"):
         return "fetch_failed"
     if normalized.startswith("search failed") or normalized.startswith("image search failed"):
