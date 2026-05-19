@@ -566,14 +566,21 @@ def options_for_download(limits: MediaAcquisitionLimits, temp_dir: Path) -> dict
 def bounded_video_format_selector(max_bytes: int) -> str:
     byte_limit = max(1, int(max_bytes))
     return (
-        f"best[ext=mp4][height<=720][filesize<={byte_limit}]/"
-        f"best[height<=720][filesize<={byte_limit}]/"
-        f"best[ext=mp4][filesize_approx<={byte_limit}]/"
-        f"best[height<=720][filesize_approx<={byte_limit}]/"
-        "best[ext=mp4][height<=720]/"
-        "best[height<=720]/"
-        "best[ext=mp4]/"
-        "best"
+        f"bestvideo[ext=mp4][height<=720][filesize<={byte_limit}]+bestaudio[filesize<={byte_limit}]/"
+        f"bestvideo[height<=720][filesize<={byte_limit}]+bestaudio[filesize<={byte_limit}]/"
+        f"best[ext=mp4][height<=720][vcodec!=none][filesize<={byte_limit}]/"
+        f"best[height<=720][vcodec!=none][filesize<={byte_limit}]/"
+        f"bestvideo[ext=mp4][height<=720][filesize_approx<={byte_limit}]+bestaudio/"
+        f"bestvideo[height<=720][filesize_approx<={byte_limit}]+bestaudio/"
+        f"best[ext=mp4][vcodec!=none][filesize_approx<={byte_limit}]/"
+        f"best[height<=720][vcodec!=none][filesize_approx<={byte_limit}]/"
+        "bestvideo[ext=mp4][height<=720]+bestaudio/"
+        "bestvideo[height<=720]+bestaudio/"
+        "best[ext=mp4][height<=720][vcodec!=none]/"
+        "best[height<=720][vcodec!=none]/"
+        "bestvideo[ext=mp4]/"
+        "bestvideo/"
+        "best[vcodec!=none]"
     )
 
 
