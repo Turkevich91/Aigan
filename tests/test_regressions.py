@@ -2011,6 +2011,92 @@ class ToolRuntimeTests(unittest.TestCase):
         self.assertTrue(acquisition_dirs)
         self.assertTrue(all(not path.exists() for path in acquisition_dirs))
 
+    def test_public_media_context_route_reports_vision_failure_after_frames(self) -> None:
+        if main.MEMORY is None:
+            self.skipTest("memory store disabled")
+        main.MEMORY.clear_all()
+        main.last_user_call.clear()
+        main.last_chat_call.clear()
+        main.recent_chat_answers.clear()
+        acquisition_dirs: list[Path] = []
+        frame_dirs: list[Path] = []
+
+        class FakeMediaAcquisitionAdapter:
+            def probe_metadata(self, request):
+                return MediaAcquisitionResult(
+                    ok=True,
+                    backend="yt_dlp",
+                    platform="tiktok",
+                    metadata={"extractor": "TikTok", "duration_seconds": 12, "has_subtitles": False},
+                )
+
+            def acquire_media(self, request):
+                temp_dir = Path(tempfile.mkdtemp(prefix="aigan-test-public-media-"))
+                acquisition_dirs.append(temp_dir)
+                source_path = temp_dir / "source.mp4"
+                source_path.write_bytes(b"fake-public-video")
+                return MediaAcquisitionFileResult(
+                    ok=True,
+                    backend="yt_dlp",
+                    platform="tiktok",
+                    source_path=source_path,
+                    mime_type="video/mp4",
+                    file_size_bytes=source_path.stat().st_size,
+                    metadata={"duration_seconds": 12},
+                    cleanup_status="pending",
+                    _temp_dir=temp_dir,
+                )
+
+            def health_summary(self):
+                return {"name": "media_acquisition", "enabled": True, "available": True, "status": "ok"}
+
+        class FakeMediaFrameAdapter:
+            async def extract_frames(self, request):
+                frame_dir = Path(tempfile.mkdtemp(prefix="aigan-test-public-frames-"))
+                frame_dirs.append(frame_dir)
+                frame_path = frame_dir / "frame_001.jpg"
+                frame_path.write_bytes(VALID_JPEG)
+                return MediaFrameResult(
+                    ok=True,
+                    backend="fake",
+                    source_family="public_media_url",
+                    frames=(MediaFrameCandidate(path=frame_path, timestamp_seconds=1.25, index=1),),
+                    candidate_count=1,
+                    selected_count=1,
+                    cleanup_status="pending",
+                    _temp_dir=frame_dir,
+                )
+
+            def health_summary(self):
+                return {"name": "media_frames", "enabled": True, "status": "ok", "adapter": "fake"}
+
+        old_acquisition = main.MEDIA_ACQUISITION_ADAPTER
+        old_frames = main.runtime_media_frame_adapter()
+        main.set_media_acquisition_adapter(FakeMediaAcquisitionAdapter())
+        main.set_media_frame_adapter(FakeMediaFrameAdapter())
+        try:
+            url = "http" + "s://" + "w" + "ww." + "tiktok." + "com/@demo/video/123"
+            prompt = f"summarize this video {url}"
+            message = FakeMessage(prompt, chat_type=ChatType.PRIVATE, message_id=1510)
+            context = SimpleNamespace(bot=SimpleNamespace(username="thrd_ua_bot", id=999, send_chat_action=AsyncMock()))
+
+            with patch.object(main, "run_vision", new=AsyncMock(return_value="")):
+                handled = asyncio.run(main.handle_public_media_context_prompt(message, context, prompt))
+        finally:
+            main.set_media_acquisition_adapter(old_acquisition)
+            main.set_media_frame_adapter(old_frames)
+
+        events_text = json.dumps([event.__dict__ for event in main.SYSTEM_LOG.latest_events(8)], ensure_ascii=False)
+
+        self.assertTrue(handled)
+        self.assertIn(media_context_unavailable_message("visual_summary_failed"), message.reply_calls[-1]["text"])
+        self.assertIn("visual_summary_failed", events_text)
+        self.assertIn("empty_vision_summary", events_text)
+        self.assertTrue(acquisition_dirs)
+        self.assertTrue(frame_dirs)
+        self.assertTrue(all(not path.exists() for path in acquisition_dirs))
+        self.assertTrue(all(not path.exists() for path in frame_dirs))
+
     def test_public_media_context_disabled_returns_safe_unavailable(self) -> None:
         old_adapter = main.MEDIA_ACQUISITION_ADAPTER
         main.set_media_acquisition_adapter(NullMediaAcquisitionAdapter())

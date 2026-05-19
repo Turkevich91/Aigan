@@ -5037,6 +5037,8 @@ def public_media_visual_failure_category(category: str) -> str:
     clean = safe_detail_code(category or "")
     if clean in {"timeout", "visual_summary_failed"}:
         return clean
+    if clean in {"vision_failed", "empty_vision_summary"}:
+        return "visual_summary_failed"
     return "visual_extraction_unavailable"
 
 
