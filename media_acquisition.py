@@ -161,7 +161,7 @@ class MediaAcquisitionFileResult:
             "platform": self.platform,
             "failure_category": self.failure_category,
             "user_message": self.user_message,
-            "mime_type": safe_code_label(self.mime_type, default=""),
+            "mime_type": safe_media_mime_type(self.mime_type),
             "file_size_bytes": self.file_size_bytes,
             "metadata": sanitize_public_mapping(self.metadata),
             "diagnostics": sanitize_public_mapping(self.diagnostics),
@@ -741,6 +741,11 @@ def mime_type_for_path(path: Path) -> str:
     if suffix == ".mkv":
         return "video/x-matroska"
     return "video/mp4"
+
+
+def safe_media_mime_type(value: Any) -> str:
+    text = sanitize_text(str(value or ""), 80).strip().lower()
+    return text if text in {"video/mp4", "video/webm", "video/quicktime", "video/x-matroska"} else ""
 
 
 def safe_code_label(value: Any, *, default: str) -> str:

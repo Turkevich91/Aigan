@@ -116,7 +116,7 @@ def media_context_unavailable_message(category: str) -> str:
 def public_media_context_response(result: MediaContextResult) -> str:
     public = result.public_dict()
     if public["ok"] and public["state"] == "visual_summary":
-        return str(public["summary"] or "")
+        return sanitize_text(result.summary, 4000)
     if public["ok"] and public["state"] == "metadata_only":
         return str(public["summary"] or metadata_only_summary(platform=public["platform"], metadata=public["metadata"]))
     return str(public["user_message"] or media_context_unavailable_message(public["failure_category"] or "unexpected_error"))

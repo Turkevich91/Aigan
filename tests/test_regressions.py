@@ -132,7 +132,7 @@ from media_frames import (
     MediaFrameResult,
     NullMediaFrameAdapter,
 )
-from media_context import media_context_from_acquisition, public_media_context_response
+from media_context import MediaContextResult, media_context_from_acquisition, public_media_context_response
 from memory import MemoryStore, SemanticMemoryResult
 from mcp_servers import web
 from reaction_memory import ReactionSpec
@@ -1272,6 +1272,7 @@ class ToolRuntimeTests(unittest.TestCase):
         self.assertEqual("yt_dlp", result.backend)
         self.assertEqual("tiktok", result.platform)
         self.assertEqual("video/mp4", result.mime_type)
+        self.assertEqual("video/mp4", result.public_dict()["mime_type"])
         self.assertEqual(len(b"fake-video"), result.file_size_bytes)
         self.assertIsNotNone(result.source_path)
         self.assertTrue(result.source_path.exists())
@@ -1605,6 +1606,15 @@ class ToolRuntimeTests(unittest.TestCase):
         self.assertIn("метадані", public_media_context_response(context_result))
         self.assertNotIn("secret-token", public_text)
         self.assertNotIn("www.tiktok.com/video", public_text)
+
+    def test_public_media_context_response_keeps_visual_summary_budget(self) -> None:
+        summary = "visual evidence. " * 180
+        context_result = MediaContextResult(ok=True, state="visual_summary", summary=summary)
+
+        response = public_media_context_response(context_result)
+
+        self.assertEqual(summary.strip(), response)
+        self.assertLess(len(context_result.public_dict()["summary"]), len(response))
 
     def test_public_media_context_route_uses_media_acquisition_metadata(self) -> None:
         class FakeMediaAcquisitionAdapter:
