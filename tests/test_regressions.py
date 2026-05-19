@@ -2501,6 +2501,24 @@ class ToolRuntimeTests(unittest.TestCase):
 
         self.assertFalse(intent.active)
 
+    def test_recent_passive_bot_output_is_not_media_url_anchor(self) -> None:
+        old_memory = main.MEMORY
+        temp_dir = tempfile.TemporaryDirectory()
+        store = MemoryStore(Path(temp_dir.name) / "memory.sqlite3", retention_days=30)
+        main.MEMORY = store
+        main.passive_contexts.clear()
+        try:
+            main.passive_contexts[-1001].append("Aigan (auto): https://vt.tiktok.com/ZSXBOTAUTO/")
+            message = FakeMessage("@thrd_ua_bot what is this video?", message_id=1530)
+
+            intent = main.resolve_public_media_context_intent(message, "what is this video?")
+        finally:
+            main.MEMORY = old_memory
+            store.close()
+            temp_dir.cleanup()
+
+        self.assertFalse(intent.active)
+
     def test_reference_media_intent_does_not_hijack_unrelated_time_sensitive_prompt(self) -> None:
         main.passive_contexts.clear()
         main.passive_contexts[-1001].append("https://vt.tiktok.com/ZSXRECENT/")

@@ -4950,7 +4950,7 @@ def current_memory_public_media_url(message: Message) -> str:
 
 def passive_context_public_media_text(value: str) -> str:
     text = str(value or "").strip()
-    if text.casefold().startswith("aigan:"):
+    if re.match(r"^aigan(?:\s*\([^)]*\))?\s*:", text, flags=re.IGNORECASE):
         return ""
     return text
 
