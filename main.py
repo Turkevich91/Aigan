@@ -24,7 +24,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from agents import Agent, ModelSettings, RunHooks, Runner
 from agents.mcp import MCPServerStdio
 from openai import OpenAI
-from telegram import InputMediaPhoto, Message, MessageEntity, Update
+from telegram import Bot, InputMediaPhoto, Message, MessageEntity, Update
 from telegram.constants import ChatAction, ChatType, ParseMode
 from telegram.error import BadRequest
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, MessageReactionHandler, filters
@@ -46,6 +46,7 @@ from social_memory import SocialMemoryStore, SocialObservation
 from system_log import SystemEvent, SystemLogStore, sanitize_text
 from tool_diagnostics import CapabilityRow, build_capability_rows, render_capability_matrix, render_recent_failures
 from tool_runtime import ToolRuntime
+from telegram_presence import ActivityPresence, ActivityPresenceSettings, activity_action_for_route
 from visual_media_summary import VISUAL_MEDIA_UNAVAILABLE_MESSAGE, VisualMediaSummaryResult, summarize_visual_media_frames
 
 try:
@@ -129,6 +130,10 @@ class Config:
     max_output_tokens: int
     telegram_text_chunk_chars: int
     max_reply_chunks: int
+    telegram_activity_presence_enabled: bool
+    telegram_activity_refresh_seconds: float
+    telegram_streaming_drafts_enabled: bool
+    telegram_streaming_draft_delay_seconds: float
     bot_trigger: str
     bot_timezone: str
     prompt_privacy_guard_enabled: bool
@@ -280,6 +285,13 @@ class Config:
             max_reply_chars=int(os.getenv("MAX_REPLY_CHARS", "12000")),
             telegram_text_chunk_chars=int(os.getenv("TELEGRAM_TEXT_CHUNK_CHARS", "3500")),
             max_reply_chunks=int(os.getenv("MAX_REPLY_CHUNKS", "4")),
+            telegram_activity_presence_enabled=_env_bool("TELEGRAM_ACTIVITY_PRESENCE_ENABLED", True),
+            telegram_activity_refresh_seconds=max(1.0, float(os.getenv("TELEGRAM_ACTIVITY_REFRESH_SECONDS", "4"))),
+            telegram_streaming_drafts_enabled=_env_bool("TELEGRAM_STREAMING_DRAFTS_ENABLED", False),
+            telegram_streaming_draft_delay_seconds=max(
+                0.0,
+                float(os.getenv("TELEGRAM_STREAMING_DRAFT_DELAY_SECONDS", "2.5")),
+            ),
             max_history_messages=int(os.getenv("MAX_HISTORY_MESSAGES", "8")),
             passive_context_messages=int(os.getenv("PASSIVE_CONTEXT_MESSAGES", "40")),
             proactive_enabled=_env_bool("PROACTIVE_ENABLED", False),
@@ -405,6 +417,57 @@ logging.basicConfig(
 )
 LOGGER = logging.getLogger("aigan")
 logging.getLogger("httpx").setLevel(logging.WARNING)
+
+
+def activity_presence_settings() -> ActivityPresenceSettings:
+    return ActivityPresenceSettings(
+        enabled=CONFIG.telegram_activity_presence_enabled,
+        refresh_seconds=CONFIG.telegram_activity_refresh_seconds,
+        drafts_enabled=CONFIG.telegram_streaming_drafts_enabled,
+        draft_delay_seconds=CONFIG.telegram_streaming_draft_delay_seconds,
+    )
+
+
+def message_thread_id(message: Message) -> int | None:
+    value = getattr(message, "message_thread_id", None)
+    return int(value) if value is not None else None
+
+
+def activity_presence_for_message(
+    message: Message,
+    *,
+    bot: Any | None = None,
+    action: str = ChatAction.TYPING,
+    draft_text: str = "",
+) -> ActivityPresence:
+    return ActivityPresence(
+        bot=bot or message.get_bot(),
+        chat_id=message.chat_id,
+        action=action,
+        settings=activity_presence_settings(),
+        message_thread_id=message_thread_id(message),
+        chat_type=str(getattr(message.chat, "type", "") or ""),
+        draft_text=draft_text,
+        logger=LOGGER,
+    )
+
+
+async def send_activity_action(
+    bot: Any,
+    chat_id: int,
+    action: str = ChatAction.TYPING,
+    *,
+    message: Message | None = None,
+) -> bool:
+    return await ActivityPresence(
+        bot=bot,
+        chat_id=chat_id,
+        action=action,
+        settings=activity_presence_settings(),
+        message_thread_id=message_thread_id(message) if message is not None else None,
+        chat_type=str(getattr(getattr(message, "chat", None), "type", "") or "") if message is not None else "",
+        logger=LOGGER,
+    ).send_once(action)
 
 MEMORY = MemoryStore(CONFIG.memory_db_path, CONFIG.memory_retention_days) if CONFIG.memory_enabled else None
 SYSTEM_LOG = (
@@ -4489,6 +4552,51 @@ def configured_capability_rows() -> list[CapabilityRow]:
             adapter="SystemLogStore" if SYSTEM_LOG is not None else "null",
         )
     )
+    send_chat_action_available = hasattr(Bot, "send_chat_action")
+    send_message_draft_available = hasattr(Bot, "send_message_draft")
+    rows.append(
+        CapabilityRow(
+            name="telegram_activity_presence",
+            family="telegram",
+            enabled=CONFIG.telegram_activity_presence_enabled,
+            configured=True,
+            available=send_chat_action_available,
+            status=(
+                "ok"
+                if CONFIG.telegram_activity_presence_enabled and send_chat_action_available
+                else ("unavailable" if CONFIG.telegram_activity_presence_enabled else "disabled")
+            ),
+            adapter="sendChatAction",
+            mode="presence",
+            details={
+                "refresh_seconds": CONFIG.telegram_activity_refresh_seconds,
+                "send_chat_action_available": send_chat_action_available,
+            },
+        )
+    )
+    rows.append(
+        CapabilityRow(
+            name="telegram_streaming_drafts",
+            family="telegram",
+            enabled=CONFIG.telegram_streaming_drafts_enabled,
+            configured=CONFIG.telegram_streaming_drafts_enabled and send_message_draft_available,
+            available=send_message_draft_available,
+            status=(
+                "ok"
+                if CONFIG.telegram_streaming_drafts_enabled and send_message_draft_available
+                else ("unavailable" if CONFIG.telegram_streaming_drafts_enabled else "disabled")
+            ),
+            adapter="sendMessageDraft",
+            mode="private_chat_draft",
+            details={
+                "drafts_enabled": CONFIG.telegram_streaming_drafts_enabled,
+                "send_message_draft_available": send_message_draft_available,
+                "private_chat_only": True,
+                "draft_delay_seconds": CONFIG.telegram_streaming_draft_delay_seconds,
+            },
+            next_action="check library support" if CONFIG.telegram_streaming_drafts_enabled and not send_message_draft_available else "",
+        )
+    )
     rows.append(
         CapabilityRow(
             name="web_image_search",
@@ -5218,78 +5326,82 @@ async def handle_visual_media_prompt(
         mark_cooldown(message)
 
     _source, file_ref, mime_type, attachment_type = source_ref
-    await message.get_bot().send_chat_action(chat_id=message.chat_id, action=ChatAction.TYPING)
     source_family = f"telegram_{attachment_type or 'video'}"
     declared_size = getattr(file_ref, "file_size", None)
-    with tempfile.TemporaryDirectory(prefix="aigan-visual-media-") as temp_dir:
-        source_path = Path(temp_dir) / ("source" + video_suffix_for_mime(mime_type))
-        try:
-            actual_size = await download_visual_media_source(
-                file_ref,
-                source_path,
-                max_bytes=CONFIG.media_frame_max_bytes,
-            )
-        except Exception as exc:
-            LOGGER.info("Visual media download failed category=%s", type(exc).__name__)
-            system_event(
-                level="warning",
-                component="visual_media",
-                event_type="download_failed",
-                telegram_message=message,
-                route=route,
-                message=type(exc).__name__,
-                details={"attachment_type": attachment_type, "mime_type": mime_type},
-            )
-            await send_reply(message, VISUAL_MEDIA_UNAVAILABLE_MESSAGE)
-            return True
-
-        frame_result = await TOOL_RUNTIME.safe_call(
-            "media_frames",
-            "extract_frames",
-            lambda: runtime_media_frame_adapter().extract_frames(
-                MediaFrameRequest(
-                    source_path=source_path,
-                    source_family=source_family,
-                    provenance_label=attachment_type or "video",
-                    mime_type=mime_type,
-                    declared_size_bytes=declared_size or actual_size,
-                    selected_frame_count=CONFIG.media_frame_selected_count,
-                    max_selected_frame_count=CONFIG.media_frame_max_selected_count,
-                    timeout_seconds=CONFIG.media_frame_timeout_seconds,
-                    mode="visual_summary",
-                )
-            ),
-            default=MediaFrameResult.unavailable(
-                failure_category="unexpected_error",
-                source_family=source_family,
-                user_message=VISUAL_MEDIA_UNAVAILABLE_MESSAGE,
-            ),
-            event_context={"telegram_message": message, "route": route},
-            details={"source_family": source_family, "attachment_type": attachment_type},
-        )
-        try:
+    presence = activity_presence_for_message(message, action=ChatAction.TYPING)
+    await presence.start()
+    try:
+        with tempfile.TemporaryDirectory(prefix="aigan-visual-media-") as temp_dir:
+            source_path = Path(temp_dir) / ("source" + video_suffix_for_mime(mime_type))
             try:
-                memory_context = await prepare_memory_context(message, prompt)
-                summary_result = await summarize_visual_media_frames(
-                    frame_result=frame_result,
-                    user_prompt=prompt,
-                    vision_runner=run_vision,
-                    max_frames=CONFIG.media_frame_max_selected_count,
-                    max_frame_bytes=CONFIG.image_max_bytes,
-                    timeout_seconds=120,
-                    reference_context=build_reference_context(message),
-                    memory_context=memory_context,
+                actual_size = await download_visual_media_source(
+                    file_ref,
+                    source_path,
+                    max_bytes=CONFIG.media_frame_max_bytes,
                 )
             except Exception as exc:
-                LOGGER.info("Visual media summary failed category=%s", type(exc).__name__)
-                summary_result = VisualMediaSummaryResult(
-                    ok=False,
-                    failure_category="unexpected_error",
-                    user_message=VISUAL_MEDIA_UNAVAILABLE_MESSAGE,
-                    source_family=source_family,
+                LOGGER.info("Visual media download failed category=%s", type(exc).__name__)
+                system_event(
+                    level="warning",
+                    component="visual_media",
+                    event_type="download_failed",
+                    telegram_message=message,
+                    route=route,
+                    message=type(exc).__name__,
+                    details={"attachment_type": attachment_type, "mime_type": mime_type},
                 )
-        finally:
-            await frame_result.cleanup()
+                await send_reply(message, VISUAL_MEDIA_UNAVAILABLE_MESSAGE)
+                return True
+
+            frame_result = await TOOL_RUNTIME.safe_call(
+                "media_frames",
+                "extract_frames",
+                lambda: runtime_media_frame_adapter().extract_frames(
+                    MediaFrameRequest(
+                        source_path=source_path,
+                        source_family=source_family,
+                        provenance_label=attachment_type or "video",
+                        mime_type=mime_type,
+                        declared_size_bytes=declared_size or actual_size,
+                        selected_frame_count=CONFIG.media_frame_selected_count,
+                        max_selected_frame_count=CONFIG.media_frame_max_selected_count,
+                        timeout_seconds=CONFIG.media_frame_timeout_seconds,
+                        mode="visual_summary",
+                    )
+                ),
+                default=MediaFrameResult.unavailable(
+                    failure_category="unexpected_error",
+                    source_family=source_family,
+                    user_message=VISUAL_MEDIA_UNAVAILABLE_MESSAGE,
+                ),
+                event_context={"telegram_message": message, "route": route},
+                details={"source_family": source_family, "attachment_type": attachment_type},
+            )
+            try:
+                try:
+                    memory_context = await prepare_memory_context(message, prompt)
+                    summary_result = await summarize_visual_media_frames(
+                        frame_result=frame_result,
+                        user_prompt=prompt,
+                        vision_runner=run_vision,
+                        max_frames=CONFIG.media_frame_max_selected_count,
+                        max_frame_bytes=CONFIG.image_max_bytes,
+                        timeout_seconds=120,
+                        reference_context=build_reference_context(message),
+                        memory_context=memory_context,
+                    )
+                except Exception as exc:
+                    LOGGER.info("Visual media summary failed category=%s", type(exc).__name__)
+                    summary_result = VisualMediaSummaryResult(
+                        ok=False,
+                        failure_category="unexpected_error",
+                        user_message=VISUAL_MEDIA_UNAVAILABLE_MESSAGE,
+                        source_family=source_family,
+                    )
+            finally:
+                await frame_result.cleanup()
+    finally:
+        await presence.stop()
 
     if not summary_result.ok:
         system_event(
@@ -5354,7 +5466,8 @@ async def maybe_send_internet_image(message: Message, prompt: str) -> bool:
     query = image_search_query(prompt)
     target_count = requested_image_count(prompt)
     search_count = min(10, max(5, target_count * 4))
-    await message.get_bot().send_chat_action(chat_id=message.chat_id, action=ChatAction.UPLOAD_PHOTO)
+    presence = activity_presence_for_message(message, action=ChatAction.TYPING)
+    await presence.start()
     try:
         candidates = await asyncio.to_thread(search_image_candidates, query, search_count)
     except Exception:
@@ -5369,6 +5482,8 @@ async def maybe_send_internet_image(message: Message, prompt: str) -> bool:
         )
         await send_reply(message, "Не зміг знайти безпечне зображення за цим запитом.")
         return True
+    finally:
+        await presence.stop()
     system_event(
         component="image_search",
         event_type="search_success",
@@ -5382,6 +5497,7 @@ async def maybe_send_internet_image(message: Message, prompt: str) -> bool:
             image = await load_web_image_result(candidate)
             if image is None:
                 continue
+            await send_activity_action(message.get_bot(), message.chat_id, ChatAction.UPLOAD_PHOTO, message=message)
             sent_images = await send_web_image_results(message, [image])
             if not sent_images:
                 continue
@@ -5397,6 +5513,7 @@ async def maybe_send_internet_image(message: Message, prompt: str) -> bool:
             images.append(image)
             if len(images) >= target_count:
                 break
+        await send_activity_action(message.get_bot(), message.chat_id, ChatAction.UPLOAD_PHOTO, message=message)
         sent_images = await send_web_image_results(message, images)
         if sent_images:
             summary = await maybe_analyze_found_images(message, prompt, sent_images)
@@ -6149,9 +6266,7 @@ Task:
 
 
 async def maybe_send_chat_action(context: ContextTypes.DEFAULT_TYPE, chat_id: int, action: str) -> None:
-    send_chat_action = getattr(context.bot, "send_chat_action", None)
-    if send_chat_action is not None:
-        await send_chat_action(chat_id=chat_id, action=action)
+    await send_activity_action(context.bot, chat_id, action)
 
 
 async def handle_character_command(message: Message, context: ContextTypes.DEFAULT_TYPE, args: str) -> None:
@@ -6991,7 +7106,7 @@ async def handle_prompt_generation(
     mark_cooldown(message)
     histories[message.chat_id].append(f"{user_label(message)}: {prompt[:500]}")
 
-    await context.bot.send_chat_action(chat_id=message.chat_id, action=ChatAction.TYPING)
+    await send_activity_action(context.bot, message.chat_id, ChatAction.TYPING, message=message)
     route, recall_intent = await classify_request_with_intent(message, prompt)
     LOGGER.info("Prompt route=%s chat_id=%s", route, message.chat_id)
     system_event(
@@ -7026,14 +7141,18 @@ async def handle_prompt_generation(
         record_chat_answer(message, prompt, route)
         return
 
+    presence = activity_presence_for_message(message, bot=context.bot, action=activity_action_for_route(route))
+    await presence.start()
     if route == "translate_reference":
-        agent_input = build_translation_agent_input(message, prompt)
         try:
+            agent_input = build_translation_agent_input(message, prompt)
             response = await asyncio.wait_for(run_agent(agent_input), timeout=120)
         except Exception:
             LOGGER.exception("Translation route failed")
             await message.reply_text("Не зміг перекласти. Деталі будуть у логах контейнера.")
             return
+        finally:
+            await presence.stop()
 
         histories[message.chat_id].append(f"Aigan: {response[:500]}")
         remember_observed_message(message, label=f"{user_label(message)} (translation request)")
@@ -7043,61 +7162,62 @@ async def handle_prompt_generation(
         record_chat_answer(message, prompt, route)
         return
 
-    has_reference = build_reference_context(message) != "(none)"
-    if has_reference:
-        user_id = message.from_user.id if message.from_user else "unknown"
-        LOGGER.info("Reference context attached chat_id=%s user_id=%s", message.chat_id, user_id)
-    web_context = await maybe_prefetch_web_context(message, prompt, route)
-    recalled_memory_context = None
-    semantic_memory_context = None
-    if route == "memory_recall":
-        recall_state = new_memory_context_state()
-        recalled_memory_context = await prepare_recalled_memory_context(message, prompt, recall_intent, recall_state)
-        memory_context, expanded_memory_context, memory_context_stats = await prepare_agent_memory_context(
-            message,
-            prompt,
-            route,
-            state=recall_state,
-        )
-    else:
-        memory_context, expanded_memory_context, memory_context_stats = await prepare_agent_memory_context(
-            message,
-            prompt,
-            route,
-        )
-        semantic_memory_context = await prepare_semantic_memory_context(
-            message,
-            prompt,
-            route,
-            exclude_item_ids=memory_context_stats.selected_item_ids,
-        )
-    agent_input = build_agent_input(
-        message,
-        prompt,
-        memory_context=memory_context,
-        expanded_memory_context=expanded_memory_context,
-        semantic_memory_context=semantic_memory_context,
-        recalled_memory_context=recalled_memory_context,
-        web_context=web_context,
-        route=route,
-    )
-    remember_context_diagnostics(
-        message.chat_id,
-        route=route,
-        prompt_chars=len(agent_input),
-        memory_context=memory_context,
-        expanded_memory_context=expanded_memory_context,
-        semantic_memory_context=semantic_memory_context,
-        recalled_memory_context=recalled_memory_context,
-        compilation_stats=memory_context_stats,
-    )
-
     try:
+        has_reference = build_reference_context(message) != "(none)"
+        if has_reference:
+            user_id = message.from_user.id if message.from_user else "unknown"
+            LOGGER.info("Reference context attached chat_id=%s user_id=%s", message.chat_id, user_id)
+        web_context = await maybe_prefetch_web_context(message, prompt, route)
+        recalled_memory_context = None
+        semantic_memory_context = None
+        if route == "memory_recall":
+            recall_state = new_memory_context_state()
+            recalled_memory_context = await prepare_recalled_memory_context(message, prompt, recall_intent, recall_state)
+            memory_context, expanded_memory_context, memory_context_stats = await prepare_agent_memory_context(
+                message,
+                prompt,
+                route,
+                state=recall_state,
+            )
+        else:
+            memory_context, expanded_memory_context, memory_context_stats = await prepare_agent_memory_context(
+                message,
+                prompt,
+                route,
+            )
+            semantic_memory_context = await prepare_semantic_memory_context(
+                message,
+                prompt,
+                route,
+                exclude_item_ids=memory_context_stats.selected_item_ids,
+            )
+        agent_input = build_agent_input(
+            message,
+            prompt,
+            memory_context=memory_context,
+            expanded_memory_context=expanded_memory_context,
+            semantic_memory_context=semantic_memory_context,
+            recalled_memory_context=recalled_memory_context,
+            web_context=web_context,
+            route=route,
+        )
+        remember_context_diagnostics(
+            message.chat_id,
+            route=route,
+            prompt_chars=len(agent_input),
+            memory_context=memory_context,
+            expanded_memory_context=expanded_memory_context,
+            semantic_memory_context=semantic_memory_context,
+            recalled_memory_context=recalled_memory_context,
+            compilation_stats=memory_context_stats,
+        )
         response = await asyncio.wait_for(run_agent(agent_input), timeout=120)
     except Exception:
         LOGGER.exception("Agent run failed")
         await message.reply_text("Запит не вдався. Деталі будуть у логах контейнера.")
         return
+    finally:
+        await presence.stop()
 
     histories[message.chat_id].append(f"Aigan: {response[:500]}")
     remember_observed_message(message, label=f"{user_label(message)} (current request)")
@@ -7122,7 +7242,8 @@ async def handle_image_prompt(message: Message, prompt: str) -> None:
 
     mark_cooldown(message)
     remember_observed_message(message, label=f"{user_label(message)} (image request)")
-    await message.get_bot().send_chat_action(chat_id=message.chat_id, action=ChatAction.TYPING)
+    presence = activity_presence_for_message(message, action=ChatAction.TYPING)
+    await presence.start()
 
     try:
         image_data_urls = await extract_image_data_urls(message)
@@ -7152,6 +7273,8 @@ Explain the image according to the current request. Ukrainian by default; Englis
         LOGGER.exception("Image analysis failed")
         await message.reply_text("Не зміг проаналізувати зображення. Деталі будуть у логах контейнера.")
         return
+    finally:
+        await presence.stop()
 
     histories[message.chat_id].append(f"{user_label(message)}: {prompt[:500]}")
     histories[message.chat_id].append(f"Aigan: {response[:500]}")

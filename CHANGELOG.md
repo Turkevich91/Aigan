@@ -1,5 +1,11 @@
 # Aigan Changelog
 
+## 2026-05-19 - Telegram activity presence
+
+- Added a centralized Telegram activity presence helper for long-running text, web, memory, translation, image, and visual-media routes.
+- Changed internet image lookup to show `typing` while searching and `upload_photo` immediately before sending photos.
+- Surfaced sanitized Telegram presence and private-chat draft capability rows in tool diagnostics.
+
 ## 2026-05-18 - Reliable public URL lookup
 
 - Added explicit configurable timeouts for MCP tool sessions and DDGS web/image search.

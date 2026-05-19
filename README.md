@@ -300,7 +300,13 @@ Long text replies are split by the delivery layer instead of being truncated at 
 MAX_REPLY_CHARS=12000
 TELEGRAM_TEXT_CHUNK_CHARS=3500
 MAX_REPLY_CHUNKS=4
+TELEGRAM_ACTIVITY_PRESENCE_ENABLED=true
+TELEGRAM_ACTIVITY_REFRESH_SECONDS=4
+TELEGRAM_STREAMING_DRAFTS_ENABLED=false
+TELEGRAM_STREAMING_DRAFT_DELAY_SECONDS=2.5
 ```
+
+`TELEGRAM_ACTIVITY_PRESENCE_ENABLED` lets Aigan show Telegram-native activity while long-running work is in progress. Text, web, memory, translation, image, and visual-media routes use `typing`; internet image sending switches to `upload_photo` immediately before sending photos. Draft previews are capability-detected but disabled by default and limited to private chats, so group UX does not depend on `sendMessageDraft`.
 
 ## System Health And Self-Analysis
 

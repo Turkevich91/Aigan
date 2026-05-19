@@ -60,6 +60,12 @@ SAFE_HEALTH_FIELDS = {
     "decision_count",
     "sent_decisions",
     "skipped_decisions",
+    "refresh_seconds",
+    "draft_delay_seconds",
+    "send_chat_action_available",
+    "send_message_draft_available",
+    "drafts_enabled",
+    "private_chat_only",
 }
 URL_VALUE_RE = re.compile(
     r"\b[A-Za-z][A-Za-z0-9+.-]{1,}://|www\.|"
@@ -198,6 +204,12 @@ ROW_DETAIL_FIELDS = (
     "decision_count",
     "sent_decisions",
     "skipped_decisions",
+    "refresh_seconds",
+    "draft_delay_seconds",
+    "send_chat_action_available",
+    "send_message_draft_available",
+    "drafts_enabled",
+    "private_chat_only",
 )
 
 
