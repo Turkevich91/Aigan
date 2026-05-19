@@ -374,7 +374,11 @@ class YtDlpMediaAcquisitionAdapter:
                     "file_too_large",
                     backend="yt_dlp",
                     platform=platform,
-                    diagnostics={"max_download_bytes": limits.max_download_bytes, "file_size_bytes": actual_size},
+                    diagnostics={
+                        "max_download_bytes": limits.max_download_bytes,
+                        "file_size_bytes": actual_size,
+                        "stage": "download",
+                    },
                 )
         except Exception as exc:
             shutil.rmtree(temp_dir, ignore_errors=True)

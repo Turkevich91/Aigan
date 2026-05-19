@@ -9,6 +9,10 @@ from system_log import sanitize_text
 
 
 MEDIA_CONTEXT_STATES = {"metadata_only", "transcript_summary", "visual_summary", "unavailable"}
+PUBLIC_MEDIA_URL_RE = re.compile(
+    r"\b(?:(?:https?://|www\.)\S+|(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,}(?:/[^\s]*)?)",
+    re.IGNORECASE,
+)
 
 
 @dataclass
@@ -178,12 +182,12 @@ Task:
 
 
 def redact_urls_for_prompt_preview(text: str) -> str:
-    redacted = re.sub(r"\b(?:https?://|www\.)\S+", "[media_url]", text or "", flags=re.IGNORECASE)
+    redacted = PUBLIC_MEDIA_URL_RE.sub("[media_url]", text or "")
     return sanitize_text(redacted, 1200)
 
 
 def sanitize_public_media_summary(text: str, limit: int = 4000) -> str:
-    redacted = re.sub(r"\b(?:https?://|www\.)\S+", "[media_url]", text or "", flags=re.IGNORECASE)
+    redacted = PUBLIC_MEDIA_URL_RE.sub("[media_url]", text or "")
     return sanitize_text(redacted, limit)
 
 

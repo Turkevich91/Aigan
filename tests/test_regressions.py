@@ -1332,6 +1332,7 @@ class ToolRuntimeTests(unittest.TestCase):
         self.assertIsNone(result.source_path)
         self.assertEqual(10, result.diagnostics["max_download_bytes"])
         self.assertEqual(11, result.diagnostics["file_size_bytes"])
+        self.assertEqual("download", result.diagnostics["stage"])
 
     def test_yt_dlp_media_acquisition_download_rejects_known_large_file_before_download(self) -> None:
         download_attempted = False
@@ -1635,7 +1636,10 @@ class ToolRuntimeTests(unittest.TestCase):
             ok=True,
             state="transcript_summary",
             platform="youtube",
-            summary="summary echoed https://www.youtube.com/watch?v=dQw4w9WgXcQ&token=secret-token",
+            summary=(
+                "summary echoed https://www.youtube.com/watch?v=dQw4w9WgXcQ&token=secret-token "
+                "and bare youtube.com/watch?v=dQw4w9WgXcQ&token=secret-token"
+            ),
         )
 
         response = public_media_context_response(context_result)
@@ -1644,6 +1648,15 @@ class ToolRuntimeTests(unittest.TestCase):
         self.assertIn("[media_url]", response)
         self.assertNotIn("youtube.com", response)
         self.assertNotIn("secret-token", response)
+
+    def test_public_media_context_prompt_preview_redacts_bare_domains(self) -> None:
+        from media_context import redact_urls_for_prompt_preview
+
+        preview = redact_urls_for_prompt_preview("look at youtube.com/watch?v=dQw4w9WgXcQ&token=secret-token")
+
+        self.assertIn("[media_url]", preview)
+        self.assertNotIn("youtube.com", preview)
+        self.assertNotIn("secret-token", preview)
 
     def test_public_media_context_route_uses_media_acquisition_metadata(self) -> None:
         class FakeMediaAcquisitionAdapter:
