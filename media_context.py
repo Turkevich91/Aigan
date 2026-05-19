@@ -8,7 +8,7 @@ from media_acquisition import MediaAcquisitionResult, safe_code_label, safe_fail
 from system_log import sanitize_text
 
 
-MEDIA_CONTEXT_STATES = {"metadata_only", "visual_summary", "unavailable"}
+MEDIA_CONTEXT_STATES = {"metadata_only", "transcript_summary", "visual_summary", "unavailable"}
 
 
 @dataclass
@@ -115,11 +115,37 @@ def media_context_unavailable_message(category: str) -> str:
 
 def public_media_context_response(result: MediaContextResult) -> str:
     public = result.public_dict()
-    if public["ok"] and public["state"] == "visual_summary":
+    if public["ok"] and public["state"] in {"transcript_summary", "visual_summary"}:
         return sanitize_text(result.summary, 4000)
     if public["ok"] and public["state"] == "metadata_only":
         return str(public["summary"] or metadata_only_summary(platform=public["platform"], metadata=public["metadata"]))
     return str(public["user_message"] or media_context_unavailable_message(public["failure_category"] or "unexpected_error"))
+
+
+def media_context_with_visual_failure(result: MediaContextResult, category: str) -> MediaContextResult:
+    clean_category = safe_failure_category(category or "unexpected_error")
+    metadata = sanitize_context_mapping(result.metadata)
+    diagnostics = {
+        **sanitize_context_mapping(result.diagnostics),
+        "visual_failure_category": clean_category,
+    }
+    base_summary = sanitize_text(result.summary, 1200)
+    if not base_summary and result.ok:
+        base_summary = metadata_only_summary(platform=safe_platform(result.platform), metadata=metadata)
+    failure_note = f"Візуальний аналіз недоступний: {media_context_unavailable_message(clean_category)}"
+    summary = sanitize_text("\n\n".join(part for part in (base_summary, failure_note) if part), 1600)
+    return MediaContextResult(
+        ok=result.ok,
+        state=safe_state(result.state),
+        platform=safe_platform(result.platform),
+        backend=safe_code_label(result.backend, default="none"),
+        modality=safe_code_label(result.modality, default="metadata"),
+        failure_category=clean_category,
+        user_message=result.user_message,
+        summary=summary,
+        metadata=metadata,
+        diagnostics=diagnostics,
+    )
 
 
 def build_youtube_media_context_prompt(*, user_prompt: str, url: str, context_result: MediaContextResult) -> str:
@@ -175,6 +201,7 @@ def media_context_event_details(result: MediaContextResult) -> dict[str, Any]:
         "frame_count",
         "candidate_frames",
         "selected_frames",
+        "transcript_used",
         "visual_only",
     ):
         if key in metadata:

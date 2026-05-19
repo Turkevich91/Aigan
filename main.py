@@ -47,6 +47,7 @@ from media_context import (
     MediaContextResult,
     media_context_event_details,
     media_context_from_acquisition,
+    media_context_with_visual_failure,
     public_media_context_response,
     redact_urls_for_prompt_preview,
 )
@@ -5021,6 +5022,13 @@ def media_context_from_visual_summary(
     )
 
 
+def public_media_visual_failure_category(category: str) -> str:
+    clean = safe_detail_code(category or "")
+    if clean in {"timeout", "visual_summary_failed"}:
+        return clean
+    return "visual_extraction_unavailable"
+
+
 async def acquire_public_media_file(
     request: MediaAcquisitionRequest,
 ) -> MediaAcquisitionFileResult:
@@ -5078,7 +5086,10 @@ async def summarize_public_media_visual_context(
                 message=acquisition_file.failure_category or "download_failed",
                 details=acquisition_file.public_dict(),
             )
-            return context_result
+            return media_context_with_visual_failure(
+                context_result,
+                acquisition_file.failure_category or "download_failed",
+            )
 
         frame_result = await TOOL_RUNTIME.safe_call(
             "media_frames",
@@ -5130,21 +5141,27 @@ async def summarize_public_media_visual_context(
                 source_family="public_media_url",
             )
         if not summary_result.ok:
+            visual_failure_category = public_media_visual_failure_category(summary_result.failure_category)
             system_event(
                 level="warning",
                 component="media_context",
                 event_type="visual_summary_failed",
                 telegram_message=message,
                 route="media_context",
-                message=summary_result.failure_category or "visual_summary_failed",
+                message=visual_failure_category,
                 details={
                     "platform": acquisition_file.platform,
+                    "failure_category": visual_failure_category,
+                    "frame_failure_category": summary_result.failure_category or "unknown",
                     "frame_count": summary_result.frame_count,
                     "source_family": summary_result.source_family,
                     "cleanup_status": frame_result.cleanup_status,
                 },
             )
-            return context_result
+            return media_context_with_visual_failure(
+                context_result,
+                visual_failure_category,
+            )
         return media_context_from_visual_summary(
             platform=acquisition_file.platform,
             backend=acquisition_file.backend,
@@ -5223,6 +5240,17 @@ async def handle_public_media_context_prompt(
                     details={**media_context_event_details(context_result), "failure_category": "unexpected_error"},
                 )
                 response = ""
+            if response:
+                context_result = MediaContextResult(
+                    ok=True,
+                    state="transcript_summary",
+                    platform=context_result.platform,
+                    backend=context_result.backend,
+                    modality="transcript",
+                    summary=sanitize_text(response, 4000),
+                    metadata={**metadata, "transcript_used": True},
+                    diagnostics={"transcript_path": "youtube_agent"},
+                )
         if not response and context_result.ok:
             context_result = await summarize_public_media_visual_context(
                 message,
@@ -5242,6 +5270,8 @@ async def handle_public_media_context_prompt(
     event_type = "context_unavailable"
     if context_result.ok and context_result.state == "visual_summary":
         event_type = "context_visual"
+    elif context_result.ok and context_result.state == "transcript_summary":
+        event_type = "context_transcript"
     elif context_result.ok:
         event_type = "context_metadata"
     system_event(

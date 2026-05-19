@@ -132,7 +132,12 @@ from media_frames import (
     MediaFrameResult,
     NullMediaFrameAdapter,
 )
-from media_context import MediaContextResult, media_context_from_acquisition, public_media_context_response
+from media_context import (
+    MediaContextResult,
+    media_context_from_acquisition,
+    media_context_unavailable_message,
+    public_media_context_response,
+)
 from memory import MemoryStore, SemanticMemoryResult
 from mcp_servers import web
 from reaction_memory import ReactionSpec
@@ -1792,6 +1797,127 @@ class ToolRuntimeTests(unittest.TestCase):
         self.assertEqual("", item.source_text)
         self.assertIn("visual source summary", item.vision_summary)
 
+    def test_public_media_context_route_reports_download_failure_after_metadata(self) -> None:
+        if main.MEMORY is None:
+            self.skipTest("memory store disabled")
+        main.MEMORY.clear_all()
+        main.last_user_call.clear()
+        main.last_chat_call.clear()
+        main.recent_chat_answers.clear()
+
+        class FakeMediaAcquisitionAdapter:
+            def probe_metadata(self, request):
+                return MediaAcquisitionResult(
+                    ok=True,
+                    backend="yt_dlp",
+                    platform="tiktok",
+                    metadata={"extractor": "TikTok", "duration_seconds": 12, "has_subtitles": False},
+                )
+
+            def acquire_media(self, request):
+                return MediaAcquisitionFileResult.unavailable(
+                    failure_category="file_too_large",
+                    backend="yt_dlp",
+                    platform="tiktok",
+                    diagnostics={"file_size_bytes": 60_000_000, "max_download_bytes": 50_000_000},
+                )
+
+            def health_summary(self):
+                return {"name": "media_acquisition", "enabled": True, "available": True, "status": "ok"}
+
+        old_adapter = main.MEDIA_ACQUISITION_ADAPTER
+        main.set_media_acquisition_adapter(FakeMediaAcquisitionAdapter())
+        try:
+            url = "http" + "s://" + "w" + "ww." + "tiktok." + "com/@demo/video/123"
+            prompt = f"summarize this video {url}"
+            message = FakeMessage(prompt, chat_type=ChatType.PRIVATE, message_id=1507)
+            context = SimpleNamespace(bot=SimpleNamespace(username="thrd_ua_bot", id=999, send_chat_action=AsyncMock()))
+
+            handled = asyncio.run(main.handle_public_media_context_prompt(message, context, prompt))
+        finally:
+            main.set_media_acquisition_adapter(old_adapter)
+
+        events_text = json.dumps([event.__dict__ for event in main.SYSTEM_LOG.latest_events(8)], ensure_ascii=False)
+        item = main.MEMORY.message_by_message_id(message.chat_id, message.message_id)
+
+        self.assertTrue(handled)
+        self.assertIn(media_context_unavailable_message("file_too_large"), message.reply_calls[-1]["text"])
+        self.assertIn("file_too_large", events_text)
+        self.assertIsNotNone(item)
+        self.assertIn(media_context_unavailable_message("file_too_large"), item.vision_summary)
+
+    def test_public_media_context_route_reports_visual_failure_after_metadata(self) -> None:
+        if main.MEMORY is None:
+            self.skipTest("memory store disabled")
+        main.MEMORY.clear_all()
+        main.last_user_call.clear()
+        main.last_chat_call.clear()
+        main.recent_chat_answers.clear()
+        acquisition_dirs: list[Path] = []
+
+        class FakeMediaAcquisitionAdapter:
+            def probe_metadata(self, request):
+                return MediaAcquisitionResult(
+                    ok=True,
+                    backend="yt_dlp",
+                    platform="tiktok",
+                    metadata={"extractor": "TikTok", "duration_seconds": 12, "has_subtitles": False},
+                )
+
+            def acquire_media(self, request):
+                temp_dir = Path(tempfile.mkdtemp(prefix="aigan-test-public-media-"))
+                acquisition_dirs.append(temp_dir)
+                source_path = temp_dir / "source.mp4"
+                source_path.write_bytes(b"fake-public-video")
+                return MediaAcquisitionFileResult(
+                    ok=True,
+                    backend="yt_dlp",
+                    platform="tiktok",
+                    source_path=source_path,
+                    mime_type="video/mp4",
+                    file_size_bytes=source_path.stat().st_size,
+                    metadata={"duration_seconds": 12},
+                    cleanup_status="pending",
+                    _temp_dir=temp_dir,
+                )
+
+            def health_summary(self):
+                return {"name": "media_acquisition", "enabled": True, "available": True, "status": "ok"}
+
+        class FailingMediaFrameAdapter:
+            async def extract_frames(self, request):
+                return MediaFrameResult.unavailable(
+                    failure_category="visual_extraction_unavailable",
+                    source_family="public_media_url",
+                    user_message="frame extraction failed",
+                )
+
+            def health_summary(self):
+                return {"name": "media_frames", "enabled": True, "status": "ok", "adapter": "fake"}
+
+        old_acquisition = main.MEDIA_ACQUISITION_ADAPTER
+        old_frames = main.runtime_media_frame_adapter()
+        main.set_media_acquisition_adapter(FakeMediaAcquisitionAdapter())
+        main.set_media_frame_adapter(FailingMediaFrameAdapter())
+        try:
+            url = "http" + "s://" + "w" + "ww." + "tiktok." + "com/@demo/video/123"
+            prompt = f"summarize this video {url}"
+            message = FakeMessage(prompt, chat_type=ChatType.PRIVATE, message_id=1508)
+            context = SimpleNamespace(bot=SimpleNamespace(username="thrd_ua_bot", id=999, send_chat_action=AsyncMock()))
+
+            handled = asyncio.run(main.handle_public_media_context_prompt(message, context, prompt))
+        finally:
+            main.set_media_acquisition_adapter(old_acquisition)
+            main.set_media_frame_adapter(old_frames)
+
+        events_text = json.dumps([event.__dict__ for event in main.SYSTEM_LOG.latest_events(8)], ensure_ascii=False)
+
+        self.assertTrue(handled)
+        self.assertIn(media_context_unavailable_message("visual_extraction_unavailable"), message.reply_calls[-1]["text"])
+        self.assertIn("visual_extraction_unavailable", events_text)
+        self.assertTrue(acquisition_dirs)
+        self.assertTrue(all(not path.exists() for path in acquisition_dirs))
+
     def test_public_media_context_disabled_returns_safe_unavailable(self) -> None:
         old_adapter = main.MEDIA_ACQUISITION_ADAPTER
         main.set_media_acquisition_adapter(NullMediaAcquisitionAdapter())
@@ -1876,6 +2002,50 @@ class ToolRuntimeTests(unittest.TestCase):
             self.assertIn("транскрипт-самарі", message.reply_calls[-1]["text"])
         finally:
             main.set_media_acquisition_adapter(old_adapter)
+
+    def test_youtube_media_context_records_transcript_provenance(self) -> None:
+        if main.MEMORY is None:
+            self.skipTest("memory store disabled")
+
+        class FakeMediaAcquisitionAdapter:
+            def probe_metadata(self, request):
+                return MediaAcquisitionResult(
+                    ok=True,
+                    backend="yt_dlp",
+                    platform="youtube",
+                    metadata={"extractor": "YouTube", "duration_seconds": 60, "has_subtitles": True},
+                )
+
+            def health_summary(self):
+                return {"name": "media_acquisition", "enabled": True, "available": True, "status": "ok", "backend": "yt_dlp"}
+
+        old_adapter = main.MEDIA_ACQUISITION_ADAPTER
+        main.set_media_acquisition_adapter(FakeMediaAcquisitionAdapter())
+        main.MEMORY.clear_all()
+        main.last_user_call.clear()
+        main.last_chat_call.clear()
+        main.recent_chat_answers.clear()
+        try:
+            url = "http" + "s://" + "w" + "ww." + "youtube." + "com/watch?v=dQw4w9WgXcQ"
+            prompt = f"summarize this video {url}"
+            message = FakeMessage(prompt, chat_type=ChatType.PRIVATE, message_id=1509)
+            context = SimpleNamespace(bot=SimpleNamespace(username="thrd_ua_bot", id=999, send_chat_action=AsyncMock()))
+
+            with patch.object(main, "run_agent", new=AsyncMock(return_value="transcript summary")):
+                handled = asyncio.run(main.handle_public_media_context_prompt(message, context, prompt))
+        finally:
+            main.set_media_acquisition_adapter(old_adapter)
+
+        events_text = json.dumps([event.__dict__ for event in main.SYSTEM_LOG.latest_events(8)], ensure_ascii=False)
+        item = main.MEMORY.message_by_message_id(message.chat_id, message.message_id)
+
+        self.assertTrue(handled)
+        self.assertIn("transcript summary", message.reply_calls[-1]["text"])
+        self.assertIn("context_transcript", events_text)
+        self.assertIn("transcript_used", events_text)
+        self.assertIsNotNone(item)
+        self.assertIn("transcript", item.raw_note)
+        self.assertIn("transcript summary", item.vision_summary)
 
     def test_media_context_diagnostics_row_reflects_acquisition_state(self) -> None:
         class FakeMediaAcquisitionAdapter:
