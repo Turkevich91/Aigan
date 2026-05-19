@@ -1,5 +1,11 @@
 # Aigan Changelog
 
+## 2026-05-19 - Public media URL context route
+
+- Added an explicit `media_context` route for private, reply-to-bot, or group-invocation requests about public media URLs.
+- Reused the existing `media_acquisition` safety boundary before answering and kept ordinary group URL messages passive.
+- Returned grounded YouTube transcript answers when the current transcript path can help, or honest metadata-only/unavailable responses without promising TikTok/Instagram reliability.
+
 ## 2026-05-19 - Telegram activity presence
 
 - Added a centralized Telegram activity presence helper for long-running text, web, memory, translation, image, and visual-media routes.

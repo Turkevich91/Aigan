@@ -12,6 +12,7 @@ import sys
 import tempfile
 import time
 import urllib.request
+import urllib.parse
 from collections import Counter, defaultdict, deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -34,8 +35,17 @@ from memory import EmbeddingCandidate, MemoryItem, MemoryStore, SemanticMemoryRe
 from media_acquisition import (
     MediaAcquisitionAdapter,
     MediaAcquisitionLimits,
+    MediaAcquisitionRequest,
+    MediaAcquisitionResult,
     NullMediaAcquisitionAdapter,
     YtDlpMediaAcquisitionAdapter,
+    platform_from_url,
+)
+from media_context import (
+    build_youtube_media_context_prompt,
+    media_context_event_details,
+    media_context_from_acquisition,
+    public_media_context_response,
 )
 from media_frames import FfmpegMediaFrameAdapter, MediaFrameAdapter, MediaFrameLimits, MediaFrameRequest, MediaFrameResult, NullMediaFrameAdapter
 from outbound_reactions import NullReactionAdapter, OutboundReactionAdapter, OutboundReactionConfig, ReactionAdapter
@@ -2510,6 +2520,8 @@ def classify_request(message: Message, prompt: str) -> str:
         return "translate_reference"
     if is_internet_image_request(prompt, has_reference=has_reference):
         return "internet_image_send"
+    if is_public_media_context_request(prompt):
+        return "media_context"
     if is_time_sensitive_request(time_sensitive_signal_text(message, prompt)):
         return "time_sensitive"
     return "normal"
@@ -2521,6 +2533,8 @@ async def classify_request_with_intent(message: Message, prompt: str) -> tuple[s
         return "translate_reference", None
     if is_internet_image_request(prompt, has_reference=has_reference):
         return "internet_image_send", None
+    if is_public_media_context_request(prompt):
+        return "media_context", None
 
     recall_intent = await detect_memory_recall_intent(message, prompt)
     if recall_intent.is_recall:
@@ -4541,6 +4555,35 @@ def configured_capability_rows() -> list[CapabilityRow]:
             ),
         )
     )
+    try:
+        media_acquisition_health = runtime_media_acquisition_adapter().health_summary()
+    except Exception:
+        media_acquisition_health = {}
+    acquisition_enabled = bool(media_acquisition_health.get("enabled", False))
+    acquisition_available = bool(media_acquisition_health.get("available", False))
+    rows.append(
+        CapabilityRow(
+            name="media_context",
+            family="media",
+            enabled=True,
+            configured=acquisition_enabled,
+            available=acquisition_available,
+            status=(
+                "ok"
+                if acquisition_available
+                else ("unconfigured" if acquisition_enabled else "disabled")
+            ),
+            adapter="media_context_route",
+            mode="explicit_public_url",
+            backend=safe_detail_code(media_acquisition_health.get("backend", "") or "media_acquisition"),
+            details={
+                "max_duration_seconds": media_acquisition_health.get("max_duration_seconds", 0),
+                "max_download_bytes": media_acquisition_health.get("max_download_bytes", 0),
+                "backend_available": bool(media_acquisition_health.get("backend_available", False)),
+            },
+            next_action=("check media_acquisition" if acquisition_enabled and not acquisition_available else ""),
+        )
+    )
     rows.append(
         CapabilityRow(
             name="system_log",
@@ -4755,6 +4798,75 @@ def extract_current_prompt_urls(text: str) -> list[str]:
     return urls[:3]
 
 
+MEDIA_CONTEXT_PLATFORMS = {"tiktok", "youtube", "instagram"}
+MEDIA_CONTEXT_HINTS = (
+    "video",
+    "clip",
+    "short",
+    "shorts",
+    "reel",
+    "reels",
+    "tiktok",
+    "youtube",
+    "youtu.be",
+    "instagram",
+    "відео",
+    "видео",
+    "ролик",
+    "кліп",
+    "клип",
+    "шортс",
+    "що тут",
+    "что тут",
+    "підсумуй",
+    "суммариз",
+    "summarize",
+)
+
+
+def has_media_context_hint(prompt: str) -> bool:
+    lowered = (prompt or "").casefold()
+    return any(hint in lowered for hint in MEDIA_CONTEXT_HINTS)
+
+
+def public_media_context_url_from_prompt(prompt: str) -> str:
+    urls = extract_current_prompt_urls(prompt)
+    if not urls:
+        return ""
+    for url in urls:
+        if platform_from_url(url) in MEDIA_CONTEXT_PLATFORMS:
+            return url
+    return ""
+
+
+def is_public_media_context_request(prompt: str) -> bool:
+    return bool(public_media_context_url_from_prompt(prompt))
+
+
+def youtube_tool_url_for_context(url: str) -> str:
+    if platform_from_url(url) != "youtube":
+        return url
+    parsed = urllib.parse.urlparse(url)
+    host = (parsed.hostname or "").lower()
+    path = parsed.path.strip("/")
+    video_id = ""
+    if host.endswith("youtu.be") and path:
+        video_id = path.split("/")[0]
+    elif "youtube.com" in host:
+        video_id = urllib.parse.parse_qs(parsed.query).get("v", [""])[0]
+        if not video_id:
+            parts = path.split("/")
+            for marker in ("shorts", "embed", "live"):
+                if marker in parts:
+                    index = parts.index(marker)
+                    if len(parts) > index + 1:
+                        video_id = parts[index + 1]
+                        break
+    if re.fullmatch(r"[A-Za-z0-9_-]{11}", video_id or ""):
+        return f"https://www.youtube.com/watch?v={video_id}"
+    return urllib.parse.urlunparse((parsed.scheme, parsed.netloc, parsed.path, "", "", ""))
+
+
 def web_prefetch_query(message: Message, prompt: str) -> str:
     payload = useful_payload_text(message, limit=3000)
     reference = build_reference_context(message)
@@ -4834,6 +4946,130 @@ async def maybe_prefetch_web_context(message: Message, prompt: str, route: str) 
             },
         )
         return f"Web prefetch failed: {failure_category}"
+
+
+def save_public_media_context_summary_memory(
+    message: Message,
+    *,
+    summary: str,
+    platform: str,
+    modality: str,
+) -> int | None:
+    if MEMORY is None or not summary.strip():
+        return None
+
+    existing = MEMORY.message_by_message_id(message.chat_id, getattr(message, "message_id", None))
+    if existing is not None:
+        item_id = existing.id
+    else:
+        user = getattr(message, "from_user", None)
+        item_id = MEMORY.save_message(
+            chat_id=message.chat_id,
+            message_id=getattr(message, "message_id", None),
+            chat_type=str(getattr(message.chat, "type", "")),
+            created_at=message_datetime(message),
+            sender_label=sender_label(message),
+            user_id=getattr(user, "id", None),
+            username=getattr(user, "username", "") or "",
+            is_bot=False,
+            text="",
+            source_text="",
+            content_kind="attachment",
+            attachment_type="public_media_url",
+            mime_type="",
+            raw_note=f"public_media_context:{platform}:{modality}",
+        )
+
+    MEMORY.update_vision_summary(item_id, summary)
+    enqueue_memory_embedding(item_id)
+    return item_id
+
+
+async def handle_public_media_context_prompt(
+    message: Message,
+    context: ContextTypes.DEFAULT_TYPE,
+    prompt: str,
+) -> bool:
+    url = public_media_context_url_from_prompt(prompt)
+    if not url:
+        return False
+
+    presence = activity_presence_for_message(message, bot=context.bot, action=ChatAction.TYPING)
+    await presence.start()
+    started = time.monotonic()
+    platform = platform_from_url(url)
+    acquisition_result = await TOOL_RUNTIME.safe_call(
+        "media_acquisition",
+        "probe_metadata",
+        lambda: asyncio.to_thread(
+            runtime_media_acquisition_adapter().probe_metadata,
+            MediaAcquisitionRequest(url=url, route="public_media_context"),
+        ),
+        default=MediaAcquisitionResult.unavailable(
+            failure_category="unexpected_error",
+            backend="media_acquisition",
+            platform=platform,
+        ),
+        event_context={"telegram_message": message, "route": "media_context"},
+        details={"stage": "metadata", "platform": platform},
+    )
+    context_result = media_context_from_acquisition(acquisition_result)
+    response = ""
+    try:
+        if context_result.ok and context_result.platform == "youtube":
+            agent_prompt = build_youtube_media_context_prompt(
+                user_prompt=prompt,
+                url=youtube_tool_url_for_context(url),
+                context_result=context_result,
+            )
+            try:
+                response = await asyncio.wait_for(run_agent(agent_prompt), timeout=120)
+            except Exception:
+                LOGGER.exception("YouTube media context agent path failed")
+                system_event(
+                    level="warning",
+                    component="media_context",
+                    event_type="context_failed",
+                    telegram_message=message,
+                    route="media_context",
+                    duration_ms=int((time.monotonic() - started) * 1000),
+                    message="youtube_agent_failed",
+                    details={**media_context_event_details(context_result), "failure_category": "provider_failed"},
+                )
+                response = public_media_context_response(context_result)
+        else:
+            response = public_media_context_response(context_result)
+    finally:
+        await presence.stop()
+
+    response = sanitize_text(str(response or "").strip(), 4000)
+    if not response:
+        response = public_media_context_response(context_result)
+
+    event_type = "context_metadata" if context_result.ok else "context_unavailable"
+    system_event(
+        level="info" if context_result.ok else "warning",
+        component="media_context",
+        event_type=event_type,
+        telegram_message=message,
+        route="media_context",
+        duration_ms=int((time.monotonic() - started) * 1000),
+        message=context_result.state,
+        details=media_context_event_details(context_result),
+    )
+    histories[message.chat_id].append(f"Aigan: {response[:500]}")
+    remember_observed_message(message, label=f"{user_label(message)} (public media context request)")
+    passive_contexts[message.chat_id].append(f"Aigan: {clip_text(response, 700)}")
+    remember_bot_message(message.chat_id, response)
+    if context_result.ok:
+        save_public_media_context_summary_memory(
+            message,
+            summary=response,
+            platform=context_result.platform,
+            modality=context_result.modality,
+        )
+    await send_reply(message, response)
+    return True
 
 
 def image_request_object_pattern() -> str:
@@ -7134,6 +7370,10 @@ async def handle_prompt_generation(
         skip_cooldown=True,
         record_user_history=False,
     ):
+        record_chat_answer(message, prompt, route)
+        return
+
+    if route == "media_context" and await handle_public_media_context_prompt(message, context, prompt):
         record_chat_answer(message, prompt, route)
         return
 
