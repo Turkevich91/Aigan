@@ -1385,6 +1385,49 @@ class ToolRuntimeTests(unittest.TestCase):
         self.assertEqual("cleanup_failed", result.diagnostics["cleanup_failure_category"])
         self.assertEqual("oserror", result.diagnostics["cleanup_exception_type"])
 
+    def test_yt_dlp_media_acquisition_download_deadline_times_out_and_cleans(self) -> None:
+        import time
+
+        class FakeYdl:
+            def __init__(self, options):
+                self.options = options
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return None
+
+            def extract_info(self, url, download=False):
+                if download:
+                    time.sleep(0.02)
+                    for hook in self.options.get("progress_hooks", []):
+                        hook({"status": "downloading"})
+                return {
+                    "extractor_key": "TikTok",
+                    "duration": 12,
+                    "formats": [{"format_id": "unknown-size"}],
+                }
+
+        adapter = YtDlpMediaAcquisitionAdapter(
+            limits=MediaAcquisitionLimits(max_duration_seconds=60, max_download_bytes=10_000),
+            ydl_factory=lambda options: FakeYdl(options),
+        )
+        public_dns = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 0))]
+
+        with patch("media_acquisition.socket.getaddrinfo", return_value=public_dns):
+            result = adapter.acquire_media(
+                MediaAcquisitionRequest(
+                    url="https://www.tiktok.com/@demo/video/123",
+                    download_timeout_seconds=0.001,
+                )
+            )
+
+        self.assertFalse(result.ok)
+        self.assertEqual("timeout", result.failure_category)
+        self.assertEqual("download", result.diagnostics["stage"])
+        self.assertEqual("cleaned", result.diagnostics["cleanup_status"])
+
     def test_yt_dlp_media_acquisition_download_rejects_known_large_file_before_download(self) -> None:
         download_attempted = False
 
@@ -1964,7 +2007,9 @@ class ToolRuntimeTests(unittest.TestCase):
         main.last_chat_call.clear()
         main.recent_chat_answers.clear()
 
-        class SlowMediaAcquisitionAdapter:
+        download_requests: list[MediaAcquisitionRequest] = []
+
+        class TimeoutMediaAcquisitionAdapter:
             def probe_metadata(self, request):
                 return MediaAcquisitionResult(
                     ok=True,
@@ -1974,20 +2019,19 @@ class ToolRuntimeTests(unittest.TestCase):
                 )
 
             def acquire_media(self, request):
-                import time
-
-                time.sleep(0.2)
+                download_requests.append(request)
                 return MediaAcquisitionFileResult.unavailable(
-                    failure_category="download_failed",
+                    failure_category="timeout",
                     backend="yt_dlp",
                     platform="tiktok",
+                    diagnostics={"stage": "download", "timeout_seconds": request.download_timeout_seconds or 0},
                 )
 
             def health_summary(self):
                 return {"name": "media_acquisition", "enabled": True, "available": True, "status": "ok"}
 
         old_adapter = main.MEDIA_ACQUISITION_ADAPTER
-        main.set_media_acquisition_adapter(SlowMediaAcquisitionAdapter())
+        main.set_media_acquisition_adapter(TimeoutMediaAcquisitionAdapter())
         try:
             url = "http" + "s://" + "w" + "ww." + "tiktok." + "com/@demo/video/123"
             prompt = f"summarize this video {url}"
@@ -2003,6 +2047,8 @@ class ToolRuntimeTests(unittest.TestCase):
         item = main.MEMORY.message_by_message_id(message.chat_id, message.message_id)
 
         self.assertTrue(handled)
+        self.assertTrue(download_requests)
+        self.assertEqual(0.01, download_requests[0].download_timeout_seconds)
         self.assertIn(media_context_unavailable_message("timeout"), message.reply_calls[-1]["text"])
         self.assertIn("timeout", events_text)
         self.assertIsNotNone(item)

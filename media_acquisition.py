@@ -5,6 +5,7 @@ import ipaddress
 import shutil
 import socket
 import tempfile
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Protocol
@@ -59,6 +60,7 @@ class MediaAcquisitionRequest:
     max_duration_seconds: int | None = None
     max_download_bytes: int | None = None
     socket_timeout_seconds: int | None = None
+    download_timeout_seconds: float | None = None
 
 
 @dataclass
@@ -356,10 +358,13 @@ class YtDlpMediaAcquisitionAdapter:
                 diagnostics=metadata_failure[1],
             )
 
+        download_timeout = request_download_timeout_seconds(limits, request)
+        download_deadline = time.monotonic() + download_timeout
         temp_dir = Path(tempfile.mkdtemp(prefix="aigan-public-media-"))
         try:
-            with self._ydl(options_for_download(limits, temp_dir)) as ydl:
+            with self._ydl(options_for_download(limits, temp_dir, deadline_monotonic=download_deadline)) as ydl:
                 ydl.extract_info(request.url, download=True)
+            raise_if_download_deadline_passed(download_deadline)
             files = downloaded_media_files(temp_dir)
             if not files:
                 return self._file_failure(
@@ -402,6 +407,7 @@ class YtDlpMediaAcquisitionAdapter:
                     **cleanup_temp_dir_for_failure(temp_dir),
                     "exception_type": safe_code_label(type(exc).__name__, default="error"),
                     "stage": "download",
+                    "timeout_seconds": download_timeout,
                 },
             )
 
@@ -541,6 +547,27 @@ def request_limits(base: MediaAcquisitionLimits, request: MediaAcquisitionReques
     return limits.bounded()
 
 
+def request_download_timeout_seconds(limits: MediaAcquisitionLimits, request: MediaAcquisitionRequest) -> float:
+    if request.download_timeout_seconds is not None:
+        try:
+            return max(0.001, float(request.download_timeout_seconds))
+        except (TypeError, ValueError):
+            return max(1.0, float(limits.socket_timeout_seconds) * 3.0)
+    return max(1.0, float(limits.socket_timeout_seconds) * 3.0)
+
+
+def raise_if_download_deadline_passed(deadline_monotonic: float | None) -> None:
+    if deadline_monotonic is not None and time.monotonic() > deadline_monotonic:
+        raise TimeoutError("media_download_timeout")
+
+
+def download_deadline_hook(deadline_monotonic: float | None) -> Callable[[dict[str, Any]], None]:
+    def hook(_status: dict[str, Any]) -> None:
+        raise_if_download_deadline_passed(deadline_monotonic)
+
+    return hook
+
+
 def options_for_probe(limits: MediaAcquisitionLimits) -> dict[str, Any]:
     return {
         "quiet": True,
@@ -557,7 +584,12 @@ def options_for_probe(limits: MediaAcquisitionLimits) -> dict[str, Any]:
     }
 
 
-def options_for_download(limits: MediaAcquisitionLimits, temp_dir: Path) -> dict[str, Any]:
+def options_for_download(
+    limits: MediaAcquisitionLimits,
+    temp_dir: Path,
+    *,
+    deadline_monotonic: float | None = None,
+) -> dict[str, Any]:
     return {
         "quiet": True,
         "no_warnings": True,
@@ -579,6 +611,7 @@ def options_for_download(limits: MediaAcquisitionLimits, temp_dir: Path) -> dict
         "writesubtitles": False,
         "writeautomaticsub": False,
         "cachedir": False,
+        "progress_hooks": [download_deadline_hook(deadline_monotonic)],
     }
 
 

@@ -5059,35 +5059,19 @@ async def acquire_public_media_file(
             platform=platform_from_url(request.url),
             diagnostics={"route": request.route, "stage": "download"},
         )
-    timeout_seconds = media_acquisition_download_timeout_seconds()
-    try:
-        return await asyncio.wait_for(
-            TOOL_RUNTIME.safe_call(
-                "media_acquisition",
-                "acquire_media",
-                lambda: asyncio.to_thread(acquire_media, request),
-                default=MediaAcquisitionFileResult.unavailable(
-                    failure_category="unexpected_error",
-                    backend="media_acquisition",
-                    platform=platform_from_url(request.url),
-                    diagnostics={"route": request.route, "stage": "download"},
-                ),
-                details={"stage": "download", "platform": platform_from_url(request.url)},
-                event_context=event_context,
-            ),
-            timeout=timeout_seconds,
-        )
-    except TimeoutError:
-        return MediaAcquisitionFileResult.unavailable(
-            failure_category="timeout",
+    return await TOOL_RUNTIME.safe_call(
+        "media_acquisition",
+        "acquire_media",
+        lambda: asyncio.to_thread(acquire_media, request),
+        default=MediaAcquisitionFileResult.unavailable(
+            failure_category="unexpected_error",
             backend="media_acquisition",
             platform=platform_from_url(request.url),
-            diagnostics={
-                "route": request.route,
-                "stage": "download",
-                "timeout_seconds": timeout_seconds,
-            },
-        )
+            diagnostics={"route": request.route, "stage": "download"},
+        ),
+        details={"stage": "download", "platform": platform_from_url(request.url)},
+        event_context=event_context,
+    )
 
 
 async def summarize_public_media_visual_context(
@@ -5111,6 +5095,7 @@ async def summarize_public_media_visual_context(
                 max_duration_seconds=CONFIG.media_acquisition_max_duration_seconds,
                 max_download_bytes=CONFIG.media_acquisition_max_download_bytes,
                 socket_timeout_seconds=CONFIG.media_acquisition_socket_timeout_seconds,
+                download_timeout_seconds=media_acquisition_download_timeout_seconds(),
             ),
             event_context={"telegram_message": message, "route": "media_context"},
         )
