@@ -10,7 +10,7 @@ from system_log import sanitize_text
 
 MEDIA_CONTEXT_STATES = {"metadata_only", "transcript_summary", "visual_summary", "unavailable"}
 PUBLIC_MEDIA_URL_RE = re.compile(
-    r"\b(?:(?:https?://|www\.)\S+|(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,}(?:/[^\s]*)?)",
+    r"\b(?:(?:https?://|www\.)\S+|(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,}(?::\d+)?(?:[/?#][^\s]*)?)",
     re.IGNORECASE,
 )
 

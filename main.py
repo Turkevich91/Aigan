@@ -5042,6 +5042,10 @@ def public_media_visual_failure_category(category: str) -> str:
     return "visual_extraction_unavailable"
 
 
+def media_acquisition_download_timeout_seconds() -> float:
+    return max(1.0, float(CONFIG.media_acquisition_socket_timeout_seconds) * 3.0)
+
+
 async def acquire_public_media_file(
     request: MediaAcquisitionRequest,
     *,
@@ -5055,19 +5059,35 @@ async def acquire_public_media_file(
             platform=platform_from_url(request.url),
             diagnostics={"route": request.route, "stage": "download"},
         )
-    return await TOOL_RUNTIME.safe_call(
-        "media_acquisition",
-        "acquire_media",
-        lambda: asyncio.to_thread(acquire_media, request),
-        default=MediaAcquisitionFileResult.unavailable(
-            failure_category="unexpected_error",
+    timeout_seconds = media_acquisition_download_timeout_seconds()
+    try:
+        return await asyncio.wait_for(
+            TOOL_RUNTIME.safe_call(
+                "media_acquisition",
+                "acquire_media",
+                lambda: asyncio.to_thread(acquire_media, request),
+                default=MediaAcquisitionFileResult.unavailable(
+                    failure_category="unexpected_error",
+                    backend="media_acquisition",
+                    platform=platform_from_url(request.url),
+                    diagnostics={"route": request.route, "stage": "download"},
+                ),
+                details={"stage": "download", "platform": platform_from_url(request.url)},
+                event_context=event_context,
+            ),
+            timeout=timeout_seconds,
+        )
+    except TimeoutError:
+        return MediaAcquisitionFileResult.unavailable(
+            failure_category="timeout",
             backend="media_acquisition",
             platform=platform_from_url(request.url),
-            diagnostics={"route": request.route, "stage": "download"},
-        ),
-        details={"stage": "download", "platform": platform_from_url(request.url)},
-        event_context=event_context,
-    )
+            diagnostics={
+                "route": request.route,
+                "stage": "download",
+                "timeout_seconds": timeout_seconds,
+            },
+        )
 
 
 async def summarize_public_media_visual_context(

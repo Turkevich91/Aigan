@@ -1333,6 +1333,57 @@ class ToolRuntimeTests(unittest.TestCase):
         self.assertEqual(10, result.diagnostics["max_download_bytes"])
         self.assertEqual(11, result.diagnostics["file_size_bytes"])
         self.assertEqual("download", result.diagnostics["stage"])
+        self.assertEqual("cleaned", result.diagnostics["cleanup_status"])
+
+    def test_yt_dlp_media_acquisition_cleanup_failure_is_diagnostic(self) -> None:
+        class FakeYdl:
+            def __init__(self, options):
+                self.options = options
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return None
+
+            def extract_info(self, url, download=False):
+                if download:
+                    output = Path(str(self.options["outtmpl"]).replace("%(ext)s", "mp4"))
+                    output.write_bytes(b"01234567890")
+                return {
+                    "extractor_key": "TikTok",
+                    "duration": 12,
+                    "formats": [{"format_id": "unknown-size"}],
+                }
+
+        adapter = YtDlpMediaAcquisitionAdapter(
+            limits=MediaAcquisitionLimits(max_duration_seconds=60, max_download_bytes=10),
+            ydl_factory=lambda options: FakeYdl(options),
+        )
+        public_dns = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 0))]
+        cleanup_paths: list[Path] = []
+        original_rmtree = shutil.rmtree
+
+        def failing_rmtree(path, ignore_errors=False):
+            cleanup_paths.append(Path(path))
+            raise OSError("cleanup denied")
+
+        try:
+            with (
+                patch("media_acquisition.socket.getaddrinfo", return_value=public_dns),
+                patch("media_acquisition.shutil.rmtree", side_effect=failing_rmtree),
+            ):
+                result = adapter.acquire_media(MediaAcquisitionRequest(url="https://www.tiktok.com/@demo/video/123"))
+        finally:
+            for path in cleanup_paths:
+                original_rmtree(path, ignore_errors=True)
+
+        self.assertFalse(result.ok)
+        self.assertEqual("file_too_large", result.failure_category)
+        self.assertEqual("download", result.diagnostics["stage"])
+        self.assertEqual("cleanup_failed", result.diagnostics["cleanup_status"])
+        self.assertEqual("cleanup_failed", result.diagnostics["cleanup_failure_category"])
+        self.assertEqual("oserror", result.diagnostics["cleanup_exception_type"])
 
     def test_yt_dlp_media_acquisition_download_rejects_known_large_file_before_download(self) -> None:
         download_attempted = False
@@ -1638,7 +1689,8 @@ class ToolRuntimeTests(unittest.TestCase):
             platform="youtube",
             summary=(
                 "summary echoed https://www.youtube.com/watch?v=dQw4w9WgXcQ&token=secret-token "
-                "and bare youtube.com/watch?v=dQw4w9WgXcQ&token=secret-token"
+                "and bare youtube.com/watch?v=dQw4w9WgXcQ&token=secret-token "
+                "plus example.com:8080/path?token=secret-token"
             ),
         )
 
@@ -1652,10 +1704,15 @@ class ToolRuntimeTests(unittest.TestCase):
     def test_public_media_context_prompt_preview_redacts_bare_domains(self) -> None:
         from media_context import redact_urls_for_prompt_preview
 
-        preview = redact_urls_for_prompt_preview("look at youtube.com/watch?v=dQw4w9WgXcQ&token=secret-token")
+        preview = redact_urls_for_prompt_preview(
+            "look at youtube.com/watch?v=dQw4w9WgXcQ&token=secret-token "
+            "and example.com:8080/path?token=secret-token and example.net?token=secret-token"
+        )
 
         self.assertIn("[media_url]", preview)
         self.assertNotIn("youtube.com", preview)
+        self.assertNotIn("example.com", preview)
+        self.assertNotIn("example.net", preview)
         self.assertNotIn("secret-token", preview)
 
     def test_public_media_context_route_uses_media_acquisition_metadata(self) -> None:
@@ -1898,6 +1955,58 @@ class ToolRuntimeTests(unittest.TestCase):
         self.assertIn("file_too_large", events_text)
         self.assertIsNotNone(item)
         self.assertIn(media_context_unavailable_message("file_too_large"), item.vision_summary)
+
+    def test_public_media_context_route_reports_download_timeout_after_metadata(self) -> None:
+        if main.MEMORY is None:
+            self.skipTest("memory store disabled")
+        main.MEMORY.clear_all()
+        main.last_user_call.clear()
+        main.last_chat_call.clear()
+        main.recent_chat_answers.clear()
+
+        class SlowMediaAcquisitionAdapter:
+            def probe_metadata(self, request):
+                return MediaAcquisitionResult(
+                    ok=True,
+                    backend="yt_dlp",
+                    platform="tiktok",
+                    metadata={"extractor": "TikTok", "duration_seconds": 12, "has_subtitles": False},
+                )
+
+            def acquire_media(self, request):
+                import time
+
+                time.sleep(0.2)
+                return MediaAcquisitionFileResult.unavailable(
+                    failure_category="download_failed",
+                    backend="yt_dlp",
+                    platform="tiktok",
+                )
+
+            def health_summary(self):
+                return {"name": "media_acquisition", "enabled": True, "available": True, "status": "ok"}
+
+        old_adapter = main.MEDIA_ACQUISITION_ADAPTER
+        main.set_media_acquisition_adapter(SlowMediaAcquisitionAdapter())
+        try:
+            url = "http" + "s://" + "w" + "ww." + "tiktok." + "com/@demo/video/123"
+            prompt = f"summarize this video {url}"
+            message = FakeMessage(prompt, chat_type=ChatType.PRIVATE, message_id=1511)
+            context = SimpleNamespace(bot=SimpleNamespace(username="thrd_ua_bot", id=999, send_chat_action=AsyncMock()))
+
+            with patch.object(main, "media_acquisition_download_timeout_seconds", return_value=0.01):
+                handled = asyncio.run(main.handle_public_media_context_prompt(message, context, prompt))
+        finally:
+            main.set_media_acquisition_adapter(old_adapter)
+
+        events_text = json.dumps([event.__dict__ for event in main.SYSTEM_LOG.latest_events(8)], ensure_ascii=False)
+        item = main.MEMORY.message_by_message_id(message.chat_id, message.message_id)
+
+        self.assertTrue(handled)
+        self.assertIn(media_context_unavailable_message("timeout"), message.reply_calls[-1]["text"])
+        self.assertIn("timeout", events_text)
+        self.assertIsNotNone(item)
+        self.assertIn(media_context_unavailable_message("timeout"), item.vision_summary)
 
     def test_public_media_context_acquisition_exception_has_event_context(self) -> None:
         if main.MEMORY is None:

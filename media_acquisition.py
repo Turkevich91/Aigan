@@ -214,6 +214,20 @@ class NullMediaAcquisitionAdapter:
         }
 
 
+def cleanup_temp_dir_for_failure(temp_dir: Path) -> dict[str, Any]:
+    try:
+        shutil.rmtree(temp_dir, ignore_errors=False)
+    except FileNotFoundError:
+        return {"cleanup_status": "cleaned"}
+    except Exception as exc:
+        return {
+            "cleanup_status": "cleanup_failed",
+            "cleanup_failure_category": "cleanup_failed",
+            "cleanup_exception_type": safe_code_label(type(exc).__name__, default="error"),
+        }
+    return {"cleanup_status": "cleaned"}
+
+
 class SilentYtDlpLogger:
     def debug(self, message: str) -> None:
         return None
@@ -348,46 +362,47 @@ class YtDlpMediaAcquisitionAdapter:
                 ydl.extract_info(request.url, download=True)
             files = downloaded_media_files(temp_dir)
             if not files:
-                shutil.rmtree(temp_dir, ignore_errors=True)
                 return self._file_failure(
                     request,
                     "download_failed",
                     backend="yt_dlp",
                     platform=platform,
-                    diagnostics={"stage": "download"},
+                    diagnostics={**cleanup_temp_dir_for_failure(temp_dir), "stage": "download"},
                 )
             source_path = max(files, key=lambda item: item.stat().st_size)
             actual_size = safe_nonnegative_int(source_path.stat().st_size)
             if actual_size <= 0:
-                shutil.rmtree(temp_dir, ignore_errors=True)
                 return self._file_failure(
                     request,
                     "download_failed",
                     backend="yt_dlp",
                     platform=platform,
-                    diagnostics={"stage": "download"},
+                    diagnostics={**cleanup_temp_dir_for_failure(temp_dir), "stage": "download"},
                 )
             if actual_size > limits.max_download_bytes:
-                shutil.rmtree(temp_dir, ignore_errors=True)
                 return self._file_failure(
                     request,
                     "file_too_large",
                     backend="yt_dlp",
                     platform=platform,
                     diagnostics={
+                        **cleanup_temp_dir_for_failure(temp_dir),
                         "max_download_bytes": limits.max_download_bytes,
                         "file_size_bytes": actual_size,
                         "stage": "download",
                     },
                 )
         except Exception as exc:
-            shutil.rmtree(temp_dir, ignore_errors=True)
             return self._file_failure(
                 request,
                 categorize_yt_dlp_download_exception(exc),
                 backend="yt_dlp",
                 platform=platform,
-                diagnostics={"exception_type": safe_code_label(type(exc).__name__, default="error"), "stage": "download"},
+                diagnostics={
+                    **cleanup_temp_dir_for_failure(temp_dir),
+                    "exception_type": safe_code_label(type(exc).__name__, default="error"),
+                    "stage": "download",
+                },
             )
 
         self.last_failure_category = ""
