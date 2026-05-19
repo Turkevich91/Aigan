@@ -1288,6 +1288,11 @@ class ToolRuntimeTests(unittest.TestCase):
         self.assertFalse(captured_options[1]["skip_download"])
         self.assertEqual(1_000, captured_options[1]["max_filesize"])
         self.assertIn("height<=720", str(captured_options[1]["format"]))
+        self.assertIn("width<=720", str(captured_options[1]["format"]))
+        self.assertLess(
+            str(captured_options[1]["format"]).index("width<=720"),
+            str(captured_options[1]["format"]).index("bestvideo[ext=mp4]/"),
+        )
         self.assertNotIn("secret-token", public_text)
         self.assertNotIn("www.tiktok.com", public_text)
         self.assertNotIn(str(result.source_path), public_text)
@@ -2333,6 +2338,28 @@ class ToolRuntimeTests(unittest.TestCase):
 
         self.assertTrue(intent.active)
         self.assertEqual("quote", intent.url_source)
+
+    def test_public_media_url_from_text_accepts_none(self) -> None:
+        self.assertEqual("", main.public_media_url_from_text(None))
+
+    def test_current_link_preview_url_routes_when_prompt_mentions_link(self) -> None:
+        message = FakeMessage("@thrd_ua_bot расскажи что по этой ссылке", message_id=1516)
+        message.link_preview_options = SimpleNamespace(url="https://vt.tiktok.com/ZSXLINKPREVIEW/")
+
+        intent = main.resolve_public_media_context_intent(message, "расскажи что по этой ссылке")
+
+        self.assertTrue(intent.active)
+        self.assertEqual("current_link_preview", intent.url_source)
+        self.assertEqual("target_summary", intent.intent_mode)
+
+    def test_reference_media_intent_does_not_hijack_unrelated_time_sensitive_prompt(self) -> None:
+        main.passive_contexts.clear()
+        main.passive_contexts[-1001].append("https://vt.tiktok.com/ZSXRECENT/")
+        message = FakeMessage("@thrd_ua_bot яка погода зараз?", message_id=1517)
+
+        intent = main.resolve_public_media_context_intent(message, "яка погода зараз?")
+
+        self.assertFalse(intent.active)
 
     def test_private_bare_media_url_routes_to_media_context(self) -> None:
         requests: list[tuple[str, MediaAcquisitionRequest]] = []

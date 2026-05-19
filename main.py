@@ -4830,6 +4830,15 @@ MEDIA_CONTEXT_HINTS = (
     "суммариз",
     "summarize",
 )
+MEDIA_REFERENCE_HINTS = (
+    "ссылка",
+    "ссылке",
+    "ссылку",
+    "посилання",
+    "лінк",
+    "линк",
+)
+MEDIA_REFERENCE_TOKEN_HINTS = ("link", "url")
 
 
 @dataclass(frozen=True)
@@ -4850,7 +4859,16 @@ def has_media_context_hint(prompt: str) -> bool:
     return any(hint in lowered for hint in MEDIA_CONTEXT_HINTS)
 
 
-def public_media_url_from_text(text: str) -> str:
+def has_media_reference_hint(prompt: str) -> bool:
+    prompt_without_urls = re.sub(r"\b(?:https?://|www\.)\S+", " ", prompt or "", flags=re.IGNORECASE)
+    lowered = prompt_without_urls.casefold()
+    return any(hint in lowered for hint in MEDIA_REFERENCE_HINTS) or any(
+        re.search(rf"\b{re.escape(hint)}\b", lowered) for hint in MEDIA_REFERENCE_TOKEN_HINTS
+    )
+
+
+def public_media_url_from_text(value: Any) -> str:
+    text = str(value or "")
     for url in extract_current_prompt_urls(text):
         if platform_from_url(url) in MEDIA_CONTEXT_PLATFORMS:
             return canonical_public_media_context_url(url)
@@ -4875,12 +4893,7 @@ def is_bare_media_url_prompt(prompt: str) -> bool:
 
 
 def has_reference_media_context_intent(prompt: str) -> bool:
-    if has_media_context_hint(prompt) or is_short_followup_prompt(prompt):
-        return True
-    words = meaningful_followup_words(media_context_prompt_without_urls(prompt))
-    if 1 <= len(words) <= 8 and "?" in (prompt or ""):
-        return True
-    return is_time_sensitive_request(media_context_prompt_without_urls(prompt))
+    return has_media_context_hint(prompt) or has_media_reference_hint(prompt) or is_short_followup_prompt(prompt)
 
 
 def memory_item_public_media_url(item: MemoryItem) -> str:
@@ -4962,7 +4975,7 @@ def resolve_public_media_context_intent(message: Message, prompt: str) -> Public
         if not url:
             continue
         if source in {"current_payload", "current_link_preview"}:
-            if message.chat.type == ChatType.PRIVATE or is_bare_media_url_prompt(text):
+            if message.chat.type == ChatType.PRIVATE or is_bare_media_url_prompt(text) or prompt_allows_reference:
                 return PublicMediaContextIntent(
                     url=url,
                     platform=platform_from_url(url),
