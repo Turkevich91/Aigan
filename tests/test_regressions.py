@@ -153,6 +153,7 @@ from tool_diagnostics import (
     render_row,
 )
 from tool_runtime import NullToolAdapter, ToolRuntime
+from telegram_presence import ActivityPresence, ActivityPresenceSettings, activity_action_for_route, draft_supported_for_chat
 from visual_media_summary import summarize_visual_media_frames
 
 VALID_JPEG = b"\xff\xd8\xff\xe0" + b"valid-jpeg"
@@ -801,6 +802,88 @@ class TelegramFormattingTests(unittest.TestCase):
 
         self.assertEqual(2, len(chunks))
         self.assertIn("[...] скорочено", chunks[-1])
+
+class ActivityPresenceTests(unittest.TestCase):
+    def test_route_mapping_uses_typing_for_current_text_routes(self) -> None:
+        for route in ("normal", "time_sensitive", "memory_recall", "translate_reference", "visual_media_summary"):
+            self.assertEqual("typing", activity_action_for_route(route))
+
+    def test_presence_refreshes_and_stops_cleanly(self) -> None:
+        bot = SimpleNamespace(send_chat_action=AsyncMock())
+        presence = ActivityPresence(
+            bot=bot,
+            chat_id=-1001,
+            action="typing",
+            settings=ActivityPresenceSettings(refresh_seconds=0.01, drafts_enabled=False),
+        )
+
+        async def run_presence() -> tuple[int, int]:
+            await presence.start()
+            await asyncio.sleep(0.025)
+            await presence.stop()
+            stopped_count = bot.send_chat_action.await_count
+            await asyncio.sleep(0.02)
+            return stopped_count, bot.send_chat_action.await_count
+
+        stopped_count, final_count = asyncio.run(run_presence())
+
+        self.assertGreaterEqual(stopped_count, 2)
+        self.assertEqual(stopped_count, final_count)
+
+    def test_missing_send_chat_action_is_safe_noop(self) -> None:
+        presence = ActivityPresence(
+            bot=SimpleNamespace(),
+            chat_id=-1001,
+            settings=ActivityPresenceSettings(refresh_seconds=0),
+        )
+
+        sent = asyncio.run(presence.send_once())
+
+        self.assertFalse(sent)
+
+    def test_streaming_draft_is_private_chat_only_and_failure_safe(self) -> None:
+        settings = ActivityPresenceSettings(refresh_seconds=0, drafts_enabled=True, draft_delay_seconds=0)
+        private_bot = SimpleNamespace(send_chat_action=AsyncMock(), send_message_draft=AsyncMock(return_value=True))
+        group_bot = SimpleNamespace(send_chat_action=AsyncMock(), send_message_draft=AsyncMock(return_value=True))
+        failing_bot = SimpleNamespace(send_chat_action=AsyncMock(), send_message_draft=AsyncMock(side_effect=RuntimeError("boom")))
+
+        async def run_drafts() -> None:
+            private_presence = ActivityPresence(
+                bot=private_bot,
+                chat_id=123,
+                settings=settings,
+                chat_type=ChatType.PRIVATE,
+                draft_text="",
+            )
+            group_presence = ActivityPresence(
+                bot=group_bot,
+                chat_id=-1001,
+                settings=settings,
+                chat_type=ChatType.SUPERGROUP,
+                draft_text="",
+            )
+            failing_presence = ActivityPresence(
+                bot=failing_bot,
+                chat_id=124,
+                settings=settings,
+                chat_type=ChatType.PRIVATE,
+                draft_text="",
+            )
+            await private_presence.start()
+            await group_presence.start()
+            await failing_presence.start()
+            await asyncio.sleep(0.01)
+            await private_presence.stop()
+            await group_presence.stop()
+            await failing_presence.stop()
+
+        asyncio.run(run_drafts())
+
+        private_bot.send_message_draft.assert_awaited_once()
+        group_bot.send_message_draft.assert_not_awaited()
+        failing_bot.send_message_draft.assert_awaited_once()
+        self.assertTrue(draft_supported_for_chat(ChatType.PRIVATE, settings))
+        self.assertFalse(draft_supported_for_chat(ChatType.SUPERGROUP, settings))
 
 
 class ToolRuntimeTests(unittest.TestCase):
@@ -2899,6 +2982,18 @@ class ToolRuntimeTests(unittest.TestCase):
         self.assertIn("reaction_memory", rows)
         self.assertEqual("reactions", rows["reaction_memory"].family)
 
+    def test_configured_rows_include_telegram_presence_and_draft_capabilities(self) -> None:
+        rows = {item.name: item for item in main.configured_capability_rows()}
+
+        self.assertIn("telegram_activity_presence", rows)
+        self.assertEqual("telegram", rows["telegram_activity_presence"].family)
+        self.assertEqual("ok", rows["telegram_activity_presence"].status)
+        self.assertTrue(rows["telegram_activity_presence"].details["send_chat_action_available"])
+        self.assertIn("telegram_streaming_drafts", rows)
+        self.assertEqual("disabled", rows["telegram_streaming_drafts"].status)
+        self.assertTrue(rows["telegram_streaming_drafts"].details["send_message_draft_available"])
+        self.assertTrue(rows["telegram_streaming_drafts"].details["private_chat_only"])
+
     def test_tools_command_is_admin_only(self) -> None:
         admin_message = FakeMessage("/tools")
         non_admin_message = FakeMessage("/tools")
@@ -4313,12 +4408,14 @@ class PersistentMemoryTests(unittest.TestCase):
 
     def test_ordinary_group_short_followup_stays_silent(self) -> None:
         message = FakeMessage("скільки?", message_id=400)
-        context = SimpleNamespace(bot=SimpleNamespace(id=999, username="thrd_ua_bot"))
+        context = SimpleNamespace(bot=SimpleNamespace(id=999, username="thrd_ua_bot", send_chat_action=AsyncMock()))
 
         asyncio.run(main.text_message(SimpleNamespace(effective_message=message), context))
 
         self.assertEqual([], message.reply_calls)
         self.assertEqual({}, main.pending_requests)
+        context.bot.send_chat_action.assert_not_awaited()
+        message.bot.send_chat_action.assert_not_awaited()
         self.assertIn("скільки?", main.format_passive_context(message.chat_id))
 
     def test_short_followup_expansion_records_system_event(self) -> None:
@@ -6304,6 +6401,11 @@ class PersistentMemoryTests(unittest.TestCase):
         self.assertTrue(handled)
         self.assertEqual(1, len(message.photo_calls))
         self.assertIn("Cat", message.photo_calls[0]["caption"])
+        actions = [call.kwargs["action"] for call in message.bot.send_chat_action.await_args_list]
+        self.assertGreaterEqual(len(actions), 2)
+        self.assertEqual("typing", actions[0])
+        self.assertIn("upload_photo", actions)
+        self.assertLess(actions.index("typing"), actions.index("upload_photo"))
 
     def test_translation_reply_route_excludes_memory_and_image_search(self) -> None:
         main.MEMORY.save_message(
