@@ -106,8 +106,8 @@ def media_context_unavailable_message(category: str) -> str:
     }
     messages.update(
         {
-            "visual_extraction_unavailable": "I could not extract representative frames from this media safely.",
-            "visual_summary_failed": "I acquired the media, but could not summarize the visual content reliably.",
+            "visual_extraction_unavailable": "Я не зміг безпечно витягти репрезентативні кадри з цього медіа.",
+            "visual_summary_failed": "Я отримав медіа, але не зміг надійно підсумувати візуальний зміст.",
         }
     )
     return messages.get(safe_failure_category(category), messages["unexpected_error"])

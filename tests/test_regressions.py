@@ -1326,6 +1326,43 @@ class ToolRuntimeTests(unittest.TestCase):
         self.assertEqual(10, result.diagnostics["max_download_bytes"])
         self.assertEqual(11, result.diagnostics["file_size_bytes"])
 
+    def test_yt_dlp_media_acquisition_download_rejects_known_large_file_before_download(self) -> None:
+        download_attempted = False
+
+        class FakeYdl:
+            def __init__(self, options):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return None
+
+            def extract_info(self, url, download=False):
+                nonlocal download_attempted
+                download_attempted = bool(download_attempted or download)
+                return {
+                    "extractor_key": "TikTok",
+                    "duration": 12,
+                    "formats": [{"format_id": "large", "filesize": 2_000_000}],
+                }
+
+        adapter = YtDlpMediaAcquisitionAdapter(
+            limits=MediaAcquisitionLimits(max_duration_seconds=60, max_download_bytes=1_000_000),
+            ydl_factory=lambda options: FakeYdl(options),
+        )
+        public_dns = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 0))]
+
+        with patch("media_acquisition.socket.getaddrinfo", return_value=public_dns):
+            result = adapter.acquire_media(MediaAcquisitionRequest(url="https://www.tiktok.com/@demo/video/123"))
+
+        self.assertFalse(result.ok)
+        self.assertFalse(download_attempted)
+        self.assertEqual("file_too_large", result.failure_category)
+        self.assertEqual(1_000_000, result.diagnostics["max_download_bytes"])
+        self.assertEqual(2_000_000, result.diagnostics["file_size_bytes"])
+
     def test_yt_dlp_media_acquisition_download_rejects_lookalike_before_dns(self) -> None:
         adapter = YtDlpMediaAcquisitionAdapter(ydl_factory=lambda options: object())
 
@@ -1703,6 +1740,13 @@ class ToolRuntimeTests(unittest.TestCase):
 
         old_acquisition = main.MEDIA_ACQUISITION_ADAPTER
         old_frames = main.runtime_media_frame_adapter()
+        main.MEMORY.save_message(
+            chat_id=-1001,
+            message_id=1505,
+            sender_label="Tester",
+            text="prior media source https://www.tiktok.com/@prior/video/999?token=secret-token",
+            created_at=datetime.now(timezone.utc),
+        )
         main.set_media_acquisition_adapter(FakeMediaAcquisitionAdapter())
         main.set_media_frame_adapter(FakeMediaFrameAdapter())
         try:

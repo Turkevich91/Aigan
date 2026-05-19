@@ -125,7 +125,6 @@ class MediaAcquisitionFileResult:
         failure_category: str,
         backend: str = "none",
         platform: str = "unknown",
-        user_message: str = "",
         diagnostics: dict[str, Any] | None = None,
     ) -> "MediaAcquisitionFileResult":
         category = safe_failure_category(failure_category)
@@ -198,7 +197,6 @@ class NullMediaAcquisitionAdapter:
             failure_category="disabled",
             backend="null",
             platform=platform_from_url(request.url),
-            user_message="Media acquisition is disabled.",
         )
 
     def health_summary(self) -> dict[str, Any]:
@@ -698,6 +696,13 @@ def metadata_validation_failure(
         return "duration_limit", {
             "max_duration_seconds": limits.max_duration_seconds,
             "duration_seconds": duration,
+            "stage": "metadata",
+        }
+    file_size = max_known_file_size(info)
+    if file_size and file_size > limits.max_download_bytes:
+        return "file_too_large", {
+            "max_download_bytes": limits.max_download_bytes,
+            "file_size_bytes": file_size,
             "stage": "metadata",
         }
     return None

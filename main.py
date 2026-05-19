@@ -5110,6 +5110,7 @@ async def summarize_public_media_visual_context(
         redacted_prompt = redact_urls_for_prompt_preview(prompt)
         try:
             memory_context = await prepare_memory_context(message, redacted_prompt)
+            memory_context = redact_urls_for_prompt_preview(memory_context)
             summary_result = await summarize_visual_media_frames(
                 frame_result=frame_result,
                 user_prompt=redacted_prompt,
