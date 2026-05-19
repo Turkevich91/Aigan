@@ -711,6 +711,8 @@ class TimeContextTests(unittest.TestCase):
     def test_tool_failure_classifier_ignores_successful_timeout_content(self) -> None:
         self.assertIsNone(main.classify_tool_result_failure("Fetched article about timeout configuration."))
         self.assertIsNone(main.classify_tool_result_failure("1. HTTPX timeout documentation\nhttps://example.com"))
+        self.assertIsNone(main.classify_tool_result_failure("Timeout configuration guide\nFetched page content."))
+        self.assertIsNone(main.classify_tool_result_failure("Timed out is a phrase in this article title."))
 
     def test_agent_tool_end_logs_counts_and_category_not_raw_result(self) -> None:
         hook = main.AiganRunHooks()

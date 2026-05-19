@@ -1295,8 +1295,6 @@ def classify_tool_result_failure(text: str) -> str | None:
             "an error occurred while running the tool",
             "error invoking mcp tool",
             "failed to call tool",
-            "timed out",
-            "timeout",
         )
     ) and has_timeout_failure_signal(normalized):
         return "tool_timeout"
@@ -1304,7 +1302,11 @@ def classify_tool_result_failure(text: str) -> str | None:
 
 
 def mcp_tool_failure_message(context: Any, error: Exception) -> str:
-    category = classify_tool_result_failure(str(error)) or "tool_failed"
+    normalized_error = " ".join(str(error).casefold().split())
+    category = classify_tool_result_failure(str(error))
+    if not category and has_timeout_failure_signal(normalized_error):
+        category = "tool_timeout"
+    category = category or "tool_failed"
     if category == "tool_timeout":
         return (
             "Tool failed: tool_timeout. Validation is incomplete; say the check hit a timeout "
