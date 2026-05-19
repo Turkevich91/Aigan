@@ -4965,10 +4965,17 @@ def public_media_url_candidate_source_kind(source: str) -> str:
 
 def public_media_url_candidates(message: Message, prompt: str) -> list[PublicMediaUrlCandidate]:
     candidates: list[PublicMediaUrlCandidate] = []
+    current_link_preview = link_preview_url_from(message)
+    current_payload = useful_payload_text(message, limit=3000)
     append_public_media_url_candidate(candidates, "current_prompt", prompt or "")
-    append_public_media_url_candidate(candidates, "current_link_preview", link_preview_url_from(message))
-    append_public_media_url_candidate(candidates, "current_payload", useful_payload_text(message, limit=3000))
-    append_public_media_url_candidate(candidates, "current_memory", current_memory_public_media_url(message))
+    append_public_media_url_candidate(candidates, "current_link_preview", current_link_preview)
+    append_public_media_url_candidate(candidates, "current_payload", current_payload)
+    should_check_current_memory = message.chat.type == ChatType.PRIVATE or has_reference_media_context_intent(prompt)
+    current_sources_have_media_url = bool(
+        public_media_url_from_text(current_link_preview) or public_media_url_from_text(current_payload)
+    )
+    if should_check_current_memory and not current_sources_have_media_url:
+        append_public_media_url_candidate(candidates, "current_memory", current_memory_public_media_url(message))
 
     quote = getattr(message, "quote", None)
     quote_text = getattr(quote, "text", "") if quote is not None else ""

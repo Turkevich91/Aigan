@@ -2381,6 +2381,16 @@ class ToolRuntimeTests(unittest.TestCase):
         self.assertEqual("current_link_preview", intent.url_source)
         self.assertIn("ZSXCURRENT", intent.url)
 
+    def test_current_link_preview_skips_current_memory_lookup(self) -> None:
+        message = FakeMessage("@thrd_ua_bot what is this link?", message_id=1519)
+        message.link_preview_options = SimpleNamespace(url="https://vt.tiktok.com/ZSXCURRENT/")
+
+        with patch.object(main, "current_memory_public_media_url", side_effect=AssertionError("unneeded lookup")):
+            intent = main.resolve_public_media_context_intent(message, "what is this link?")
+
+        self.assertTrue(intent.active)
+        self.assertEqual("current_link_preview", intent.url_source)
+
     def test_recent_memory_media_fallback_uses_newest_user_url(self) -> None:
         old_memory = main.MEMORY
         temp_dir = tempfile.TemporaryDirectory()
