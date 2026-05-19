@@ -899,6 +899,7 @@ class ToolRuntimeTests(unittest.TestCase):
         if main.SYSTEM_LOG is not None:
             main.SYSTEM_LOG.clear_all()
         main.TOOL_RUNTIME.clear_error_counts()
+        main.pending_requests.clear()
 
     def test_null_tool_adapter_noops_and_reports_disabled_health(self) -> None:
         runtime = ToolRuntime()
@@ -2310,10 +2311,205 @@ class ToolRuntimeTests(unittest.TestCase):
         self.assertFalse(main.is_public_media_context_request("що тут https://evil-tiktok.com/video/123"))
         self.assertEqual("", main.public_media_context_url_from_prompt("summarize video https://media.example/video"))
 
-    def test_public_media_context_route_requires_explicit_hint_outside_url(self) -> None:
-        self.assertFalse(main.is_public_media_context_request("https://www.tiktok.com/@demo/video/123"))
-        self.assertFalse(main.is_public_media_context_request("https://www.youtube.com/watch?v=dQw4w9WgXcQ"))
+    def test_public_media_context_prompt_accepts_bare_supported_media_url(self) -> None:
+        self.assertTrue(main.is_public_media_context_request("https://www.tiktok.com/@demo/video/123"))
+        self.assertTrue(main.is_public_media_context_request("https://www.youtube.com/watch?v=dQw4w9WgXcQ"))
         self.assertTrue(main.is_public_media_context_request("що тут https://www.tiktok.com/@demo/video/123"))
+
+    def test_public_media_context_intent_marks_non_summary_url_as_supporting_context(self) -> None:
+        message = FakeMessage("це доказ https://www.tiktok.com/@demo/video/123", chat_type=ChatType.PRIVATE)
+
+        intent = main.resolve_public_media_context_intent(message, message.text)
+
+        self.assertTrue(intent.active)
+        self.assertEqual("supporting_context", intent.intent_mode)
+        self.assertEqual("current_prompt", intent.url_source)
+
+    def test_public_media_context_intent_resolves_quote_url(self) -> None:
+        message = FakeMessage("@thrd_ua_bot про що цей рілс?", message_id=1515)
+        message.quote = SimpleNamespace(text="https://vt.tiktok.com/ZSXQUOTE/")
+
+        intent = main.resolve_public_media_context_intent(message, "про що цей рілс?")
+
+        self.assertTrue(intent.active)
+        self.assertEqual("quote", intent.url_source)
+
+    def test_private_bare_media_url_routes_to_media_context(self) -> None:
+        requests: list[tuple[str, MediaAcquisitionRequest]] = []
+
+        class FakeMediaAcquisitionAdapter:
+            def probe_metadata(self, request):
+                requests.append(("metadata", request))
+                return MediaAcquisitionResult(
+                    ok=True,
+                    backend="yt_dlp",
+                    platform="tiktok",
+                    metadata={"extractor": "TikTok", "duration_seconds": 12, "has_subtitles": False},
+                )
+
+            def acquire_media(self, request):
+                requests.append(("download", request))
+                return MediaAcquisitionFileResult.unavailable(
+                    failure_category="download_failed",
+                    backend="yt_dlp",
+                    platform="tiktok",
+                    diagnostics={"stage": "download"},
+                )
+
+            def health_summary(self):
+                return {"name": "media_acquisition", "enabled": True, "available": True, "status": "ok"}
+
+        old_adapter = main.MEDIA_ACQUISITION_ADAPTER
+        main.set_media_acquisition_adapter(FakeMediaAcquisitionAdapter())
+        main.last_user_call.clear()
+        main.last_chat_call.clear()
+        main.recent_chat_answers.clear()
+        try:
+            message = FakeMessage("https://vt.tiktok.com/ZSXTEST/", chat_type=ChatType.PRIVATE, chat_id=407892151)
+            context = SimpleNamespace(bot=SimpleNamespace(username="thrd_ua_bot", id=999, send_chat_action=AsyncMock()))
+
+            asyncio.run(main.text_message(SimpleNamespace(effective_message=message), context))
+        finally:
+            main.set_media_acquisition_adapter(old_adapter)
+
+        self.assertTrue(message.reply_calls)
+        self.assertTrue(requests)
+        self.assertEqual("public_media_context", requests[0][1].route)
+        self.assertEqual("metadata", requests[0][0])
+
+    def test_private_forwarded_bare_media_url_uses_payload_for_media_context(self) -> None:
+        requests: list[MediaAcquisitionRequest] = []
+
+        class FakeMediaAcquisitionAdapter:
+            def probe_metadata(self, request):
+                requests.append(request)
+                return MediaAcquisitionResult(
+                    ok=True,
+                    backend="yt_dlp",
+                    platform="tiktok",
+                    metadata={"extractor": "TikTok", "duration_seconds": 12, "has_subtitles": False},
+                )
+
+            def acquire_media(self, request):
+                requests.append(request)
+                return MediaAcquisitionFileResult.unavailable(
+                    failure_category="download_failed",
+                    backend="yt_dlp",
+                    platform="tiktok",
+                    diagnostics={"stage": "download"},
+                )
+
+            def health_summary(self):
+                return {"name": "media_acquisition", "enabled": True, "available": True, "status": "ok"}
+
+        old_adapter = main.MEDIA_ACQUISITION_ADAPTER
+        main.set_media_acquisition_adapter(FakeMediaAcquisitionAdapter())
+        main.last_user_call.clear()
+        main.last_chat_call.clear()
+        main.recent_chat_answers.clear()
+        try:
+            message = FakeMessage("https://vt.tiktok.com/ZSXFORWARD/", chat_type=ChatType.PRIVATE, chat_id=407892151)
+            message.forward_date = datetime.now(timezone.utc)
+            context = SimpleNamespace(bot=SimpleNamespace(username="thrd_ua_bot", id=999, send_chat_action=AsyncMock()))
+
+            asyncio.run(main.text_message(SimpleNamespace(effective_message=message), context))
+        finally:
+            main.set_media_acquisition_adapter(old_adapter)
+
+        self.assertTrue(message.reply_calls)
+        self.assertTrue(requests)
+        self.assertEqual("public_media_context", requests[0].route)
+
+    def test_group_reply_media_question_resolves_replied_url(self) -> None:
+        requests: list[MediaAcquisitionRequest] = []
+
+        class FakeMediaAcquisitionAdapter:
+            def probe_metadata(self, request):
+                requests.append(request)
+                return MediaAcquisitionResult(
+                    ok=True,
+                    backend="yt_dlp",
+                    platform="tiktok",
+                    metadata={"extractor": "TikTok", "duration_seconds": 12, "has_subtitles": False},
+                )
+
+            def acquire_media(self, request):
+                requests.append(request)
+                return MediaAcquisitionFileResult.unavailable(
+                    failure_category="download_failed",
+                    backend="yt_dlp",
+                    platform="tiktok",
+                    diagnostics={"stage": "download"},
+                )
+
+            def health_summary(self):
+                return {"name": "media_acquisition", "enabled": True, "available": True, "status": "ok"}
+
+        old_adapter = main.MEDIA_ACQUISITION_ADAPTER
+        main.set_media_acquisition_adapter(FakeMediaAcquisitionAdapter())
+        main.last_user_call.clear()
+        main.last_chat_call.clear()
+        main.recent_chat_answers.clear()
+        try:
+            message = FakeMessage("@thrd_ua_bot про що цей рілс?", message_id=1512)
+            message.reply_to_message = FakeMessage("https://vt.tiktok.com/ZSXREPLY/", message_id=1511)
+            context = SimpleNamespace(bot=SimpleNamespace(username="thrd_ua_bot", id=999, send_chat_action=AsyncMock()))
+
+            asyncio.run(main.text_message(SimpleNamespace(effective_message=message), context))
+        finally:
+            main.set_media_acquisition_adapter(old_adapter)
+
+        self.assertTrue(message.reply_calls)
+        self.assertTrue(requests)
+        self.assertEqual("public_media_context", requests[0].route)
+
+    def test_group_followup_media_question_resolves_recent_passive_url(self) -> None:
+        requests: list[MediaAcquisitionRequest] = []
+
+        class FakeMediaAcquisitionAdapter:
+            def probe_metadata(self, request):
+                requests.append(request)
+                return MediaAcquisitionResult(
+                    ok=True,
+                    backend="yt_dlp",
+                    platform="tiktok",
+                    metadata={"extractor": "TikTok", "duration_seconds": 12, "has_subtitles": False},
+                )
+
+            def acquire_media(self, request):
+                requests.append(request)
+                return MediaAcquisitionFileResult.unavailable(
+                    failure_category="download_failed",
+                    backend="yt_dlp",
+                    platform="tiktok",
+                    diagnostics={"stage": "download"},
+                )
+
+            def health_summary(self):
+                return {"name": "media_acquisition", "enabled": True, "available": True, "status": "ok"}
+
+        old_adapter = main.MEDIA_ACQUISITION_ADAPTER
+        main.set_media_acquisition_adapter(FakeMediaAcquisitionAdapter())
+        main.passive_contexts.clear()
+        main.last_user_call.clear()
+        main.last_chat_call.clear()
+        main.recent_chat_answers.clear()
+        try:
+            passive = FakeMessage("https://vt.tiktok.com/ZSXPASSIVE/", message_id=1513)
+            question = FakeMessage("@thrd_ua_bot про що цей рілс?", message_id=1514)
+            context = SimpleNamespace(bot=SimpleNamespace(username="thrd_ua_bot", id=999, send_chat_action=AsyncMock()))
+
+            asyncio.run(main.text_message(SimpleNamespace(effective_message=passive), context))
+            self.assertEqual([], passive.reply_calls)
+            self.assertEqual([], requests)
+
+            asyncio.run(main.text_message(SimpleNamespace(effective_message=question), context))
+        finally:
+            main.set_media_acquisition_adapter(old_adapter)
+
+        self.assertTrue(question.reply_calls)
+        self.assertTrue(requests)
+        self.assertEqual("public_media_context", requests[0].route)
 
     def test_youtube_media_context_uses_transcript_agent_with_sanitized_url(self) -> None:
         class FakeMediaAcquisitionAdapter:
