@@ -1562,6 +1562,11 @@ class ToolRuntimeTests(unittest.TestCase):
         self.assertFalse(main.is_public_media_context_request("що тут https://evil-tiktok.com/video/123"))
         self.assertEqual("", main.public_media_context_url_from_prompt("summarize video https://media.example/video"))
 
+    def test_public_media_context_route_requires_explicit_hint_outside_url(self) -> None:
+        self.assertFalse(main.is_public_media_context_request("https://www.tiktok.com/@demo/video/123"))
+        self.assertFalse(main.is_public_media_context_request("https://www.youtube.com/watch?v=dQw4w9WgXcQ"))
+        self.assertTrue(main.is_public_media_context_request("що тут https://www.tiktok.com/@demo/video/123"))
+
     def test_youtube_media_context_uses_transcript_agent_with_sanitized_url(self) -> None:
         class FakeMediaAcquisitionAdapter:
             def probe_metadata(self, request):

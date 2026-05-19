@@ -4825,13 +4825,16 @@ MEDIA_CONTEXT_HINTS = (
 
 
 def has_media_context_hint(prompt: str) -> bool:
-    lowered = (prompt or "").casefold()
+    prompt_without_urls = re.sub(r"\b(?:https?://|www\.)\S+", " ", prompt or "", flags=re.IGNORECASE)
+    lowered = prompt_without_urls.casefold()
     return any(hint in lowered for hint in MEDIA_CONTEXT_HINTS)
 
 
 def public_media_context_url_from_prompt(prompt: str) -> str:
     urls = extract_current_prompt_urls(prompt)
     if not urls:
+        return ""
+    if not has_media_context_hint(prompt):
         return ""
     for url in urls:
         if platform_from_url(url) in MEDIA_CONTEXT_PLATFORMS:
