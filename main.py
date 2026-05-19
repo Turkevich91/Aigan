@@ -2527,9 +2527,10 @@ def classify_request(message: Message, prompt: str) -> str:
         return "translate_reference"
     if is_internet_image_request(prompt, has_reference=has_reference):
         return "internet_image_send"
-    if resolve_public_media_context_intent(message, prompt).active:
+    public_media_intent = resolve_public_media_context_intent(message, prompt)
+    if public_media_intent.active:
         return "media_context"
-    if has_unresolved_public_media_context_intent(message, prompt):
+    if has_unresolved_public_media_context_intent(message, prompt, public_media_intent):
         return "media_context_unresolved"
     if is_time_sensitive_request(time_sensitive_signal_text(message, prompt)):
         return "time_sensitive"
@@ -2542,9 +2543,10 @@ async def classify_request_with_intent(message: Message, prompt: str) -> tuple[s
         return "translate_reference", None
     if is_internet_image_request(prompt, has_reference=has_reference):
         return "internet_image_send", None
-    if resolve_public_media_context_intent(message, prompt).active:
+    public_media_intent = resolve_public_media_context_intent(message, prompt)
+    if public_media_intent.active:
         return "media_context", None
-    if has_unresolved_public_media_context_intent(message, prompt):
+    if has_unresolved_public_media_context_intent(message, prompt, public_media_intent):
         return "media_context_unresolved", None
 
     recall_intent = await detect_memory_recall_intent(message, prompt)
@@ -5266,8 +5268,13 @@ PUBLIC_MEDIA_MISSING_REFERENT_RESPONSE = (
 )
 
 
-def has_unresolved_public_media_context_intent(message: Message, prompt: str) -> bool:
-    if resolve_public_media_context_intent(message, prompt).active:
+def has_unresolved_public_media_context_intent(
+    message: Message,
+    prompt: str,
+    resolved_intent: PublicMediaContextIntent | None = None,
+) -> bool:
+    intent = resolved_intent if resolved_intent is not None else resolve_public_media_context_intent(message, prompt)
+    if intent.active:
         return False
     if has_supported_image(message) or has_supported_visual_media(message):
         return False
@@ -7941,7 +7948,7 @@ async def reply_missing_public_media_referent(message: Message, prompt: str) -> 
         component="media_context",
         event_type="context_missing_referent",
         telegram_message=message,
-        route="media_context",
+        route="media_context_unresolved",
         message="missing_referent",
         details=public_media_referent_diagnostics(message, prompt),
     )
@@ -7997,8 +8004,9 @@ async def handle_prompt(
         return
 
     has_current_payload = has_current_context_payload(message)
-    has_public_media_context = resolve_public_media_context_intent(message, prompt).active
-    if not has_public_media_context and has_unresolved_public_media_context_intent(message, prompt):
+    public_media_intent = resolve_public_media_context_intent(message, prompt)
+    has_public_media_context = public_media_intent.active
+    if not has_public_media_context and has_unresolved_public_media_context_intent(message, prompt, public_media_intent):
         await reply_missing_public_media_referent(message, prompt)
         return
 

@@ -229,7 +229,7 @@ class FakeMessage:
         return self.bot
 
     def parse_entity(self, entity):
-        return self.text[getattr(entity, "offset", 0) : getattr(entity, "offset", 0) + getattr(entity, "length", 0)]
+        return main.utf16_entity_slice(self.text, getattr(entity, "offset", 0), getattr(entity, "length", 0))
 
 
 class FakeTelegramFile:
