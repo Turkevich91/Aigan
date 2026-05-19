@@ -2645,6 +2645,22 @@ class ToolRuntimeTests(unittest.TestCase):
         self.assertIn("errors=1", text)
         self.assertIn("warnings=2", text)
 
+    def test_tool_diagnostics_render_row_shows_download_support(self) -> None:
+        text = render_row(
+            CapabilityRow(
+                name="media_acquisition",
+                family="media",
+                enabled=True,
+                configured=True,
+                available=True,
+                status="ok",
+                details={"download_supported": True, "max_download_bytes": 50_000_000},
+            ).normalized()
+        )
+
+        self.assertIn("download_supported=true", text)
+        self.assertIn("max_download_bytes=50000000", text)
+
     def test_tool_diagnostics_adapter_warning_degrades_status(self) -> None:
         rows = build_capability_rows(
             {

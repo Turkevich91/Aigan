@@ -184,6 +184,7 @@ ROW_DETAIL_FIELDS = (
     "max_duration_seconds",
     "max_audio_bytes",
     "max_download_bytes",
+    "download_supported",
     "max_pixels",
     "max_extracted_chars",
     "max_frame_count",
