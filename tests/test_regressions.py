@@ -1630,6 +1630,21 @@ class ToolRuntimeTests(unittest.TestCase):
         self.assertEqual(summary.strip(), response)
         self.assertLess(len(context_result.public_dict()["summary"]), len(response))
 
+    def test_public_media_context_response_redacts_summary_urls(self) -> None:
+        context_result = MediaContextResult(
+            ok=True,
+            state="transcript_summary",
+            platform="youtube",
+            summary="summary echoed https://www.youtube.com/watch?v=dQw4w9WgXcQ&token=secret-token",
+        )
+
+        response = public_media_context_response(context_result)
+
+        self.assertIn("summary echoed", response)
+        self.assertIn("[media_url]", response)
+        self.assertNotIn("youtube.com", response)
+        self.assertNotIn("secret-token", response)
+
     def test_public_media_context_route_uses_media_acquisition_metadata(self) -> None:
         class FakeMediaAcquisitionAdapter:
             def __init__(self) -> None:
@@ -1694,12 +1709,14 @@ class ToolRuntimeTests(unittest.TestCase):
         main.last_chat_call.clear()
         main.recent_chat_answers.clear()
         acquisition_dirs: list[Path] = []
+        acquisition_requests: list[MediaAcquisitionRequest] = []
         frame_dirs: list[Path] = []
         frame_requests: list[MediaFrameRequest] = []
         case = self
 
         class FakeMediaAcquisitionAdapter:
             def probe_metadata(self, request):
+                acquisition_requests.append(request)
                 return MediaAcquisitionResult(
                     ok=True,
                     backend="yt_dlp",
@@ -1708,6 +1725,7 @@ class ToolRuntimeTests(unittest.TestCase):
                 )
 
             def acquire_media(self, request):
+                acquisition_requests.append(request)
                 temp_dir = Path(tempfile.mkdtemp(prefix="aigan-test-public-media-"))
                 acquisition_dirs.append(temp_dir)
                 source_path = temp_dir / "source.mp4"
@@ -1778,7 +1796,13 @@ class ToolRuntimeTests(unittest.TestCase):
             message = FakeMessage(prompt, chat_type=ChatType.PRIVATE, message_id=1506)
             context = SimpleNamespace(bot=SimpleNamespace(username="thrd_ua_bot", id=999, send_chat_action=AsyncMock()))
 
-            with patch.object(main, "run_vision", new=AsyncMock(return_value="visual source summary from frames")) as run_vision:
+            with patch.object(
+                main,
+                "run_vision",
+                new=AsyncMock(
+                    return_value="visual source summary from frames https://www.tiktok.com/@demo/video/123?token=secret-token"
+                ),
+            ) as run_vision:
                 handled = asyncio.run(main.handle_public_media_context_prompt(message, context, prompt))
         finally:
             main.set_media_acquisition_adapter(old_acquisition)
@@ -1790,9 +1814,14 @@ class ToolRuntimeTests(unittest.TestCase):
 
         self.assertTrue(handled)
         self.assertEqual(1, len(frame_requests))
+        self.assertTrue(acquisition_requests)
+        self.assertTrue(all("secret-token" not in request.url for request in acquisition_requests))
+        self.assertTrue(all("?" not in request.url for request in acquisition_requests))
         self.assertEqual("public_media_url", frame_requests[0].source_family)
         self.assertEqual("tiktok", frame_requests[0].provenance_label)
         self.assertIn("visual source summary", message.reply_calls[-1]["text"])
+        self.assertNotIn("www.tiktok.com", message.reply_calls[-1]["text"])
+        self.assertNotIn("secret-token", message.reply_calls[-1]["text"])
         self.assertNotIn("www.tiktok.com", vision_prompt)
         self.assertNotIn("secret-token", vision_prompt)
         self.assertNotIn("www.tiktok.com", events_text)
@@ -1805,6 +1834,8 @@ class ToolRuntimeTests(unittest.TestCase):
         self.assertEqual("", item.text)
         self.assertEqual("", item.source_text)
         self.assertIn("visual source summary", item.vision_summary)
+        self.assertNotIn("www.tiktok.com", item.vision_summary)
+        self.assertNotIn("secret-token", item.vision_summary)
 
     def test_public_media_context_route_reports_download_failure_after_metadata(self) -> None:
         if main.MEMORY is None:
@@ -1854,6 +1885,59 @@ class ToolRuntimeTests(unittest.TestCase):
         self.assertIn("file_too_large", events_text)
         self.assertIsNotNone(item)
         self.assertIn(media_context_unavailable_message("file_too_large"), item.vision_summary)
+
+    def test_public_media_context_acquisition_exception_has_event_context(self) -> None:
+        if main.MEMORY is None:
+            self.skipTest("memory store disabled")
+        main.MEMORY.clear_all()
+        main.SYSTEM_LOG.clear_all()
+        main.last_user_call.clear()
+        main.last_chat_call.clear()
+        main.recent_chat_answers.clear()
+
+        class FakeMediaAcquisitionAdapter:
+            def probe_metadata(self, request):
+                return MediaAcquisitionResult(
+                    ok=True,
+                    backend="yt_dlp",
+                    platform="tiktok",
+                    metadata={"extractor": "TikTok", "duration_seconds": 12, "has_subtitles": False},
+                )
+
+            def acquire_media(self, request):
+                raise RuntimeError("download failed")
+
+            def health_summary(self):
+                return {"name": "media_acquisition", "enabled": True, "available": True, "status": "ok"}
+
+        old_adapter = main.MEDIA_ACQUISITION_ADAPTER
+        main.set_media_acquisition_adapter(FakeMediaAcquisitionAdapter())
+        try:
+            url = "http" + "s://" + "w" + "ww." + "tiktok." + "com/@demo/video/123?token=secret-token"
+            prompt = f"summarize this video {url}"
+            message = FakeMessage(prompt, chat_type=ChatType.PRIVATE, message_id=1509)
+            context = SimpleNamespace(bot=SimpleNamespace(username="thrd_ua_bot", id=999, send_chat_action=AsyncMock()))
+
+            handled = asyncio.run(main.handle_public_media_context_prompt(message, context, prompt))
+        finally:
+            main.set_media_acquisition_adapter(old_adapter)
+
+        events = main.SYSTEM_LOG.latest_events(12)
+        tool_events = [
+            event
+            for event in events
+            if event.component == "tool_runtime" and event.details.get("operation") == "acquire_media"
+        ]
+        events_text = json.dumps([event.__dict__ for event in events], ensure_ascii=False)
+
+        self.assertTrue(handled)
+        self.assertTrue(tool_events)
+        self.assertEqual("media_context", tool_events[0].route)
+        self.assertEqual(message.chat_id, tool_events[0].chat_id)
+        self.assertEqual("download", tool_events[0].details.get("stage"))
+        self.assertEqual("tiktok", tool_events[0].details.get("platform"))
+        self.assertNotIn("www.tiktok.com", events_text)
+        self.assertNotIn("secret-token", events_text)
 
     def test_public_media_context_route_reports_visual_failure_after_metadata(self) -> None:
         if main.MEMORY is None:

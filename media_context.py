@@ -33,7 +33,7 @@ class MediaContextResult:
             "modality": safe_code_label(self.modality, default="unavailable"),
             "failure_category": safe_failure_category(self.failure_category) if self.failure_category else "",
             "user_message": sanitize_text(self.user_message, 240),
-            "summary": sanitize_text(self.summary, 1200),
+            "summary": sanitize_public_media_summary(self.summary, 1200),
             "metadata": sanitize_context_mapping(self.metadata),
             "diagnostics": sanitize_context_mapping(self.diagnostics),
         }
@@ -116,7 +116,7 @@ def media_context_unavailable_message(category: str) -> str:
 def public_media_context_response(result: MediaContextResult) -> str:
     public = result.public_dict()
     if public["ok"] and public["state"] in {"transcript_summary", "visual_summary"}:
-        return sanitize_text(result.summary, 4000)
+        return sanitize_public_media_summary(result.summary, 4000)
     if public["ok"] and public["state"] == "metadata_only":
         return str(public["summary"] or metadata_only_summary(platform=public["platform"], metadata=public["metadata"]))
     return str(public["user_message"] or media_context_unavailable_message(public["failure_category"] or "unexpected_error"))
@@ -180,6 +180,11 @@ Task:
 def redact_urls_for_prompt_preview(text: str) -> str:
     redacted = re.sub(r"\b(?:https?://|www\.)\S+", "[media_url]", text or "", flags=re.IGNORECASE)
     return sanitize_text(redacted, 1200)
+
+
+def sanitize_public_media_summary(text: str, limit: int = 4000) -> str:
+    redacted = re.sub(r"\b(?:https?://|www\.)\S+", "[media_url]", text or "", flags=re.IGNORECASE)
+    return sanitize_text(redacted, limit)
 
 
 def media_context_event_details(result: MediaContextResult) -> dict[str, Any]:

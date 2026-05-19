@@ -50,6 +50,7 @@ from media_context import (
     media_context_with_visual_failure,
     public_media_context_response,
     redact_urls_for_prompt_preview,
+    sanitize_public_media_summary,
 )
 from media_frames import FfmpegMediaFrameAdapter, MediaFrameAdapter, MediaFrameLimits, MediaFrameRequest, MediaFrameResult, NullMediaFrameAdapter
 from outbound_reactions import NullReactionAdapter, OutboundReactionAdapter, OutboundReactionConfig, ReactionAdapter
@@ -4842,12 +4843,22 @@ def public_media_context_url_from_prompt(prompt: str) -> str:
         return ""
     for url in urls:
         if platform_from_url(url) in MEDIA_CONTEXT_PLATFORMS:
-            return url
+            return canonical_public_media_context_url(url)
     return ""
 
 
 def is_public_media_context_request(prompt: str) -> bool:
     return bool(public_media_context_url_from_prompt(prompt))
+
+
+def canonical_public_media_context_url(url: str) -> str:
+    platform = platform_from_url(url)
+    if platform == "youtube":
+        return youtube_tool_url_for_context(url)
+    parsed = urllib.parse.urlparse(url)
+    if not parsed.scheme or not parsed.netloc:
+        return url
+    return urllib.parse.urlunparse((parsed.scheme, parsed.netloc, parsed.path, "", "", ""))
 
 
 def youtube_tool_url_for_context(url: str) -> str:
@@ -5013,7 +5024,7 @@ def media_context_from_visual_summary(
         platform=platform,
         backend=backend,
         modality="visual_summary",
-        summary=sanitize_text(summary_result.summary, 4000),
+        summary=sanitize_public_media_summary(summary_result.summary, 4000),
         metadata=metadata,
         diagnostics={
             "source_family": frame_result.source_family,
@@ -5031,6 +5042,8 @@ def public_media_visual_failure_category(category: str) -> str:
 
 async def acquire_public_media_file(
     request: MediaAcquisitionRequest,
+    *,
+    event_context: dict[str, Any] | None = None,
 ) -> MediaAcquisitionFileResult:
     acquire_media = getattr(runtime_media_acquisition_adapter(), "acquire_media", None)
     if not callable(acquire_media):
@@ -5051,12 +5064,14 @@ async def acquire_public_media_file(
             diagnostics={"route": request.route, "stage": "download"},
         ),
         details={"stage": "download", "platform": platform_from_url(request.url)},
+        event_context=event_context,
     )
 
 
 async def summarize_public_media_visual_context(
     message: Message,
     prompt: str,
+    url: str,
     acquisition_result: MediaAcquisitionResult,
     context_result: MediaContextResult,
 ) -> MediaContextResult:
@@ -5069,12 +5084,13 @@ async def summarize_public_media_visual_context(
     try:
         acquisition_file = await acquire_public_media_file(
             MediaAcquisitionRequest(
-                url=public_media_context_url_from_prompt(prompt),
+                url=url,
                 route="public_media_context",
                 max_duration_seconds=CONFIG.media_acquisition_max_duration_seconds,
                 max_download_bytes=CONFIG.media_acquisition_max_download_bytes,
                 socket_timeout_seconds=CONFIG.media_acquisition_socket_timeout_seconds,
-            )
+            ),
+            event_context={"telegram_message": message, "route": "media_context"},
         )
         if not acquisition_file.ok or acquisition_file.source_path is None:
             system_event(
@@ -5247,14 +5263,16 @@ async def handle_public_media_context_prompt(
                     platform=context_result.platform,
                     backend=context_result.backend,
                     modality="transcript",
-                    summary=sanitize_text(response, 4000),
+                    summary=sanitize_public_media_summary(response, 4000),
                     metadata={**metadata, "transcript_used": True},
                     diagnostics={"transcript_path": "youtube_agent"},
                 )
+                response = public_media_context_response(context_result)
         if not response and context_result.ok:
             context_result = await summarize_public_media_visual_context(
                 message,
                 prompt,
+                url,
                 acquisition_result,
                 context_result,
             )
