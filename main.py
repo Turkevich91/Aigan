@@ -1252,21 +1252,25 @@ def prefixed_tool_failure_category(normalized: str, prefix: str, fallback: str) 
     category = re.sub(r"[^a-z0-9_-]", "", suffix.split(maxsplit=1)[0]) if suffix else ""
     if category in TOOL_FAILURE_CATEGORIES:
         return category
+    if has_timeout_failure_signal(suffix):
+        return "tool_timeout"
     return fallback
+
+
+def has_timeout_failure_signal(normalized: str) -> bool:
+    return (
+        normalized == "tool_timeout"
+        or normalized.startswith(("tool_timeout", "timed out", "timeout", "request timed out"))
+        or "timed out" in normalized
+        or "timedout" in normalized
+        or ("waited " in normalized and "seconds" in normalized)
+    )
 
 
 def classify_tool_result_failure(text: str) -> str | None:
     normalized = " ".join((text or "").casefold().split())
     if not normalized:
         return None
-    if (
-        "tool_timeout" in normalized
-        or "timed out" in normalized
-        or "timeout" in normalized
-        or "timedout" in normalized
-        or ("waited " in normalized and "seconds" in normalized)
-    ):
-        return "tool_timeout"
     for prefix, fallback in (
         ("fetch failed:", "fetch_failed"),
         ("search failed:", "search_failed"),
@@ -1286,6 +1290,16 @@ def classify_tool_result_failure(text: str) -> str | None:
         return "no_results"
     if normalized.startswith("tool failed"):
         return "tool_failed"
+    if normalized.startswith(
+        (
+            "an error occurred while running the tool",
+            "error invoking mcp tool",
+            "failed to call tool",
+            "timed out",
+            "timeout",
+        )
+    ) and has_timeout_failure_signal(normalized):
+        return "tool_timeout"
     return None
 
 

@@ -695,11 +695,22 @@ class TimeContextTests(unittest.TestCase):
     def test_tool_failure_classifier_preserves_stable_prefixed_categories(self) -> None:
         self.assertEqual("url_rejected", main.classify_tool_result_failure("Fetch failed: url_rejected"))
         self.assertEqual("network_error", main.classify_tool_result_failure("Search failed: network_error"))
+        self.assertEqual("tool_timeout", main.classify_tool_result_failure("Fetch failed: TimeoutError: request timed out"))
         self.assertEqual(
             "auth_or_rate_limited",
             main.classify_tool_result_failure("Tool failed: auth_or_rate_limited. Validation incomplete"),
         )
         self.assertEqual("fetch_failed", main.classify_tool_result_failure("Fetch failed: raw.example.com"))
+        self.assertEqual(
+            "tool_timeout",
+            main.classify_tool_result_failure(
+                "An error occurred while running the tool. Error: Timed out while waiting."
+            ),
+        )
+
+    def test_tool_failure_classifier_ignores_successful_timeout_content(self) -> None:
+        self.assertIsNone(main.classify_tool_result_failure("Fetched article about timeout configuration."))
+        self.assertIsNone(main.classify_tool_result_failure("1. HTTPX timeout documentation\nhttps://example.com"))
 
     def test_agent_tool_end_logs_counts_and_category_not_raw_result(self) -> None:
         hook = main.AiganRunHooks()
