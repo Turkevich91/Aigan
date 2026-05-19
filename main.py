@@ -1249,7 +1249,7 @@ def prefixed_tool_failure_category(normalized: str, prefix: str, fallback: str) 
     if not normalized.startswith(prefix):
         return None
     suffix = normalized.removeprefix(prefix).strip()
-    category = re.sub(r"[^a-z0-9_.-]", "", suffix.split(maxsplit=1)[0]) if suffix else ""
+    category = re.sub(r"[^a-z0-9_-]", "", suffix.split(maxsplit=1)[0]) if suffix else ""
     if category in TOOL_FAILURE_CATEGORIES:
         return category
     return fallback

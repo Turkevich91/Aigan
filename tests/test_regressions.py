@@ -697,7 +697,7 @@ class TimeContextTests(unittest.TestCase):
         self.assertEqual("network_error", main.classify_tool_result_failure("Search failed: network_error"))
         self.assertEqual(
             "auth_or_rate_limited",
-            main.classify_tool_result_failure("Tool failed: auth_or_rate_limited"),
+            main.classify_tool_result_failure("Tool failed: auth_or_rate_limited. Validation incomplete"),
         )
         self.assertEqual("fetch_failed", main.classify_tool_result_failure("Fetch failed: raw.example.com"))
 
