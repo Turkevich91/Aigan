@@ -115,6 +115,7 @@ from telegram.error import BadRequest
 import main
 from outbound_reactions import EmotionPolicyDecision
 from media_acquisition import (
+    MediaAcquisitionFileResult,
     MediaAcquisitionLimits,
     MediaAcquisitionRequest,
     MediaAcquisitionResult,
@@ -1229,6 +1230,111 @@ class ToolRuntimeTests(unittest.TestCase):
         self.assertNotIn("secret-token", public_text)
         self.assertNotIn("www.tiktok.com/video", public_text)
 
+    def test_yt_dlp_media_acquisition_downloads_temp_file_and_cleans_it(self) -> None:
+        captured_options: list[dict[str, object]] = []
+
+        class FakeYdl:
+            def __init__(self, options):
+                self.options = options
+                captured_options.append(options)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return None
+
+            def extract_info(self, url, download=False):
+                if download:
+                    output = Path(str(self.options["outtmpl"]).replace("%(ext)s", "mp4"))
+                    output.write_bytes(b"fake-video")
+                return {
+                    "extractor_key": "TikTok",
+                    "duration": 12,
+                    "formats": [{"format_id": "low", "filesize": 900}],
+                    "subtitles": {},
+                    "automatic_captions": {},
+                }
+
+        adapter = YtDlpMediaAcquisitionAdapter(
+            limits=MediaAcquisitionLimits(max_duration_seconds=60, max_download_bytes=1_000, socket_timeout_seconds=3),
+            ydl_factory=lambda options: FakeYdl(options),
+        )
+        public_dns = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 0))]
+        with patch("media_acquisition.socket.getaddrinfo", return_value=public_dns):
+            result = adapter.acquire_media(
+                MediaAcquisitionRequest(url="https://www.tiktok.com/@demo/video/123?token=secret-token", route="field_probe")
+            )
+        public_text = json.dumps(result.public_dict(), ensure_ascii=False)
+        temp_dir = result.source_path.parent if result.source_path is not None else None
+
+        self.assertTrue(result.ok)
+        self.assertEqual("yt_dlp", result.backend)
+        self.assertEqual("tiktok", result.platform)
+        self.assertEqual("video/mp4", result.mime_type)
+        self.assertEqual(len(b"fake-video"), result.file_size_bytes)
+        self.assertIsNotNone(result.source_path)
+        self.assertTrue(result.source_path.exists())
+        self.assertEqual("pending", result.cleanup_status)
+        self.assertTrue(captured_options[0]["skip_download"])
+        self.assertFalse(captured_options[1]["skip_download"])
+        self.assertEqual(1_000, captured_options[1]["max_filesize"])
+        self.assertIn("height<=720", str(captured_options[1]["format"]))
+        self.assertNotIn("secret-token", public_text)
+        self.assertNotIn("www.tiktok.com", public_text)
+        self.assertNotIn(str(result.source_path), public_text)
+
+        asyncio.run(result.cleanup())
+
+        self.assertEqual("cleaned", result.cleanup_status)
+        self.assertIsNotNone(temp_dir)
+        self.assertFalse(temp_dir.exists())
+
+    def test_yt_dlp_media_acquisition_download_enforces_actual_file_size(self) -> None:
+        class FakeYdl:
+            def __init__(self, options):
+                self.options = options
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return None
+
+            def extract_info(self, url, download=False):
+                if download:
+                    output = Path(str(self.options["outtmpl"]).replace("%(ext)s", "mp4"))
+                    output.write_bytes(b"01234567890")
+                return {
+                    "extractor_key": "TikTok",
+                    "duration": 12,
+                    "formats": [{"format_id": "unknown-size"}],
+                }
+
+        adapter = YtDlpMediaAcquisitionAdapter(
+            limits=MediaAcquisitionLimits(max_duration_seconds=60, max_download_bytes=10),
+            ydl_factory=lambda options: FakeYdl(options),
+        )
+        public_dns = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 0))]
+
+        with patch("media_acquisition.socket.getaddrinfo", return_value=public_dns):
+            result = adapter.acquire_media(MediaAcquisitionRequest(url="https://www.tiktok.com/@demo/video/123"))
+
+        self.assertFalse(result.ok)
+        self.assertEqual("file_too_large", result.failure_category)
+        self.assertIsNone(result.source_path)
+        self.assertEqual(10, result.diagnostics["max_download_bytes"])
+        self.assertEqual(11, result.diagnostics["file_size_bytes"])
+
+    def test_yt_dlp_media_acquisition_download_rejects_lookalike_before_dns(self) -> None:
+        adapter = YtDlpMediaAcquisitionAdapter(ydl_factory=lambda options: object())
+
+        with patch("media_acquisition.socket.getaddrinfo", side_effect=AssertionError("dns should not run")):
+            result = adapter.acquire_media(MediaAcquisitionRequest(url="https://evil-tiktok.com/video"))
+
+        self.assertFalse(result.ok)
+        self.assertEqual("unsupported_url", result.failure_category)
+
     def test_yt_dlp_media_acquisition_failure_is_low_cardinality_and_sanitized(self) -> None:
         class FakeYdl:
             def __init__(self, options):
@@ -1516,6 +1622,121 @@ class ToolRuntimeTests(unittest.TestCase):
             self.assertNotIn("www.tiktok.com", events_text)
         finally:
             main.set_media_acquisition_adapter(old_adapter)
+
+    def test_public_media_context_route_uses_downloaded_frames_when_available(self) -> None:
+        if main.MEMORY is None:
+            self.skipTest("memory store disabled")
+        main.MEMORY.clear_all()
+        main.histories.clear()
+        main.passive_contexts.clear()
+        main.last_user_call.clear()
+        main.last_chat_call.clear()
+        main.recent_chat_answers.clear()
+        acquisition_dirs: list[Path] = []
+        frame_dirs: list[Path] = []
+        frame_requests: list[MediaFrameRequest] = []
+        case = self
+
+        class FakeMediaAcquisitionAdapter:
+            def probe_metadata(self, request):
+                return MediaAcquisitionResult(
+                    ok=True,
+                    backend="yt_dlp",
+                    platform="tiktok",
+                    metadata={"extractor": "TikTok", "duration_seconds": 12, "has_subtitles": False},
+                )
+
+            def acquire_media(self, request):
+                temp_dir = Path(tempfile.mkdtemp(prefix="aigan-test-public-media-"))
+                acquisition_dirs.append(temp_dir)
+                source_path = temp_dir / "source.mp4"
+                source_path.write_bytes(b"fake-public-video")
+                return MediaAcquisitionFileResult(
+                    ok=True,
+                    backend="yt_dlp",
+                    platform="tiktok",
+                    source_path=source_path,
+                    mime_type="video/mp4",
+                    file_size_bytes=source_path.stat().st_size,
+                    metadata={"duration_seconds": 12},
+                    diagnostics={"stage": "download"},
+                    cleanup_status="pending",
+                    _temp_dir=temp_dir,
+                )
+
+            def health_summary(self):
+                return {
+                    "name": "media_acquisition",
+                    "family": "media",
+                    "enabled": True,
+                    "configured": True,
+                    "available": True,
+                    "adapter": "fake",
+                    "status": "ok",
+                    "backend": "yt_dlp",
+                    "backend_available": True,
+                    "max_duration_seconds": 180,
+                    "max_download_bytes": 50000000,
+                }
+
+        class FakeMediaFrameAdapter:
+            async def extract_frames(self, request):
+                frame_requests.append(request)
+                case.assertTrue(Path(request.source_path).exists())
+                frame_dir = Path(tempfile.mkdtemp(prefix="aigan-test-public-frames-"))
+                frame_dirs.append(frame_dir)
+                frame_path = frame_dir / "frame_001.jpg"
+                frame_path.write_bytes(VALID_JPEG)
+                return MediaFrameResult(
+                    ok=True,
+                    backend="fake",
+                    source_family=request.source_family,
+                    frames=(MediaFrameCandidate(path=frame_path, timestamp_seconds=1.25, index=1),),
+                    candidate_count=1,
+                    selected_count=1,
+                    cleanup_status="pending",
+                    _temp_dir=frame_dir,
+                )
+
+            def health_summary(self):
+                return {"name": "media_frames", "enabled": True, "status": "ok", "adapter": "fake"}
+
+        old_acquisition = main.MEDIA_ACQUISITION_ADAPTER
+        old_frames = main.runtime_media_frame_adapter()
+        main.set_media_acquisition_adapter(FakeMediaAcquisitionAdapter())
+        main.set_media_frame_adapter(FakeMediaFrameAdapter())
+        try:
+            prompt = "summarize this video https://www.tiktok.com/@demo/video/123?token=secret-token"
+            message = FakeMessage(prompt, chat_type=ChatType.PRIVATE, message_id=1506)
+            context = SimpleNamespace(bot=SimpleNamespace(username="thrd_ua_bot", id=999, send_chat_action=AsyncMock()))
+
+            with patch.object(main, "run_vision", new=AsyncMock(return_value="visual source summary from frames")) as run_vision:
+                handled = asyncio.run(main.handle_public_media_context_prompt(message, context, prompt))
+        finally:
+            main.set_media_acquisition_adapter(old_acquisition)
+            main.set_media_frame_adapter(old_frames)
+
+        vision_prompt = run_vision.await_args.args[0]
+        events_text = json.dumps([event.__dict__ for event in main.SYSTEM_LOG.latest_events(8)], ensure_ascii=False)
+        item = main.MEMORY.message_by_message_id(message.chat_id, message.message_id)
+
+        self.assertTrue(handled)
+        self.assertEqual(1, len(frame_requests))
+        self.assertEqual("public_media_url", frame_requests[0].source_family)
+        self.assertEqual("tiktok", frame_requests[0].provenance_label)
+        self.assertIn("visual source summary", message.reply_calls[-1]["text"])
+        self.assertNotIn("www.tiktok.com", vision_prompt)
+        self.assertNotIn("secret-token", vision_prompt)
+        self.assertNotIn("www.tiktok.com", events_text)
+        self.assertNotIn("secret-token", events_text)
+        self.assertTrue(acquisition_dirs)
+        self.assertTrue(frame_dirs)
+        self.assertTrue(all(not path.exists() for path in acquisition_dirs))
+        self.assertTrue(all(not path.exists() for path in frame_dirs))
+        self.assertIsNotNone(item)
+        self.assertEqual("", item.text)
+        self.assertEqual("", item.source_text)
+        self.assertIn("visual source summary", item.vision_summary)
 
     def test_public_media_context_disabled_returns_safe_unavailable(self) -> None:
         old_adapter = main.MEDIA_ACQUISITION_ADAPTER

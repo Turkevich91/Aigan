@@ -8,7 +8,7 @@ from media_acquisition import MediaAcquisitionResult, safe_code_label, safe_fail
 from system_log import sanitize_text
 
 
-MEDIA_CONTEXT_STATES = {"metadata_only", "unavailable"}
+MEDIA_CONTEXT_STATES = {"metadata_only", "visual_summary", "unavailable"}
 
 
 @dataclass
@@ -104,11 +104,19 @@ def media_context_unavailable_message(category: str) -> str:
         "timeout": "Перевірка медіа вперлася у timeout.",
         "unexpected_error": "Перевірка медіа не вдалася.",
     }
+    messages.update(
+        {
+            "visual_extraction_unavailable": "I could not extract representative frames from this media safely.",
+            "visual_summary_failed": "I acquired the media, but could not summarize the visual content reliably.",
+        }
+    )
     return messages.get(safe_failure_category(category), messages["unexpected_error"])
 
 
 def public_media_context_response(result: MediaContextResult) -> str:
     public = result.public_dict()
+    if public["ok"] and public["state"] == "visual_summary":
+        return str(public["summary"] or "")
     if public["ok"] and public["state"] == "metadata_only":
         return str(public["summary"] or metadata_only_summary(platform=public["platform"], metadata=public["metadata"]))
     return str(public["user_message"] or media_context_unavailable_message(public["failure_category"] or "unexpected_error"))
@@ -159,7 +167,16 @@ def media_context_event_details(result: MediaContextResult) -> dict[str, Any]:
     if public["failure_category"]:
         details["failure_category"] = public["failure_category"]
     metadata = public.get("metadata") if isinstance(public.get("metadata"), dict) else {}
-    for key in ("duration_seconds", "format_count", "has_subtitles", "has_auto_captions"):
+    for key in (
+        "duration_seconds",
+        "format_count",
+        "has_subtitles",
+        "has_auto_captions",
+        "frame_count",
+        "candidate_frames",
+        "selected_frames",
+        "visual_only",
+    ):
         if key in metadata:
             details[key] = metadata[key]
     return details

@@ -5,6 +5,7 @@
 - Added an explicit `media_context` route for private, reply-to-bot, or group-invocation requests about public media URLs.
 - Reused the existing `media_acquisition` safety boundary before answering and kept ordinary group URL messages passive.
 - Returned grounded YouTube transcript answers when the current transcript path can help, or honest metadata-only/unavailable responses without promising TikTok/Instagram reliability.
+- Added bounded temporary public-media acquisition for supported links so explicit transcriptless requests can reuse `media_frames` and vision summaries when download, frame extraction, and cleanup all pass.
 
 ## 2026-05-19 - Telegram activity presence
 

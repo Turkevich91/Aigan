@@ -37,6 +37,7 @@ SAFE_HEALTH_FIELDS = {
     "max_duration_seconds",
     "max_audio_bytes",
     "max_download_bytes",
+    "download_supported",
     "max_pixels",
     "max_extracted_chars",
     "max_frame_count",
@@ -136,6 +137,8 @@ SAFE_CATEGORY_VALUES = {
     "tool_operation_failed",
     "unexpected_error",
     "unsupported_url",
+    "visual_extraction_unavailable",
+    "visual_summary_failed",
     "worker_failed",
 }
 SAFE_CATEGORY_PREFIXES = (

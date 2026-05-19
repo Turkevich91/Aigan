@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import importlib.util
 import ipaddress
+import shutil
 import socket
+import tempfile
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Callable, Protocol
 from urllib.parse import urlparse
 
@@ -24,6 +27,8 @@ MEDIA_ACQUISITION_FAILURE_CATEGORIES = {
     "extractor_unavailable",
     "private_or_drm",
     "cleanup_failed",
+    "visual_extraction_unavailable",
+    "visual_summary_failed",
     "timeout",
     "unexpected_error",
 }
@@ -98,8 +103,78 @@ class MediaAcquisitionResult:
         }
 
 
+@dataclass
+class MediaAcquisitionFileResult:
+    ok: bool
+    backend: str = "none"
+    platform: str = "unknown"
+    failure_category: str = ""
+    user_message: str = ""
+    source_path: Path | None = None
+    mime_type: str = ""
+    file_size_bytes: int = 0
+    metadata: dict[str, Any] = field(default_factory=dict)
+    diagnostics: dict[str, Any] = field(default_factory=dict)
+    cleanup_status: str = "not_needed"
+    _temp_dir: Path | None = None
+
+    @classmethod
+    def unavailable(
+        cls,
+        *,
+        failure_category: str,
+        backend: str = "none",
+        platform: str = "unknown",
+        user_message: str = "",
+        diagnostics: dict[str, Any] | None = None,
+    ) -> "MediaAcquisitionFileResult":
+        category = safe_failure_category(failure_category)
+        return cls(
+            ok=False,
+            backend=safe_code_label(backend, default="none"),
+            platform=safe_platform(platform),
+            failure_category=category,
+            user_message=sanitize_text(user_message_for_failure(category), 180),
+            diagnostics=sanitize_public_mapping(diagnostics or {}),
+        )
+
+    async def cleanup(self) -> None:
+        if self._temp_dir is None:
+            if self.cleanup_status == "pending":
+                self.cleanup_status = "not_needed"
+            return
+        try:
+            shutil.rmtree(self._temp_dir, ignore_errors=False)
+        except FileNotFoundError:
+            self.cleanup_status = "cleaned"
+        except Exception:
+            self.cleanup_status = "cleanup_failed"
+        else:
+            self.cleanup_status = "cleaned"
+        finally:
+            self._temp_dir = None
+            self.source_path = None
+
+    def public_dict(self) -> dict[str, Any]:
+        return {
+            "ok": self.ok,
+            "backend": self.backend,
+            "platform": self.platform,
+            "failure_category": self.failure_category,
+            "user_message": self.user_message,
+            "mime_type": safe_code_label(self.mime_type, default=""),
+            "file_size_bytes": self.file_size_bytes,
+            "metadata": sanitize_public_mapping(self.metadata),
+            "diagnostics": sanitize_public_mapping(self.diagnostics),
+            "cleanup_status": safe_code_label(self.cleanup_status, default="not_needed"),
+        }
+
+
 class MediaAcquisitionAdapter(Protocol):
     def probe_metadata(self, request: MediaAcquisitionRequest) -> MediaAcquisitionResult:
+        ...
+
+    def acquire_media(self, request: MediaAcquisitionRequest) -> MediaAcquisitionFileResult:
         ...
 
     def health_summary(self) -> dict[str, Any]:
@@ -118,6 +193,14 @@ class NullMediaAcquisitionAdapter:
             user_message="Media acquisition is disabled.",
         )
 
+    def acquire_media(self, request: MediaAcquisitionRequest) -> MediaAcquisitionFileResult:
+        return MediaAcquisitionFileResult.unavailable(
+            failure_category="disabled",
+            backend="null",
+            platform=platform_from_url(request.url),
+            user_message="Media acquisition is disabled.",
+        )
+
     def health_summary(self) -> dict[str, Any]:
         return {
             "name": self.name,
@@ -129,6 +212,7 @@ class NullMediaAcquisitionAdapter:
             "status": "disabled",
             "error_count": 0,
             "backend": "none",
+            "download_supported": False,
         }
 
 
@@ -228,6 +312,101 @@ class YtDlpMediaAcquisitionAdapter:
             },
         )
 
+    def acquire_media(self, request: MediaAcquisitionRequest) -> MediaAcquisitionFileResult:
+        if not self.enabled:
+            return self._file_failure(request, "disabled", backend="yt_dlp")
+        limits = request_limits(self.limits, request)
+        platform = platform_from_url(request.url)
+        validation_failure = validate_public_media_url(request.url)
+        if validation_failure:
+            return self._file_failure(request, validation_failure, backend="yt_dlp", platform=platform)
+        if not yt_dlp_available() and self.ydl_factory is None:
+            return self._file_failure(request, "extractor_unavailable", backend="yt_dlp", platform=platform)
+
+        try:
+            with self._ydl(options_for_probe(limits)) as ydl:
+                info = ydl.extract_info(request.url, download=False)
+        except Exception as exc:
+            return self._file_failure(
+                request,
+                categorize_yt_dlp_exception(exc),
+                backend="yt_dlp",
+                platform=platform,
+                diagnostics={"exception_type": safe_code_label(type(exc).__name__, default="error"), "stage": "metadata"},
+            )
+        metadata_failure = metadata_validation_failure(info, limits)
+        if metadata_failure:
+            return self._file_failure(
+                request,
+                metadata_failure[0],
+                backend="yt_dlp",
+                platform=platform,
+                diagnostics=metadata_failure[1],
+            )
+
+        temp_dir = Path(tempfile.mkdtemp(prefix="aigan-public-media-"))
+        try:
+            with self._ydl(options_for_download(limits, temp_dir)) as ydl:
+                ydl.extract_info(request.url, download=True)
+            files = downloaded_media_files(temp_dir)
+            if not files:
+                shutil.rmtree(temp_dir, ignore_errors=True)
+                return self._file_failure(
+                    request,
+                    "download_failed",
+                    backend="yt_dlp",
+                    platform=platform,
+                    diagnostics={"stage": "download"},
+                )
+            source_path = max(files, key=lambda item: item.stat().st_size)
+            actual_size = safe_nonnegative_int(source_path.stat().st_size)
+            if actual_size <= 0:
+                shutil.rmtree(temp_dir, ignore_errors=True)
+                return self._file_failure(
+                    request,
+                    "download_failed",
+                    backend="yt_dlp",
+                    platform=platform,
+                    diagnostics={"stage": "download"},
+                )
+            if actual_size > limits.max_download_bytes:
+                shutil.rmtree(temp_dir, ignore_errors=True)
+                return self._file_failure(
+                    request,
+                    "file_too_large",
+                    backend="yt_dlp",
+                    platform=platform,
+                    diagnostics={"max_download_bytes": limits.max_download_bytes, "file_size_bytes": actual_size},
+                )
+        except Exception as exc:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            return self._file_failure(
+                request,
+                categorize_yt_dlp_download_exception(exc),
+                backend="yt_dlp",
+                platform=platform,
+                diagnostics={"exception_type": safe_code_label(type(exc).__name__, default="error"), "stage": "download"},
+            )
+
+        self.last_failure_category = ""
+        metadata = metadata_from_info(info)
+        return MediaAcquisitionFileResult(
+            ok=True,
+            backend="yt_dlp",
+            platform=safe_platform(platform),
+            source_path=source_path,
+            mime_type=mime_type_for_path(source_path),
+            file_size_bytes=actual_size,
+            metadata=metadata,
+            diagnostics={
+                "route": safe_code_label(request.route, default="media_context"),
+                "metadata_only": False,
+                "stage": "download",
+            },
+            cleanup_status="pending",
+            _temp_dir=temp_dir,
+        )
+
     def health_summary(self) -> dict[str, Any]:
         dependency_available = yt_dlp_available()
         backend_available = self.ydl_factory is not None or dependency_available
@@ -252,6 +431,7 @@ class YtDlpMediaAcquisitionAdapter:
             "error_count": self.error_count,
             "warning_count": self.warning_count,
             "backend": "yt_dlp",
+            "download_supported": True,
             "backend_available": backend_available,
             "yt_dlp_available": dependency_available,
             "max_duration_seconds": self.limits.max_duration_seconds,
@@ -282,6 +462,29 @@ class YtDlpMediaAcquisitionAdapter:
             self.error_count += 1
             self.last_failure_category = clean_category
         return MediaAcquisitionResult.unavailable(
+            failure_category=clean_category,
+            backend=backend,
+            platform=platform or platform_from_url(request.url),
+            diagnostics={
+                "route": safe_code_label(request.route, default="media_context"),
+                **sanitize_public_mapping(diagnostics or {}),
+            },
+        )
+
+    def _file_failure(
+        self,
+        request: MediaAcquisitionRequest,
+        category: str,
+        *,
+        backend: str,
+        platform: str | None = None,
+        diagnostics: dict[str, Any] | None = None,
+    ) -> MediaAcquisitionFileResult:
+        clean_category = safe_failure_category(category)
+        if clean_category != "disabled":
+            self.error_count += 1
+            self.last_failure_category = clean_category
+        return MediaAcquisitionFileResult.unavailable(
             failure_category=clean_category,
             backend=backend,
             platform=platform or platform_from_url(request.url),
@@ -335,6 +538,45 @@ def options_for_probe(limits: MediaAcquisitionLimits) -> dict[str, Any]:
         "extractor_retries": 0,
         "ignore_no_formats_error": True,
     }
+
+
+def options_for_download(limits: MediaAcquisitionLimits, temp_dir: Path) -> dict[str, Any]:
+    return {
+        "quiet": True,
+        "no_warnings": True,
+        "logger": SilentYtDlpLogger(),
+        "noplaylist": True,
+        "skip_download": False,
+        "socket_timeout": limits.socket_timeout_seconds,
+        "max_filesize": limits.max_download_bytes,
+        "retries": 0,
+        "fragment_retries": 0,
+        "extractor_retries": 0,
+        "outtmpl": str(temp_dir / "source.%(ext)s"),
+        "format": bounded_video_format_selector(limits.max_download_bytes),
+        "format_sort": ["res:720", "size"],
+        "merge_output_format": "mp4",
+        "overwrites": False,
+        "continuedl": False,
+        "writethumbnail": False,
+        "writesubtitles": False,
+        "writeautomaticsub": False,
+        "cachedir": False,
+    }
+
+
+def bounded_video_format_selector(max_bytes: int) -> str:
+    byte_limit = max(1, int(max_bytes))
+    return (
+        f"best[ext=mp4][height<=720][filesize<={byte_limit}]/"
+        f"best[height<=720][filesize<={byte_limit}]/"
+        f"best[ext=mp4][filesize_approx<={byte_limit}]/"
+        f"best[height<=720][filesize_approx<={byte_limit}]/"
+        "best[ext=mp4][height<=720]/"
+        "best[height<=720]/"
+        "best[ext=mp4]/"
+        "best"
+    )
 
 
 def validate_public_media_url(value: str) -> str:
@@ -417,6 +659,11 @@ def categorize_yt_dlp_exception(exc: Exception) -> str:
     return "unexpected_error"
 
 
+def categorize_yt_dlp_download_exception(exc: Exception) -> str:
+    category = categorize_yt_dlp_exception(exc)
+    return "download_failed" if category == "metadata_failed" else category
+
+
 def yt_dlp_available() -> bool:
     return importlib.util.find_spec("yt_dlp") is not None
 
@@ -439,6 +686,56 @@ def max_known_file_size(info: dict[str, Any]) -> int:
             sizes.append(safe_nonnegative_int(item.get("filesize")))
             sizes.append(safe_nonnegative_int(item.get("filesize_approx")))
     return max(sizes or [0])
+
+
+def metadata_validation_failure(
+    info: Any, limits: MediaAcquisitionLimits
+) -> tuple[str, dict[str, Any]] | None:
+    if not isinstance(info, dict) or not info:
+        return "metadata_failed", {"stage": "metadata"}
+    duration = safe_nonnegative_int(info.get("duration"))
+    if duration and duration > limits.max_duration_seconds:
+        return "duration_limit", {
+            "max_duration_seconds": limits.max_duration_seconds,
+            "duration_seconds": duration,
+            "stage": "metadata",
+        }
+    return None
+
+
+def metadata_from_info(info: dict[str, Any]) -> dict[str, Any]:
+    formats = info.get("formats") if isinstance(info.get("formats"), list) else []
+    subtitles = info.get("subtitles") if isinstance(info.get("subtitles"), dict) else {}
+    automatic_captions = info.get("automatic_captions") if isinstance(info.get("automatic_captions"), dict) else {}
+    return {
+        "extractor": safe_code_label(info.get("extractor_key") or info.get("extractor") or "", default="unknown"),
+        "duration_seconds": safe_nonnegative_int(info.get("duration")),
+        "format_count": len(formats),
+        "has_subtitles": any(bool(items) for items in subtitles.values()),
+        "has_auto_captions": any(bool(items) for items in automatic_captions.values()),
+    }
+
+
+def downloaded_media_files(temp_dir: Path) -> list[Path]:
+    suffixes = {".mp4", ".webm", ".mov", ".mkv", ".m4v"}
+    files: list[Path] = []
+    for item in temp_dir.iterdir():
+        if item.is_file() and item.suffix.lower() in suffixes and not item.name.endswith(".part"):
+            files.append(item)
+    return files
+
+
+def mime_type_for_path(path: Path) -> str:
+    suffix = path.suffix.lower()
+    if suffix == ".mp4" or suffix == ".m4v":
+        return "video/mp4"
+    if suffix == ".webm":
+        return "video/webm"
+    if suffix == ".mov":
+        return "video/quicktime"
+    if suffix == ".mkv":
+        return "video/x-matroska"
+    return "video/mp4"
 
 
 def safe_code_label(value: Any, *, default: str) -> str:
@@ -488,6 +785,8 @@ def user_message_for_failure(category: str) -> str:
         "extractor_unavailable": "The media extractor is unavailable.",
         "private_or_drm": "This media appears private, protected, or DRM-restricted.",
         "cleanup_failed": "Media acquisition cleanup failed.",
+        "visual_extraction_unavailable": "Visual frame extraction is unavailable.",
+        "visual_summary_failed": "Visual media summary failed.",
         "timeout": "Media acquisition timed out.",
     }
     return messages.get(category, "Media acquisition failed.")
