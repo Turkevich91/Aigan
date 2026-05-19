@@ -1,5 +1,11 @@
 # Aigan Changelog
 
+## 2026-05-18 - Reliable public URL lookup
+
+- Added explicit configurable timeouts for MCP tool sessions and DDGS web/image search.
+- Made time-sensitive prefetch prefer URLs in the current trusted prompt before reply/reference context and include direct URL fetch evidence ahead of secondary search.
+- Normalized timeout/fetch/search failures into stable categories so Aigan can report incomplete validation instead of guessing from weak evidence.
+
 ## 2026-05-18 - Working-memory context compiler
 
 - Added source-linked recall expansion so semantic/FTS hits become evidence windows with neighboring messages and reply-chain context.
