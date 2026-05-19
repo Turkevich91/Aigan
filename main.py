@@ -4847,10 +4847,20 @@ class PublicMediaContextIntent:
     platform: str = ""
     url_source: str = ""
     intent_mode: str = ""
+    candidate_rank: int = 0
+    candidate_distance: int = 0
 
     @property
     def active(self) -> bool:
         return bool(self.url)
+
+
+@dataclass(frozen=True)
+class PublicMediaUrlCandidate:
+    source: str
+    text: str
+    rank: int
+    distance: int = 0
 
 
 def has_media_context_hint(prompt: str) -> bool:
@@ -4897,11 +4907,12 @@ def has_reference_media_context_intent(prompt: str) -> bool:
 
 
 def memory_item_public_media_url(item: MemoryItem) -> str:
+    if item.is_bot:
+        return ""
     fields = (
         item.text,
         item.source_text,
         item.source_url,
-        item.vision_summary,
     )
     for field in fields:
         url = public_media_url_from_text(field)
@@ -4910,48 +4921,107 @@ def memory_item_public_media_url(item: MemoryItem) -> str:
     return ""
 
 
-def public_media_url_candidates(message: Message, prompt: str) -> list[tuple[str, str]]:
-    candidates: list[tuple[str, str]] = [
-        ("current_prompt", prompt or ""),
-        ("current_payload", useful_payload_text(message, limit=3000)),
-        ("current_link_preview", link_preview_url_from(message)),
-    ]
+def append_public_media_url_candidate(
+    candidates: list[PublicMediaUrlCandidate],
+    source: str,
+    text: Any,
+    *,
+    distance: int = 0,
+) -> None:
+    value = str(text or "").strip()
+    if not value:
+        return
+    candidates.append(
+        PublicMediaUrlCandidate(
+            source=source,
+            text=value,
+            rank=len(candidates) + 1,
+            distance=max(0, int(distance)),
+        )
+    )
+
+
+def current_memory_public_media_url(message: Message) -> str:
+    if MEMORY is None:
+        return ""
+    item = MEMORY.message_by_message_id(message.chat_id, getattr(message, "message_id", None))
+    return memory_item_public_media_url(item) if item is not None else ""
+
+
+def passive_context_public_media_text(value: str) -> str:
+    text = str(value or "").strip()
+    if re.match(r"^aigan(?:\s*\([^)]*\))?\s*:", text, flags=re.IGNORECASE):
+        return ""
+    return text
+
+
+def public_media_url_candidate_source_kind(source: str) -> str:
+    if source.startswith("current_"):
+        return "current"
+    if source in {"recent_memory", "recent_context"}:
+        return "recent"
+    return "reference"
+
+
+def public_media_url_candidates(message: Message, prompt: str) -> list[PublicMediaUrlCandidate]:
+    candidates: list[PublicMediaUrlCandidate] = []
+    current_link_preview = link_preview_url_from(message)
+    current_payload = useful_payload_text(message, limit=3000)
+    append_public_media_url_candidate(candidates, "current_prompt", prompt or "")
+    append_public_media_url_candidate(candidates, "current_link_preview", current_link_preview)
+    append_public_media_url_candidate(candidates, "current_payload", current_payload)
+    should_check_current_memory = message.chat.type == ChatType.PRIVATE or has_reference_media_context_intent(prompt)
+    current_sources_have_media_url = bool(
+        public_media_url_from_text(current_link_preview) or public_media_url_from_text(current_payload)
+    )
+    if should_check_current_memory and not current_sources_have_media_url:
+        append_public_media_url_candidate(candidates, "current_memory", current_memory_public_media_url(message))
 
     quote = getattr(message, "quote", None)
     quote_text = getattr(quote, "text", "") if quote is not None else ""
-    if quote_text:
-        candidates.append(("quote", quote_text))
+    if quote is not None:
+        append_public_media_url_candidate(candidates, "quote_link_preview", link_preview_url_from(quote))
+    append_public_media_url_candidate(candidates, "quote", quote_text)
 
     replied = getattr(message, "reply_to_message", None)
     if replied is not None:
-        candidates.extend(
-            (
-                ("reply_reference", message_content(replied, limit=3000)),
-                ("reply_link_preview", link_preview_url_from(replied)),
-            )
-        )
+        append_public_media_url_candidate(candidates, "reply_link_preview", link_preview_url_from(replied))
+        append_public_media_url_candidate(candidates, "reply_reference", message_content(replied, limit=3000))
 
     external_reply = getattr(message, "external_reply", None)
     if external_reply is not None:
-        candidates.extend(
-            (
-                ("external_reply", getattr(external_reply, "text", "") or getattr(external_reply, "caption", "")),
-                ("external_link_preview", link_preview_url_from(external_reply)),
-            )
+        append_public_media_url_candidate(candidates, "external_link_preview", link_preview_url_from(external_reply))
+        append_public_media_url_candidate(
+            candidates,
+            "external_reply",
+            getattr(external_reply, "text", "") or getattr(external_reply, "caption", ""),
         )
 
     if has_reference_media_context_intent(prompt):
-        for item in stored_reply_chain_items(message):
+        for distance, item in enumerate(reversed(stored_reply_chain_items(message)), start=1):
             url = memory_item_public_media_url(item)
             if url:
-                candidates.append(("reply_chain_memory", url))
+                append_public_media_url_candidate(candidates, "reply_chain_memory", url, distance=distance)
+        recent_candidates: list[tuple[int, int, str, str]] = []
         if MEMORY is not None:
-            for item in MEMORY.latest(message.chat_id, MEDIA_CONTEXT_RECENT_CANDIDATES):
+            current_message_id = getattr(message, "message_id", None)
+            distance = 0
+            for item in reversed(MEMORY.latest(message.chat_id, MEDIA_CONTEXT_RECENT_CANDIDATES)):
+                if item.message_id == current_message_id or item.is_bot:
+                    continue
+                distance += 1
                 url = memory_item_public_media_url(item)
                 if url:
-                    candidates.append(("recent_memory", url))
-        for item in reversed(list(passive_contexts[message.chat_id])[-MEDIA_CONTEXT_RECENT_CANDIDATES:]):
-            candidates.append(("recent_context", item))
+                    recent_candidates.append((distance, 1, "recent_memory", url))
+        for distance, item in enumerate(
+            reversed(list(passive_contexts[message.chat_id])[-MEDIA_CONTEXT_RECENT_CANDIDATES:]),
+            start=1,
+        ):
+            text = passive_context_public_media_text(item)
+            if text and public_media_url_from_text(text):
+                recent_candidates.append((distance, 0, "recent_context", text))
+        for distance, _priority, source, text in sorted(recent_candidates):
+            append_public_media_url_candidate(candidates, source, text, distance=distance)
 
     return candidates
 
@@ -4965,22 +5035,28 @@ def resolve_public_media_context_intent(message: Message, prompt: str) -> Public
             platform=platform_from_url(current_url),
             url_source="current_prompt",
             intent_mode=intent_mode,
+            candidate_rank=1,
+            candidate_distance=0,
         )
 
     prompt_allows_reference = has_reference_media_context_intent(prompt)
-    for source, text in public_media_url_candidates(message, prompt):
+    for candidate in public_media_url_candidates(message, prompt):
+        source = candidate.source
+        text = candidate.text
         if source == "current_prompt":
             continue
         url = public_media_url_from_text(text)
         if not url:
             continue
-        if source in {"current_payload", "current_link_preview"}:
+        if source in {"current_payload", "current_link_preview", "current_memory"}:
             if message.chat.type == ChatType.PRIVATE or is_bare_media_url_prompt(text) or prompt_allows_reference:
                 return PublicMediaContextIntent(
                     url=url,
                     platform=platform_from_url(url),
                     url_source=source,
                     intent_mode="target_summary",
+                    candidate_rank=candidate.rank,
+                    candidate_distance=candidate.distance,
                 )
             continue
         if prompt_allows_reference:
@@ -4989,6 +5065,8 @@ def resolve_public_media_context_intent(message: Message, prompt: str) -> Public
                 platform=platform_from_url(url),
                 url_source=source,
                 intent_mode="target_summary" if has_media_context_hint(prompt) or is_short_followup_prompt(prompt) else "supporting_context",
+                candidate_rank=candidate.rank,
+                candidate_distance=candidate.distance,
             )
     return PublicMediaContextIntent()
 
@@ -5461,6 +5539,9 @@ async def handle_public_media_context_prompt(
         details={
             **media_context_event_details(context_result),
             "url_source": safe_detail_code(intent.url_source or "unknown"),
+            "candidate_source_kind": public_media_url_candidate_source_kind(intent.url_source or "unknown"),
+            "candidate_rank": intent.candidate_rank,
+            "candidate_distance": intent.candidate_distance,
             "intent_mode": safe_detail_code(intent.intent_mode or "target_summary"),
         },
     )
