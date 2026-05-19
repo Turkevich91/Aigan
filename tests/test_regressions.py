@@ -2506,6 +2506,28 @@ class ToolRuntimeTests(unittest.TestCase):
 
         self.assertFalse(main.has_unresolved_public_media_context_intent(message, "what is this video?"))
 
+    def test_normal_route_does_not_compute_media_referent_diagnostics(self) -> None:
+        main.last_user_call.clear()
+        main.last_chat_call.clear()
+        main.recent_chat_answers.clear()
+        message = FakeMessage("tell me a joke", message_id=1541)
+        context = SimpleNamespace(bot=SimpleNamespace(send_chat_action=AsyncMock()))
+
+        with patch.object(main, "classify_request_with_intent", new=AsyncMock(return_value=("normal", None))):
+            with patch.object(main, "public_media_referent_diagnostics", side_effect=AssertionError("unexpected media diagnostics")):
+                with patch.object(main, "run_agent", new=AsyncMock(return_value="ok")):
+                    asyncio.run(
+                        main.handle_prompt_generation(
+                            message,
+                            context,
+                            "tell me a joke",
+                            allow_pending_wait=False,
+                            skip_cooldown=True,
+                        )
+                    )
+
+        self.assertTrue(message.reply_calls)
+
     def test_current_link_preview_beats_recent_memory_media_url(self) -> None:
         old_memory = main.MEMORY
         temp_dir = tempfile.TemporaryDirectory()

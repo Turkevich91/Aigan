@@ -8096,23 +8096,25 @@ async def handle_prompt_generation(
     await send_activity_action(context.bot, message.chat_id, ChatAction.TYPING, message=message)
     route, recall_intent = await classify_request_with_intent(message, prompt)
     LOGGER.info("Prompt route=%s chat_id=%s", route, message.chat_id)
+    route_details = {
+        "prompt_chars": len(prompt),
+        "has_reference": build_reference_context(message) != "(none)",
+        "has_image": has_supported_image(message),
+        "has_visual_media": has_supported_visual_media(message),
+        "has_url": has_url(prompt),
+        "allow_pending_wait": allow_pending_wait,
+        "memory_recall_confidence": recall_intent.confidence if recall_intent else 0.0,
+        "memory_recall_reason": recall_intent.reason if recall_intent else "",
+    }
+    if route in {"media_context", "media_context_unresolved"} or has_media_context_hint(prompt) or has_media_reference_hint(prompt):
+        route_details.update(public_media_referent_diagnostics(message, prompt))
     system_event(
         component="routing",
         event_type="route_decision",
         telegram_message=message,
         route=route,
         message=route,
-        details={
-            "prompt_chars": len(prompt),
-            "has_reference": build_reference_context(message) != "(none)",
-            "has_image": has_supported_image(message),
-            "has_visual_media": has_supported_visual_media(message),
-            "has_url": has_url(prompt),
-            "allow_pending_wait": allow_pending_wait,
-            "memory_recall_confidence": recall_intent.confidence if recall_intent else 0.0,
-            "memory_recall_reason": recall_intent.reason if recall_intent else "",
-            **public_media_referent_diagnostics(message, prompt),
-        },
+        details=route_details,
     )
 
     if has_supported_visual_media(message) and await handle_visual_media_prompt(
