@@ -1814,6 +1814,8 @@ class ToolRuntimeTests(unittest.TestCase):
             self.assertIn("метадані", item.vision_summary)
             events_text = json.dumps([event.__dict__ for event in main.SYSTEM_LOG.latest_events(5)], ensure_ascii=False)
             self.assertIn("media_context", events_text)
+            self.assertIn("candidate_rank", events_text)
+            self.assertIn("candidate_source_kind", events_text)
             self.assertNotIn("www.tiktok.com", events_text)
         finally:
             main.set_media_acquisition_adapter(old_adapter)
@@ -2351,6 +2353,153 @@ class ToolRuntimeTests(unittest.TestCase):
         self.assertTrue(intent.active)
         self.assertEqual("current_link_preview", intent.url_source)
         self.assertEqual("target_summary", intent.intent_mode)
+
+    def test_current_link_preview_beats_recent_memory_media_url(self) -> None:
+        old_memory = main.MEMORY
+        temp_dir = tempfile.TemporaryDirectory()
+        store = MemoryStore(Path(temp_dir.name) / "memory.sqlite3", retention_days=30)
+        main.MEMORY = store
+        main.passive_contexts.clear()
+        try:
+            store.save_message(
+                chat_id=-1001,
+                message_id=1517,
+                created_at=datetime.now(timezone.utc) - timedelta(minutes=1),
+                is_bot=False,
+                text="https://vt.tiktok.com/ZSXRECENT/",
+            )
+            message = FakeMessage("@thrd_ua_bot what is this link?", message_id=1518)
+            message.link_preview_options = SimpleNamespace(url="https://vt.tiktok.com/ZSXCURRENT/")
+
+            intent = main.resolve_public_media_context_intent(message, "what is this link?")
+        finally:
+            main.MEMORY = old_memory
+            store.close()
+            temp_dir.cleanup()
+
+        self.assertTrue(intent.active)
+        self.assertEqual("current_link_preview", intent.url_source)
+        self.assertIn("ZSXCURRENT", intent.url)
+
+    def test_recent_memory_media_fallback_uses_newest_user_url(self) -> None:
+        old_memory = main.MEMORY
+        temp_dir = tempfile.TemporaryDirectory()
+        store = MemoryStore(Path(temp_dir.name) / "memory.sqlite3", retention_days=30)
+        main.MEMORY = store
+        main.passive_contexts.clear()
+        try:
+            store.save_message(
+                chat_id=-1001,
+                message_id=1520,
+                created_at=datetime.now(timezone.utc) - timedelta(minutes=10),
+                is_bot=False,
+                text="https://vt.tiktok.com/ZSXOLDER/",
+            )
+            store.save_message(
+                chat_id=-1001,
+                message_id=1521,
+                created_at=datetime.now(timezone.utc) - timedelta(minutes=1),
+                is_bot=False,
+                source_text="https://vt.tiktok.com/ZSXNEWER/",
+            )
+            message = FakeMessage("@thrd_ua_bot what is this video?", message_id=1522)
+
+            intent = main.resolve_public_media_context_intent(message, "what is this video?")
+        finally:
+            main.MEMORY = old_memory
+            store.close()
+            temp_dir.cleanup()
+
+        self.assertTrue(intent.active)
+        self.assertEqual("recent_memory", intent.url_source)
+        self.assertEqual(1, intent.candidate_distance)
+        self.assertIn("ZSXNEWER", intent.url)
+
+    def test_recent_passive_media_context_can_beat_older_memory_url(self) -> None:
+        old_memory = main.MEMORY
+        temp_dir = tempfile.TemporaryDirectory()
+        store = MemoryStore(Path(temp_dir.name) / "memory.sqlite3", retention_days=30)
+        main.MEMORY = store
+        main.passive_contexts.clear()
+        try:
+            store.save_message(
+                chat_id=-1001,
+                message_id=1528,
+                created_at=datetime.now(timezone.utc) - timedelta(minutes=10),
+                is_bot=False,
+                text="https://vt.tiktok.com/ZSXOLDER/",
+            )
+            main.passive_contexts[-1001].append("User: https://vt.tiktok.com/ZSXPASSIVE/")
+            message = FakeMessage("@thrd_ua_bot what is this video?", message_id=1529)
+
+            intent = main.resolve_public_media_context_intent(message, "what is this video?")
+        finally:
+            main.MEMORY = old_memory
+            store.close()
+            temp_dir.cleanup()
+
+        self.assertTrue(intent.active)
+        self.assertEqual("recent_context", intent.url_source)
+        self.assertIn("ZSXPASSIVE", intent.url)
+
+    def test_replied_media_url_beats_recent_memory_media_url(self) -> None:
+        old_memory = main.MEMORY
+        temp_dir = tempfile.TemporaryDirectory()
+        store = MemoryStore(Path(temp_dir.name) / "memory.sqlite3", retention_days=30)
+        main.MEMORY = store
+        main.passive_contexts.clear()
+        try:
+            store.save_message(
+                chat_id=-1001,
+                message_id=1524,
+                created_at=datetime.now(timezone.utc) - timedelta(minutes=1),
+                is_bot=False,
+                text="https://vt.tiktok.com/ZSXRECENT/",
+            )
+            message = FakeMessage("@thrd_ua_bot what is this video?", message_id=1525)
+            message.reply_to_message = FakeMessage("https://vt.tiktok.com/ZSXREPLY/", message_id=1523)
+
+            intent = main.resolve_public_media_context_intent(message, "what is this video?")
+        finally:
+            main.MEMORY = old_memory
+            store.close()
+            temp_dir.cleanup()
+
+        self.assertTrue(intent.active)
+        self.assertEqual("reply_reference", intent.url_source)
+        self.assertIn("ZSXREPLY", intent.url)
+
+    def test_recent_generated_media_summaries_are_not_url_anchors(self) -> None:
+        old_memory = main.MEMORY
+        temp_dir = tempfile.TemporaryDirectory()
+        store = MemoryStore(Path(temp_dir.name) / "memory.sqlite3", retention_days=30)
+        main.MEMORY = store
+        main.passive_contexts.clear()
+        try:
+            store.save_message(
+                chat_id=-1001,
+                message_id=None,
+                created_at=datetime.now(timezone.utc) - timedelta(minutes=2),
+                is_bot=True,
+                text="Aigan summary https://vt.tiktok.com/ZSXBOT/",
+            )
+            store.save_message(
+                chat_id=-1001,
+                message_id=1526,
+                created_at=datetime.now(timezone.utc) - timedelta(minutes=1),
+                is_bot=False,
+                text="",
+                vision_summary="Generated source context mentions https://vt.tiktok.com/ZSXVISION/",
+            )
+            message = FakeMessage("@thrd_ua_bot what is this video?", message_id=1527)
+
+            intent = main.resolve_public_media_context_intent(message, "what is this video?")
+        finally:
+            main.MEMORY = old_memory
+            store.close()
+            temp_dir.cleanup()
+
+        self.assertFalse(intent.active)
 
     def test_reference_media_intent_does_not_hijack_unrelated_time_sensitive_prompt(self) -> None:
         main.passive_contexts.clear()

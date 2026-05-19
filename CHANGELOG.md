@@ -8,6 +8,7 @@
 - Added bounded temporary public-media acquisition for supported links so explicit transcriptless requests can reuse `media_frames` and vision summaries when download, frame extraction, and cleanup all pass.
 - Resolved bare private media URLs and explicit reply/follow-up questions against current, replied, quoted, and recent passive media-link context instead of falling through to generic web fallback.
 - Resolved explicit link-preview prompts and portrait/vertical public-media format selection while keeping unrelated time-sensitive prompts out of recent-media recall.
+- Tightened media referent selection so current/replied/quoted links beat recent memory, recent fallback scans newest-first, and generated summaries are not reused as URL anchors.
 
 ## 2026-05-19 - Telegram activity presence
 
