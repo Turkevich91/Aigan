@@ -237,8 +237,8 @@ def fetch_url(url: str, limit_chars: int = 12000) -> str:
     limit_chars = max(1000, min(int(limit_chars), 30000))
     try:
         safe_url = _safe_url(url)
-    except ValueError as exc:
-        return f"URL rejected: {exc}"
+    except ValueError:
+        return "URL rejected: url_rejected"
 
     headers = {"User-Agent": "aigan-mcp/1.0 (+https://modelcontextprotocol.io)"}
     try:

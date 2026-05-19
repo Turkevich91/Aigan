@@ -564,6 +564,12 @@ class WebSafetyTests(unittest.TestCase):
 
         self.assertEqual("Fetch failed: url_rejected", result)
 
+    def test_fetch_url_initial_rejection_is_stable_category_only(self) -> None:
+        result = web.fetch_url("https://metadata.google.internal/private")
+
+        self.assertEqual("URL rejected: url_rejected", result)
+        self.assertNotIn("metadata.google.internal", result)
+
     def test_image_search_filters_unsafe_hosts(self) -> None:
         class FakeDDGS:
             def __init__(self, *args, **kwargs) -> None:
