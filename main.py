@@ -2752,13 +2752,14 @@ def build_reference_context(message: Message) -> str:
 
     if message.reply_to_message is not None:
         replied = message.reply_to_message
+        replied_content = message_content(replied)
         reply_parts = [
             "Replied-to Telegram message:",
             f"Author: {sender_label(replied)}",
-            f"Message: {message_content(replied)}",
+            f"Message: {replied_content}",
         ]
         reply_url = first_public_media_url(telegram_payload_public_media_urls(replied))
-        if reply_url and reply_url not in message_content(replied):
+        if reply_url and reply_url not in replied_content:
             reply_parts.append(f"Source public media URL: {reply_url}")
         sections.append("\n".join(reply_parts))
 
