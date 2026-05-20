@@ -2456,6 +2456,20 @@ class ToolRuntimeTests(unittest.TestCase):
         self.assertEqual("current_link_preview", intent.url_source)
         self.assertIn("ZSXAPIKWARGS", intent.url)
 
+    def test_api_kwargs_scan_ignores_unrelated_nested_urls(self) -> None:
+        message = FakeMessage("@thrd_ua_bot what is this video?", message_id=1536)
+        message.api_kwargs = {
+            "unrelated_payload": {"url": "https://vt.tiktok.com/ZSXUNRELATED/"},
+            "link_preview_options": {"url": "https://vt.tiktok.com/ZSXALLOWED/"},
+        }
+
+        self.assertEqual(["https://vt.tiktok.com/ZSXALLOWED/"], main.telegram_api_kwargs_url_values(message))
+        intent = main.resolve_public_media_context_intent(message, "what is this video?")
+
+        self.assertTrue(intent.active)
+        self.assertIn("ZSXALLOWED", intent.url)
+        self.assertNotIn("ZSXUNRELATED", intent.url)
+
     def test_missing_media_referent_fails_closed_without_normal_agent(self) -> None:
         main.last_user_call.clear()
         main.last_chat_call.clear()
@@ -2473,6 +2487,9 @@ class ToolRuntimeTests(unittest.TestCase):
 
         self.assertTrue(message.reply_calls)
         self.assertIn("\u043f\u043e\u0441\u0438\u043b\u0430\u043d\u043d\u044f", message.reply_calls[-1]["text"])
+        self.assertIn(message.from_user.id, main.last_user_call)
+        self.assertIn(message.chat_id, main.last_chat_call)
+        self.assertEqual("media_context_unresolved", main.recent_chat_answers[message.chat_id][-1].route)
 
     def test_generic_summary_prompt_without_reference_is_not_media_unresolved(self) -> None:
         message = FakeMessage("@thrd_ua_bot summarize this", message_id=1538)

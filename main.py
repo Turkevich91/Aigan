@@ -4981,10 +4981,15 @@ TELEGRAM_API_NESTED_URL_FIELDS = {
 
 
 def telegram_api_kwargs_url_values(value: Any, *, depth: int = 0) -> list[str]:
-    if value is None or depth > 5:
+    if value is None or depth > 4:
         return []
     if isinstance(value, dict):
         mapping = value
+    elif isinstance(value, (list, tuple)):
+        urls: list[str] = []
+        for item in value:
+            urls.extend(telegram_api_kwargs_url_values(item, depth=depth + 1))
+        return urls
     else:
         mapping = getattr(value, "api_kwargs", None)
     if not isinstance(mapping, dict):
@@ -4999,11 +5004,6 @@ def telegram_api_kwargs_url_values(value: Any, *, depth: int = 0) -> list[str]:
         if key_name in TELEGRAM_API_NESTED_URL_FIELDS:
             urls.extend(telegram_api_kwargs_url_values(nested, depth=depth + 1))
             continue
-        if isinstance(nested, dict):
-            urls.extend(telegram_api_kwargs_url_values(nested, depth=depth + 1))
-        elif isinstance(nested, (list, tuple)):
-            for item in nested:
-                urls.extend(telegram_api_kwargs_url_values(item, depth=depth + 1))
     return urls
 
 
@@ -5300,7 +5300,6 @@ def has_unresolved_public_media_context_intent(
         return False
     if has_supported_image(message) or has_supported_visual_media(message) or referenced_media_available(message):
         return False
-    has_reference = build_reference_context(message) != "(none)"
     if has_media_reference_hint(prompt):
         return True
     if has_explicit_media_context_hint(prompt):
@@ -8028,11 +8027,17 @@ async def handle_prompt(
     has_current_payload = has_current_context_payload(message)
     public_media_intent = resolve_public_media_context_intent(message, prompt)
     has_public_media_context = public_media_intent.active
-    if not has_public_media_context and has_unresolved_public_media_context_intent(message, prompt, public_media_intent):
-        await reply_missing_public_media_referent(message, prompt)
-        return
+    has_unresolved_public_media_context = not has_public_media_context and has_unresolved_public_media_context_intent(
+        message, prompt, public_media_intent
+    )
 
-    if allow_pending_wait and not has_current_payload and not has_public_media_context and should_wait_for_followup_context(message, prompt):
+    if (
+        allow_pending_wait
+        and not has_current_payload
+        and not has_public_media_context
+        and not has_unresolved_public_media_context
+        and should_wait_for_followup_context(message, prompt)
+    ):
         await start_pending_debounce(message, context, prompt, "followup_context")
         return
 
@@ -8040,6 +8045,7 @@ async def handle_prompt(
         allow_pending_wait
         and not has_current_payload
         and not has_public_media_context
+        and not has_unresolved_public_media_context
         and not has_supported_image(message)
         and build_reference_context(message) == "(none)"
         and is_image_request(prompt)
@@ -8051,6 +8057,7 @@ async def handle_prompt(
         allow_pending_wait
         and not has_current_payload
         and not has_public_media_context
+        and not has_unresolved_public_media_context
         and build_reference_context(message) == "(none)"
         and is_context_dependent_request(prompt)
         and not has_url(prompt)
