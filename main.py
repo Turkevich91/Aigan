@@ -4919,9 +4919,6 @@ class TelegramContextVisibility:
     reply_chain_memory_url_count: int = 0
     recent_memory_url_count: int = 0
     recent_context_url_count: int = 0
-    selected_source_kind: str = ""
-    selected_candidate_rank: int = 0
-    selected_candidate_distance: int = 0
 
     def event_details(self) -> dict[str, Any]:
         return {
@@ -4939,9 +4936,6 @@ class TelegramContextVisibility:
             "media_reply_chain_memory_url_count": self.reply_chain_memory_url_count,
             "media_recent_memory_url_count": self.recent_memory_url_count,
             "media_recent_context_url_count": self.recent_context_url_count,
-            "media_selected_source_kind": safe_detail_code(self.selected_source_kind),
-            "media_selected_candidate_rank": self.selected_candidate_rank,
-            "media_selected_candidate_distance": self.selected_candidate_distance,
         }
 
 
@@ -5820,8 +5814,9 @@ async def handle_public_media_context_prompt(
     message: Message,
     context: ContextTypes.DEFAULT_TYPE,
     prompt: str,
+    resolved_intent: PublicMediaContextIntent | None = None,
 ) -> bool:
-    intent = resolve_public_media_context_intent(message, prompt)
+    intent = resolved_intent if resolved_intent is not None else resolve_public_media_context_intent(message, prompt)
     if not intent.active:
         return False
     url = intent.url
@@ -8231,10 +8226,24 @@ async def handle_prompt(
         async with lock:
             if should_suppress_duplicate_prompt(message, prompt, "after_lock"):
                 return
-            await handle_prompt_generation(message, context, prompt, allow_pending_wait, waited_for_generation)
+            await handle_prompt_generation(
+                message,
+                context,
+                prompt,
+                allow_pending_wait,
+                waited_for_generation,
+                public_media_intent,
+            )
         return
 
-    await handle_prompt_generation(message, context, prompt, allow_pending_wait, skip_cooldown=False)
+    await handle_prompt_generation(
+        message,
+        context,
+        prompt,
+        allow_pending_wait,
+        skip_cooldown=False,
+        public_media_intent=public_media_intent,
+    )
 
 
 async def handle_prompt_generation(
@@ -8243,6 +8252,7 @@ async def handle_prompt_generation(
     prompt: str,
     allow_pending_wait: bool,
     skip_cooldown: bool = False,
+    public_media_intent: PublicMediaContextIntent | None = None,
 ) -> None:
     left = cooldown_left(message)
     if left > 0 and not skip_cooldown:
@@ -8254,7 +8264,9 @@ async def handle_prompt_generation(
 
     await send_activity_action(context.bot, message.chat_id, ChatAction.TYPING, message=message)
     route, recall_intent = await classify_request_with_intent(message, prompt)
-    public_media_intent = resolve_public_media_context_intent(message, prompt)
+    resolved_public_media_intent = (
+        public_media_intent if public_media_intent is not None else resolve_public_media_context_intent(message, prompt)
+    )
     LOGGER.info("Prompt route=%s chat_id=%s", route, message.chat_id)
     route_details = {
         "prompt_chars": len(prompt),
@@ -8271,7 +8283,7 @@ async def handle_prompt_generation(
         or has_explicit_media_context_hint(prompt)
         or has_media_reference_hint(prompt)
     ):
-        route_details.update(public_media_referent_diagnostics(message, prompt, public_media_intent))
+        route_details.update(public_media_referent_diagnostics(message, prompt, resolved_public_media_intent))
     system_event(
         component="routing",
         event_type="route_decision",
@@ -8291,7 +8303,12 @@ async def handle_prompt_generation(
         record_chat_answer(message, prompt, route)
         return
 
-    if route == "media_context" and await handle_public_media_context_prompt(message, context, prompt):
+    if route == "media_context" and await handle_public_media_context_prompt(
+        message,
+        context,
+        prompt,
+        resolved_public_media_intent,
+    ):
         record_chat_answer(message, prompt, route)
         return
 
