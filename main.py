@@ -2750,7 +2750,7 @@ def build_reference_context(message: Message) -> str:
     else:
         clipped_quote_text = ""
     quote_url = first_public_media_url(telegram_payload_public_media_urls(quote)) if quote is not None else ""
-    if quote_url and quote_url not in clipped_quote_text:
+    if quote_url and not public_media_url_present_in_text(quote_url, clipped_quote_text):
         sections.append("Selected quote public media URL:\n" + quote_url)
 
     if message.reply_to_message is not None:
@@ -2762,7 +2762,7 @@ def build_reference_context(message: Message) -> str:
             f"Message: {replied_content}",
         ]
         reply_url = first_public_media_url(telegram_payload_public_media_urls(replied))
-        if reply_url and reply_url not in replied_content:
+        if reply_url and not public_media_url_present_in_text(reply_url, replied_content):
             reply_parts.append(f"Source public media URL: {reply_url}")
         sections.append("\n".join(reply_parts))
 
@@ -2780,7 +2780,7 @@ def build_reference_context(message: Message) -> str:
         else:
             clipped_external_text = ""
         external_url = first_public_media_url(telegram_payload_public_media_urls(external_reply))
-        if external_url and external_url not in clipped_external_text:
+        if external_url and not public_media_url_present_in_text(external_url, clipped_external_text):
             external_parts.append(f"Source public media URL: {external_url}")
         for attr in ("photo", "video", "document", "audio", "voice", "animation", "sticker", "poll"):
             if getattr(external_reply, attr, None):
@@ -4987,6 +4987,10 @@ def unique_public_media_urls(values: Sequence[Any]) -> list[str]:
 
 def first_public_media_url(values: Sequence[Any]) -> str:
     return next(iter(unique_public_media_urls(values)), "")
+
+
+def public_media_url_present_in_text(url: str, text: str) -> bool:
+    return bool(url and text and url in unique_public_media_urls([text]))
 
 
 def utf16_entity_slice(text: str, offset: Any, length: Any) -> str:

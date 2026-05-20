@@ -2590,6 +2590,33 @@ class ToolRuntimeTests(unittest.TestCase):
         self.assertIn("ZSXQUOTEAFTERTRIM", reference)
         self.assertIn("ZSXEXTAFTERTRIM", reference)
 
+    def test_reference_context_avoids_duplicate_canonical_url_lines(self) -> None:
+        raw_url = "https://vt.tiktok.com/ZSXDUP/?utm=chat#fragment"
+        message = FakeMessage("@thrd_ua_bot what is this video?", message_id=1550)
+        message.reply_to_message = FakeMessage(raw_url, message_id=1549)
+        message.quote = SimpleNamespace(
+            text=raw_url,
+            caption=None,
+            entities=None,
+            caption_entities=None,
+            link_preview_options=None,
+            api_kwargs={},
+        )
+        message.external_reply = SimpleNamespace(
+            text=raw_url,
+            caption=None,
+            entities=None,
+            caption_entities=None,
+            link_preview_options=None,
+            api_kwargs={},
+        )
+
+        reference = main.build_reference_context(message)
+
+        self.assertIn(raw_url, reference)
+        self.assertNotIn("Selected quote public media URL", reference)
+        self.assertEqual(0, reference.count("Source public media URL"))
+
     def test_public_media_visibility_diagnostics_reports_exposed_reference_sources(self) -> None:
         old_memory = main.MEMORY
         temp_dir = tempfile.TemporaryDirectory()
