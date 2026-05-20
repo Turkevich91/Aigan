@@ -2446,6 +2446,180 @@ class ToolRuntimeTests(unittest.TestCase):
         self.assertEqual("current_memory", intent.url_source)
         self.assertIn("ZSXHIDDEN", intent.url)
 
+    def test_replied_public_media_url_is_persisted_as_current_source_context(self) -> None:
+        old_memory = main.MEMORY
+        temp_dir = tempfile.TemporaryDirectory()
+        store = MemoryStore(Path(temp_dir.name) / "memory.sqlite3", retention_days=30)
+        main.MEMORY = store
+        try:
+            message = FakeMessage("@thrd_ua_bot what is this video?", message_id=1542)
+            message.reply_to_message = FakeMessage("https://vt.tiktok.com/ZSXREPLYPERSIST/", message_id=1541)
+
+            main.save_memory_message(message)
+            stored = store.message_by_message_id(message.chat_id, message.message_id)
+            intent = main.resolve_public_media_context_intent(message, "what is this video?")
+        finally:
+            main.MEMORY = old_memory
+            store.close()
+            temp_dir.cleanup()
+
+        self.assertIsNotNone(stored)
+        self.assertIn("ZSXREPLYPERSIST", stored.source_url)
+        self.assertTrue(intent.active)
+        self.assertEqual("current_memory", intent.url_source)
+
+    def test_quote_public_media_url_is_persisted_as_current_source_context(self) -> None:
+        old_memory = main.MEMORY
+        temp_dir = tempfile.TemporaryDirectory()
+        store = MemoryStore(Path(temp_dir.name) / "memory.sqlite3", retention_days=30)
+        main.MEMORY = store
+        try:
+            message = FakeMessage("@thrd_ua_bot what is this link?", message_id=1543)
+            message.quote = SimpleNamespace(
+                text="preview card",
+                caption=None,
+                entities=[
+                    SimpleNamespace(
+                        type=MessageEntity.TEXT_LINK,
+                        url="https://vt.tiktok.com/ZSXQUOTEPERSIST/",
+                        offset=0,
+                        length=7,
+                    )
+                ],
+                caption_entities=None,
+                link_preview_options=None,
+                api_kwargs={},
+            )
+
+            main.save_memory_message(message)
+            stored = store.message_by_message_id(message.chat_id, message.message_id)
+            intent = main.resolve_public_media_context_intent(message, "what is this link?")
+        finally:
+            main.MEMORY = old_memory
+            store.close()
+            temp_dir.cleanup()
+
+        self.assertIsNotNone(stored)
+        self.assertIn("ZSXQUOTEPERSIST", stored.source_url)
+        self.assertTrue(intent.active)
+        self.assertEqual("current_memory", intent.url_source)
+
+    def test_external_reply_public_media_url_is_persisted_as_current_source_context(self) -> None:
+        old_memory = main.MEMORY
+        temp_dir = tempfile.TemporaryDirectory()
+        store = MemoryStore(Path(temp_dir.name) / "memory.sqlite3", retention_days=30)
+        main.MEMORY = store
+        try:
+            message = FakeMessage("@thrd_ua_bot what is this link?", message_id=1547)
+            message.external_reply = SimpleNamespace(
+                text="preview card",
+                caption=None,
+                entities=[
+                    SimpleNamespace(
+                        type=MessageEntity.TEXT_LINK,
+                        url="https://vt.tiktok.com/ZSXEXTPERSIST/",
+                        offset=0,
+                        length=7,
+                    )
+                ],
+                caption_entities=None,
+                link_preview_options=None,
+                api_kwargs={},
+            )
+
+            main.save_memory_message(message)
+            stored = store.message_by_message_id(message.chat_id, message.message_id)
+            intent = main.resolve_public_media_context_intent(message, "what is this link?")
+        finally:
+            main.MEMORY = old_memory
+            store.close()
+            temp_dir.cleanup()
+
+        self.assertIsNotNone(stored)
+        self.assertIn("ZSXEXTPERSIST", stored.source_url)
+        self.assertTrue(intent.active)
+        self.assertEqual("current_memory", intent.url_source)
+
+    def test_external_reply_text_and_source_url_are_in_reference_context(self) -> None:
+        message = FakeMessage("@thrd_ua_bot what is this video?", message_id=1544)
+        message.external_reply = SimpleNamespace(
+            text="external preview",
+            caption=None,
+            entities=[
+                SimpleNamespace(
+                    type=MessageEntity.TEXT_LINK,
+                    url="https://vt.tiktok.com/ZSXEXTREF/",
+                    offset=0,
+                    length=8,
+                )
+            ],
+            caption_entities=None,
+            link_preview_options=None,
+            api_kwargs={},
+            origin=SimpleNamespace(type="channel"),
+        )
+
+        reference = main.build_reference_context(message)
+
+        self.assertIn("external preview", reference)
+        self.assertIn("ZSXEXTREF", reference)
+
+    def test_public_media_visibility_diagnostics_reports_exposed_reference_sources(self) -> None:
+        old_memory = main.MEMORY
+        temp_dir = tempfile.TemporaryDirectory()
+        store = MemoryStore(Path(temp_dir.name) / "memory.sqlite3", retention_days=30)
+        main.MEMORY = store
+        try:
+            store.save_message(
+                chat_id=-1001,
+                message_id=1545,
+                created_at=datetime.now(timezone.utc) - timedelta(minutes=1),
+                is_bot=False,
+                text="https://vt.tiktok.com/ZSXRECENTDIAG/",
+            )
+            message = FakeMessage("@thrd_ua_bot what is this link?", message_id=1546)
+            message.link_preview_options = SimpleNamespace(url="https://vt.tiktok.com/ZSXCURRENTDIAG/")
+            message.reply_to_message = FakeMessage("https://vt.tiktok.com/ZSXREPLYDIAG/", message_id=1540)
+            message.quote = SimpleNamespace(
+                text="https://vt.tiktok.com/ZSXQUOTEDIAG/",
+                caption=None,
+                entities=None,
+                caption_entities=None,
+                link_preview_options=None,
+                api_kwargs={},
+            )
+            message.external_reply = SimpleNamespace(
+                text="preview",
+                caption=None,
+                entities=[
+                    SimpleNamespace(
+                        type=MessageEntity.TEXT_LINK,
+                        url="https://vt.tiktok.com/ZSXEXTDIAG/",
+                        offset=0,
+                        length=7,
+                    )
+                ],
+                caption_entities=None,
+                link_preview_options=None,
+                api_kwargs={},
+            )
+            details = main.public_media_referent_diagnostics(message, "what is this link?")
+        finally:
+            main.MEMORY = old_memory
+            store.close()
+            temp_dir.cleanup()
+
+        self.assertTrue(details["media_has_reply"])
+        self.assertTrue(details["media_has_quote"])
+        self.assertTrue(details["media_has_external_reply"])
+        self.assertEqual(1, details["media_current_link_preview_url_count"])
+        self.assertEqual(1, details["media_replied_message_url_count"])
+        self.assertEqual(1, details["media_quote_url_count"])
+        self.assertEqual(2, details["media_reply_url_count"])
+        self.assertEqual(1, details["media_external_reply_url_count"])
+        self.assertEqual("current", details["media_selected_source_kind"])
+        self.assertNotIn("ZSXCURRENTDIAG", str(details))
+
     def test_api_kwargs_link_preview_url_routes_to_media_context(self) -> None:
         message = FakeMessage("@thrd_ua_bot what is this video?", message_id=1536)
         message.api_kwargs = {"link_preview_options": {"url": "https://vt.tiktok.com/ZSXAPIKWARGS/"}}
