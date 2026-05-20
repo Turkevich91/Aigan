@@ -4966,22 +4966,31 @@ def has_media_reference_hint(prompt: str) -> bool:
 
 
 def public_media_url_from_text(value: Any) -> str:
+    return next(iter(public_media_urls_from_text(value)), "")
+
+
+def public_media_urls_from_text(value: Any) -> list[str]:
     text = str(value or "")
+    urls: list[str] = []
+    seen: set[str] = set()
     for url in extract_current_prompt_urls(text):
         if platform_from_url(url) in MEDIA_CONTEXT_PLATFORMS:
-            return canonical_public_media_context_url(url)
-    return ""
+            canonical_url = canonical_public_media_context_url(url)
+            if canonical_url and canonical_url not in seen:
+                urls.append(canonical_url)
+                seen.add(canonical_url)
+    return urls
 
 
 def unique_public_media_urls(values: Sequence[Any]) -> list[str]:
     urls: list[str] = []
     seen: set[str] = set()
     for value in values:
-        url = public_media_url_from_text(value)
-        if not url or url in seen:
-            continue
-        urls.append(url)
-        seen.add(url)
+        for url in public_media_urls_from_text(value):
+            if not url or url in seen:
+                continue
+            urls.append(url)
+            seen.add(url)
     return urls
 
 

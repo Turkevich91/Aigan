@@ -2350,6 +2350,17 @@ class ToolRuntimeTests(unittest.TestCase):
     def test_public_media_url_from_text_accepts_none(self) -> None:
         self.assertEqual("", main.public_media_url_from_text(None))
 
+    def test_public_media_url_presence_checks_all_urls_in_text(self) -> None:
+        first_url = "https://vt.tiktok.com/ZSXFIRST/"
+        second_url = "https://vt.tiktok.com/ZSXSECOND/?utm=chat#fragment"
+        text = f"one {first_url} two {second_url}"
+
+        urls = main.unique_public_media_urls([text])
+
+        self.assertIn("https://vt.tiktok.com/ZSXFIRST/", urls)
+        self.assertIn("https://vt.tiktok.com/ZSXSECOND/", urls)
+        self.assertTrue(main.public_media_url_present_in_text("https://vt.tiktok.com/ZSXSECOND/", text))
+
     def test_current_link_preview_url_routes_when_prompt_mentions_link(self) -> None:
         message = FakeMessage("@thrd_ua_bot расскажи что по этой ссылке", message_id=1516)
         message.link_preview_options = SimpleNamespace(url="https://vt.tiktok.com/ZSXLINKPREVIEW/")
