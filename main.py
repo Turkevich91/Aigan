@@ -2745,19 +2745,26 @@ def build_reference_context(message: Message) -> str:
     quote = getattr(message, "quote", None)
     quote_text = getattr(quote, "text", None)
     if quote_text:
-        sections.append("Selected quote text from the referenced message:\n" + clip_text(quote_text, 2000))
+        clipped_quote_text = clip_text(quote_text, 2000)
+        sections.append("Selected quote text from the referenced message:\n" + clipped_quote_text)
+    else:
+        clipped_quote_text = ""
+    quote_url = first_public_media_url(telegram_payload_public_media_urls(quote)) if quote is not None else ""
+    if quote_url and not public_media_url_present_in_text(quote_url, clipped_quote_text):
+        sections.append("Selected quote public media URL:\n" + quote_url)
 
     if message.reply_to_message is not None:
         replied = message.reply_to_message
-        sections.append(
-            "\n".join(
-                [
-                    "Replied-to Telegram message:",
-                    f"Author: {sender_label(replied)}",
-                    f"Message: {message_content(replied)}",
-                ]
-            )
-        )
+        replied_content = message_content(replied)
+        reply_parts = [
+            "Replied-to Telegram message:",
+            f"Author: {sender_label(replied)}",
+            f"Message: {replied_content}",
+        ]
+        reply_url = first_public_media_url(telegram_payload_public_media_urls(replied))
+        if reply_url and not public_media_url_present_in_text(reply_url, replied_content):
+            reply_parts.append(f"Source public media URL: {reply_url}")
+        sections.append("\n".join(reply_parts))
 
     external_reply = getattr(message, "external_reply", None)
     if external_reply is not None:
@@ -2766,6 +2773,15 @@ def build_reference_context(message: Message) -> str:
         if origin is not None:
             origin_type = getattr(origin, "type", type(origin).__name__)
             external_parts.append(f"Origin: {origin_type}")
+        external_text = getattr(external_reply, "text", None) or getattr(external_reply, "caption", None)
+        if external_text:
+            clipped_external_text = clip_text(str(external_text), 2000)
+            external_parts.append(f"Message: {clipped_external_text}")
+        else:
+            clipped_external_text = ""
+        external_url = first_public_media_url(telegram_payload_public_media_urls(external_reply))
+        if external_url and not public_media_url_present_in_text(external_url, clipped_external_text):
+            external_parts.append(f"Source public media URL: {external_url}")
         for attr in ("photo", "video", "document", "audio", "voice", "animation", "sticker", "poll"):
             if getattr(external_reply, attr, None):
                 external_parts.append(f"Attachment: {attr}")
@@ -4887,6 +4903,42 @@ class PublicMediaUrlCandidate:
     distance: int = 0
 
 
+@dataclass(frozen=True)
+class TelegramContextVisibility:
+    has_reply: bool = False
+    has_quote: bool = False
+    has_external_reply: bool = False
+    current_text_url_count: int = 0
+    current_entity_url_count: int = 0
+    current_link_preview_url_count: int = 0
+    current_api_kwargs_url_count: int = 0
+    current_memory_url_count: int = 0
+    reply_url_count: int = 0
+    quote_url_count: int = 0
+    external_reply_url_count: int = 0
+    reply_chain_memory_url_count: int = 0
+    recent_memory_url_count: int = 0
+    recent_context_url_count: int = 0
+
+    def event_details(self) -> dict[str, Any]:
+        return {
+            "media_has_reply": self.has_reply,
+            "media_has_quote": self.has_quote,
+            "media_has_external_reply": self.has_external_reply,
+            "media_current_text_url_count": self.current_text_url_count,
+            "media_current_entity_url_count": self.current_entity_url_count,
+            "media_current_link_preview_url_count": self.current_link_preview_url_count,
+            "media_current_api_kwargs_url_count": self.current_api_kwargs_url_count,
+            "media_current_memory_url_count": self.current_memory_url_count,
+            "media_replied_message_url_count": self.reply_url_count,
+            "media_quote_url_count": self.quote_url_count,
+            "media_external_reply_url_count": self.external_reply_url_count,
+            "media_reply_chain_memory_url_count": self.reply_chain_memory_url_count,
+            "media_recent_memory_url_count": self.recent_memory_url_count,
+            "media_recent_context_url_count": self.recent_context_url_count,
+        }
+
+
 def has_media_context_hint(prompt: str) -> bool:
     prompt_without_urls = re.sub(r"\b(?:https?://|www\.)\S+", " ", prompt or "", flags=re.IGNORECASE)
     lowered = prompt_without_urls.casefold()
@@ -4908,27 +4960,40 @@ def has_media_reference_hint(prompt: str) -> bool:
 
 
 def public_media_url_from_text(value: Any) -> str:
+    return next(iter(public_media_urls_from_text(value)), "")
+
+
+def public_media_urls_from_text(value: Any) -> list[str]:
     text = str(value or "")
+    urls: list[str] = []
+    seen: set[str] = set()
     for url in extract_current_prompt_urls(text):
         if platform_from_url(url) in MEDIA_CONTEXT_PLATFORMS:
-            return canonical_public_media_context_url(url)
-    return ""
+            canonical_url = canonical_public_media_context_url(url)
+            if canonical_url and canonical_url not in seen:
+                urls.append(canonical_url)
+                seen.add(canonical_url)
+    return urls
 
 
 def unique_public_media_urls(values: Sequence[Any]) -> list[str]:
     urls: list[str] = []
     seen: set[str] = set()
     for value in values:
-        url = public_media_url_from_text(value)
-        if not url or url in seen:
-            continue
-        urls.append(url)
-        seen.add(url)
+        for url in public_media_urls_from_text(value):
+            if not url or url in seen:
+                continue
+            urls.append(url)
+            seen.add(url)
     return urls
 
 
 def first_public_media_url(values: Sequence[Any]) -> str:
     return next(iter(unique_public_media_urls(values)), "")
+
+
+def public_media_url_present_in_text(url: str, text: str) -> bool:
+    return bool(url and text and url in unique_public_media_urls([text]))
 
 
 def utf16_entity_slice(text: str, offset: Any, length: Any) -> str:
@@ -5034,6 +5099,17 @@ def telegram_payload_public_media_urls(value: Any) -> list[str]:
     )
 
 
+def telegram_reference_public_media_urls(value: Any) -> list[str]:
+    if value is None:
+        return []
+    urls: list[str] = []
+    for attr in ("quote", "reply_to_message", "external_reply"):
+        referenced = getattr(value, attr, None)
+        if referenced is not None:
+            urls.extend(telegram_payload_public_media_urls(referenced))
+    return unique_public_media_urls(urls)
+
+
 def telegram_entity_public_media_url(value: Any) -> str:
     return first_public_media_url(telegram_entity_url_values(value))
 
@@ -5043,7 +5119,12 @@ def telegram_api_kwargs_public_media_url(value: Any) -> str:
 
 
 def source_public_media_url_for_memory(message: Message) -> str:
-    return first_public_media_url(telegram_payload_public_media_urls(message))
+    return first_public_media_url(
+        [
+            *telegram_payload_public_media_urls(message),
+            *telegram_reference_public_media_urls(message),
+        ]
+    )
 
 
 def link_preview_url_from(value: Any) -> str:
@@ -5126,34 +5207,91 @@ def count_public_media_urls(values: Sequence[Any]) -> int:
     return len(unique_public_media_urls(values))
 
 
-def public_media_referent_diagnostics(message: Message, prompt: str) -> dict[str, Any]:
+def telegram_context_visibility(message: Message, prompt: str) -> TelegramContextVisibility:
     reply = getattr(message, "reply_to_message", None)
     quote = getattr(message, "quote", None)
     external_reply = getattr(message, "external_reply", None)
     candidates = public_media_url_candidates(message, prompt)
-    memory_sources = {"current_memory", "reply_chain_memory", "recent_memory", "recent_context"}
-    return {
-        "media_text_url_count": count_public_media_urls(
+    candidate_counts = Counter(
+        candidate.source for candidate in candidates if public_media_url_from_text(candidate.text)
+    )
+    return TelegramContextVisibility(
+        has_reply=reply is not None,
+        has_quote=quote is not None,
+        has_external_reply=external_reply is not None,
+        current_text_url_count=count_public_media_urls(
             [
                 prompt,
                 getattr(message, "text", "") or "",
                 getattr(message, "caption", "") or "",
             ]
         ),
-        "media_entity_url_count": count_public_media_urls(telegram_entity_url_values(message)),
-        "media_link_preview_url_count": count_public_media_urls(telegram_link_preview_url_values(message)),
-        "media_reply_url_count": count_public_media_urls(
-            [
-                *(telegram_payload_public_media_urls(reply) if reply is not None else []),
-                *(telegram_payload_public_media_urls(quote) if quote is not None else []),
-            ]
-        ),
-        "media_external_reply_url_count": count_public_media_urls(
+        current_entity_url_count=count_public_media_urls(telegram_entity_url_values(message)),
+        current_link_preview_url_count=count_public_media_urls(telegram_link_preview_url_values(message)),
+        current_api_kwargs_url_count=count_public_media_urls(telegram_api_kwargs_url_values(message)),
+        current_memory_url_count=candidate_counts.get("current_memory", 0),
+        reply_url_count=count_public_media_urls(telegram_payload_public_media_urls(reply) if reply is not None else []),
+        quote_url_count=count_public_media_urls(telegram_payload_public_media_urls(quote) if quote is not None else []),
+        external_reply_url_count=count_public_media_urls(
             telegram_payload_public_media_urls(external_reply) if external_reply is not None else []
         ),
-        "media_memory_url_count": sum(
-            1 for candidate in candidates if candidate.source in memory_sources and public_media_url_from_text(candidate.text)
-        ),
+        reply_chain_memory_url_count=candidate_counts.get("reply_chain_memory", 0),
+        recent_memory_url_count=candidate_counts.get("recent_memory", 0),
+        recent_context_url_count=candidate_counts.get("recent_context", 0),
+    )
+
+
+def public_media_referent_diagnostics(
+    message: Message,
+    prompt: str,
+    resolved_intent: PublicMediaContextIntent | None = None,
+) -> dict[str, Any]:
+    visibility = telegram_context_visibility(message, prompt)
+    reply = getattr(message, "reply_to_message", None)
+    quote = getattr(message, "quote", None)
+    intent = resolved_intent if resolved_intent is not None else resolve_public_media_context_intent(message, prompt)
+    details = visibility.event_details()
+    details.update(
+        {
+            # Legacy compact keys retained for existing dashboards.
+            "media_text_url_count": visibility.current_text_url_count,
+            "media_entity_url_count": visibility.current_entity_url_count,
+            "media_link_preview_url_count": visibility.current_link_preview_url_count,
+            "media_reply_url_count": count_public_media_urls(
+                [
+                    *(telegram_payload_public_media_urls(reply) if reply is not None else []),
+                    *(telegram_payload_public_media_urls(quote) if quote is not None else []),
+                ]
+            ),
+            "media_external_reply_url_count": visibility.external_reply_url_count,
+            "media_memory_url_count": (
+                visibility.current_memory_url_count
+                + visibility.reply_chain_memory_url_count
+                + visibility.recent_memory_url_count
+                + visibility.recent_context_url_count
+            ),
+        }
+    )
+    if intent.active:
+        details.update(
+            {
+                "media_selected_source_kind": safe_detail_code(public_media_url_candidate_source_kind(intent.url_source)),
+                "media_selected_candidate_rank": intent.candidate_rank,
+                "media_selected_candidate_distance": intent.candidate_distance,
+            }
+        )
+    else:
+        details.update(
+            {
+                "media_selected_source_kind": "",
+                "media_selected_candidate_rank": 0,
+                "media_selected_candidate_distance": 0,
+            }
+        )
+    return {
+        key: value
+        for key, value in details.items()
+        if isinstance(value, (bool, int, float)) or (isinstance(value, str) and len(value) <= 80)
     }
 
 
@@ -5168,7 +5306,7 @@ def public_media_url_candidates(message: Message, prompt: str) -> list[PublicMed
     append_public_media_url_candidate(candidates, "current_link_preview", current_link_preview)
     append_public_media_url_candidate(candidates, "current_api_kwargs", current_api_kwargs_url)
     append_public_media_url_candidate(candidates, "current_payload", current_payload)
-    should_check_current_memory = message.chat.type == ChatType.PRIVATE or has_reference_media_context_intent(prompt)
+    should_check_current_memory = has_reference_media_context_intent(prompt)
     current_sources_have_media_url = bool(
         public_media_url_from_text(current_entity_url)
         or public_media_url_from_text(current_link_preview)
@@ -5260,9 +5398,19 @@ def resolve_public_media_context_intent(message: Message, prompt: str) -> Public
             "current_payload",
             "current_link_preview",
             "current_api_kwargs",
-            "current_memory",
         }:
             if message.chat.type == ChatType.PRIVATE or is_bare_media_url_prompt(text) or prompt_allows_reference:
+                return PublicMediaContextIntent(
+                    url=url,
+                    platform=platform_from_url(url),
+                    url_source=source,
+                    intent_mode="target_summary",
+                    candidate_rank=candidate.rank,
+                    candidate_distance=candidate.distance,
+                )
+            continue
+        if source == "current_memory":
+            if prompt_allows_reference:
                 return PublicMediaContextIntent(
                     url=url,
                     platform=platform_from_url(url),
@@ -5285,8 +5433,8 @@ def resolve_public_media_context_intent(message: Message, prompt: str) -> Public
 
 
 PUBLIC_MEDIA_MISSING_REFERENT_RESPONSE = (
-    "Не бачу доступного посилання або медіа в цьому повідомленні. "
-    "Надішли сам лінк чи файл або відповідай саме на повідомлення з ним — тоді розберу."
+    "До мене дійшов лише текст запиту: Telegram не передав доступного лінка/посилання, reply/quote або медіа. "
+    "Надішли сам URL/файл або відповідай саме на повідомлення, де Telegram передає лінк чи медіа, тоді розберу."
 )
 
 
@@ -5666,8 +5814,9 @@ async def handle_public_media_context_prompt(
     message: Message,
     context: ContextTypes.DEFAULT_TYPE,
     prompt: str,
+    resolved_intent: PublicMediaContextIntent | None = None,
 ) -> bool:
-    intent = resolve_public_media_context_intent(message, prompt)
+    intent = resolved_intent if resolved_intent is not None else resolve_public_media_context_intent(message, prompt)
     if not intent.active:
         return False
     url = intent.url
@@ -5779,7 +5928,7 @@ async def handle_public_media_context_prompt(
             "candidate_rank": intent.candidate_rank,
             "candidate_distance": intent.candidate_distance,
             "intent_mode": safe_detail_code(intent.intent_mode or "target_summary"),
-            **public_media_referent_diagnostics(message, prompt),
+            **public_media_referent_diagnostics(message, prompt, intent),
         },
     )
     histories[message.chat_id].append(f"Aigan: {response[:500]}")
@@ -7971,7 +8120,7 @@ async def reply_missing_public_media_referent(message: Message, prompt: str) -> 
         telegram_message=message,
         route="media_context_unresolved",
         message="missing_referent",
-        details=public_media_referent_diagnostics(message, prompt),
+        details=public_media_referent_diagnostics(message, prompt, PublicMediaContextIntent()),
     )
     response = PUBLIC_MEDIA_MISSING_REFERENT_RESPONSE
     histories[message.chat_id].append(f"Aigan: {response[:500]}")
@@ -8077,10 +8226,24 @@ async def handle_prompt(
         async with lock:
             if should_suppress_duplicate_prompt(message, prompt, "after_lock"):
                 return
-            await handle_prompt_generation(message, context, prompt, allow_pending_wait, waited_for_generation)
+            await handle_prompt_generation(
+                message,
+                context,
+                prompt,
+                allow_pending_wait,
+                waited_for_generation,
+                public_media_intent,
+            )
         return
 
-    await handle_prompt_generation(message, context, prompt, allow_pending_wait, skip_cooldown=False)
+    await handle_prompt_generation(
+        message,
+        context,
+        prompt,
+        allow_pending_wait,
+        skip_cooldown=False,
+        public_media_intent=public_media_intent,
+    )
 
 
 async def handle_prompt_generation(
@@ -8089,6 +8252,7 @@ async def handle_prompt_generation(
     prompt: str,
     allow_pending_wait: bool,
     skip_cooldown: bool = False,
+    public_media_intent: PublicMediaContextIntent | None = None,
 ) -> None:
     left = cooldown_left(message)
     if left > 0 and not skip_cooldown:
@@ -8100,6 +8264,12 @@ async def handle_prompt_generation(
 
     await send_activity_action(context.bot, message.chat_id, ChatAction.TYPING, message=message)
     route, recall_intent = await classify_request_with_intent(message, prompt)
+    if route in {"media_context", "media_context_unresolved"}:
+        resolved_public_media_intent = resolve_public_media_context_intent(message, prompt)
+    else:
+        resolved_public_media_intent = (
+            public_media_intent if public_media_intent is not None else resolve_public_media_context_intent(message, prompt)
+        )
     LOGGER.info("Prompt route=%s chat_id=%s", route, message.chat_id)
     route_details = {
         "prompt_chars": len(prompt),
@@ -8116,7 +8286,7 @@ async def handle_prompt_generation(
         or has_explicit_media_context_hint(prompt)
         or has_media_reference_hint(prompt)
     ):
-        route_details.update(public_media_referent_diagnostics(message, prompt))
+        route_details.update(public_media_referent_diagnostics(message, prompt, resolved_public_media_intent))
     system_event(
         component="routing",
         event_type="route_decision",
@@ -8136,8 +8306,18 @@ async def handle_prompt_generation(
         record_chat_answer(message, prompt, route)
         return
 
-    if route == "media_context" and await handle_public_media_context_prompt(message, context, prompt):
+    if route == "media_context" and await handle_public_media_context_prompt(
+        message,
+        context,
+        prompt,
+        resolved_public_media_intent,
+    ):
         record_chat_answer(message, prompt, route)
+        return
+
+    if route == "media_context":
+        await reply_missing_public_media_referent(message, prompt)
+        record_chat_answer(message, prompt, "media_context_unresolved")
         return
 
     if route == "media_context_unresolved":
