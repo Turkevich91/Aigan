@@ -2745,9 +2745,12 @@ def build_reference_context(message: Message) -> str:
     quote = getattr(message, "quote", None)
     quote_text = getattr(quote, "text", None)
     if quote_text:
-        sections.append("Selected quote text from the referenced message:\n" + clip_text(quote_text, 2000))
+        clipped_quote_text = clip_text(quote_text, 2000)
+        sections.append("Selected quote text from the referenced message:\n" + clipped_quote_text)
+    else:
+        clipped_quote_text = ""
     quote_url = first_public_media_url(telegram_payload_public_media_urls(quote)) if quote is not None else ""
-    if quote_url and quote_url not in str(quote_text or ""):
+    if quote_url and quote_url not in clipped_quote_text:
         sections.append("Selected quote public media URL:\n" + quote_url)
 
     if message.reply_to_message is not None:
@@ -2772,9 +2775,12 @@ def build_reference_context(message: Message) -> str:
             external_parts.append(f"Origin: {origin_type}")
         external_text = getattr(external_reply, "text", None) or getattr(external_reply, "caption", None)
         if external_text:
-            external_parts.append(f"Message: {clip_text(str(external_text), 2000)}")
+            clipped_external_text = clip_text(str(external_text), 2000)
+            external_parts.append(f"Message: {clipped_external_text}")
+        else:
+            clipped_external_text = ""
         external_url = first_public_media_url(telegram_payload_public_media_urls(external_reply))
-        if external_url and external_url not in str(external_text or ""):
+        if external_url and external_url not in clipped_external_text:
             external_parts.append(f"Source public media URL: {external_url}")
         for attr in ("photo", "video", "document", "audio", "voice", "animation", "sticker", "poll"):
             if getattr(external_reply, attr, None):
@@ -5237,6 +5243,8 @@ def telegram_context_visibility(message: Message, prompt: str) -> TelegramContex
 
 def public_media_referent_diagnostics(message: Message, prompt: str) -> dict[str, Any]:
     visibility = telegram_context_visibility(message, prompt)
+    reply = getattr(message, "reply_to_message", None)
+    quote = getattr(message, "quote", None)
     details = visibility.event_details()
     details.update(
         {
@@ -5244,7 +5252,12 @@ def public_media_referent_diagnostics(message: Message, prompt: str) -> dict[str
             "media_text_url_count": visibility.current_text_url_count,
             "media_entity_url_count": visibility.current_entity_url_count,
             "media_link_preview_url_count": visibility.current_link_preview_url_count,
-            "media_reply_url_count": visibility.reply_url_count + visibility.quote_url_count,
+            "media_reply_url_count": count_public_media_urls(
+                [
+                    *(telegram_payload_public_media_urls(reply) if reply is not None else []),
+                    *(telegram_payload_public_media_urls(quote) if quote is not None else []),
+                ]
+            ),
             "media_external_reply_url_count": visibility.external_reply_url_count,
             "media_memory_url_count": (
                 visibility.current_memory_url_count

@@ -2564,6 +2564,32 @@ class ToolRuntimeTests(unittest.TestCase):
         self.assertIn("external preview", reference)
         self.assertIn("ZSXEXTREF", reference)
 
+    def test_trimmed_quote_and_external_reference_urls_remain_visible(self) -> None:
+        quote_url = "https://vt.tiktok.com/ZSXQUOTEAFTERTRIM/"
+        external_url = "https://vt.tiktok.com/ZSXEXTAFTERTRIM/"
+        message = FakeMessage("@thrd_ua_bot what is this video?", message_id=1548)
+        message.quote = SimpleNamespace(
+            text=("q" * 2100) + " " + quote_url,
+            caption=None,
+            entities=None,
+            caption_entities=None,
+            link_preview_options=None,
+            api_kwargs={},
+        )
+        message.external_reply = SimpleNamespace(
+            text=("e" * 2100) + " " + external_url,
+            caption=None,
+            entities=None,
+            caption_entities=None,
+            link_preview_options=None,
+            api_kwargs={},
+        )
+
+        reference = main.build_reference_context(message)
+
+        self.assertIn("ZSXQUOTEAFTERTRIM", reference)
+        self.assertIn("ZSXEXTAFTERTRIM", reference)
+
     def test_public_media_visibility_diagnostics_reports_exposed_reference_sources(self) -> None:
         old_memory = main.MEMORY
         temp_dir = tempfile.TemporaryDirectory()
@@ -2619,6 +2645,25 @@ class ToolRuntimeTests(unittest.TestCase):
         self.assertEqual(1, details["media_external_reply_url_count"])
         self.assertEqual("current", details["media_selected_source_kind"])
         self.assertNotIn("ZSXCURRENTDIAG", str(details))
+
+    def test_legacy_reply_url_count_keeps_unique_reply_quote_semantics(self) -> None:
+        shared_url = "https://vt.tiktok.com/ZSXSHAREDDIAG/"
+        message = FakeMessage("@thrd_ua_bot what is this link?", message_id=1549)
+        message.reply_to_message = FakeMessage(shared_url, message_id=1540)
+        message.quote = SimpleNamespace(
+            text=shared_url,
+            caption=None,
+            entities=None,
+            caption_entities=None,
+            link_preview_options=None,
+            api_kwargs={},
+        )
+
+        details = main.public_media_referent_diagnostics(message, "what is this link?")
+
+        self.assertEqual(1, details["media_replied_message_url_count"])
+        self.assertEqual(1, details["media_quote_url_count"])
+        self.assertEqual(1, details["media_reply_url_count"])
 
     def test_api_kwargs_link_preview_url_routes_to_media_context(self) -> None:
         message = FakeMessage("@thrd_ua_bot what is this video?", message_id=1536)
