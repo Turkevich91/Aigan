@@ -5305,8 +5305,6 @@ def has_unresolved_public_media_context_intent(
         return True
     if has_explicit_media_context_hint(prompt):
         return True
-    if has_media_context_hint(prompt) and not has_reference:
-        return True
     return False
 
 
@@ -8106,7 +8104,11 @@ async def handle_prompt_generation(
         "memory_recall_confidence": recall_intent.confidence if recall_intent else 0.0,
         "memory_recall_reason": recall_intent.reason if recall_intent else "",
     }
-    if route in {"media_context", "media_context_unresolved"} or has_media_context_hint(prompt) or has_media_reference_hint(prompt):
+    if (
+        route in {"media_context", "media_context_unresolved"}
+        or has_explicit_media_context_hint(prompt)
+        or has_media_reference_hint(prompt)
+    ):
         route_details.update(public_media_referent_diagnostics(message, prompt))
     system_event(
         component="routing",

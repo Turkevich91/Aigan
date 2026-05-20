@@ -2463,7 +2463,7 @@ class ToolRuntimeTests(unittest.TestCase):
         main.passive_contexts.clear()
         if main.MEMORY is not None:
             main.MEMORY.clear_all()
-        message = FakeMessage("@thrd_ua_bot \u043f\u0440\u043e \u0449\u043e \u0442\u0443\u0442?", message_id=1537)
+        message = FakeMessage("@thrd_ua_bot \u043f\u0440\u043e \u0449\u043e \u0446\u0435 \u0432\u0456\u0434\u0435\u043e?", message_id=1537)
         message.entities = [SimpleNamespace(type=MessageEntity.MENTION, offset=0, length=len("@thrd_ua_bot"))]
         main.passive_contexts[message.chat_id].append("Human: unrelated ordinary chat context")
         context = SimpleNamespace(bot=SimpleNamespace(username="thrd_ua_bot", id=999, send_chat_action=AsyncMock()))
@@ -2473,6 +2473,12 @@ class ToolRuntimeTests(unittest.TestCase):
 
         self.assertTrue(message.reply_calls)
         self.assertIn("\u043f\u043e\u0441\u0438\u043b\u0430\u043d\u043d\u044f", message.reply_calls[-1]["text"])
+
+    def test_generic_summary_prompt_without_reference_is_not_media_unresolved(self) -> None:
+        message = FakeMessage("@thrd_ua_bot summarize this", message_id=1538)
+
+        self.assertFalse(main.has_unresolved_public_media_context_intent(message, "summarize this"))
+        self.assertEqual("normal", main.classify_request(message, "summarize this"))
 
     def test_explicit_media_question_replying_to_text_fails_closed(self) -> None:
         main.last_user_call.clear()
