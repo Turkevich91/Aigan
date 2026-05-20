@@ -2479,6 +2479,24 @@ class ToolRuntimeTests(unittest.TestCase):
         self.assertTrue(intent.active)
         self.assertEqual("current_memory", intent.url_source)
 
+    def test_reference_source_url_memory_requires_media_reference_prompt(self) -> None:
+        old_memory = main.MEMORY
+        temp_dir = tempfile.TemporaryDirectory()
+        store = MemoryStore(Path(temp_dir.name) / "memory.sqlite3", retention_days=30)
+        main.MEMORY = store
+        try:
+            message = FakeMessage("ordinary reply", chat_type=ChatType.PRIVATE, message_id=15421)
+            message.reply_to_message = FakeMessage("https://vt.tiktok.com/ZSXREFMEMORY/", message_id=15420)
+            main.save_memory_message(message)
+
+            intent = main.resolve_public_media_context_intent(message, "ordinary reply")
+        finally:
+            main.MEMORY = old_memory
+            store.close()
+            temp_dir.cleanup()
+
+        self.assertFalse(intent.active)
+
     def test_quote_public_media_url_is_persisted_as_current_source_context(self) -> None:
         old_memory = main.MEMORY
         temp_dir = tempfile.TemporaryDirectory()
@@ -2683,6 +2701,23 @@ class ToolRuntimeTests(unittest.TestCase):
         self.assertEqual(1, details["media_external_reply_url_count"])
         self.assertEqual("current", details["media_selected_source_kind"])
         self.assertNotIn("ZSXCURRENTDIAG", str(details))
+
+    def test_public_media_visibility_diagnostics_selection_requires_resolved_intent(self) -> None:
+        message = FakeMessage("ordinary reply", chat_type=ChatType.PRIVATE, message_id=15461)
+        message.quote = SimpleNamespace(
+            text="https://vt.tiktok.com/ZSXDIAGNOINTENT/",
+            caption=None,
+            entities=None,
+            caption_entities=None,
+            link_preview_options=None,
+            api_kwargs={},
+        )
+
+        details = main.public_media_referent_diagnostics(message, "ordinary reply")
+
+        self.assertEqual(1, details["media_quote_url_count"])
+        self.assertEqual("", details["media_selected_source_kind"])
+        self.assertEqual(0, details["media_selected_candidate_rank"])
 
     def test_legacy_reply_url_count_keeps_unique_reply_quote_semantics(self) -> None:
         shared_url = "https://vt.tiktok.com/ZSXSHAREDDIAG/"

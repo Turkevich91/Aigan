@@ -5218,10 +5218,6 @@ def telegram_context_visibility(message: Message, prompt: str) -> TelegramContex
     quote = getattr(message, "quote", None)
     external_reply = getattr(message, "external_reply", None)
     candidates = public_media_url_candidates(message, prompt)
-    selected_candidate = next(
-        (candidate for candidate in candidates if public_media_url_from_text(candidate.text)),
-        None,
-    )
     candidate_counts = Counter(
         candidate.source for candidate in candidates if public_media_url_from_text(candidate.text)
     )
@@ -5248,16 +5244,18 @@ def telegram_context_visibility(message: Message, prompt: str) -> TelegramContex
         reply_chain_memory_url_count=candidate_counts.get("reply_chain_memory", 0),
         recent_memory_url_count=candidate_counts.get("recent_memory", 0),
         recent_context_url_count=candidate_counts.get("recent_context", 0),
-        selected_source_kind=public_media_url_candidate_source_kind(selected_candidate.source) if selected_candidate else "",
-        selected_candidate_rank=selected_candidate.rank if selected_candidate else 0,
-        selected_candidate_distance=selected_candidate.distance if selected_candidate else 0,
     )
 
 
-def public_media_referent_diagnostics(message: Message, prompt: str) -> dict[str, Any]:
+def public_media_referent_diagnostics(
+    message: Message,
+    prompt: str,
+    resolved_intent: PublicMediaContextIntent | None = None,
+) -> dict[str, Any]:
     visibility = telegram_context_visibility(message, prompt)
     reply = getattr(message, "reply_to_message", None)
     quote = getattr(message, "quote", None)
+    intent = resolved_intent if resolved_intent is not None else resolve_public_media_context_intent(message, prompt)
     details = visibility.event_details()
     details.update(
         {
@@ -5280,6 +5278,22 @@ def public_media_referent_diagnostics(message: Message, prompt: str) -> dict[str
             ),
         }
     )
+    if intent.active:
+        details.update(
+            {
+                "media_selected_source_kind": safe_detail_code(public_media_url_candidate_source_kind(intent.url_source)),
+                "media_selected_candidate_rank": intent.candidate_rank,
+                "media_selected_candidate_distance": intent.candidate_distance,
+            }
+        )
+    else:
+        details.update(
+            {
+                "media_selected_source_kind": "",
+                "media_selected_candidate_rank": 0,
+                "media_selected_candidate_distance": 0,
+            }
+        )
     return {
         key: value
         for key, value in details.items()
@@ -5298,7 +5312,7 @@ def public_media_url_candidates(message: Message, prompt: str) -> list[PublicMed
     append_public_media_url_candidate(candidates, "current_link_preview", current_link_preview)
     append_public_media_url_candidate(candidates, "current_api_kwargs", current_api_kwargs_url)
     append_public_media_url_candidate(candidates, "current_payload", current_payload)
-    should_check_current_memory = message.chat.type == ChatType.PRIVATE or has_reference_media_context_intent(prompt)
+    should_check_current_memory = has_reference_media_context_intent(prompt)
     current_sources_have_media_url = bool(
         public_media_url_from_text(current_entity_url)
         or public_media_url_from_text(current_link_preview)
@@ -5390,9 +5404,19 @@ def resolve_public_media_context_intent(message: Message, prompt: str) -> Public
             "current_payload",
             "current_link_preview",
             "current_api_kwargs",
-            "current_memory",
         }:
             if message.chat.type == ChatType.PRIVATE or is_bare_media_url_prompt(text) or prompt_allows_reference:
+                return PublicMediaContextIntent(
+                    url=url,
+                    platform=platform_from_url(url),
+                    url_source=source,
+                    intent_mode="target_summary",
+                    candidate_rank=candidate.rank,
+                    candidate_distance=candidate.distance,
+                )
+            continue
+        if source == "current_memory":
+            if prompt_allows_reference:
                 return PublicMediaContextIntent(
                     url=url,
                     platform=platform_from_url(url),
@@ -5909,7 +5933,7 @@ async def handle_public_media_context_prompt(
             "candidate_rank": intent.candidate_rank,
             "candidate_distance": intent.candidate_distance,
             "intent_mode": safe_detail_code(intent.intent_mode or "target_summary"),
-            **public_media_referent_diagnostics(message, prompt),
+            **public_media_referent_diagnostics(message, prompt, intent),
         },
     )
     histories[message.chat_id].append(f"Aigan: {response[:500]}")
@@ -8101,7 +8125,7 @@ async def reply_missing_public_media_referent(message: Message, prompt: str) -> 
         telegram_message=message,
         route="media_context_unresolved",
         message="missing_referent",
-        details=public_media_referent_diagnostics(message, prompt),
+        details=public_media_referent_diagnostics(message, prompt, PublicMediaContextIntent()),
     )
     response = PUBLIC_MEDIA_MISSING_REFERENT_RESPONSE
     histories[message.chat_id].append(f"Aigan: {response[:500]}")
@@ -8230,6 +8254,7 @@ async def handle_prompt_generation(
 
     await send_activity_action(context.bot, message.chat_id, ChatAction.TYPING, message=message)
     route, recall_intent = await classify_request_with_intent(message, prompt)
+    public_media_intent = resolve_public_media_context_intent(message, prompt)
     LOGGER.info("Prompt route=%s chat_id=%s", route, message.chat_id)
     route_details = {
         "prompt_chars": len(prompt),
@@ -8246,7 +8271,7 @@ async def handle_prompt_generation(
         or has_explicit_media_context_hint(prompt)
         or has_media_reference_hint(prompt)
     ):
-        route_details.update(public_media_referent_diagnostics(message, prompt))
+        route_details.update(public_media_referent_diagnostics(message, prompt, public_media_intent))
     system_event(
         component="routing",
         event_type="route_decision",
