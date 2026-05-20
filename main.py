@@ -8264,9 +8264,12 @@ async def handle_prompt_generation(
 
     await send_activity_action(context.bot, message.chat_id, ChatAction.TYPING, message=message)
     route, recall_intent = await classify_request_with_intent(message, prompt)
-    resolved_public_media_intent = (
-        public_media_intent if public_media_intent is not None else resolve_public_media_context_intent(message, prompt)
-    )
+    if route in {"media_context", "media_context_unresolved"}:
+        resolved_public_media_intent = resolve_public_media_context_intent(message, prompt)
+    else:
+        resolved_public_media_intent = (
+            public_media_intent if public_media_intent is not None else resolve_public_media_context_intent(message, prompt)
+        )
     LOGGER.info("Prompt route=%s chat_id=%s", route, message.chat_id)
     route_details = {
         "prompt_chars": len(prompt),
@@ -8310,6 +8313,11 @@ async def handle_prompt_generation(
         resolved_public_media_intent,
     ):
         record_chat_answer(message, prompt, route)
+        return
+
+    if route == "media_context":
+        await reply_missing_public_media_referent(message, prompt)
+        record_chat_answer(message, prompt, "media_context_unresolved")
         return
 
     if route == "media_context_unresolved":

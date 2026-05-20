@@ -2843,6 +2843,39 @@ class ToolRuntimeTests(unittest.TestCase):
 
         self.assertTrue(message.reply_calls)
 
+    def test_stale_media_intent_recomputes_and_fails_closed(self) -> None:
+        main.last_user_call.clear()
+        main.last_chat_call.clear()
+        main.recent_chat_answers.clear()
+        old_memory = main.MEMORY
+        temp_dir = tempfile.TemporaryDirectory()
+        store = MemoryStore(Path(temp_dir.name) / "memory.sqlite3", retention_days=30)
+        main.MEMORY = store
+        main.passive_contexts.clear()
+        message = FakeMessage("@thrd_ua_bot what is this video?", chat_id=-7715411, message_id=15411)
+        context = SimpleNamespace(bot=SimpleNamespace(send_chat_action=AsyncMock()))
+
+        try:
+            with patch.object(main, "classify_request_with_intent", new=AsyncMock(return_value=("media_context", None))):
+                with patch.object(main, "run_agent", new=AsyncMock(side_effect=AssertionError("normal agent fallback"))):
+                    asyncio.run(
+                        main.handle_prompt_generation(
+                            message,
+                            context,
+                            "what is this video?",
+                            allow_pending_wait=False,
+                            skip_cooldown=True,
+                            public_media_intent=main.PublicMediaContextIntent(url="https://vt.tiktok.com/ZSXSTALE/"),
+                        )
+                    )
+        finally:
+            main.MEMORY = old_memory
+            store.close()
+            temp_dir.cleanup()
+
+        self.assertTrue(message.reply_calls)
+        self.assertIn("Telegram", message.reply_calls[-1]["text"])
+
     def test_current_link_preview_beats_recent_memory_media_url(self) -> None:
         old_memory = main.MEMORY
         temp_dir = tempfile.TemporaryDirectory()
