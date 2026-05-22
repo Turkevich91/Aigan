@@ -12,7 +12,6 @@ import sys
 import tempfile
 import time
 import urllib.request
-import urllib.parse
 from collections import Counter, defaultdict, deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -34,23 +33,9 @@ from mcp_servers.web import fetch_binary_url, fetch_url, search_image_candidates
 from memory import EmbeddingCandidate, MemoryItem, MemoryStore, SemanticMemoryResult
 from media_acquisition import (
     MediaAcquisitionAdapter,
-    MediaAcquisitionFileResult,
     MediaAcquisitionLimits,
-    MediaAcquisitionRequest,
-    MediaAcquisitionResult,
     NullMediaAcquisitionAdapter,
     YtDlpMediaAcquisitionAdapter,
-    platform_from_url,
-)
-from media_context import (
-    build_youtube_media_context_prompt,
-    MediaContextResult,
-    media_context_event_details,
-    media_context_from_acquisition,
-    media_context_with_visual_failure,
-    public_media_context_response,
-    redact_urls_for_prompt_preview,
-    sanitize_public_media_summary,
 )
 from media_frames import FfmpegMediaFrameAdapter, MediaFrameAdapter, MediaFrameLimits, MediaFrameRequest, MediaFrameResult, NullMediaFrameAdapter
 from outbound_reactions import NullReactionAdapter, OutboundReactionAdapter, OutboundReactionConfig, ReactionAdapter
@@ -1670,19 +1655,6 @@ def has_supported_visual_media(message: Message) -> bool:
     return visual_media_source_from_context(message) is not None
 
 
-def referenced_media_available(message: Message) -> bool:
-    for source in (
-        getattr(message, "reply_to_message", None),
-        getattr(message, "external_reply", None),
-        getattr(message, "quote", None),
-    ):
-        if source is None:
-            continue
-        if image_file_ref_from(source) is not None or visual_media_file_ref_from(source) is not None:
-            return True
-    return False
-
-
 def image_suffix_for_mime(mime_type: str) -> str:
     mapping = {
         "image/jpeg": ".jpg",
@@ -2038,7 +2010,6 @@ def save_memory_message(message: Message, *, label: str | None = None, is_bot: b
     username = getattr(user, "username", "") or ""
     item_text = text if text is not None else authored_memory_text_for(message)
     source_text = "" if text is not None else source_memory_text_for(message)
-    source_url = "" if text is not None else source_public_media_url_for_memory(message)
     attachment_type = attachment_type_for(message)
     return MEMORY.save_message(
         chat_id=message.chat_id,
@@ -2053,7 +2024,6 @@ def save_memory_message(message: Message, *, label: str | None = None, is_bot: b
         source_text=source_text,
         content_kind="image" if has_supported_image(message) else ("attachment" if attachment_type else "text"),
         attachment_type=attachment_type,
-        source_url=source_url,
         reply_to_message_id=getattr(getattr(message, "reply_to_message", None), "message_id", None),
         forward_origin=forward_origin_label(message),
     )
@@ -2540,11 +2510,6 @@ def classify_request(message: Message, prompt: str) -> str:
         return "translate_reference"
     if is_internet_image_request(prompt, has_reference=has_reference):
         return "internet_image_send"
-    public_media_intent = resolve_public_media_context_intent(message, prompt)
-    if public_media_intent.active:
-        return "media_context"
-    if has_unresolved_public_media_context_intent(message, prompt, public_media_intent):
-        return "media_context_unresolved"
     if is_time_sensitive_request(time_sensitive_signal_text(message, prompt)):
         return "time_sensitive"
     return "normal"
@@ -2556,11 +2521,6 @@ async def classify_request_with_intent(message: Message, prompt: str) -> tuple[s
         return "translate_reference", None
     if is_internet_image_request(prompt, has_reference=has_reference):
         return "internet_image_send", None
-    public_media_intent = resolve_public_media_context_intent(message, prompt)
-    if public_media_intent.active:
-        return "media_context", None
-    if has_unresolved_public_media_context_intent(message, prompt, public_media_intent):
-        return "media_context_unresolved", None
 
     recall_intent = await detect_memory_recall_intent(message, prompt)
     if recall_intent.is_recall:
@@ -2745,26 +2705,19 @@ def build_reference_context(message: Message) -> str:
     quote = getattr(message, "quote", None)
     quote_text = getattr(quote, "text", None)
     if quote_text:
-        clipped_quote_text = clip_text(quote_text, 2000)
-        sections.append("Selected quote text from the referenced message:\n" + clipped_quote_text)
-    else:
-        clipped_quote_text = ""
-    quote_url = first_public_media_url(telegram_payload_public_media_urls(quote)) if quote is not None else ""
-    if quote_url and not public_media_url_present_in_text(quote_url, clipped_quote_text):
-        sections.append("Selected quote public media URL:\n" + quote_url)
+        sections.append("Selected quote text from the referenced message:\n" + clip_text(quote_text, 2000))
 
     if message.reply_to_message is not None:
         replied = message.reply_to_message
-        replied_content = message_content(replied)
-        reply_parts = [
-            "Replied-to Telegram message:",
-            f"Author: {sender_label(replied)}",
-            f"Message: {replied_content}",
-        ]
-        reply_url = first_public_media_url(telegram_payload_public_media_urls(replied))
-        if reply_url and not public_media_url_present_in_text(reply_url, replied_content):
-            reply_parts.append(f"Source public media URL: {reply_url}")
-        sections.append("\n".join(reply_parts))
+        sections.append(
+            "\n".join(
+                [
+                    "Replied-to Telegram message:",
+                    f"Author: {sender_label(replied)}",
+                    f"Message: {message_content(replied)}",
+                ]
+            )
+        )
 
     external_reply = getattr(message, "external_reply", None)
     if external_reply is not None:
@@ -2773,15 +2726,6 @@ def build_reference_context(message: Message) -> str:
         if origin is not None:
             origin_type = getattr(origin, "type", type(origin).__name__)
             external_parts.append(f"Origin: {origin_type}")
-        external_text = getattr(external_reply, "text", None) or getattr(external_reply, "caption", None)
-        if external_text:
-            clipped_external_text = clip_text(str(external_text), 2000)
-            external_parts.append(f"Message: {clipped_external_text}")
-        else:
-            clipped_external_text = ""
-        external_url = first_public_media_url(telegram_payload_public_media_urls(external_reply))
-        if external_url and not public_media_url_present_in_text(external_url, clipped_external_text):
-            external_parts.append(f"Source public media URL: {external_url}")
         for attr in ("photo", "video", "document", "audio", "voice", "animation", "sticker", "poll"):
             if getattr(external_reply, attr, None):
                 external_parts.append(f"Attachment: {attr}")
@@ -4597,35 +4541,6 @@ def configured_capability_rows() -> list[CapabilityRow]:
             ),
         )
     )
-    try:
-        media_acquisition_health = runtime_media_acquisition_adapter().health_summary()
-    except Exception:
-        media_acquisition_health = {}
-    acquisition_enabled = bool(media_acquisition_health.get("enabled", False))
-    acquisition_available = bool(media_acquisition_health.get("available", False))
-    rows.append(
-        CapabilityRow(
-            name="media_context",
-            family="media",
-            enabled=True,
-            configured=acquisition_enabled,
-            available=acquisition_available,
-            status=(
-                "ok"
-                if acquisition_available
-                else ("unconfigured" if acquisition_enabled else "disabled")
-            ),
-            adapter="media_context_route",
-            mode="explicit_public_url",
-            backend=safe_detail_code(media_acquisition_health.get("backend", "") or "media_acquisition"),
-            details={
-                "max_duration_seconds": media_acquisition_health.get("max_duration_seconds", 0),
-                "max_download_bytes": media_acquisition_health.get("max_download_bytes", 0),
-                "backend_available": bool(media_acquisition_health.get("backend_available", False)),
-            },
-            next_action=("check media_acquisition" if acquisition_enabled and not acquisition_available else ""),
-        )
-    )
     rows.append(
         CapabilityRow(
             name="system_log",
@@ -4840,663 +4755,6 @@ def extract_current_prompt_urls(text: str) -> list[str]:
     return urls[:3]
 
 
-MEDIA_CONTEXT_PLATFORMS = {"tiktok", "youtube", "instagram"}
-MEDIA_CONTEXT_RECENT_CANDIDATES = 8
-EXPLICIT_MEDIA_CONTEXT_HINTS = (
-    "video",
-    "clip",
-    "short",
-    "shorts",
-    "reel",
-    "reels",
-    "tiktok",
-    "youtube",
-    "youtu.be",
-    "instagram",
-    "відео",
-    "видео",
-    "ролик",
-    "кліп",
-    "клип",
-    "рілс",
-    "рилс",
-    "шортс",
-)
-MEDIA_CONTEXT_HINTS = (
-    *EXPLICIT_MEDIA_CONTEXT_HINTS,
-    "що тут",
-    "что тут",
-    "підсумуй",
-    "суммариз",
-    "summarize",
-)
-MEDIA_REFERENCE_HINTS = (
-    "ссылка",
-    "ссылке",
-    "ссылку",
-    "посилання",
-    "лінк",
-    "линк",
-)
-MEDIA_REFERENCE_TOKEN_HINTS = ("link", "url")
-
-
-@dataclass(frozen=True)
-class PublicMediaContextIntent:
-    url: str = ""
-    platform: str = ""
-    url_source: str = ""
-    intent_mode: str = ""
-    candidate_rank: int = 0
-    candidate_distance: int = 0
-
-    @property
-    def active(self) -> bool:
-        return bool(self.url)
-
-
-@dataclass(frozen=True)
-class PublicMediaUrlCandidate:
-    source: str
-    text: str
-    rank: int
-    distance: int = 0
-
-
-@dataclass(frozen=True)
-class TelegramContextVisibility:
-    has_reply: bool = False
-    has_quote: bool = False
-    has_external_reply: bool = False
-    current_text_url_count: int = 0
-    current_entity_url_count: int = 0
-    current_link_preview_url_count: int = 0
-    current_api_kwargs_url_count: int = 0
-    current_memory_url_count: int = 0
-    reply_url_count: int = 0
-    quote_url_count: int = 0
-    external_reply_url_count: int = 0
-    reply_chain_memory_url_count: int = 0
-    recent_memory_url_count: int = 0
-    recent_context_url_count: int = 0
-
-    def event_details(self) -> dict[str, Any]:
-        return {
-            "media_has_reply": self.has_reply,
-            "media_has_quote": self.has_quote,
-            "media_has_external_reply": self.has_external_reply,
-            "media_current_text_url_count": self.current_text_url_count,
-            "media_current_entity_url_count": self.current_entity_url_count,
-            "media_current_link_preview_url_count": self.current_link_preview_url_count,
-            "media_current_api_kwargs_url_count": self.current_api_kwargs_url_count,
-            "media_current_memory_url_count": self.current_memory_url_count,
-            "media_replied_message_url_count": self.reply_url_count,
-            "media_quote_url_count": self.quote_url_count,
-            "media_external_reply_url_count": self.external_reply_url_count,
-            "media_reply_chain_memory_url_count": self.reply_chain_memory_url_count,
-            "media_recent_memory_url_count": self.recent_memory_url_count,
-            "media_recent_context_url_count": self.recent_context_url_count,
-        }
-
-
-def has_media_context_hint(prompt: str) -> bool:
-    prompt_without_urls = re.sub(r"\b(?:https?://|www\.)\S+", " ", prompt or "", flags=re.IGNORECASE)
-    lowered = prompt_without_urls.casefold()
-    return any(hint in lowered for hint in MEDIA_CONTEXT_HINTS)
-
-
-def has_explicit_media_context_hint(prompt: str) -> bool:
-    prompt_without_urls = re.sub(r"\b(?:https?://|www\.)\S+", " ", prompt or "", flags=re.IGNORECASE)
-    lowered = prompt_without_urls.casefold()
-    return any(hint in lowered for hint in EXPLICIT_MEDIA_CONTEXT_HINTS)
-
-
-def has_media_reference_hint(prompt: str) -> bool:
-    prompt_without_urls = re.sub(r"\b(?:https?://|www\.)\S+", " ", prompt or "", flags=re.IGNORECASE)
-    lowered = prompt_without_urls.casefold()
-    return any(hint in lowered for hint in MEDIA_REFERENCE_HINTS) or any(
-        re.search(rf"\b{re.escape(hint)}\b", lowered) for hint in MEDIA_REFERENCE_TOKEN_HINTS
-    )
-
-
-def public_media_url_from_text(value: Any) -> str:
-    return next(iter(public_media_urls_from_text(value)), "")
-
-
-def public_media_urls_from_text(value: Any) -> list[str]:
-    text = str(value or "")
-    urls: list[str] = []
-    seen: set[str] = set()
-    for url in extract_current_prompt_urls(text):
-        if platform_from_url(url) in MEDIA_CONTEXT_PLATFORMS:
-            canonical_url = canonical_public_media_context_url(url)
-            if canonical_url and canonical_url not in seen:
-                urls.append(canonical_url)
-                seen.add(canonical_url)
-    return urls
-
-
-def unique_public_media_urls(values: Sequence[Any]) -> list[str]:
-    urls: list[str] = []
-    seen: set[str] = set()
-    for value in values:
-        for url in public_media_urls_from_text(value):
-            if not url or url in seen:
-                continue
-            urls.append(url)
-            seen.add(url)
-    return urls
-
-
-def first_public_media_url(values: Sequence[Any]) -> str:
-    return next(iter(unique_public_media_urls(values)), "")
-
-
-def public_media_url_present_in_text(url: str, text: str) -> bool:
-    return bool(url and text and url in unique_public_media_urls([text]))
-
-
-def utf16_entity_slice(text: str, offset: Any, length: Any) -> str:
-    try:
-        start_units = max(0, int(offset))
-        length_units = max(0, int(length))
-    except (TypeError, ValueError):
-        return ""
-    if not text or length_units <= 0:
-        return ""
-    encoded = text.encode("utf-16-le", errors="surrogatepass")
-    start = start_units * 2
-    end = (start_units + length_units) * 2
-    if start >= len(encoded):
-        return ""
-    return encoded[start:end].decode("utf-16-le", errors="ignore")
-
-
-def telegram_entity_url_values(value: Any) -> list[str]:
-    urls: list[str] = []
-    entity_specs = (
-        ("text", "entities"),
-        ("caption", "caption_entities"),
-    )
-    url_type = str(getattr(MessageEntity, "URL", "url"))
-    text_link_type = str(getattr(MessageEntity, "TEXT_LINK", "text_link"))
-    for text_attr, entity_attr in entity_specs:
-        text = str(getattr(value, text_attr, "") or "")
-        entities = getattr(value, entity_attr, None) or ()
-        for entity in entities:
-            entity_type = str(getattr(entity, "type", "") or "")
-            if entity_type == text_link_type:
-                urls.append(str(getattr(entity, "url", "") or ""))
-            elif entity_type == url_type:
-                urls.append(utf16_entity_slice(text, getattr(entity, "offset", 0), getattr(entity, "length", 0)))
-    return urls
-
-
-TELEGRAM_API_URL_FIELD_NAMES = {"url", "source_url"}
-TELEGRAM_API_NESTED_URL_FIELDS = {
-    "link_preview_options",
-    "external_reply",
-    "reply_to_message",
-    "quote",
-    "entities",
-    "caption_entities",
-    "web_page",
-    "web_app",
-}
-
-
-def telegram_api_kwargs_url_values(value: Any, *, depth: int = 0) -> list[str]:
-    if value is None or depth > 4:
-        return []
-    if isinstance(value, dict):
-        mapping = value
-    elif isinstance(value, (list, tuple)):
-        urls: list[str] = []
-        for item in value:
-            urls.extend(telegram_api_kwargs_url_values(item, depth=depth + 1))
-        return urls
-    else:
-        mapping = getattr(value, "api_kwargs", None)
-    if not isinstance(mapping, dict):
-        return []
-
-    urls: list[str] = []
-    for key, nested in mapping.items():
-        key_name = str(key or "").casefold()
-        if key_name in TELEGRAM_API_URL_FIELD_NAMES and isinstance(nested, str):
-            urls.append(nested)
-            continue
-        if key_name in TELEGRAM_API_NESTED_URL_FIELDS:
-            urls.extend(telegram_api_kwargs_url_values(nested, depth=depth + 1))
-            continue
-    return urls
-
-
-def telegram_link_preview_url_values(value: Any) -> list[str]:
-    urls: list[str] = []
-    preview = getattr(value, "link_preview_options", None)
-    if preview is not None:
-        urls.append(str(getattr(preview, "url", "") or ""))
-        urls.extend(telegram_api_kwargs_url_values(preview))
-    api_kwargs = getattr(value, "api_kwargs", None)
-    if isinstance(api_kwargs, dict):
-        urls.extend(telegram_api_kwargs_url_values({"link_preview_options": api_kwargs.get("link_preview_options")}))
-    return urls
-
-
-def telegram_payload_public_media_urls(value: Any) -> list[str]:
-    text_values = [
-        getattr(value, "text", "") or "",
-        getattr(value, "caption", "") or "",
-    ]
-    return unique_public_media_urls(
-        [
-            *text_values,
-            *telegram_entity_url_values(value),
-            *telegram_link_preview_url_values(value),
-            *telegram_api_kwargs_url_values(value),
-        ]
-    )
-
-
-def telegram_reference_public_media_urls(value: Any) -> list[str]:
-    if value is None:
-        return []
-    urls: list[str] = []
-    for attr in ("quote", "reply_to_message", "external_reply"):
-        referenced = getattr(value, attr, None)
-        if referenced is not None:
-            urls.extend(telegram_payload_public_media_urls(referenced))
-    return unique_public_media_urls(urls)
-
-
-def telegram_entity_public_media_url(value: Any) -> str:
-    return first_public_media_url(telegram_entity_url_values(value))
-
-
-def telegram_api_kwargs_public_media_url(value: Any) -> str:
-    return first_public_media_url(telegram_api_kwargs_url_values(value))
-
-
-def source_public_media_url_for_memory(message: Message) -> str:
-    return first_public_media_url(
-        [
-            *telegram_payload_public_media_urls(message),
-            *telegram_reference_public_media_urls(message),
-        ]
-    )
-
-
-def link_preview_url_from(value: Any) -> str:
-    return first_public_media_url(telegram_link_preview_url_values(value))
-
-
-def media_context_prompt_without_urls(prompt: str) -> str:
-    cleaned = URL_TOKEN_RE.sub(" ", prompt or "")
-    cleaned = MENTION_TOKEN_RE.sub(" ", cleaned)
-    cleaned = SLASH_COMMAND_TOKEN_RE.sub(" ", cleaned)
-    return " ".join(cleaned.split())
-
-
-def is_bare_media_url_prompt(prompt: str) -> bool:
-    return bool(public_media_url_from_text(prompt)) and not meaningful_followup_words(media_context_prompt_without_urls(prompt))
-
-
-def has_reference_media_context_intent(prompt: str) -> bool:
-    return has_media_context_hint(prompt) or has_media_reference_hint(prompt) or is_short_followup_prompt(prompt)
-
-
-def memory_item_public_media_url(item: MemoryItem) -> str:
-    if item.is_bot:
-        return ""
-    fields = (
-        item.text,
-        item.source_text,
-        item.source_url,
-    )
-    for field in fields:
-        url = public_media_url_from_text(field)
-        if url:
-            return url
-    return ""
-
-
-def append_public_media_url_candidate(
-    candidates: list[PublicMediaUrlCandidate],
-    source: str,
-    text: Any,
-    *,
-    distance: int = 0,
-) -> None:
-    value = str(text or "").strip()
-    if not value:
-        return
-    candidates.append(
-        PublicMediaUrlCandidate(
-            source=source,
-            text=value,
-            rank=len(candidates) + 1,
-            distance=max(0, int(distance)),
-        )
-    )
-
-
-def current_memory_public_media_url(message: Message) -> str:
-    if MEMORY is None:
-        return ""
-    item = MEMORY.message_by_message_id(message.chat_id, getattr(message, "message_id", None))
-    return memory_item_public_media_url(item) if item is not None else ""
-
-
-def passive_context_public_media_text(value: str) -> str:
-    text = str(value or "").strip()
-    if re.match(r"^aigan(?:\s*\([^)]*\))?\s*:", text, flags=re.IGNORECASE):
-        return ""
-    return text
-
-
-def public_media_url_candidate_source_kind(source: str) -> str:
-    if source.startswith("current_"):
-        return "current"
-    if source in {"recent_memory", "recent_context"}:
-        return "recent"
-    return "reference"
-
-
-def count_public_media_urls(values: Sequence[Any]) -> int:
-    return len(unique_public_media_urls(values))
-
-
-def telegram_context_visibility(message: Message, prompt: str) -> TelegramContextVisibility:
-    reply = getattr(message, "reply_to_message", None)
-    quote = getattr(message, "quote", None)
-    external_reply = getattr(message, "external_reply", None)
-    candidates = public_media_url_candidates(message, prompt)
-    candidate_counts = Counter(
-        candidate.source for candidate in candidates if public_media_url_from_text(candidate.text)
-    )
-    return TelegramContextVisibility(
-        has_reply=reply is not None,
-        has_quote=quote is not None,
-        has_external_reply=external_reply is not None,
-        current_text_url_count=count_public_media_urls(
-            [
-                prompt,
-                getattr(message, "text", "") or "",
-                getattr(message, "caption", "") or "",
-            ]
-        ),
-        current_entity_url_count=count_public_media_urls(telegram_entity_url_values(message)),
-        current_link_preview_url_count=count_public_media_urls(telegram_link_preview_url_values(message)),
-        current_api_kwargs_url_count=count_public_media_urls(telegram_api_kwargs_url_values(message)),
-        current_memory_url_count=candidate_counts.get("current_memory", 0),
-        reply_url_count=count_public_media_urls(telegram_payload_public_media_urls(reply) if reply is not None else []),
-        quote_url_count=count_public_media_urls(telegram_payload_public_media_urls(quote) if quote is not None else []),
-        external_reply_url_count=count_public_media_urls(
-            telegram_payload_public_media_urls(external_reply) if external_reply is not None else []
-        ),
-        reply_chain_memory_url_count=candidate_counts.get("reply_chain_memory", 0),
-        recent_memory_url_count=candidate_counts.get("recent_memory", 0),
-        recent_context_url_count=candidate_counts.get("recent_context", 0),
-    )
-
-
-def public_media_referent_diagnostics(
-    message: Message,
-    prompt: str,
-    resolved_intent: PublicMediaContextIntent | None = None,
-) -> dict[str, Any]:
-    visibility = telegram_context_visibility(message, prompt)
-    reply = getattr(message, "reply_to_message", None)
-    quote = getattr(message, "quote", None)
-    intent = resolved_intent if resolved_intent is not None else resolve_public_media_context_intent(message, prompt)
-    details = visibility.event_details()
-    details.update(
-        {
-            # Legacy compact keys retained for existing dashboards.
-            "media_text_url_count": visibility.current_text_url_count,
-            "media_entity_url_count": visibility.current_entity_url_count,
-            "media_link_preview_url_count": visibility.current_link_preview_url_count,
-            "media_reply_url_count": count_public_media_urls(
-                [
-                    *(telegram_payload_public_media_urls(reply) if reply is not None else []),
-                    *(telegram_payload_public_media_urls(quote) if quote is not None else []),
-                ]
-            ),
-            "media_external_reply_url_count": visibility.external_reply_url_count,
-            "media_memory_url_count": (
-                visibility.current_memory_url_count
-                + visibility.reply_chain_memory_url_count
-                + visibility.recent_memory_url_count
-                + visibility.recent_context_url_count
-            ),
-        }
-    )
-    if intent.active:
-        details.update(
-            {
-                "media_selected_source_kind": safe_detail_code(public_media_url_candidate_source_kind(intent.url_source)),
-                "media_selected_candidate_rank": intent.candidate_rank,
-                "media_selected_candidate_distance": intent.candidate_distance,
-            }
-        )
-    else:
-        details.update(
-            {
-                "media_selected_source_kind": "",
-                "media_selected_candidate_rank": 0,
-                "media_selected_candidate_distance": 0,
-            }
-        )
-    return {
-        key: value
-        for key, value in details.items()
-        if isinstance(value, (bool, int, float)) or (isinstance(value, str) and len(value) <= 80)
-    }
-
-
-def public_media_url_candidates(message: Message, prompt: str) -> list[PublicMediaUrlCandidate]:
-    candidates: list[PublicMediaUrlCandidate] = []
-    current_link_preview = link_preview_url_from(message)
-    current_entity_url = telegram_entity_public_media_url(message)
-    current_api_kwargs_url = telegram_api_kwargs_public_media_url(message)
-    current_payload = useful_payload_text(message, limit=3000)
-    append_public_media_url_candidate(candidates, "current_prompt", prompt or "")
-    append_public_media_url_candidate(candidates, "current_entity_url", current_entity_url)
-    append_public_media_url_candidate(candidates, "current_link_preview", current_link_preview)
-    append_public_media_url_candidate(candidates, "current_api_kwargs", current_api_kwargs_url)
-    append_public_media_url_candidate(candidates, "current_payload", current_payload)
-    should_check_current_memory = has_reference_media_context_intent(prompt)
-    current_sources_have_media_url = bool(
-        public_media_url_from_text(current_entity_url)
-        or public_media_url_from_text(current_link_preview)
-        or public_media_url_from_text(current_api_kwargs_url)
-        or public_media_url_from_text(current_payload)
-    )
-    if should_check_current_memory and not current_sources_have_media_url:
-        append_public_media_url_candidate(candidates, "current_memory", current_memory_public_media_url(message))
-
-    quote = getattr(message, "quote", None)
-    quote_text = getattr(quote, "text", "") if quote is not None else ""
-    if quote is not None:
-        append_public_media_url_candidate(candidates, "quote_entity_url", telegram_entity_public_media_url(quote))
-        append_public_media_url_candidate(candidates, "quote_link_preview", link_preview_url_from(quote))
-        append_public_media_url_candidate(candidates, "quote_api_kwargs", telegram_api_kwargs_public_media_url(quote))
-    append_public_media_url_candidate(candidates, "quote", quote_text)
-
-    replied = getattr(message, "reply_to_message", None)
-    if replied is not None:
-        append_public_media_url_candidate(candidates, "reply_entity_url", telegram_entity_public_media_url(replied))
-        append_public_media_url_candidate(candidates, "reply_link_preview", link_preview_url_from(replied))
-        append_public_media_url_candidate(candidates, "reply_api_kwargs", telegram_api_kwargs_public_media_url(replied))
-        append_public_media_url_candidate(candidates, "reply_reference", message_content(replied, limit=3000))
-
-    external_reply = getattr(message, "external_reply", None)
-    if external_reply is not None:
-        append_public_media_url_candidate(candidates, "external_entity_url", telegram_entity_public_media_url(external_reply))
-        append_public_media_url_candidate(candidates, "external_link_preview", link_preview_url_from(external_reply))
-        append_public_media_url_candidate(candidates, "external_api_kwargs", telegram_api_kwargs_public_media_url(external_reply))
-        append_public_media_url_candidate(
-            candidates,
-            "external_reply",
-            getattr(external_reply, "text", "") or getattr(external_reply, "caption", ""),
-        )
-
-    if has_reference_media_context_intent(prompt):
-        for distance, item in enumerate(reversed(stored_reply_chain_items(message)), start=1):
-            url = memory_item_public_media_url(item)
-            if url:
-                append_public_media_url_candidate(candidates, "reply_chain_memory", url, distance=distance)
-        recent_candidates: list[tuple[int, int, str, str]] = []
-        if MEMORY is not None:
-            current_message_id = getattr(message, "message_id", None)
-            distance = 0
-            for item in reversed(MEMORY.latest(message.chat_id, MEDIA_CONTEXT_RECENT_CANDIDATES)):
-                if item.message_id == current_message_id or item.is_bot:
-                    continue
-                distance += 1
-                url = memory_item_public_media_url(item)
-                if url:
-                    recent_candidates.append((distance, 1, "recent_memory", url))
-        for distance, item in enumerate(
-            reversed(list(passive_contexts[message.chat_id])[-MEDIA_CONTEXT_RECENT_CANDIDATES:]),
-            start=1,
-        ):
-            text = passive_context_public_media_text(item)
-            if text and public_media_url_from_text(text):
-                recent_candidates.append((distance, 0, "recent_context", text))
-        for distance, _priority, source, text in sorted(recent_candidates):
-            append_public_media_url_candidate(candidates, source, text, distance=distance)
-
-    return candidates
-
-
-def resolve_public_media_context_intent(message: Message, prompt: str) -> PublicMediaContextIntent:
-    current_url = public_media_url_from_text(prompt)
-    if current_url:
-        intent_mode = "target_summary" if is_bare_media_url_prompt(prompt) or has_media_context_hint(prompt) else "supporting_context"
-        return PublicMediaContextIntent(
-            url=current_url,
-            platform=platform_from_url(current_url),
-            url_source="current_prompt",
-            intent_mode=intent_mode,
-            candidate_rank=1,
-            candidate_distance=0,
-        )
-
-    prompt_allows_reference = has_reference_media_context_intent(prompt)
-    for candidate in public_media_url_candidates(message, prompt):
-        source = candidate.source
-        text = candidate.text
-        if source == "current_prompt":
-            continue
-        url = public_media_url_from_text(text)
-        if not url:
-            continue
-        if source in {
-            "current_entity_url",
-            "current_payload",
-            "current_link_preview",
-            "current_api_kwargs",
-        }:
-            if message.chat.type == ChatType.PRIVATE or is_bare_media_url_prompt(text) or prompt_allows_reference:
-                return PublicMediaContextIntent(
-                    url=url,
-                    platform=platform_from_url(url),
-                    url_source=source,
-                    intent_mode="target_summary",
-                    candidate_rank=candidate.rank,
-                    candidate_distance=candidate.distance,
-                )
-            continue
-        if source == "current_memory":
-            if prompt_allows_reference:
-                return PublicMediaContextIntent(
-                    url=url,
-                    platform=platform_from_url(url),
-                    url_source=source,
-                    intent_mode="target_summary",
-                    candidate_rank=candidate.rank,
-                    candidate_distance=candidate.distance,
-                )
-            continue
-        if prompt_allows_reference:
-            return PublicMediaContextIntent(
-                url=url,
-                platform=platform_from_url(url),
-                url_source=source,
-                intent_mode="target_summary" if has_media_context_hint(prompt) or is_short_followup_prompt(prompt) else "supporting_context",
-                candidate_rank=candidate.rank,
-                candidate_distance=candidate.distance,
-            )
-    return PublicMediaContextIntent()
-
-
-PUBLIC_MEDIA_MISSING_REFERENT_RESPONSE = (
-    "До мене дійшов лише текст запиту: Telegram не передав доступного лінка/посилання, reply/quote або медіа. "
-    "Надішли сам URL/файл або відповідай саме на повідомлення, де Telegram передає лінк чи медіа, тоді розберу."
-)
-
-
-def has_unresolved_public_media_context_intent(
-    message: Message,
-    prompt: str,
-    resolved_intent: PublicMediaContextIntent | None = None,
-) -> bool:
-    intent = resolved_intent if resolved_intent is not None else resolve_public_media_context_intent(message, prompt)
-    if intent.active:
-        return False
-    if has_supported_image(message) or has_supported_visual_media(message) or referenced_media_available(message):
-        return False
-    if has_media_reference_hint(prompt):
-        return True
-    if has_explicit_media_context_hint(prompt):
-        return True
-    return False
-
-
-def public_media_context_url_from_prompt(prompt: str) -> str:
-    return public_media_url_from_text(prompt)
-
-
-def is_public_media_context_request(prompt: str) -> bool:
-    return bool(public_media_context_url_from_prompt(prompt))
-
-
-def canonical_public_media_context_url(url: str) -> str:
-    platform = platform_from_url(url)
-    if platform == "youtube":
-        return youtube_tool_url_for_context(url)
-    parsed = urllib.parse.urlparse(url)
-    if not parsed.scheme or not parsed.netloc:
-        return url
-    return urllib.parse.urlunparse((parsed.scheme, parsed.netloc, parsed.path, "", "", ""))
-
-
-def youtube_tool_url_for_context(url: str) -> str:
-    if platform_from_url(url) != "youtube":
-        return url
-    parsed = urllib.parse.urlparse(url)
-    host = (parsed.hostname or "").lower()
-    path = parsed.path.strip("/")
-    video_id = ""
-    if host.endswith("youtu.be") and path:
-        video_id = path.split("/")[0]
-    elif "youtube.com" in host:
-        video_id = urllib.parse.parse_qs(parsed.query).get("v", [""])[0]
-        if not video_id:
-            parts = path.split("/")
-            for marker in ("shorts", "embed", "live"):
-                if marker in parts:
-                    index = parts.index(marker)
-                    if len(parts) > index + 1:
-                        video_id = parts[index + 1]
-                        break
-    if re.fullmatch(r"[A-Za-z0-9_-]{11}", video_id or ""):
-        return f"https://www.youtube.com/watch?v={video_id}"
-    return urllib.parse.urlunparse((parsed.scheme, parsed.netloc, parsed.path, "", "", ""))
-
-
 def web_prefetch_query(message: Message, prompt: str) -> str:
     payload = useful_payload_text(message, limit=3000)
     reference = build_reference_context(message)
@@ -5576,374 +4834,6 @@ async def maybe_prefetch_web_context(message: Message, prompt: str, route: str) 
             },
         )
         return f"Web prefetch failed: {failure_category}"
-
-
-def save_public_media_context_summary_memory(
-    message: Message,
-    *,
-    summary: str,
-    platform: str,
-    modality: str,
-) -> int | None:
-    if MEMORY is None or not summary.strip():
-        return None
-
-    existing = MEMORY.message_by_message_id(message.chat_id, getattr(message, "message_id", None))
-    if existing is not None:
-        item_id = existing.id
-    else:
-        user = getattr(message, "from_user", None)
-        item_id = MEMORY.save_message(
-            chat_id=message.chat_id,
-            message_id=getattr(message, "message_id", None),
-            chat_type=str(getattr(message.chat, "type", "")),
-            created_at=message_datetime(message),
-            sender_label=sender_label(message),
-            user_id=getattr(user, "id", None),
-            username=getattr(user, "username", "") or "",
-            is_bot=False,
-            text="",
-            source_text="",
-            content_kind="attachment",
-            attachment_type="public_media_url",
-            mime_type="",
-            raw_note=f"public_media_context:{platform}:{modality}",
-        )
-
-    MEMORY.update_vision_summary(item_id, summary)
-    enqueue_memory_embedding(item_id)
-    return item_id
-
-
-def media_context_from_visual_summary(
-    *,
-    platform: str,
-    backend: str,
-    acquisition_metadata: dict[str, Any],
-    frame_result: MediaFrameResult,
-    summary_result: VisualMediaSummaryResult,
-) -> MediaContextResult:
-    metadata = {
-        **(acquisition_metadata or {}),
-        "frame_count": summary_result.frame_count,
-        "candidate_frames": frame_result.candidate_count,
-        "selected_frames": frame_result.selected_count,
-        "visual_only": True,
-    }
-    return MediaContextResult(
-        ok=True,
-        state="visual_summary",
-        platform=platform,
-        backend=backend,
-        modality="visual_summary",
-        summary=sanitize_public_media_summary(summary_result.summary, 4000),
-        metadata=metadata,
-        diagnostics={
-            "source_family": frame_result.source_family,
-            "frame_backend": frame_result.backend,
-        },
-    )
-
-
-def public_media_visual_failure_category(category: str) -> str:
-    clean = safe_detail_code(category or "")
-    if clean in {"timeout", "visual_summary_failed"}:
-        return clean
-    if clean in {"vision_failed", "empty_vision_summary"}:
-        return "visual_summary_failed"
-    return "visual_extraction_unavailable"
-
-
-def media_acquisition_download_timeout_seconds() -> float:
-    return max(1.0, float(CONFIG.media_acquisition_socket_timeout_seconds) * 3.0)
-
-
-async def acquire_public_media_file(
-    request: MediaAcquisitionRequest,
-    *,
-    event_context: dict[str, Any] | None = None,
-) -> MediaAcquisitionFileResult:
-    acquire_media = getattr(runtime_media_acquisition_adapter(), "acquire_media", None)
-    if not callable(acquire_media):
-        return MediaAcquisitionFileResult.unavailable(
-            failure_category="unconfigured",
-            backend="media_acquisition",
-            platform=platform_from_url(request.url),
-            diagnostics={"route": request.route, "stage": "download"},
-        )
-    return await TOOL_RUNTIME.safe_call(
-        "media_acquisition",
-        "acquire_media",
-        lambda: asyncio.to_thread(acquire_media, request),
-        default=MediaAcquisitionFileResult.unavailable(
-            failure_category="unexpected_error",
-            backend="media_acquisition",
-            platform=platform_from_url(request.url),
-            diagnostics={"route": request.route, "stage": "download"},
-        ),
-        details={"stage": "download", "platform": platform_from_url(request.url)},
-        event_context=event_context,
-    )
-
-
-async def summarize_public_media_visual_context(
-    message: Message,
-    prompt: str,
-    url: str,
-    acquisition_result: MediaAcquisitionResult,
-    context_result: MediaContextResult,
-) -> MediaContextResult:
-    acquisition_file: MediaAcquisitionFileResult | None = None
-    frame_result = MediaFrameResult.unavailable(
-        failure_category="visual_extraction_unavailable",
-        source_family="public_media_url",
-        user_message=VISUAL_MEDIA_UNAVAILABLE_MESSAGE,
-    )
-    try:
-        acquisition_file = await acquire_public_media_file(
-            MediaAcquisitionRequest(
-                url=url,
-                route="public_media_context",
-                max_duration_seconds=CONFIG.media_acquisition_max_duration_seconds,
-                max_download_bytes=CONFIG.media_acquisition_max_download_bytes,
-                socket_timeout_seconds=CONFIG.media_acquisition_socket_timeout_seconds,
-                download_timeout_seconds=media_acquisition_download_timeout_seconds(),
-            ),
-            event_context={"telegram_message": message, "route": "media_context"},
-        )
-        if not acquisition_file.ok or acquisition_file.source_path is None:
-            system_event(
-                level="warning",
-                component="media_context",
-                event_type="context_download_unavailable",
-                telegram_message=message,
-                route="media_context",
-                message=acquisition_file.failure_category or "download_failed",
-                details=acquisition_file.public_dict(),
-            )
-            return media_context_with_visual_failure(
-                context_result,
-                acquisition_file.failure_category or "download_failed",
-            )
-
-        frame_result = await TOOL_RUNTIME.safe_call(
-            "media_frames",
-            "extract_frames",
-            lambda: runtime_media_frame_adapter().extract_frames(
-                MediaFrameRequest(
-                    source_path=acquisition_file.source_path,
-                    source_family="public_media_url",
-                    provenance_label=acquisition_file.platform,
-                    mime_type=acquisition_file.mime_type,
-                    declared_size_bytes=acquisition_file.file_size_bytes,
-                    max_duration_seconds=CONFIG.media_frame_max_duration_seconds,
-                    max_bytes=CONFIG.media_frame_max_bytes,
-                    selected_frame_count=CONFIG.media_frame_selected_count,
-                    max_selected_frame_count=CONFIG.media_frame_max_selected_count,
-                    timeout_seconds=CONFIG.media_frame_timeout_seconds,
-                    mode="public_media_context",
-                )
-            ),
-            default=MediaFrameResult.unavailable(
-                failure_category="visual_extraction_unavailable",
-                source_family="public_media_url",
-                user_message=VISUAL_MEDIA_UNAVAILABLE_MESSAGE,
-            ),
-            event_context={"telegram_message": message, "route": "media_context"},
-            details={"source_family": "public_media_url", "platform": acquisition_file.platform},
-        )
-
-        redacted_prompt = redact_urls_for_prompt_preview(prompt)
-        try:
-            memory_context = await prepare_memory_context(message, redacted_prompt)
-            memory_context = redact_urls_for_prompt_preview(memory_context)
-            summary_result = await summarize_visual_media_frames(
-                frame_result=frame_result,
-                user_prompt=redacted_prompt,
-                vision_runner=run_vision,
-                max_frames=CONFIG.media_frame_max_selected_count,
-                max_frame_bytes=CONFIG.image_max_bytes,
-                timeout_seconds=120,
-                reference_context="",
-                memory_context=memory_context,
-            )
-        except Exception as exc:
-            LOGGER.info("Public media visual summary failed category=%s", type(exc).__name__)
-            summary_result = VisualMediaSummaryResult(
-                ok=False,
-                failure_category="visual_summary_failed",
-                user_message=VISUAL_MEDIA_UNAVAILABLE_MESSAGE,
-                source_family="public_media_url",
-            )
-        if not summary_result.ok:
-            visual_failure_category = public_media_visual_failure_category(summary_result.failure_category)
-            system_event(
-                level="warning",
-                component="media_context",
-                event_type="visual_summary_failed",
-                telegram_message=message,
-                route="media_context",
-                message=visual_failure_category,
-                details={
-                    "platform": acquisition_file.platform,
-                    "failure_category": visual_failure_category,
-                    "frame_failure_category": summary_result.failure_category or "unknown",
-                    "frame_count": summary_result.frame_count,
-                    "source_family": summary_result.source_family,
-                    "cleanup_status": frame_result.cleanup_status,
-                },
-            )
-            return media_context_with_visual_failure(
-                context_result,
-                visual_failure_category,
-            )
-        return media_context_from_visual_summary(
-            platform=acquisition_file.platform,
-            backend=acquisition_file.backend,
-            acquisition_metadata=acquisition_result.metadata,
-            frame_result=frame_result,
-            summary_result=summary_result,
-        )
-    finally:
-        await frame_result.cleanup()
-        if acquisition_file is not None:
-            await acquisition_file.cleanup()
-
-
-async def handle_public_media_context_prompt(
-    message: Message,
-    context: ContextTypes.DEFAULT_TYPE,
-    prompt: str,
-    resolved_intent: PublicMediaContextIntent | None = None,
-) -> bool:
-    intent = resolved_intent if resolved_intent is not None else resolve_public_media_context_intent(message, prompt)
-    if not intent.active:
-        return False
-    url = intent.url
-
-    presence = activity_presence_for_message(message, bot=context.bot, action=ChatAction.TYPING)
-    await presence.start()
-    started = time.monotonic()
-    platform = intent.platform or platform_from_url(url)
-    context_result = media_context_from_acquisition(
-        MediaAcquisitionResult.unavailable(
-            failure_category="unexpected_error",
-            backend="media_acquisition",
-            platform=platform,
-        )
-    )
-    response = ""
-    try:
-        acquisition_result = await TOOL_RUNTIME.safe_call(
-            "media_acquisition",
-            "probe_metadata",
-            lambda: asyncio.to_thread(
-                runtime_media_acquisition_adapter().probe_metadata,
-                MediaAcquisitionRequest(url=url, route="public_media_context"),
-            ),
-            default=MediaAcquisitionResult.unavailable(
-                failure_category="unexpected_error",
-                backend="media_acquisition",
-                platform=platform,
-            ),
-            event_context={"telegram_message": message, "route": "media_context"},
-            details={"stage": "metadata", "platform": platform},
-        )
-        context_result = media_context_from_acquisition(acquisition_result)
-        metadata = context_result.metadata if isinstance(context_result.metadata, dict) else {}
-        should_try_youtube_transcript = (
-            context_result.ok
-            and context_result.platform == "youtube"
-            and (bool(metadata.get("has_subtitles")) or bool(metadata.get("has_auto_captions")))
-        )
-        if should_try_youtube_transcript:
-            agent_prompt = build_youtube_media_context_prompt(
-                user_prompt=prompt,
-                url=youtube_tool_url_for_context(url),
-                context_result=context_result,
-            )
-            try:
-                response = await asyncio.wait_for(run_agent(agent_prompt), timeout=120)
-            except Exception as exc:
-                LOGGER.warning("YouTube media context agent path failed: %s", type(exc).__name__)
-                system_event(
-                    level="warning",
-                    component="media_context",
-                    event_type="context_failed",
-                    telegram_message=message,
-                    route="media_context",
-                    duration_ms=int((time.monotonic() - started) * 1000),
-                    message="youtube_agent_failed",
-                    details={**media_context_event_details(context_result), "failure_category": "unexpected_error"},
-                )
-                response = ""
-            if response:
-                context_result = MediaContextResult(
-                    ok=True,
-                    state="transcript_summary",
-                    platform=context_result.platform,
-                    backend=context_result.backend,
-                    modality="transcript",
-                    summary=sanitize_public_media_summary(response, 4000),
-                    metadata={**metadata, "transcript_used": True},
-                    diagnostics={"transcript_path": "youtube_agent"},
-                )
-                response = public_media_context_response(context_result)
-        if not response and context_result.ok:
-            context_result = await summarize_public_media_visual_context(
-                message,
-                prompt,
-                url,
-                acquisition_result,
-                context_result,
-            )
-        if not response:
-            response = public_media_context_response(context_result)
-    finally:
-        await presence.stop()
-
-    response = sanitize_text(str(response or "").strip(), 4000)
-    if not response:
-        response = public_media_context_response(context_result)
-
-    event_type = "context_unavailable"
-    if context_result.ok and context_result.state == "visual_summary":
-        event_type = "context_visual"
-    elif context_result.ok and context_result.state == "transcript_summary":
-        event_type = "context_transcript"
-    elif context_result.ok:
-        event_type = "context_metadata"
-    system_event(
-        level="info" if context_result.ok else "warning",
-        component="media_context",
-        event_type=event_type,
-        telegram_message=message,
-        route="media_context",
-        duration_ms=int((time.monotonic() - started) * 1000),
-        message=context_result.state,
-        details={
-            **media_context_event_details(context_result),
-            "url_source": safe_detail_code(intent.url_source or "unknown"),
-            "candidate_source_kind": public_media_url_candidate_source_kind(intent.url_source or "unknown"),
-            "candidate_rank": intent.candidate_rank,
-            "candidate_distance": intent.candidate_distance,
-            "intent_mode": safe_detail_code(intent.intent_mode or "target_summary"),
-            **public_media_referent_diagnostics(message, prompt, intent),
-        },
-    )
-    histories[message.chat_id].append(f"Aigan: {response[:500]}")
-    remember_observed_message(message, label=f"{user_label(message)} (public media context request)")
-    passive_contexts[message.chat_id].append(f"Aigan: {clip_text(response, 700)}")
-    remember_bot_message(message.chat_id, response)
-    if context_result.ok:
-        save_public_media_context_summary_memory(
-            message,
-            summary=response,
-            platform=context_result.platform,
-            modality=context_result.modality,
-        )
-    await send_reply(message, response)
-    return True
 
 
 def image_request_object_pattern() -> str:
@@ -8113,22 +7003,6 @@ async def resolve_pending_after_debounce(
         system_event(level="error", component="pending", event_type="pending_debounce_failed", telegram_message=message)
 
 
-async def reply_missing_public_media_referent(message: Message, prompt: str) -> None:
-    system_event(
-        component="media_context",
-        event_type="context_missing_referent",
-        telegram_message=message,
-        route="media_context_unresolved",
-        message="missing_referent",
-        details=public_media_referent_diagnostics(message, prompt, PublicMediaContextIntent()),
-    )
-    response = PUBLIC_MEDIA_MISSING_REFERENT_RESPONSE
-    histories[message.chat_id].append(f"Aigan: {response[:500]}")
-    passive_contexts[message.chat_id].append(f"Aigan: {clip_text(response, 700)}")
-    remember_bot_message(message.chat_id, response)
-    await send_reply(message, response)
-
-
 async def handle_prompt(
     message: Message,
     context: ContextTypes.DEFAULT_TYPE,
@@ -8174,27 +7048,14 @@ async def handle_prompt(
         return
 
     has_current_payload = has_current_context_payload(message)
-    public_media_intent = resolve_public_media_context_intent(message, prompt)
-    has_public_media_context = public_media_intent.active
-    has_unresolved_public_media_context = not has_public_media_context and has_unresolved_public_media_context_intent(
-        message, prompt, public_media_intent
-    )
 
-    if (
-        allow_pending_wait
-        and not has_current_payload
-        and not has_public_media_context
-        and not has_unresolved_public_media_context
-        and should_wait_for_followup_context(message, prompt)
-    ):
+    if allow_pending_wait and not has_current_payload and should_wait_for_followup_context(message, prompt):
         await start_pending_debounce(message, context, prompt, "followup_context")
         return
 
     if (
         allow_pending_wait
         and not has_current_payload
-        and not has_public_media_context
-        and not has_unresolved_public_media_context
         and not has_supported_image(message)
         and build_reference_context(message) == "(none)"
         and is_image_request(prompt)
@@ -8205,8 +7066,6 @@ async def handle_prompt(
     if (
         allow_pending_wait
         and not has_current_payload
-        and not has_public_media_context
-        and not has_unresolved_public_media_context
         and build_reference_context(message) == "(none)"
         and is_context_dependent_request(prompt)
         and not has_url(prompt)
@@ -8226,24 +7085,10 @@ async def handle_prompt(
         async with lock:
             if should_suppress_duplicate_prompt(message, prompt, "after_lock"):
                 return
-            await handle_prompt_generation(
-                message,
-                context,
-                prompt,
-                allow_pending_wait,
-                waited_for_generation,
-                public_media_intent,
-            )
+            await handle_prompt_generation(message, context, prompt, allow_pending_wait, waited_for_generation)
         return
 
-    await handle_prompt_generation(
-        message,
-        context,
-        prompt,
-        allow_pending_wait,
-        skip_cooldown=False,
-        public_media_intent=public_media_intent,
-    )
+    await handle_prompt_generation(message, context, prompt, allow_pending_wait, skip_cooldown=False)
 
 
 async def handle_prompt_generation(
@@ -8252,7 +7097,6 @@ async def handle_prompt_generation(
     prompt: str,
     allow_pending_wait: bool,
     skip_cooldown: bool = False,
-    public_media_intent: PublicMediaContextIntent | None = None,
 ) -> None:
     left = cooldown_left(message)
     if left > 0 and not skip_cooldown:
@@ -8264,36 +7108,23 @@ async def handle_prompt_generation(
 
     await send_activity_action(context.bot, message.chat_id, ChatAction.TYPING, message=message)
     route, recall_intent = await classify_request_with_intent(message, prompt)
-    if route in {"media_context", "media_context_unresolved"}:
-        resolved_public_media_intent = resolve_public_media_context_intent(message, prompt)
-    else:
-        resolved_public_media_intent = (
-            public_media_intent if public_media_intent is not None else resolve_public_media_context_intent(message, prompt)
-        )
     LOGGER.info("Prompt route=%s chat_id=%s", route, message.chat_id)
-    route_details = {
-        "prompt_chars": len(prompt),
-        "has_reference": build_reference_context(message) != "(none)",
-        "has_image": has_supported_image(message),
-        "has_visual_media": has_supported_visual_media(message),
-        "has_url": has_url(prompt),
-        "allow_pending_wait": allow_pending_wait,
-        "memory_recall_confidence": recall_intent.confidence if recall_intent else 0.0,
-        "memory_recall_reason": recall_intent.reason if recall_intent else "",
-    }
-    if (
-        route in {"media_context", "media_context_unresolved"}
-        or has_explicit_media_context_hint(prompt)
-        or has_media_reference_hint(prompt)
-    ):
-        route_details.update(public_media_referent_diagnostics(message, prompt, resolved_public_media_intent))
     system_event(
         component="routing",
         event_type="route_decision",
         telegram_message=message,
         route=route,
         message=route,
-        details=route_details,
+        details={
+            "prompt_chars": len(prompt),
+            "has_reference": build_reference_context(message) != "(none)",
+            "has_image": has_supported_image(message),
+            "has_visual_media": has_supported_visual_media(message),
+            "has_url": has_url(prompt),
+            "allow_pending_wait": allow_pending_wait,
+            "memory_recall_confidence": recall_intent.confidence if recall_intent else 0.0,
+            "memory_recall_reason": recall_intent.reason if recall_intent else "",
+        },
     )
 
     if has_supported_visual_media(message) and await handle_visual_media_prompt(
@@ -8303,25 +7134,6 @@ async def handle_prompt_generation(
         skip_cooldown=True,
         record_user_history=False,
     ):
-        record_chat_answer(message, prompt, route)
-        return
-
-    if route == "media_context" and await handle_public_media_context_prompt(
-        message,
-        context,
-        prompt,
-        resolved_public_media_intent,
-    ):
-        record_chat_answer(message, prompt, route)
-        return
-
-    if route == "media_context":
-        await reply_missing_public_media_referent(message, prompt)
-        record_chat_answer(message, prompt, "media_context_unresolved")
-        return
-
-    if route == "media_context_unresolved":
-        await reply_missing_public_media_referent(message, prompt)
         record_chat_answer(message, prompt, route)
         return
 
