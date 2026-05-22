@@ -1,15 +1,10 @@
 # Aigan Changelog
 
-## 2026-05-19 - Public media URL context route
+## 2026-05-22 - Public media route rollback
 
-- Added an explicit `media_context` route for private, reply-to-bot, or group-invocation requests about public media URLs.
-- Reused the existing `media_acquisition` safety boundary before answering and kept ordinary group URL messages passive.
-- Returned grounded YouTube transcript answers when the current transcript path can help, or honest metadata-only/unavailable responses without promising TikTok/Instagram reliability.
-- Added bounded temporary public-media acquisition for supported links so explicit transcriptless requests can reuse `media_frames` and vision summaries when download, frame extraction, and cleanup all pass.
-- Resolved bare private media URLs and explicit reply/follow-up questions against current, replied, quoted, and recent passive media-link context instead of falling through to generic web fallback.
-- Resolved explicit link-preview prompts and portrait/vertical public-media format selection while keeping unrelated time-sensitive prompts out of recent-media recall.
-- Tightened media referent selection so current/replied/quoted links beat recent memory, recent fallback scans newest-first, and generated summaries are not reused as URL anchors.
-- Extracted hidden Telegram URL entities and preview metadata for public-media routing, and made unresolved media questions fail closed instead of guessing from ordinary chat context.
+- Rolled back the public media URL/TikTok context route so YouTube links return to the normal agent path with the YouTube transcript MCP.
+- Removed public-media temp downloads and visual frame fallback from URL handling after the route over-triggered expensive media analysis and degraded transcript requests.
+- Kept earlier reliable URL lookup, Telegram activity presence, and working-memory improvements intact.
 
 ## 2026-05-19 - Telegram activity presence
 
