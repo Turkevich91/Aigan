@@ -1,5 +1,11 @@
 # Aigan Changelog
 
+## 2026-05-23 - Telegram video frame fallback rollback
+
+- Removed chat-facing Telegram video frame analysis so video/animation/video-note/video-document messages no longer trigger downloads, frame extraction, vision calls, or the representative-frame failure reply.
+- Kept video attachments visible to the normal agent path as safe attachment markers alongside available text, captions, and reply context.
+- Left image/photo analysis and the YouTube transcript path unchanged.
+
 ## 2026-05-22 - Public media route rollback
 
 - Rolled back the public media URL/TikTok context route so YouTube links return to the normal agent path with the YouTube transcript MCP.
@@ -8,7 +14,7 @@
 
 ## 2026-05-19 - Telegram activity presence
 
-- Added a centralized Telegram activity presence helper for long-running text, web, memory, translation, image, and visual-media routes.
+- Added a centralized Telegram activity presence helper for long-running text, web, memory, translation, and image routes.
 - Changed internet image lookup to show `typing` while searching and `upload_photo` immediately before sending photos.
 - Surfaced sanitized Telegram presence and private-chat draft capability rows in tool diagnostics.
 

@@ -625,9 +625,9 @@ def user_message_for_failure(category: str) -> str:
         "input_too_large": "The media file is too large for visual frame extraction.",
         "duration_too_long": "The video is too long for bounded visual frame extraction.",
         "resolution_too_large": "The video resolution is too large for bounded visual frame extraction.",
-        "decode_failed": "I could not decode representative video frames.",
+        "decode_failed": "Media frame decoding failed.",
         "scene_detection_failed": "I could not detect representative scenes.",
-        "no_frames_selected": "I could not select useful representative frames.",
+        "no_frames_selected": "Media frame selection failed.",
         "timeout": "Media frame extraction timed out.",
         "cleanup_failed": "Media frame extraction cleanup failed.",
     }

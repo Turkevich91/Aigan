@@ -359,7 +359,6 @@ def static_capability_rows() -> list[CapabilityRow]:
         CapabilityRow("stt_local", "stt", False, False, False, "disabled"),
         CapabilityRow("media_acquisition", "media", False, False, False, "disabled"),
         CapabilityRow("media_frames", "media", False, False, False, "not_implemented"),
-        CapabilityRow("visual_media_summary", "media", False, False, False, "not_implemented"),
         CapabilityRow("document_ingest", "documents", False, False, False, "not_implemented"),
         CapabilityRow("image_understanding", "vision", False, False, False, "disabled"),
         CapabilityRow("ocr", "vision", False, False, False, "not_implemented"),
