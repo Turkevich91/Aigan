@@ -274,11 +274,11 @@ Each tool family should provide a small adapter with:
 
 Tool failures must not block message persistence, embeddings, memory recall, `/stat`, `/character`, Telegram routing, or normal replies. Tool outputs that are later saved to memory must be stored as source context, not as user-authored text.
 
-The media frame extraction adapter is registered as `media_frames` and is disabled by default. When `MEDIA_FRAME_EXTRACTION_ENABLED=true`, explicit Telegram video/animation/video-document routes can use bounded ffprobe/ffmpeg frame extraction for visual summaries. These summaries are saved only as source-context vision summaries, not user-authored text, and do not enable TikTok/Instagram support or passive group handling.
+The media frame extraction adapter remains registered as `media_frames` for future tooling experiments, but it is not wired into chat routing. Telegram video/animation/video-note/video-document messages are treated as attachments plus any text/caption/reply context visible to the bot; Aigan does not download them for frame extraction or visual summaries.
 
 The public media acquisition boundary is registered as `media_acquisition` and is disabled by default. It remains a metadata-only `yt-dlp` telemetry probe and is not wired into chat routing. It records only stable platform/backend/capability fields and sanitized failure categories such as `unsupported_url`, `auth_or_rate_limited`, `challenge_required`, `duration_limit`, or `metadata_failed`; it must not log raw media URLs, provider stderr, source text, transcripts, frame OCR, usernames, tokens, or local paths.
 
-Universal media plans should keep the same ladder: captions first, optional audio transcription second, optional visual-frame summary only for explicit transcriptless cases, and a structured unavailable result when the media cannot be handled safely.
+Universal media plans are future research only. The current chat path should prefer captions/transcripts when a supported text tool exists and otherwise treat video as an opaque attachment instead of falling back to frame extraction.
 
 Future tool research notes:
 
