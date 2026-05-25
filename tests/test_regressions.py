@@ -8299,9 +8299,19 @@ class LivingReminderTests(unittest.TestCase):
         reminder = self.create_due_reminder()
         first = main.REMINDERS.claim_due_fires(limit=1)[0]
 
-        main.REMINDERS.mark_failed(first.fire.id, category="send_or_model_failed", max_attempts=2)
+        main.REMINDERS.mark_failed(
+            first.fire.id,
+            expected_claimed_at=first.fire.claimed_at,
+            category="send_or_model_failed",
+            max_attempts=2,
+        )
         retry = main.REMINDERS.claim_due_fires(limit=1)[0]
-        main.REMINDERS.mark_failed(retry.fire.id, category="send_or_model_failed", max_attempts=2)
+        main.REMINDERS.mark_failed(
+            retry.fire.id,
+            expected_claimed_at=retry.fire.claimed_at,
+            category="send_or_model_failed",
+            max_attempts=2,
+        )
 
         self.assertEqual(first.fire.id, retry.fire.id)
         self.assertEqual(2, retry.fire.attempt_count)
@@ -8312,7 +8322,7 @@ class LivingReminderTests(unittest.TestCase):
         reminder = self.create_due_reminder(recurrence="yearly")
         claim = main.REMINDERS.claim_due_fires(limit=1)[0]
 
-        main.REMINDERS.mark_sent(claim.fire.id)
+        main.REMINDERS.mark_sent(claim.fire.id, expected_claimed_at=claim.fire.claimed_at)
 
         updated = main.REMINDERS.reminder_by_id(reminder.id)
         self.assertIsNotNone(updated)
@@ -8347,7 +8357,11 @@ class LivingReminderTests(unittest.TestCase):
             misfire_grace_seconds=86400 * 100,
         )[0]
 
-        main.REMINDERS.mark_sent(claim.fire.id, now=datetime(2026, 5, 25, 12, 1, tzinfo=timezone.utc))
+        main.REMINDERS.mark_sent(
+            claim.fire.id,
+            expected_claimed_at=claim.fire.claimed_at,
+            now=datetime(2026, 5, 25, 12, 1, tzinfo=timezone.utc),
+        )
 
         updated = main.REMINDERS.reminder_by_id(reminder.id)
         self.assertEqual("2027-03-08T14:00:00+00:00", updated.due_at_utc)
@@ -8491,7 +8505,7 @@ class LivingReminderTests(unittest.TestCase):
     def test_context_answer_requeues_needs_context_fire(self) -> None:
         reminder = self.create_due_reminder()
         claim = main.REMINDERS.claim_due_fires(limit=1)[0]
-        main.REMINDERS.mark_needs_context(claim.fire.id)
+        main.REMINDERS.mark_needs_context(claim.fire.id, expected_claimed_at=claim.fire.claimed_at)
 
         resolved = main.REMINDERS.resolve_context_request(
             reminder.chat_id,
@@ -8511,7 +8525,7 @@ class LivingReminderTests(unittest.TestCase):
     def test_context_answer_helper_acknowledges_and_requeues(self) -> None:
         reminder = self.create_due_reminder()
         claim = main.REMINDERS.claim_due_fires(limit=1)[0]
-        main.REMINDERS.mark_needs_context(claim.fire.id)
+        main.REMINDERS.mark_needs_context(claim.fire.id, expected_claimed_at=claim.fire.claimed_at)
         message = FakeMessage("зроби це як тепле привітання", chat_type=ChatType.SUPERGROUP, chat_id=reminder.chat_id)
         reply = FakeMessage(f"Для нагадування #{reminder.id}: кого саме привітати?", chat_id=reminder.chat_id)
         reply.from_user = FakeUser(user_id=999, username="aigan")
@@ -8533,7 +8547,7 @@ class LivingReminderTests(unittest.TestCase):
     def test_context_answer_without_reminder_id_is_not_consumed(self) -> None:
         reminder = self.create_due_reminder()
         claim = main.REMINDERS.claim_due_fires(limit=1)[0]
-        main.REMINDERS.mark_needs_context(claim.fire.id)
+        main.REMINDERS.mark_needs_context(claim.fire.id, expected_claimed_at=claim.fire.claimed_at)
         message = FakeMessage("це має бути дружньо", chat_type=ChatType.SUPERGROUP, chat_id=reminder.chat_id)
         reply = FakeMessage("кого саме привітати?", chat_id=reminder.chat_id)
         reply.from_user = FakeUser(user_id=999, username="aigan")

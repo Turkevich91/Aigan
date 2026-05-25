@@ -382,9 +382,9 @@ class ReminderStore:
         self,
         fire_id: int,
         *,
+        expected_claimed_at: str,
         sent_message_id: int | None = None,
         now: datetime | str | None = None,
-        expected_claimed_at: str | None = None,
     ) -> None:
         self._finish_fire(
             fire_id,
@@ -399,24 +399,19 @@ class ReminderStore:
         self,
         fire_id: int,
         *,
+        expected_claimed_at: str,
         category: str = "insufficient_context",
         now: datetime | str | None = None,
-        expected_claimed_at: str | None = None,
     ) -> None:
         now_text = format_datetime(now or utc_now())
-        conditions = ["id = ?", "status = 'claimed'"]
-        params: list[Any] = [category, now_text, int(fire_id)]
-        if expected_claimed_at is not None:
-            conditions.append("claimed_at = ?")
-            params.append(str(expected_claimed_at))
         with self._lock:
             self._conn.execute(
-                f"""
+                """
                 UPDATE reminder_fires
                 SET status = 'needs_context', failure_category = ?, updated_at = ?
-                WHERE {' AND '.join(conditions)}
+                WHERE id = ? AND status = 'claimed' AND claimed_at = ?
                 """,
-                params,
+                (category, now_text, int(fire_id), str(expected_claimed_at)),
             )
             self._conn.commit()
 
@@ -491,33 +486,31 @@ class ReminderStore:
         self,
         fire_id: int,
         *,
+        expected_claimed_at: str,
         category: str = "failed",
         now: datetime | str | None = None,
         max_attempts: int = DEFAULT_MAX_FIRE_ATTEMPTS,
-        expected_claimed_at: str | None = None,
     ) -> None:
         now_text = format_datetime(now or utc_now())
-        conditions = ["id = ?", "status = 'claimed'"]
-        params: list[Any] = [int(fire_id)]
-        if expected_claimed_at is not None:
-            conditions.append("claimed_at = ?")
-            params.append(str(expected_claimed_at))
         with self._lock:
             row = self._conn.execute(
-                f"SELECT attempt_count FROM reminder_fires WHERE {' AND '.join(conditions)}",
-                params,
+                """
+                SELECT attempt_count FROM reminder_fires
+                WHERE id = ? AND status = 'claimed' AND claimed_at = ?
+                """,
+                (int(fire_id), str(expected_claimed_at)),
             ).fetchone()
             if row is None:
                 self._conn.commit()
                 return
             if int(row["attempt_count"]) < max(1, int(max_attempts)):
                 cursor = self._conn.execute(
-                    f"""
+                    """
                     UPDATE reminder_fires
                     SET status = 'pending', claimed_at = '', updated_at = ?, failure_category = ?
-                    WHERE {' AND '.join(conditions)}
+                    WHERE id = ? AND status = 'claimed' AND claimed_at = ?
                     """,
-                    [now_text, category, *params],
+                    (now_text, category, int(fire_id), str(expected_claimed_at)),
                 )
                 self._conn.commit()
                 if not cursor.rowcount:
@@ -536,9 +529,9 @@ class ReminderStore:
         self,
         fire_id: int,
         *,
+        expected_claimed_at: str,
         category: str = "model_skip",
         now: datetime | str | None = None,
-        expected_claimed_at: str | None = None,
     ) -> None:
         self._finish_fire(
             fire_id,
@@ -597,7 +590,7 @@ class ReminderStore:
         failure_category: str,
         sent_message_id: int | None,
         now: datetime | str | None,
-        expected_claimed_at: str | None = None,
+        expected_claimed_at: str,
     ) -> None:
         now_dt = parse_datetime(now or utc_now())
         now_text = format_datetime(now_dt)
@@ -615,6 +608,7 @@ class ReminderStore:
                 return
             completed = self._complete_fire_locked(
                 int(fire_id),
+                expected_status="claimed",
                 status=status,
                 failure_category=failure_category,
                 now_text=now_text,
@@ -666,13 +660,16 @@ class ReminderStore:
             (cutoff_text,),
         ).fetchall()
         for row in rows:
-            self._complete_fire_locked(
+            completed = self._complete_fire_locked(
                 int(row["id"]),
+                expected_status="pending",
                 status="failed",
                 failure_category="misfire_expired",
                 now_text=now_text,
                 sent_message_id=None,
             )
+            if not completed:
+                continue
             if str(row["recurrence"]) == "yearly":
                 self._schedule_next_yearly_locked(
                     int(row["reminder_id"]),
@@ -687,16 +684,25 @@ class ReminderStore:
         self,
         fire_id: int,
         *,
+        expected_status: str,
         status: str,
         failure_category: str,
         now_text: str,
         sent_message_id: int | None,
         expected_claimed_at: str | None = None,
     ) -> bool:
-        conditions = ["id = ?"]
-        params: list[Any] = [status, now_text, now_text, failure_category or "", sent_message_id, int(fire_id)]
+        conditions = ["id = ?", "status = ?"]
+        params: list[Any] = [
+            status,
+            now_text,
+            now_text,
+            failure_category or "",
+            sent_message_id,
+            int(fire_id),
+            str(expected_status),
+        ]
         if expected_claimed_at is not None:
-            conditions.extend(["status = 'claimed'", "claimed_at = ?"])
+            conditions.append("claimed_at = ?")
             params.append(str(expected_claimed_at))
         cursor = self._conn.execute(
             f"""
