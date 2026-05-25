@@ -66,6 +66,14 @@ SAFE_HEALTH_FIELDS = {
     "send_message_draft_available",
     "drafts_enabled",
     "private_chat_only",
+    "tool_enabled",
+    "poll_seconds",
+    "max_due_per_tick",
+    "active",
+    "pending",
+    "needs_context",
+    "failed",
+    "next_due_set",
 }
 URL_VALUE_RE = re.compile(
     r"\b[A-Za-z][A-Za-z0-9+.-]{1,}://|www\.|"

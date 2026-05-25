@@ -61,6 +61,12 @@ os.environ["PROACTIVE_SELF_REFERENCE_GUARD"] = "true"
 os.environ["PROACTIVE_META_TOPIC_GUARD"] = "true"
 os.environ["PROACTIVE_META_TOPIC_STRICT"] = "true"
 os.environ["PROACTIVE_RECENT_SEED_COOLDOWN_DAYS"] = "14"
+os.environ["REMINDERS_ENABLED"] = "false"
+os.environ["REMINDER_TOOL_ENABLED"] = "true"
+os.environ["REMINDER_POLL_SECONDS"] = "60"
+os.environ["REMINDER_MAX_DUE_PER_TICK"] = "5"
+os.environ["REMINDER_MISFIRE_GRACE_SECONDS"] = "86400"
+os.environ["REMINDER_CONTEXT_REQUEST_TTL_SECONDS"] = "86400"
 os.environ["PROMPT_PRIVACY_GUARD_ENABLED"] = "true"
 os.environ["MEMORY_ENABLED"] = "true"
 os.environ["MEMORY_DB_PATH"] = TEST_DB_PATH
@@ -134,6 +140,7 @@ from media_frames import (
 from memory import MemoryStore, SemanticMemoryResult
 from mcp_servers import web
 from reaction_memory import ReactionSpec
+from reminders import ReminderStore
 from scripts import import_telegram_export
 from scripts.import_telegram_export import ImportOptions
 from self_analysis import (
@@ -8178,6 +8185,180 @@ class SystemHealthTests(unittest.TestCase):
         self.assertNotIn(fake_openai_secret(), prompt)
         self.assertIn("[redacted]", prompt)
         self.assertIn("health degraded", message.reply_calls[0]["text"])
+
+
+class LivingReminderTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.original_config = main.CONFIG
+        self.original_reminders = main.REMINDERS
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.db_path = Path(self.tmpdir.name) / "reminders.sqlite3"
+        main.CONFIG = replace(
+            main.CONFIG,
+            reminders_enabled=True,
+            reminder_tool_enabled=True,
+            reminder_poll_seconds=60,
+            reminder_max_due_per_tick=5,
+            reminder_misfire_grace_seconds=86400,
+            reminder_context_request_ttl_seconds=86400,
+        )
+        main.REMINDERS = ReminderStore(self.db_path)
+        main.passive_contexts.clear()
+        if main.MEMORY is not None:
+            main.MEMORY.clear_all()
+
+    def tearDown(self) -> None:
+        if main.REMINDERS is not None:
+            main.REMINDERS.close()
+        main.CONFIG = self.original_config
+        main.REMINDERS = self.original_reminders
+        self.tmpdir.cleanup()
+
+    def create_due_reminder(self, *, recurrence: str = "none"):
+        due = datetime.now(timezone.utc) - timedelta(minutes=1)
+        return main.REMINDERS.create_reminder(
+            chat_id=-1001,
+            created_by_user_id=407892151,
+            created_from_message_id=123,
+            target_label="@tester",
+            kind="birthday" if recurrence == "yearly" else "one_off",
+            trusted_instruction="write a warm reminder",
+            due_at_utc=due,
+            timezone_name="America/New_York",
+            recurrence=recurrence,
+        )
+
+    def test_reminder_store_claims_due_fire_once_and_survives_reopen(self) -> None:
+        self.create_due_reminder()
+
+        first = main.REMINDERS.claim_due_fires(limit=5, misfire_grace_seconds=86400)
+        second = main.REMINDERS.claim_due_fires(limit=5, misfire_grace_seconds=86400)
+        reopened = ReminderStore(self.db_path)
+        third = reopened.claim_due_fires(limit=5, misfire_grace_seconds=86400)
+        reopened.close()
+
+        self.assertEqual(1, len(first))
+        self.assertEqual([], second)
+        self.assertEqual([], third)
+        self.assertEqual("claimed", first[0].fire.status)
+        self.assertEqual(1, first[0].fire.attempt_count)
+
+    def test_yearly_reminder_schedules_next_fire_after_send(self) -> None:
+        reminder = self.create_due_reminder(recurrence="yearly")
+        claim = main.REMINDERS.claim_due_fires(limit=1)[0]
+
+        main.REMINDERS.mark_sent(claim.fire.id)
+
+        updated = main.REMINDERS.reminder_by_id(reminder.id)
+        self.assertIsNotNone(updated)
+        self.assertEqual("active", updated.status)
+        self.assertEqual("yearly", updated.recurrence)
+        self.assertGreater(main.parse_reminder_datetime(updated.due_at_utc), datetime.now(timezone.utc))
+
+    def test_tool_creates_complete_reminder_from_current_context(self) -> None:
+        future = (datetime.now(timezone.utc) + timedelta(days=1)).isoformat(timespec="minutes")
+        token = main.REMINDER_TOOL_CONTEXT.set(
+            main.ReminderToolContext(chat_id=-1001, chat_type=ChatType.SUPERGROUP, user_id=407892151, message_id=555)
+        )
+        try:
+            result = main.create_living_reminder_from_tool(
+                kind="one_off",
+                due_at=future,
+                timezone_name="UTC",
+                target_label="@friend",
+                instruction="remind the room about the release",
+                recurrence="none",
+                confidence=0.92,
+                missing_fields="",
+            )
+        finally:
+            main.REMINDER_TOOL_CONTEXT.reset(token)
+
+        self.assertEqual("created", result["status"])
+        items = main.REMINDERS.list_reminders(-1001, user_id=407892151)
+        self.assertEqual(1, len(items))
+        self.assertEqual("@friend", items[0].target_label)
+
+    def test_tool_returns_confirmation_request_for_missing_time(self) -> None:
+        token = main.REMINDER_TOOL_CONTEXT.set(
+            main.ReminderToolContext(chat_id=-1001, chat_type=ChatType.SUPERGROUP, user_id=407892151, message_id=556)
+        )
+        try:
+            result = main.create_living_reminder_from_tool(
+                kind="one_off",
+                due_at="2026-07-14",
+                timezone_name="America/New_York",
+                target_label="",
+                instruction="remind me",
+                recurrence="none",
+                confidence=0.9,
+                missing_fields="",
+            )
+        finally:
+            main.REMINDER_TOOL_CONTEXT.reset(token)
+
+        self.assertEqual("needs_confirmation", result["status"])
+        self.assertIn("missing_time", result["missing_fields"])
+        self.assertEqual([], main.REMINDERS.list_reminders(-1001, user_id=407892151))
+
+    def test_scheduler_sends_model_generated_reminder_and_completes_fire(self) -> None:
+        reminder = self.create_due_reminder()
+        app = SimpleNamespace(bot=SimpleNamespace(send_message=AsyncMock()))
+
+        with patch.object(main, "run_proactive_model", new=AsyncMock(return_value="тепле живе нагадування")) as model:
+            sent = asyncio.run(main.run_reminder_scheduler_once(app))
+
+        self.assertEqual(1, sent)
+        model.assert_awaited_once()
+        app.bot.send_message.assert_awaited()
+        self.assertEqual("тепле живе нагадування", app.bot.send_message.await_args.kwargs["text"])
+        self.assertEqual("completed", main.REMINDERS.reminder_by_id(reminder.id).status)
+
+    def test_scheduler_asks_for_context_in_original_chat(self) -> None:
+        reminder = self.create_due_reminder()
+        app = SimpleNamespace(bot=SimpleNamespace(send_message=AsyncMock()))
+
+        with patch.object(
+            main,
+            "run_proactive_model",
+            new=AsyncMock(return_value="NEEDS_CONTEXT: кого саме привітати?"),
+        ):
+            sent = asyncio.run(main.run_reminder_scheduler_once(app))
+
+        self.assertEqual(1, sent)
+        app.bot.send_message.assert_awaited()
+        self.assertEqual("кого саме привітати?", app.bot.send_message.await_args.kwargs["text"])
+        claims = main.REMINDERS.claim_due_fires(limit=5)
+        self.assertEqual([], claims)
+        fires = main.REMINDERS.health_summary()
+        self.assertEqual(1, fires["needs_context"])
+        self.assertEqual("active", main.REMINDERS.reminder_by_id(reminder.id).status)
+
+    def test_reminder_commands_respect_owner_and_admin_cancel(self) -> None:
+        message = FakeMessage("/remind 2999-01-01 09:00 test reminder")
+
+        asyncio.run(main.remind_command(SimpleNamespace(effective_message=message), SimpleNamespace()))
+
+        self.assertTrue(message.reply_calls)
+        items = main.REMINDERS.list_reminders(message.chat_id, user_id=message.from_user.id)
+        self.assertEqual(1, len(items))
+        guest_cancel = FakeMessage(f"/remind_cancel {items[0].id}")
+        guest_cancel.from_user = FakeUser(user_id=123, username="guest")
+        asyncio.run(main.remind_cancel_command(SimpleNamespace(effective_message=guest_cancel), SimpleNamespace()))
+        self.assertIn("немає прав", guest_cancel.reply_calls[0]["text"])
+
+        admin_cancel = FakeMessage(f"/remind_cancel {items[0].id}")
+        asyncio.run(main.remind_cancel_command(SimpleNamespace(effective_message=admin_cancel), SimpleNamespace()))
+        self.assertIn("Скасував", admin_cancel.reply_calls[0]["text"])
+
+    def test_living_reminders_diagnostics_row_is_low_cardinality(self) -> None:
+        rows = {row.name: row for row in main.tool_capability_rows()}
+
+        self.assertIn("living_reminders", rows)
+        row = rows["living_reminders"]
+        self.assertEqual("scheduler", row.family)
+        self.assertTrue(row.enabled)
+        self.assertIn("pending", row.details)
 
 
 if __name__ == "__main__":
