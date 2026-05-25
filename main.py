@@ -1269,10 +1269,36 @@ def parse_reminder_due_at(
     return parsed.astimezone(timezone.utc), None
 
 
-def reminder_tool_context_for_message(message: Message) -> ReminderToolContext | None:
+REMINDER_ACTION_INTENT_RE = re.compile(
+    r"(?i)(?:"
+    r"\b/remind\b|\bremind(?:er| me)?\b|\bschedule\b|\bremember\s+to\b|\bdon['’]?t\s+forget\b|"
+    r"\bнагада(?:й|ти|тися|ння|ування)\b|\bне\s+забудь\b|\bзапам['’]?ятай\b|\bпривітай\b|"
+    r"\bнапомни\b|\bнапомнить\b|\bне\s+забудь\b|\bзапомни\b|\bпоздравь\b"
+    r")"
+)
+REMINDER_BIRTHDAY_INTENT_RE = re.compile(
+    r"(?i)(?:\bbirthday\b|\bbday\b|\bд[нр]\b|день\s+народження|день\s+рожд(?:ення|ения))"
+)
+REMINDER_DATE_HINT_RE = re.compile(
+    r"\b\d{4}-\d{1,2}-\d{1,2}\b|\b\d{1,2}[./-]\d{1,2}(?:[./-]\d{2,4})?\b"
+)
+
+
+def has_living_reminder_intent(prompt: str | None) -> bool:
+    text = (prompt or "").strip()
+    if not text:
+        return False
+    if REMINDER_ACTION_INTENT_RE.search(text):
+        return True
+    return bool(REMINDER_BIRTHDAY_INTENT_RE.search(text) and REMINDER_DATE_HINT_RE.search(text))
+
+
+def reminder_tool_context_for_message(message: Message, prompt: str | None = None) -> ReminderToolContext | None:
     if not CONFIG.reminders_enabled or not CONFIG.reminder_tool_enabled or REMINDERS is None:
         return None
     if message.from_user is None:
+        return None
+    if not has_living_reminder_intent(prompt):
         return None
     return ReminderToolContext(
         chat_id=message.chat_id,
@@ -6759,7 +6785,7 @@ def parse_remind_command_args(args: str) -> tuple[dict[str, str] | None, str | N
             return None, "Для birthday треба target і дату: `/remind birthday @name 07/14/1990`."
         target = parts[1]
         due_at = parts[2]
-        instruction = " ".join(parts[3:]).strip() or f"Remember {target}'s birthday and write a warm concise message."
+        instruction = " ".join(parts[3:]).strip() or f"Згадай день народження {target} і напиши тепле коротке привітання."
         return {
             "kind": "birthday",
             "target_label": target,
@@ -7446,7 +7472,7 @@ async def handle_prompt_generation(
             recalled_memory_context=recalled_memory_context,
             compilation_stats=memory_context_stats,
         )
-        reminder_context = reminder_tool_context_for_message(message)
+        reminder_context = reminder_tool_context_for_message(message, prompt)
         agent_coro = (
             run_agent(agent_input, reminder_tool_context=reminder_context)
             if reminder_context is not None

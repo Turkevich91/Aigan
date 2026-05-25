@@ -8385,6 +8385,23 @@ class LivingReminderTests(unittest.TestCase):
         self.assertIn("instruction", result["missing_fields"])
         self.assertEqual([], main.REMINDERS.list_reminders(-1001, user_id=407892151))
 
+    def test_reminder_tool_context_requires_trusted_reminder_intent(self) -> None:
+        message = FakeMessage("що думаєш про дату 2026-07-14?")
+
+        self.assertIsNone(main.reminder_tool_context_for_message(message, "що думаєш про дату 2026-07-14?"))
+
+        context = main.reminder_tool_context_for_message(message, "нагадай 2026-07-14 09:00 написати в чат")
+        self.assertIsNotNone(context)
+        self.assertEqual(message.chat_id, context.chat_id)
+
+    def test_birthday_command_default_instruction_is_ukrainian(self) -> None:
+        parsed, error = main.parse_remind_command_args("birthday @friend 07/14/1990")
+
+        self.assertIsNone(error)
+        self.assertIsNotNone(parsed)
+        self.assertIn("день народження", parsed["instruction"])
+        self.assertNotIn("Remember", parsed["instruction"])
+
     def test_scheduler_sends_model_generated_reminder_and_completes_fire(self) -> None:
         reminder = self.create_due_reminder()
         app = SimpleNamespace(bot=SimpleNamespace(send_message=AsyncMock()))
@@ -8527,6 +8544,9 @@ class LivingReminderTests(unittest.TestCase):
         self.assertEqual("scheduler", row.family)
         self.assertTrue(row.enabled)
         self.assertIn("pending", row.details)
+        rendered = render_row(row)
+        self.assertIn("poll_seconds=", rendered)
+        self.assertIn("pending=", rendered)
 
 
 if __name__ == "__main__":
