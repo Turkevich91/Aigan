@@ -572,6 +572,7 @@ class ReminderStore:
             claimed = self._scalar("SELECT COUNT(*) FROM reminder_fires WHERE status = 'claimed'")
             needs_context = self._scalar("SELECT COUNT(*) FROM reminder_fires WHERE status = 'needs_context'")
             failed = self._scalar("SELECT COUNT(*) FROM reminder_fires WHERE status = 'failed'")
+            skipped_unsafe = self._scalar("SELECT COUNT(*) FROM reminder_fires WHERE status = 'skipped_unsafe'")
             next_row = self._conn.execute(
                 """
                 SELECT scheduled_for_utc FROM reminder_fires
@@ -586,6 +587,7 @@ class ReminderStore:
             "claimed": claimed,
             "needs_context": needs_context,
             "failed": failed,
+            "skipped_unsafe": skipped_unsafe,
             "next_due_set": bool(next_row),
         }
 
@@ -650,7 +652,9 @@ class ReminderStore:
                 )
             elif status == "failed":
                 self._fail_one_off_locked(int(row["reminder_id"]), now_text)
-            else:
+            elif status == "skipped_unsafe":
+                self._skip_one_off_locked(int(row["reminder_id"]), now_text)
+            elif status == "sent":
                 self._complete_one_off_locked(int(row["reminder_id"]), now_text)
             self._conn.commit()
 
@@ -752,6 +756,16 @@ class ReminderStore:
             """
             UPDATE reminders
             SET status = 'failed', updated_at = ?
+            WHERE id = ? AND recurrence = 'none'
+            """,
+            (now_text, int(reminder_id)),
+        )
+
+    def _skip_one_off_locked(self, reminder_id: int, now_text: str) -> None:
+        self._conn.execute(
+            """
+            UPDATE reminders
+            SET status = 'skipped_unsafe', updated_at = ?
             WHERE id = ? AND recurrence = 'none'
             """,
             (now_text, int(reminder_id)),

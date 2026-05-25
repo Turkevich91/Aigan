@@ -5,6 +5,7 @@ import shutil
 import socket
 import subprocess
 import tempfile
+import time
 import unittest
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
@@ -8496,7 +8497,7 @@ class LivingReminderTests(unittest.TestCase):
         reminder = self.create_due_reminder()
         app = SimpleNamespace(bot=SimpleNamespace(send_message=AsyncMock()))
 
-        with patch.object(main, "run_proactive_model", new=AsyncMock(return_value="тепле живе нагадування")) as model:
+        with patch.object(main, "run_reminder_model", new=AsyncMock(return_value=("тепле живе нагадування", ""))) as model:
             sent = asyncio.run(main.run_reminder_scheduler_once(app))
 
         self.assertEqual(1, sent)
@@ -8505,14 +8506,103 @@ class LivingReminderTests(unittest.TestCase):
         self.assertEqual("тепле живе нагадування", app.bot.send_message.await_args.kwargs["text"])
         self.assertEqual("completed", main.REMINDERS.reminder_by_id(reminder.id).status)
 
+    def test_reminder_persona_guard_allows_harmless_first_person_phrase(self) -> None:
+        self.assertEqual("", main.reminder_persona_violation("Я можу сказати: ти красачек, і нагадування живе."))
+        self.assertTrue(main.proactive_persona_violation("Я можу сказати: ти красачек, і нагадування живе."))
+        self.assertTrue(main.reminder_persona_violation("Я можу допомогти перевірити факти."))
+        self.assertTrue(main.reminder_persona_violation("I could help with that."))
+        self.assertTrue(main.reminder_persona_violation("I will help with that."))
+
+    def test_reminder_persona_guard_checks_needs_context_question(self) -> None:
+        self.assertTrue(main.reminder_persona_violation("NEEDS_CONTEXT: Я бот, уточни деталі."))
+        self.assertEqual("", main.reminder_persona_violation("NEEDS_CONTEXT: кого саме привітати?"))
+
+    def test_reminder_model_allows_harmless_first_person_draft(self) -> None:
+        with patch.object(main, "run_agent", new=AsyncMock(return_value="Я можу сказати: ти красачек, і нагадування живе.")):
+            response, category = asyncio.run(
+                main.run_reminder_model(
+                    "wake reminder",
+                    chat_id=-1001,
+                    event_message="reminder:1",
+                    user_id=407892151,
+                )
+            )
+
+        self.assertEqual("Я можу сказати: ти красачек, і нагадування живе.", response)
+        self.assertEqual("", category)
+
+    def test_reminder_model_rewrites_unsafe_needs_context_question(self) -> None:
+        with patch.object(
+            main,
+            "run_agent",
+            new=AsyncMock(side_effect=["NEEDS_CONTEXT: Я бот, уточни деталі.", "NEEDS_CONTEXT: кого саме привітати?"]),
+        ) as model:
+            response, category = asyncio.run(
+                main.run_reminder_model(
+                    "wake reminder",
+                    chat_id=-1001,
+                    event_message="reminder:1",
+                    user_id=407892151,
+                )
+            )
+
+        self.assertEqual(2, model.await_count)
+        self.assertEqual("NEEDS_CONTEXT: кого саме привітати?", response)
+        self.assertEqual("", category)
+
+    def test_scheduler_is_not_blocked_by_proactive_cooldown_state(self) -> None:
+        reminder = self.create_due_reminder()
+        app = SimpleNamespace(bot=SimpleNamespace(send_message=AsyncMock()))
+
+        with patch.dict(main.last_proactive_sent_chat, {reminder.chat_id: time.monotonic()}):
+            with patch.object(main, "run_reminder_model", new=AsyncMock(return_value=("reminder still sends", ""))) as model:
+                sent = asyncio.run(main.run_reminder_scheduler_once(app))
+
+        self.assertEqual(1, sent)
+        model.assert_awaited_once()
+        app.bot.send_message.assert_awaited()
+        self.assertEqual("reminder still sends", app.bot.send_message.await_args.kwargs["text"])
+        self.assertEqual("completed", main.REMINDERS.reminder_by_id(reminder.id).status)
+
+    def test_scheduler_model_skip_is_visible_not_completed(self) -> None:
+        reminder = self.create_due_reminder()
+        app = SimpleNamespace(bot=SimpleNamespace(send_message=AsyncMock()))
+
+        with patch.object(main, "run_reminder_model", new=AsyncMock(return_value=(None, "model_skip"))):
+            sent = asyncio.run(main.run_reminder_scheduler_once(app))
+
+        self.assertEqual(0, sent)
+        app.bot.send_message.assert_not_awaited()
+        fire = main.REMINDERS.fire_by_id(1)
+        self.assertEqual("skipped_unsafe", fire.status)
+        self.assertEqual("model_skip", fire.failure_category)
+        self.assertEqual("skipped_unsafe", main.REMINDERS.reminder_by_id(reminder.id).status)
+        self.assertEqual(1, main.REMINDERS.health_summary()["skipped_unsafe"])
+
+    def test_scheduler_style_rejection_is_visible_skip_not_retry(self) -> None:
+        reminder = self.create_due_reminder()
+        app = SimpleNamespace(bot=SimpleNamespace(send_message=AsyncMock()))
+
+        with patch.object(main, "run_reminder_model", new=AsyncMock(return_value=(None, "style_rejected"))):
+            sent = asyncio.run(main.run_reminder_scheduler_once(app))
+
+        self.assertEqual(0, sent)
+        app.bot.send_message.assert_not_awaited()
+        fire = main.REMINDERS.fire_by_id(1)
+        self.assertEqual("skipped_unsafe", fire.status)
+        self.assertEqual("style_rejected", fire.failure_category)
+        self.assertEqual(1, fire.attempt_count)
+        self.assertEqual([], main.REMINDERS.claim_due_fires(limit=1))
+        self.assertEqual("skipped_unsafe", main.REMINDERS.reminder_by_id(reminder.id).status)
+
     def test_scheduler_asks_for_context_in_original_chat(self) -> None:
         reminder = self.create_due_reminder()
         app = SimpleNamespace(bot=SimpleNamespace(send_message=AsyncMock()))
 
         with patch.object(
             main,
-            "run_proactive_model",
-            new=AsyncMock(return_value="NEEDS_CONTEXT: кого саме привітати?"),
+            "run_reminder_model",
+            new=AsyncMock(return_value=("NEEDS_CONTEXT: кого саме привітати?", "")),
         ):
             sent = asyncio.run(main.run_reminder_scheduler_once(app))
 
