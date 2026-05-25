@@ -8398,6 +8398,19 @@ class LivingReminderTests(unittest.TestCase):
             main.reminder_tool_context_for_message(message, "будь ласка /remind 2026-07-14 09:00 написати")
         )
 
+    def test_reminder_tool_guidance_only_when_tool_context_attached(self) -> None:
+        message = FakeMessage("нагадай 2026-07-14 09:00 написати в чат")
+
+        without_tool = main.build_agent_input(message, "нагадай 2026-07-14 09:00 написати в чат")
+        with_tool = main.build_agent_input(
+            message,
+            "нагадай 2026-07-14 09:00 написати в чат",
+            include_reminder_tool_guidance=True,
+        )
+
+        self.assertNotIn("Reminder scheduling tool", without_tool)
+        self.assertIn("Reminder scheduling tool", with_tool)
+
     def test_birthday_command_default_instruction_is_ukrainian(self) -> None:
         parsed, error = main.parse_remind_command_args("birthday @friend 07/14/1990")
 

@@ -3604,6 +3604,7 @@ def build_agent_input(
     recalled_memory_context: str | None = None,
     web_context: str | None = None,
     route: str = "normal",
+    include_reminder_tool_guidance: bool = False,
 ) -> str:
     chat_title = message.chat.title or str(message.chat_id)
     history = format_history(message.chat_id)
@@ -3614,11 +3615,12 @@ def build_agent_input(
     semantic_long_term_memory = semantic_memory_context or "(not active)"
     recalled_long_term_memory = recalled_memory_context or "(not active)"
     current_web_context = web_context or "(none)"
+    reminder_guidance = reminder_tool_guidance() if include_reminder_tool_guidance else ""
     return f"""Telegram chat: {chat_title} ({message.chat_id})
 Current user: {user_label(message)}
 Request route: {route}
 
-{reminder_tool_guidance()}
+{reminder_guidance}
 
 Trusted current user request:
 {prompt}
@@ -7430,6 +7432,7 @@ async def handle_prompt_generation(
             user_id = message.from_user.id if message.from_user else "unknown"
             LOGGER.info("Reference context attached chat_id=%s user_id=%s", message.chat_id, user_id)
         web_context = await maybe_prefetch_web_context(message, prompt, route)
+        reminder_context = reminder_tool_context_for_message(message, prompt)
         recalled_memory_context = None
         semantic_memory_context = None
         if route == "memory_recall":
@@ -7462,6 +7465,7 @@ async def handle_prompt_generation(
             recalled_memory_context=recalled_memory_context,
             web_context=web_context,
             route=route,
+            include_reminder_tool_guidance=reminder_context is not None,
         )
         remember_context_diagnostics(
             message.chat_id,
@@ -7473,7 +7477,6 @@ async def handle_prompt_generation(
             recalled_memory_context=recalled_memory_context,
             compilation_stats=memory_context_stats,
         )
-        reminder_context = reminder_tool_context_for_message(message, prompt)
         agent_coro = (
             run_agent(agent_input, reminder_tool_context=reminder_context)
             if reminder_context is not None
