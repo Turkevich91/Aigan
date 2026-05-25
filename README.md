@@ -53,6 +53,8 @@ In a group chat, use:
  /selfcheck
  /complaints
  /proactive_now
+/remind 2026-06-01 09:00 check the release
+/reminders
 !m explain this briefly
 /ai summarize this https://www.youtube.com/watch?v=...
 ```
@@ -429,6 +431,23 @@ Test without waiting:
 ```text
 /proactive_now
 ```
+
+## Living Reminders
+
+Disabled by default. Living reminders are durable SQLite wake-ups that re-enter Aigan through the model with current chat memory instead of sending a static scheduled template:
+
+```env
+REMINDERS_ENABLED=false
+REMINDER_TOOL_ENABLED=true
+REMINDER_POLL_SECONDS=60
+REMINDER_MAX_DUE_PER_TICK=5
+REMINDER_MISFIRE_GRACE_SECONDS=86400
+REMINDER_CONTEXT_REQUEST_TTL_SECONDS=86400
+```
+
+When enabled, explicit requests such as `/remind 2026-06-01 09:00 check the release` or a clear mention asking Aigan to remind/congratulate can create a reminder. Clear requests are stored immediately; ambiguous dates, missing targets, or missing purpose should make Aigan ask one clarification. Ordinary group chatter never creates reminders passively.
+
+Due reminders are claimed idempotently, wake the model with source/recent/social context, and then send only a short contextual Telegram message. If context is insufficient, Aigan asks in the original chat instead of silently skipping. `/reminders` lists a user's active reminders; `/reminders all` and broad diagnostics are admin-only. `/remind_cancel ID` cancels a reminder owned by the caller, or any reminder for admins.
 
 ## Auto-Reactions
 

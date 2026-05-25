@@ -1,5 +1,11 @@
 # Aigan Changelog
 
+## 2026-05-25 - Living reminders
+
+- Added durable SQLite living reminders with idempotent due-fire claiming, misfire handling, and yearly birthday recurrence.
+- Added explicit `/remind`, `/reminders`, and `/remind_cancel` commands plus an Agents SDK reminder tool for clear model-detected reminder requests.
+- Added a scheduled model wake-up path that uses chat memory/context, asks for missing context instead of silently skipping, and surfaces sanitized reminder health diagnostics.
+
 ## 2026-05-23 - Telegram video frame fallback rollback
 
 - Removed chat-facing Telegram video frame analysis so video/animation/video-note/video-document messages no longer trigger downloads, frame extraction, vision calls, or the representative-frame failure reply.
