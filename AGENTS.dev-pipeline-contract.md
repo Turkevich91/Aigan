@@ -28,6 +28,7 @@ Private runtime details, host aliases, local paths, MCP endpoints, logs, databas
 - Re-request Copilot review after pushing review fixes and create another Heartbeat before sleeping again.
 - When Copilot has no relevant new comments, spawn or ask a reviewer sub-agent for a final blocker-focused pass, then run the final tests.
 - Mark the PR ready only after the final gates pass. Squash merge, delete the branch, close/update the task issue, and update the parent epic checklist when applicable.
+- For model or tool flows that mutate durable state, enforce a postcondition check: user-facing claims such as created, remembered, updated, canceled, deleted, scheduled, or saved are valid only after a successful tool result or persisted-state verification. If no mutation succeeded, the model must clarify instead of claiming success.
 - After a task is closed, if the parent epic still has `Todo` child issues, either continue to the next task immediately or create a 1-minute Heartbeat with `NEXT_STEP=start_next_task` before ending the ReAct session.
 - When the last child task of an epic is closed, run the epic completion testing gate before declaring the epic complete.
 - Deploy only after the deploy gate passes: tests are green, bookkeeping is complete, the target worktree is clean, persistent data is backed up, required environment keys are reconciled, and post-deploy validation has a named fallback.
@@ -277,6 +278,7 @@ Wake-up recovery algorithm:
 - Copilot comments are classified as relevant, not relevant, duplicate, or already fixed.
 - Final reviewer sub-agent verdict is recorded before merge.
 - Task issue gets a concise completion note with important pitfalls, decisions, and verification.
+- After completing a task or deploy loop, the agent briefly evaluates whether the work exposed a reusable process improvement. Propose a contract change only when confidence is high (`>=0.9`), the lesson generalizes beyond the current task, and it reduces a real failure mode rather than adding ceremony.
 - Parent epic checklist is updated after task completion when a parent epic exists.
 - If the parent epic still has Todo tasks and the session is ending, a 1-minute next-task Heartbeat is scheduled with `NEXT_STEP=start_next_task`.
 - When the parent epic has no Todo tasks, the epic completion testing result is recorded before closing the epic.
