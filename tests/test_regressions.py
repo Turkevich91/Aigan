@@ -8461,6 +8461,7 @@ class LivingReminderTests(unittest.TestCase):
         message = FakeMessage("що думаєш про дату 2026-07-14?")
 
         self.assertIsNone(main.reminder_tool_context_for_message(message, "що думаєш про дату 2026-07-14?"))
+        self.assertIsNone(main.reminder_tool_context_for_message(message, "my birthday is 2026-07-14"))
 
         context = main.reminder_tool_context_for_message(message, "нагадай 2026-07-14 09:00 написати в чат")
         self.assertIsNotNone(context)
@@ -8523,6 +8524,25 @@ class LivingReminderTests(unittest.TestCase):
         fires = main.REMINDERS.health_summary()
         self.assertEqual(1, fires["needs_context"])
         self.assertEqual("active", main.REMINDERS.reminder_by_id(reminder.id).status)
+
+    def test_needs_context_fire_expires_after_ttl(self) -> None:
+        reminder = self.create_due_reminder()
+        now = datetime.now(timezone.utc)
+        claim = main.REMINDERS.claim_due_fires(now=now, limit=1)[0]
+        main.REMINDERS.mark_needs_context(
+            claim.fire.id,
+            expected_claimed_at=claim.fire.claimed_at,
+            now=now - timedelta(days=2),
+        )
+
+        expired = main.REMINDERS.expire_context_requests(now=now, ttl_seconds=86400)
+
+        fire = main.REMINDERS.fire_by_id(claim.fire.id)
+        updated = main.REMINDERS.reminder_by_id(reminder.id)
+        self.assertEqual(1, expired)
+        self.assertEqual("failed", fire.status)
+        self.assertEqual("context_timeout", fire.failure_category)
+        self.assertEqual("failed", updated.status)
 
     def test_context_answer_requeues_needs_context_fire(self) -> None:
         reminder = self.create_due_reminder()

@@ -1288,9 +1288,7 @@ def has_living_reminder_intent(prompt: str | None) -> bool:
     text = (prompt or "").strip()
     if not text:
         return False
-    if REMINDER_ACTION_INTENT_RE.search(text):
-        return True
-    return bool(REMINDER_BIRTHDAY_INTENT_RE.search(text) and REMINDER_DATE_HINT_RE.search(text))
+    return bool(REMINDER_ACTION_INTENT_RE.search(text))
 
 
 def reminder_tool_context_for_message(message: Message, prompt: str | None = None) -> ReminderToolContext | None:

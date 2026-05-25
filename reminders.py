@@ -358,13 +358,16 @@ class ReminderStore:
                 (cutoff,),
             ).fetchall()
             for row in rows:
-                self._complete_fire_locked(
+                completed = self._complete_fire_locked(
                     int(row["id"]),
+                    expected_status="needs_context",
                     status="failed",
                     failure_category="context_timeout",
                     now_text=now_text,
                     sent_message_id=None,
                 )
+                if not completed:
+                    continue
                 if str(row["recurrence"]) == "yearly":
                     self._schedule_next_yearly_locked(
                         int(row["reminder_id"]),
