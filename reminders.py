@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
 REMINDER_KINDS = {"one_off", "birthday", "custom"}
@@ -82,15 +83,28 @@ def parse_datetime(value: datetime | str) -> datetime:
     return parsed.astimezone(timezone.utc)
 
 
-def next_yearly_time(scheduled_for: datetime | str, after: datetime | str | None = None) -> datetime:
-    candidate = parse_datetime(scheduled_for)
+def reminder_timezone(timezone_name: str) -> ZoneInfo:
+    try:
+        return ZoneInfo(timezone_name or "UTC")
+    except ZoneInfoNotFoundError:
+        return ZoneInfo("UTC")
+
+
+def next_yearly_time(
+    scheduled_for: datetime | str,
+    after: datetime | str | None = None,
+    *,
+    timezone_name: str = "UTC",
+) -> datetime:
+    zone = reminder_timezone(timezone_name)
+    candidate = parse_datetime(scheduled_for).astimezone(zone)
     boundary = parse_datetime(after or utc_now())
-    while candidate <= boundary:
+    while candidate.astimezone(timezone.utc) <= boundary:
         try:
             candidate = candidate.replace(year=candidate.year + 1)
         except ValueError:
             candidate = candidate.replace(month=2, day=28, year=candidate.year + 1)
-    return candidate
+    return candidate.astimezone(timezone.utc)
 
 
 def normalize_kind(value: str) -> str:
@@ -338,7 +352,7 @@ class ReminderStore:
         with self._lock:
             rows = self._conn.execute(
                 """
-                SELECT f.id, f.reminder_id, f.scheduled_for_utc, r.recurrence
+                SELECT f.id, f.reminder_id, f.scheduled_for_utc, r.recurrence, r.timezone
                 FROM reminder_fires f
                 JOIN reminders r ON r.id = f.reminder_id
                 WHERE f.status = 'needs_context' AND f.updated_at < ?
@@ -354,7 +368,12 @@ class ReminderStore:
                     sent_message_id=None,
                 )
                 if str(row["recurrence"]) == "yearly":
-                    self._schedule_next_yearly_locked(int(row["reminder_id"]), row["scheduled_for_utc"], now_dt)
+                    self._schedule_next_yearly_locked(
+                        int(row["reminder_id"]),
+                        row["scheduled_for_utc"],
+                        row["timezone"],
+                        now_dt,
+                    )
                 else:
                     self._fail_one_off_locked(int(row["reminder_id"]), now_text)
                 expired += 1
@@ -515,7 +534,7 @@ class ReminderStore:
         with self._lock:
             row = self._conn.execute(
                 """
-                SELECT f.reminder_id, f.scheduled_for_utc, r.recurrence
+                SELECT f.reminder_id, f.scheduled_for_utc, r.recurrence, r.timezone
                 FROM reminder_fires f
                 JOIN reminders r ON r.id = f.reminder_id
                 WHERE f.id = ?
@@ -532,7 +551,12 @@ class ReminderStore:
                 sent_message_id=sent_message_id,
             )
             if str(row["recurrence"]) == "yearly":
-                self._schedule_next_yearly_locked(int(row["reminder_id"]), row["scheduled_for_utc"], now_dt)
+                self._schedule_next_yearly_locked(
+                    int(row["reminder_id"]),
+                    row["scheduled_for_utc"],
+                    row["timezone"],
+                    now_dt,
+                )
             elif status == "failed":
                 self._fail_one_off_locked(int(row["reminder_id"]), now_text)
             else:
@@ -558,7 +582,7 @@ class ReminderStore:
         now_text = format_datetime(now_dt)
         rows = self._conn.execute(
             """
-            SELECT f.id, f.reminder_id, f.scheduled_for_utc, r.recurrence
+            SELECT f.id, f.reminder_id, f.scheduled_for_utc, r.recurrence, r.timezone
             FROM reminder_fires f
             JOIN reminders r ON r.id = f.reminder_id
             WHERE f.status = 'pending'
@@ -576,7 +600,12 @@ class ReminderStore:
                 sent_message_id=None,
             )
             if str(row["recurrence"]) == "yearly":
-                self._schedule_next_yearly_locked(int(row["reminder_id"]), row["scheduled_for_utc"], now_dt)
+                self._schedule_next_yearly_locked(
+                    int(row["reminder_id"]),
+                    row["scheduled_for_utc"],
+                    row["timezone"],
+                    now_dt,
+                )
             else:
                 self._fail_one_off_locked(int(row["reminder_id"]), now_text)
 
@@ -618,8 +647,16 @@ class ReminderStore:
             (now_text, int(reminder_id)),
         )
 
-    def _schedule_next_yearly_locked(self, reminder_id: int, scheduled_for_utc: str, now_dt: datetime) -> None:
-        next_due = format_datetime(next_yearly_time(scheduled_for_utc, after=now_dt))
+    def _schedule_next_yearly_locked(
+        self,
+        reminder_id: int,
+        scheduled_for_utc: str,
+        timezone_name: str,
+        now_dt: datetime,
+    ) -> None:
+        next_due = format_datetime(
+            next_yearly_time(scheduled_for_utc, after=now_dt, timezone_name=timezone_name)
+        )
         now_text = format_datetime(now_dt)
         self._conn.execute(
             """

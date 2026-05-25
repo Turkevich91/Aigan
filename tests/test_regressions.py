@@ -140,7 +140,7 @@ from media_frames import (
 from memory import MemoryStore, SemanticMemoryResult
 from mcp_servers import web
 from reaction_memory import ReactionSpec
-from reminders import ReminderStore, format_datetime
+from reminders import ReminderStore, format_datetime, next_yearly_time
 from scripts import import_telegram_export
 from scripts.import_telegram_export import ImportOptions
 from self_analysis import (
@@ -8283,6 +8283,38 @@ class LivingReminderTests(unittest.TestCase):
         self.assertEqual("active", updated.status)
         self.assertEqual("yearly", updated.recurrence)
         self.assertGreater(main.parse_reminder_datetime(updated.due_at_utc), datetime.now(timezone.utc))
+
+    def test_yearly_reminder_preserves_local_time_across_dst(self) -> None:
+        first_due = datetime(2026, 3, 8, 13, 0, tzinfo=timezone.utc)
+        after = datetime(2026, 5, 25, 12, 0, tzinfo=timezone.utc)
+
+        next_due = next_yearly_time(first_due, after=after, timezone_name="America/New_York")
+
+        self.assertEqual(datetime(2027, 3, 8, 14, 0, tzinfo=timezone.utc), next_due)
+
+    def test_yearly_reminder_store_uses_local_timezone_for_next_fire(self) -> None:
+        first_due = datetime(2026, 3, 8, 13, 0, tzinfo=timezone.utc)
+        reminder = main.REMINDERS.create_reminder(
+            chat_id=-1001,
+            created_by_user_id=407892151,
+            created_from_message_id=123,
+            target_label="@tester",
+            kind="birthday",
+            trusted_instruction="write a warm reminder",
+            due_at_utc=first_due,
+            timezone_name="America/New_York",
+            recurrence="yearly",
+        )
+        claim = main.REMINDERS.claim_due_fires(
+            now=datetime(2026, 5, 25, 12, 0, tzinfo=timezone.utc),
+            limit=1,
+            misfire_grace_seconds=86400 * 100,
+        )[0]
+
+        main.REMINDERS.mark_sent(claim.fire.id, now=datetime(2026, 5, 25, 12, 1, tzinfo=timezone.utc))
+
+        updated = main.REMINDERS.reminder_by_id(reminder.id)
+        self.assertEqual("2027-03-08T14:00:00+00:00", updated.due_at_utc)
 
     def test_tool_creates_complete_reminder_from_current_context(self) -> None:
         future = (datetime.now(timezone.utc) + timedelta(days=1)).isoformat(timespec="minutes")
