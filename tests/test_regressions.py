@@ -140,7 +140,7 @@ from media_frames import (
 from memory import MemoryStore, SemanticMemoryResult
 from mcp_servers import web
 from reaction_memory import ReactionSpec
-from reminders import ReminderStore
+from reminders import ReminderStore, format_datetime
 from scripts import import_telegram_export
 from scripts.import_telegram_export import ImportOptions
 from self_analysis import (
@@ -8379,7 +8379,7 @@ class LivingReminderTests(unittest.TestCase):
 
         self.assertEqual(1, sent)
         app.bot.send_message.assert_awaited()
-        self.assertEqual("кого саме привітати?", app.bot.send_message.await_args.kwargs["text"])
+        self.assertEqual(f"Для нагадування #{reminder.id}: кого саме привітати?", app.bot.send_message.await_args.kwargs["text"])
         claims = main.REMINDERS.claim_due_fires(limit=5)
         self.assertEqual([], claims)
         fires = main.REMINDERS.health_summary()
@@ -8393,6 +8393,7 @@ class LivingReminderTests(unittest.TestCase):
 
         resolved = main.REMINDERS.resolve_context_request(
             reminder.chat_id,
+            reminder_id=reminder.id,
             user_id=reminder.created_by_user_id,
             clarification="згадай, що це дружнє привітання",
         )
@@ -8409,7 +8410,11 @@ class LivingReminderTests(unittest.TestCase):
         reminder = self.create_due_reminder()
         claim = main.REMINDERS.claim_due_fires(limit=1)[0]
         main.REMINDERS.mark_needs_context(claim.fire.id)
-        message = FakeMessage("зроби це як тепле привітання", chat_type=ChatType.PRIVATE, chat_id=reminder.chat_id)
+        message = FakeMessage("зроби це як тепле привітання", chat_type=ChatType.SUPERGROUP, chat_id=reminder.chat_id)
+        reply = FakeMessage(f"Для нагадування #{reminder.id}: кого саме привітати?", chat_id=reminder.chat_id)
+        reply.from_user = FakeUser(user_id=999, username="aigan")
+        reply.from_user.is_bot = True
+        message.reply_to_message = reply
 
         handled = asyncio.run(
             main.maybe_resolve_reminder_context_response(
@@ -8423,6 +8428,32 @@ class LivingReminderTests(unittest.TestCase):
         self.assertIn(f"#{reminder.id}", message.reply_calls[0]["text"])
         self.assertEqual("pending", main.REMINDERS.fire_by_id(claim.fire.id).status)
 
+    def test_context_answer_without_reminder_id_is_not_consumed(self) -> None:
+        reminder = self.create_due_reminder()
+        claim = main.REMINDERS.claim_due_fires(limit=1)[0]
+        main.REMINDERS.mark_needs_context(claim.fire.id)
+        message = FakeMessage("це має бути дружньо", chat_type=ChatType.SUPERGROUP, chat_id=reminder.chat_id)
+        reply = FakeMessage("кого саме привітати?", chat_id=reminder.chat_id)
+        reply.from_user = FakeUser(user_id=999, username="aigan")
+        reply.from_user.is_bot = True
+        message.reply_to_message = reply
+
+        handled = asyncio.run(
+            main.maybe_resolve_reminder_context_response(
+                message,
+                SimpleNamespace(bot=SimpleNamespace(id=999)),
+                "це має бути дружньо",
+            )
+        )
+
+        self.assertFalse(handled)
+        self.assertEqual([], message.reply_calls)
+        self.assertEqual("needs_context", main.REMINDERS.fire_by_id(claim.fire.id).status)
+
+    def test_reminder_datetimes_are_canonicalized_for_text_ordering(self) -> None:
+        self.assertEqual("2026-01-02T03:04:00+00:00", format_datetime("2026-01-02T03:04:00+00:00"))
+        self.assertEqual("2026-01-02T03:04:00+00:00", format_datetime("2026-01-02T05:04:00+02:00"))
+
     def test_remind_command_maps_missing_time_error_to_user_text(self) -> None:
         message = FakeMessage("/remind 2999-01-01 test reminder")
 
@@ -8431,6 +8462,13 @@ class LivingReminderTests(unittest.TestCase):
         self.assertTrue(message.reply_calls)
         self.assertNotIn("missing_time", message.reply_calls[0]["text"])
         self.assertIn("немає часу", message.reply_calls[0]["text"])
+
+    def test_owner_scoped_reminders_ignore_missing_user_identity(self) -> None:
+        reminder = self.create_due_reminder()
+
+        self.assertEqual([], main.REMINDERS.list_reminders(reminder.chat_id, user_id=None))
+        self.assertFalse(main.REMINDERS.cancel_reminder(reminder.chat_id, reminder.id, user_id=None))
+        self.assertEqual("active", main.REMINDERS.reminder_by_id(reminder.id).status)
 
     def test_reminder_commands_respect_owner_and_admin_cancel(self) -> None:
         message = FakeMessage("/remind 2999-01-01 09:00 test reminder")

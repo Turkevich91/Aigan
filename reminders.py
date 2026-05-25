@@ -66,7 +66,7 @@ def format_datetime(value: datetime | str | None = None) -> str:
     if value is None:
         value = utc_now()
     if isinstance(value, str):
-        return value
+        value = parse_datetime(value)
     if value.tzinfo is None:
         value = value.replace(tzinfo=timezone.utc)
     return value.astimezone(timezone.utc).isoformat(timespec="seconds")
@@ -229,11 +229,13 @@ class ReminderStore:
         return row_to_fire(row) if row else None
 
     def list_reminders(self, chat_id: int, *, user_id: int | None = None, include_all: bool = False) -> list[Reminder]:
+        if not include_all and user_id is None:
+            return []
         conditions = ["chat_id = ?", "status IN ('active', 'paused')"]
         params: list[Any] = [int(chat_id)]
         if not include_all:
-            conditions.append("created_by_user_id IS ?")
-            params.append(user_id)
+            conditions.append("created_by_user_id = ?")
+            params.append(int(user_id))
         with self._lock:
             rows = self._conn.execute(
                 f"""
@@ -247,12 +249,14 @@ class ReminderStore:
         return [row_to_reminder(row) for row in rows]
 
     def cancel_reminder(self, chat_id: int, reminder_id: int, *, user_id: int | None, is_admin: bool = False) -> bool:
+        if not is_admin and user_id is None:
+            return False
         now = format_datetime()
         conditions = ["id = ?", "chat_id = ?", "status IN ('active', 'paused')"]
         params: list[Any] = [int(reminder_id), int(chat_id)]
         if not is_admin:
-            conditions.append("created_by_user_id IS ?")
-            params.append(user_id)
+            conditions.append("created_by_user_id = ?")
+            params.append(int(user_id))
         with self._lock:
             cursor = self._conn.execute(
                 f"UPDATE reminders SET status = 'canceled', updated_at = ? WHERE {' AND '.join(conditions)}",
@@ -377,6 +381,7 @@ class ReminderStore:
         self,
         chat_id: int,
         *,
+        reminder_id: int,
         user_id: int | None,
         clarification: str,
         now: datetime | str | None = None,
@@ -384,12 +389,13 @@ class ReminderStore:
         text = " ".join((clarification or "").split())
         if not text:
             return None
+        if user_id is None:
+            return None
         now_text = format_datetime(now or utc_now())
-        conditions = ["r.chat_id = ?", "r.status = 'active'", "f.status = 'needs_context'"]
-        params: list[Any] = [int(chat_id)]
-        if user_id is not None:
-            conditions.append("(r.created_by_user_id = ? OR r.created_by_user_id IS NULL)")
-            params.append(int(user_id))
+        conditions = ["r.chat_id = ?", "r.id = ?", "r.status = 'active'", "f.status = 'needs_context'"]
+        params: list[Any] = [int(chat_id), int(reminder_id)]
+        conditions.append("r.created_by_user_id = ?")
+        params.append(int(user_id))
         with self._lock:
             row = self._conn.execute(
                 f"""
