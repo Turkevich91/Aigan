@@ -899,6 +899,25 @@ PROACTIVE_SERVANT_PHRASE_RE = re.compile(
     r")",
     re.UNICODE,
 )
+REMINDER_SERVANT_PHRASE_RE = re.compile(
+    r"(?i)("
+    r"\bi\s+can\s+help\b|"
+    r"\bi(?:'m| am)\s+here\s+to\s+help\b|"
+    r"\bhow\s+can\s+i\s+help\b|"
+    r"\btag\s+me\b|\bping\s+me\b|"
+    r"\bas\s+an\s+ai\b|\bi\s+am\s+(?:a\s+)?bot\b|\bi'?m\s+(?:an?\s+)?ai\b|"
+    r"можу\s+допомогти|"
+    r"я\s+(?:бот|ai|аі|штучний\s+інтелект)|як\s+(?:ai|аі|штучний\s+інтелект)|"
+    r"я\s+(?:учасник|учасниця)\b|мені\s+дали\s+інструкц|"
+    r"я\s+на\s+зв[’']?язку|"
+    r"якщо\s+треба[^.\n]{0,80}(?:тегайте|пишіть|звертайтеся)|"
+    r"тегайте|пишіть\s+прямо|звертайтеся|"
+    r"ось\s+що\s+я\s+(?:вмію|можу)|"
+    r"готов(?:ий|а|і)\s+допомогти|"
+    r"можу\s+(?:перевірити|резюмувати|проаналізувати|пояснити|знайти|перекласти)"
+    r")",
+    re.UNICODE,
+)
 SELF_DISCLOSURE_TOPIC_RE = re.compile(
     r"(?i)("
     r"\baigan\b|@thrd_ua_bot|айган|аіган|"
@@ -7994,6 +8013,22 @@ def proactive_persona_violation(text: str) -> str:
     return ""
 
 
+def reminder_persona_violation(text: str) -> str:
+    stripped = (text or "").strip()
+    if not stripped or stripped.upper() == "SKIP" or stripped.upper().startswith("NEEDS_CONTEXT:"):
+        return ""
+    if not CONFIG.proactive_self_reference_guard:
+        return ""
+    if CONFIG.proactive_meta_topic_guard:
+        match = SELF_DISCLOSURE_TOPIC_RE.search(stripped)
+        if match:
+            return f"meta_topic:{match.group(0)[:80]}"
+    match = REMINDER_SERVANT_PHRASE_RE.search(stripped)
+    if match:
+        return f"servant_phrase:{match.group(0)[:80]}"
+    return ""
+
+
 async def run_proactive_model(
     prompt: str,
     *,
@@ -8045,6 +8080,59 @@ Rewrite once about a non-meta chat topic. No availability notice, no capability 
         LOGGER.info("Proactive persona rejected after retry chat_id=%s reason=%s", chat_id, retry_violation)
         return None
     return retry
+
+
+async def run_reminder_model(
+    prompt: str,
+    *,
+    chat_id: int,
+    event_message: str = "",
+    user_id: int | None = None,
+) -> tuple[str | None, str]:
+    response = await asyncio.wait_for(run_agent(prompt), timeout=120)
+    if response.strip().upper() == "SKIP":
+        return None, "model_skip"
+
+    violation = reminder_persona_violation(response)
+    if not violation:
+        return response, ""
+
+    system_event_for_chat(
+        component="reminders",
+        event_type="reminder_persona_rejected",
+        chat_id=chat_id,
+        user_id=user_id,
+        message=event_message,
+        details={"attempt": 1, "reason": violation, "regenerate": CONFIG.proactive_regenerate_on_persona_reject},
+    )
+    LOGGER.info("Reminder persona rejected chat_id=%s reason=%s", chat_id, violation)
+    if not CONFIG.proactive_regenerate_on_persona_reject:
+        return None, "style_rejected"
+
+    retry_prompt = f"""{prompt}
+
+The previous reminder draft was rejected by the reminder safety guard.
+Rejection reason: {violation}
+
+Rewrite once as the reminder itself. No availability notice, no capability list, no self-description, no internal setup, and no contact request. If the reminder is unsafe or impossible to make useful, reply exactly: SKIP
+"""
+    retry = await asyncio.wait_for(run_agent(retry_prompt), timeout=120)
+    if retry.strip().upper() == "SKIP":
+        return None, "model_skip"
+
+    retry_violation = reminder_persona_violation(retry)
+    if retry_violation:
+        system_event_for_chat(
+            component="reminders",
+            event_type="reminder_persona_rejected",
+            chat_id=chat_id,
+            user_id=user_id,
+            message=event_message,
+            details={"attempt": 2, "reason": retry_violation, "regenerate": False},
+        )
+        LOGGER.info("Reminder persona rejected after retry chat_id=%s reason=%s", chat_id, retry_violation)
+        return None, "style_rejected"
+    return retry, ""
 
 
 async def run_proactive_once(application: Application) -> bool:
@@ -8288,25 +8376,41 @@ async def run_reminder_scheduler_once(application: Application) -> int:
         claim_token = claim.fire.claimed_at
         prompt = build_scheduled_reminder_prompt(claim)
         try:
-            response = await run_proactive_model(
+            response, failure_category = await run_reminder_model(
                 prompt,
                 chat_id=reminder.chat_id,
                 event_message=f"reminder:{reminder.id}",
                 user_id=reminder.created_by_user_id,
             )
             if response is None:
-                REMINDERS.mark_skipped_unsafe(
-                    claim.fire.id,
-                    category="model_skip",
-                    expected_claimed_at=claim_token,
-                )
-                system_event_for_chat(
-                    component="reminders",
-                    event_type="reminder_model_skip",
-                    chat_id=reminder.chat_id,
-                    user_id=reminder.created_by_user_id,
-                    message=str(reminder.id),
-                )
+                if failure_category == "model_skip":
+                    REMINDERS.mark_skipped_unsafe(
+                        claim.fire.id,
+                        category="model_skip",
+                        expected_claimed_at=claim_token,
+                    )
+                    system_event_for_chat(
+                        component="reminders",
+                        event_type="reminder_model_skip",
+                        chat_id=reminder.chat_id,
+                        user_id=reminder.created_by_user_id,
+                        message=str(reminder.id),
+                    )
+                else:
+                    REMINDERS.mark_failed(
+                        claim.fire.id,
+                        category=failure_category or "model_failed",
+                        expected_claimed_at=claim_token,
+                    )
+                    system_event_for_chat(
+                        level="error",
+                        component="reminders",
+                        event_type="reminder_failed",
+                        chat_id=reminder.chat_id,
+                        user_id=reminder.created_by_user_id,
+                        message=str(reminder.id),
+                        details={"failure_category": failure_category or "model_failed"},
+                    )
                 continue
             question = needs_context_text(response)
             if question is not None:
