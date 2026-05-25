@@ -71,6 +71,7 @@ SAFE_HEALTH_FIELDS = {
     "max_due_per_tick",
     "active",
     "pending",
+    "claimed",
     "needs_context",
     "failed",
     "next_due_set",

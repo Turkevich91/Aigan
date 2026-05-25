@@ -674,7 +674,7 @@ last_embedding_at = ""
 last_embedding_backlog = 0
 last_memory_cleanup = 0.0
 last_health_report_sent = 0.0
-REMINDER_TOOL_CONTEXT: contextvars.ContextVar[ReminderToolContext | None] = contextvars.ContextVar(
+REMINDER_TOOL_CONTEXT: contextvars.ContextVar["ReminderToolContext | None"] = contextvars.ContextVar(
     "reminder_tool_context",
     default=None,
 )

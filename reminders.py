@@ -12,6 +12,8 @@ REMINDER_KINDS = {"one_off", "birthday", "custom"}
 REMINDER_RECURRENCES = {"none", "yearly"}
 ACTIVE_REMINDER_STATUSES = {"active", "paused"}
 TERMINAL_FIRE_STATUSES = {"sent", "failed", "skipped_unsafe", "canceled"}
+DEFAULT_CLAIM_TTL_SECONDS = 900
+DEFAULT_MAX_FIRE_ATTEMPTS = 3
 
 
 @dataclass(frozen=True)
@@ -274,13 +276,16 @@ class ReminderStore:
         now: datetime | str | None = None,
         limit: int = 5,
         misfire_grace_seconds: int = 86400,
+        claim_ttl_seconds: int = DEFAULT_CLAIM_TTL_SECONDS,
     ) -> list[ClaimedReminderFire]:
         now_dt = parse_datetime(now or utc_now())
         now_text = format_datetime(now_dt)
         grace = max(0, int(misfire_grace_seconds))
         cutoff_text = format_datetime(now_dt - timedelta(seconds=grace))
+        claim_cutoff_text = format_datetime(now_dt - timedelta(seconds=max(1, int(claim_ttl_seconds))))
         claimed: list[ClaimedReminderFire] = []
         with self._lock:
+            self._reclaim_stale_claims_locked(claim_cutoff_text, now_text)
             self._expire_misfires_locked(now_dt, cutoff_text)
             rows = self._conn.execute(
                 """
@@ -347,7 +352,7 @@ class ReminderStore:
                 if str(row["recurrence"]) == "yearly":
                     self._schedule_next_yearly_locked(int(row["reminder_id"]), row["scheduled_for_utc"], now_dt)
                 else:
-                    self._complete_one_off_locked(int(row["reminder_id"]), now_text)
+                    self._fail_one_off_locked(int(row["reminder_id"]), now_text)
                 expired += 1
             self._conn.commit()
         return expired
@@ -368,8 +373,32 @@ class ReminderStore:
             )
             self._conn.commit()
 
-    def mark_failed(self, fire_id: int, *, category: str = "failed", now: datetime | str | None = None) -> None:
-        self._finish_fire(fire_id, status="failed", failure_category=category, sent_message_id=None, now=now)
+    def mark_failed(
+        self,
+        fire_id: int,
+        *,
+        category: str = "failed",
+        now: datetime | str | None = None,
+        max_attempts: int = DEFAULT_MAX_FIRE_ATTEMPTS,
+    ) -> None:
+        now_text = format_datetime(now or utc_now())
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT attempt_count FROM reminder_fires WHERE id = ? AND status = 'claimed'",
+                (int(fire_id),),
+            ).fetchone()
+            if row is not None and int(row["attempt_count"]) < max(1, int(max_attempts)):
+                self._conn.execute(
+                    """
+                    UPDATE reminder_fires
+                    SET status = 'pending', claimed_at = '', updated_at = ?, failure_category = ?
+                    WHERE id = ? AND status = 'claimed'
+                    """,
+                    (now_text, category, int(fire_id)),
+                )
+                self._conn.commit()
+                return
+        self._finish_fire(fire_id, status="failed", failure_category=category, sent_message_id=None, now=now_text)
 
     def mark_skipped_unsafe(self, fire_id: int, *, category: str = "model_skip", now: datetime | str | None = None) -> None:
         self._finish_fire(fire_id, status="skipped_unsafe", failure_category=category, sent_message_id=None, now=now)
@@ -378,6 +407,7 @@ class ReminderStore:
         with self._lock:
             active = self._scalar("SELECT COUNT(*) FROM reminders WHERE status = 'active'")
             pending = self._scalar("SELECT COUNT(*) FROM reminder_fires WHERE status = 'pending'")
+            claimed = self._scalar("SELECT COUNT(*) FROM reminder_fires WHERE status = 'claimed'")
             needs_context = self._scalar("SELECT COUNT(*) FROM reminder_fires WHERE status = 'needs_context'")
             failed = self._scalar("SELECT COUNT(*) FROM reminder_fires WHERE status = 'failed'")
             next_row = self._conn.execute(
@@ -391,6 +421,7 @@ class ReminderStore:
         return {
             "active": active,
             "pending": pending,
+            "claimed": claimed,
             "needs_context": needs_context,
             "failed": failed,
             "next_due_set": bool(next_row),
@@ -444,9 +475,26 @@ class ReminderStore:
             )
             if str(row["recurrence"]) == "yearly":
                 self._schedule_next_yearly_locked(int(row["reminder_id"]), row["scheduled_for_utc"], now_dt)
+            elif status == "failed":
+                self._fail_one_off_locked(int(row["reminder_id"]), now_text)
             else:
                 self._complete_one_off_locked(int(row["reminder_id"]), now_text)
             self._conn.commit()
+
+    def _reclaim_stale_claims_locked(self, claim_cutoff_text: str, now_text: str) -> None:
+        self._conn.execute(
+            """
+            UPDATE reminder_fires
+            SET status = 'pending',
+                claimed_at = '',
+                updated_at = ?,
+                failure_category = 'claim_reclaimed'
+            WHERE status = 'claimed'
+              AND claimed_at != ''
+              AND claimed_at < ?
+            """,
+            (now_text, claim_cutoff_text),
+        )
 
     def _expire_misfires_locked(self, now_dt: datetime, cutoff_text: str) -> None:
         now_text = format_datetime(now_dt)
@@ -472,7 +520,7 @@ class ReminderStore:
             if str(row["recurrence"]) == "yearly":
                 self._schedule_next_yearly_locked(int(row["reminder_id"]), row["scheduled_for_utc"], now_dt)
             else:
-                self._complete_one_off_locked(int(row["reminder_id"]), now_text)
+                self._fail_one_off_locked(int(row["reminder_id"]), now_text)
 
     def _complete_fire_locked(
         self,
@@ -497,6 +545,16 @@ class ReminderStore:
             """
             UPDATE reminders
             SET status = 'completed', updated_at = ?
+            WHERE id = ? AND recurrence = 'none'
+            """,
+            (now_text, int(reminder_id)),
+        )
+
+    def _fail_one_off_locked(self, reminder_id: int, now_text: str) -> None:
+        self._conn.execute(
+            """
+            UPDATE reminders
+            SET status = 'failed', updated_at = ?
             WHERE id = ? AND recurrence = 'none'
             """,
             (now_text, int(reminder_id)),

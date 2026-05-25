@@ -8243,6 +8243,35 @@ class LivingReminderTests(unittest.TestCase):
         self.assertEqual("claimed", first[0].fire.status)
         self.assertEqual(1, first[0].fire.attempt_count)
 
+    def test_stale_claim_is_reclaimed_after_claim_ttl(self) -> None:
+        self.create_due_reminder()
+        now = datetime.now(timezone.utc)
+
+        first = main.REMINDERS.claim_due_fires(now=now, limit=5, claim_ttl_seconds=900)
+        second = main.REMINDERS.claim_due_fires(
+            now=now + timedelta(minutes=16),
+            limit=5,
+            claim_ttl_seconds=900,
+        )
+
+        self.assertEqual(1, len(first))
+        self.assertEqual(1, len(second))
+        self.assertEqual(first[0].fire.id, second[0].fire.id)
+        self.assertEqual(2, second[0].fire.attempt_count)
+
+    def test_failed_claim_retries_before_terminal_failure(self) -> None:
+        reminder = self.create_due_reminder()
+        first = main.REMINDERS.claim_due_fires(limit=1)[0]
+
+        main.REMINDERS.mark_failed(first.fire.id, category="send_or_model_failed", max_attempts=2)
+        retry = main.REMINDERS.claim_due_fires(limit=1)[0]
+        main.REMINDERS.mark_failed(retry.fire.id, category="send_or_model_failed", max_attempts=2)
+
+        self.assertEqual(first.fire.id, retry.fire.id)
+        self.assertEqual(2, retry.fire.attempt_count)
+        self.assertEqual("failed", main.REMINDERS.fire_by_id(retry.fire.id).status)
+        self.assertEqual("failed", main.REMINDERS.reminder_by_id(reminder.id).status)
+
     def test_yearly_reminder_schedules_next_fire_after_send(self) -> None:
         reminder = self.create_due_reminder(recurrence="yearly")
         claim = main.REMINDERS.claim_due_fires(limit=1)[0]
