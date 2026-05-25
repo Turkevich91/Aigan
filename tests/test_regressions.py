@@ -8393,6 +8393,10 @@ class LivingReminderTests(unittest.TestCase):
         context = main.reminder_tool_context_for_message(message, "нагадай 2026-07-14 09:00 написати в чат")
         self.assertIsNotNone(context)
         self.assertEqual(message.chat_id, context.chat_id)
+        self.assertIsNotNone(main.reminder_tool_context_for_message(message, "/remind 2026-07-14 09:00 написати"))
+        self.assertIsNotNone(
+            main.reminder_tool_context_for_message(message, "будь ласка /remind 2026-07-14 09:00 написати")
+        )
 
     def test_birthday_command_default_instruction_is_ukrainian(self) -> None:
         parsed, error = main.parse_remind_command_args("birthday @friend 07/14/1990")
@@ -8547,6 +8551,20 @@ class LivingReminderTests(unittest.TestCase):
         rendered = render_row(row)
         self.assertIn("poll_seconds=", rendered)
         self.assertIn("pending=", rendered)
+
+    def test_living_reminders_diagnostics_disabled_without_runtime_store(self) -> None:
+        store = main.REMINDERS
+        try:
+            main.REMINDERS = None
+            rows = {row.name: row for row in main.tool_capability_rows()}
+        finally:
+            main.REMINDERS = store
+
+        row = rows["living_reminders"]
+        self.assertTrue(row.configured)
+        self.assertFalse(row.enabled)
+        self.assertFalse(row.available)
+        self.assertEqual("disabled", row.status)
 
 
 if __name__ == "__main__":

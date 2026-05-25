@@ -1271,7 +1271,7 @@ def parse_reminder_due_at(
 
 REMINDER_ACTION_INTENT_RE = re.compile(
     r"(?i)(?:"
-    r"\b/remind\b|\bremind(?:er| me)?\b|\bschedule\b|\bremember\s+to\b|\bdon['’]?t\s+forget\b|"
+    r"(?:^|\s)/remind\b|\bremind(?:er| me)?\b|\bschedule\b|\bremember\s+to\b|\bdon['’]?t\s+forget\b|"
     r"\bнагада(?:й|ти|тися|ння|ування)\b|\bне\s+забудь\b|\bзапам['’]?ятай\b|\bпривітай\b|"
     r"\bнапомни\b|\bнапомнить\b|\bне\s+забудь\b|\bзапомни\b|\bпоздравь\b"
     r")"
@@ -4844,16 +4844,17 @@ def memory_capability_rows() -> list[CapabilityRow]:
 def configured_capability_rows() -> list[CapabilityRow]:
     rows = memory_capability_rows()
     reminder_details = REMINDERS.health_summary() if REMINDERS is not None else {}
+    reminders_available = REMINDERS is not None
     rows.append(
         CapabilityRow(
             name="living_reminders",
             family="scheduler",
-            enabled=CONFIG.reminders_enabled,
+            enabled=reminders_available,
             configured=CONFIG.reminders_enabled,
-            available=REMINDERS is not None,
-            status="ok" if CONFIG.reminders_enabled and REMINDERS is not None else "disabled",
-            adapter="ReminderStore" if REMINDERS is not None else "null",
-            mode="sqlite_polling",
+            available=reminders_available,
+            status="ok" if reminders_available else "disabled",
+            adapter="ReminderStore" if reminders_available else "null",
+            mode="sqlite_polling" if reminders_available else "",
             details={
                 "tool_enabled": CONFIG.reminder_tool_enabled,
                 "poll_seconds": CONFIG.reminder_poll_seconds,

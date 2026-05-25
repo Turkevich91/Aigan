@@ -255,7 +255,7 @@ class ReminderStore:
                 f"""
                 SELECT * FROM reminders
                 WHERE {' AND '.join(conditions)}
-                ORDER BY datetime(due_at_utc) ASC, id ASC
+                ORDER BY due_at_utc ASC, id ASC
                 LIMIT 50
                 """,
                 params,
@@ -324,7 +324,7 @@ class ReminderStore:
                 WHERE f.status = 'pending'
                   AND r.status = 'active'
                   AND f.scheduled_for_utc <= ?
-                ORDER BY datetime(f.scheduled_for_utc) ASC, f.id ASC
+                ORDER BY f.scheduled_for_utc ASC, f.id ASC
                 LIMIT ?
                 """,
                 (now_text, max(1, int(limit))),
@@ -422,7 +422,7 @@ class ReminderStore:
                 FROM reminder_fires f
                 JOIN reminders r ON r.id = f.reminder_id
                 WHERE {' AND '.join(conditions)}
-                ORDER BY datetime(f.updated_at) DESC, f.id DESC
+                ORDER BY f.updated_at DESC, f.id DESC
                 LIMIT 1
                 """,
                 params,
@@ -491,7 +491,7 @@ class ReminderStore:
                 """
                 SELECT scheduled_for_utc FROM reminder_fires
                 WHERE status = 'pending'
-                ORDER BY datetime(scheduled_for_utc) ASC, id ASC
+                ORDER BY scheduled_for_utc ASC, id ASC
                 LIMIT 1
                 """
             ).fetchone()
