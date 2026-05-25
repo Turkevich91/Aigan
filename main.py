@@ -8387,15 +8387,15 @@ async def run_reminder_scheduler_once(application: Application) -> int:
                 user_id=reminder.created_by_user_id,
             )
             if response is None:
-                if failure_category == "model_skip":
+                if failure_category in {"model_skip", "style_rejected"}:
                     REMINDERS.mark_skipped_unsafe(
                         claim.fire.id,
-                        category="model_skip",
+                        category=failure_category,
                         expected_claimed_at=claim_token,
                     )
                     system_event_for_chat(
                         component="reminders",
-                        event_type="reminder_model_skip",
+                        event_type="reminder_model_skip" if failure_category == "model_skip" else "reminder_style_rejected",
                         chat_id=reminder.chat_id,
                         user_id=reminder.created_by_user_id,
                         message=str(reminder.id),

@@ -8553,10 +8553,10 @@ class LivingReminderTests(unittest.TestCase):
     def test_scheduler_is_not_blocked_by_proactive_cooldown_state(self) -> None:
         reminder = self.create_due_reminder()
         app = SimpleNamespace(bot=SimpleNamespace(send_message=AsyncMock()))
-        main.last_proactive_sent_chat[reminder.chat_id] = time.monotonic()
 
-        with patch.object(main, "run_reminder_model", new=AsyncMock(return_value=("reminder still sends", ""))) as model:
-            sent = asyncio.run(main.run_reminder_scheduler_once(app))
+        with patch.dict(main.last_proactive_sent_chat, {reminder.chat_id: time.monotonic()}):
+            with patch.object(main, "run_reminder_model", new=AsyncMock(return_value=("reminder still sends", ""))) as model:
+                sent = asyncio.run(main.run_reminder_scheduler_once(app))
 
         self.assertEqual(1, sent)
         model.assert_awaited_once()
@@ -8578,6 +8578,22 @@ class LivingReminderTests(unittest.TestCase):
         self.assertEqual("model_skip", fire.failure_category)
         self.assertEqual("skipped_unsafe", main.REMINDERS.reminder_by_id(reminder.id).status)
         self.assertEqual(1, main.REMINDERS.health_summary()["skipped_unsafe"])
+
+    def test_scheduler_style_rejection_is_visible_skip_not_retry(self) -> None:
+        reminder = self.create_due_reminder()
+        app = SimpleNamespace(bot=SimpleNamespace(send_message=AsyncMock()))
+
+        with patch.object(main, "run_reminder_model", new=AsyncMock(return_value=(None, "style_rejected"))):
+            sent = asyncio.run(main.run_reminder_scheduler_once(app))
+
+        self.assertEqual(0, sent)
+        app.bot.send_message.assert_not_awaited()
+        fire = main.REMINDERS.fire_by_id(1)
+        self.assertEqual("skipped_unsafe", fire.status)
+        self.assertEqual("style_rejected", fire.failure_category)
+        self.assertEqual(1, fire.attempt_count)
+        self.assertEqual([], main.REMINDERS.claim_due_fires(limit=1))
+        self.assertEqual("skipped_unsafe", main.REMINDERS.reminder_by_id(reminder.id).status)
 
     def test_scheduler_asks_for_context_in_original_chat(self) -> None:
         reminder = self.create_due_reminder()
