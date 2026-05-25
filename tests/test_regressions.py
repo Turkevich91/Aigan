@@ -8386,6 +8386,52 @@ class LivingReminderTests(unittest.TestCase):
         self.assertEqual(1, fires["needs_context"])
         self.assertEqual("active", main.REMINDERS.reminder_by_id(reminder.id).status)
 
+    def test_context_answer_requeues_needs_context_fire(self) -> None:
+        reminder = self.create_due_reminder()
+        claim = main.REMINDERS.claim_due_fires(limit=1)[0]
+        main.REMINDERS.mark_needs_context(claim.fire.id)
+
+        resolved = main.REMINDERS.resolve_context_request(
+            reminder.chat_id,
+            user_id=reminder.created_by_user_id,
+            clarification="згадай, що це дружнє привітання",
+        )
+
+        self.assertEqual(reminder.id, resolved)
+        updated = main.REMINDERS.reminder_by_id(reminder.id)
+        self.assertIn("Clarification:", updated.trusted_instruction)
+        self.assertEqual("pending", main.REMINDERS.fire_by_id(claim.fire.id).status)
+        retried = main.REMINDERS.claim_due_fires(limit=1)
+        self.assertEqual(1, len(retried))
+        self.assertEqual(claim.fire.id, retried[0].fire.id)
+
+    def test_context_answer_helper_acknowledges_and_requeues(self) -> None:
+        reminder = self.create_due_reminder()
+        claim = main.REMINDERS.claim_due_fires(limit=1)[0]
+        main.REMINDERS.mark_needs_context(claim.fire.id)
+        message = FakeMessage("зроби це як тепле привітання", chat_type=ChatType.PRIVATE, chat_id=reminder.chat_id)
+
+        handled = asyncio.run(
+            main.maybe_resolve_reminder_context_response(
+                message,
+                SimpleNamespace(bot=SimpleNamespace(id=999)),
+                "зроби це як тепле привітання",
+            )
+        )
+
+        self.assertTrue(handled)
+        self.assertIn(f"#{reminder.id}", message.reply_calls[0]["text"])
+        self.assertEqual("pending", main.REMINDERS.fire_by_id(claim.fire.id).status)
+
+    def test_remind_command_maps_missing_time_error_to_user_text(self) -> None:
+        message = FakeMessage("/remind 2999-01-01 test reminder")
+
+        asyncio.run(main.remind_command(SimpleNamespace(effective_message=message), SimpleNamespace()))
+
+        self.assertTrue(message.reply_calls)
+        self.assertNotIn("missing_time", message.reply_calls[0]["text"])
+        self.assertIn("немає часу", message.reply_calls[0]["text"])
+
     def test_reminder_commands_respect_owner_and_admin_cancel(self) -> None:
         message = FakeMessage("/remind 2999-01-01 09:00 test reminder")
 

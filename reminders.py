@@ -373,6 +373,58 @@ class ReminderStore:
             )
             self._conn.commit()
 
+    def resolve_context_request(
+        self,
+        chat_id: int,
+        *,
+        user_id: int | None,
+        clarification: str,
+        now: datetime | str | None = None,
+    ) -> int | None:
+        text = " ".join((clarification or "").split())
+        if not text:
+            return None
+        now_text = format_datetime(now or utc_now())
+        conditions = ["r.chat_id = ?", "r.status = 'active'", "f.status = 'needs_context'"]
+        params: list[Any] = [int(chat_id)]
+        if user_id is not None:
+            conditions.append("(r.created_by_user_id = ? OR r.created_by_user_id IS NULL)")
+            params.append(int(user_id))
+        with self._lock:
+            row = self._conn.execute(
+                f"""
+                SELECT f.id AS fire_id, r.id AS reminder_id, r.trusted_instruction AS trusted_instruction
+                FROM reminder_fires f
+                JOIN reminders r ON r.id = f.reminder_id
+                WHERE {' AND '.join(conditions)}
+                ORDER BY datetime(f.updated_at) DESC, f.id DESC
+                LIMIT 1
+                """,
+                params,
+            ).fetchone()
+            if row is None:
+                return None
+            instruction = str(row["trusted_instruction"] or "").strip()
+            updated_instruction = f"{instruction}\nClarification: {text}" if instruction else text
+            self._conn.execute(
+                """
+                UPDATE reminders
+                SET trusted_instruction = ?, updated_at = ?
+                WHERE id = ? AND status = 'active'
+                """,
+                (updated_instruction, now_text, int(row["reminder_id"])),
+            )
+            self._conn.execute(
+                """
+                UPDATE reminder_fires
+                SET status = 'pending', claimed_at = '', updated_at = ?, failure_category = 'context_resolved'
+                WHERE id = ? AND status = 'needs_context'
+                """,
+                (now_text, int(row["fire_id"])),
+            )
+            self._conn.commit()
+            return int(row["reminder_id"])
+
     def mark_failed(
         self,
         fire_id: int,
