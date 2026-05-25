@@ -901,7 +901,7 @@ PROACTIVE_SERVANT_PHRASE_RE = re.compile(
 )
 REMINDER_SERVANT_PHRASE_RE = re.compile(
     r"(?i)("
-    r"\bi\s+can\s+help\b|"
+    r"\bi\s+(?:can|could|will)\s+help\b|"
     r"\bi(?:'m| am)\s+here\s+to\s+help\b|"
     r"\bhow\s+can\s+i\s+help\b|"
     r"\btag\s+me\b|\bping\s+me\b|"
@@ -8015,8 +8015,12 @@ def proactive_persona_violation(text: str) -> str:
 
 def reminder_persona_violation(text: str) -> str:
     stripped = (text or "").strip()
-    if not stripped or stripped.upper() == "SKIP" or stripped.upper().startswith("NEEDS_CONTEXT:"):
+    if not stripped or stripped.upper() == "SKIP":
         return ""
+    if stripped.upper().startswith("NEEDS_CONTEXT:"):
+        stripped = stripped.split(":", 1)[1].strip()
+        if not stripped:
+            return ""
     if not CONFIG.proactive_self_reference_guard:
         return ""
     if CONFIG.proactive_meta_topic_guard:

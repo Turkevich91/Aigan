@@ -8510,6 +8510,12 @@ class LivingReminderTests(unittest.TestCase):
         self.assertEqual("", main.reminder_persona_violation("Я можу сказати: ти красачек, і нагадування живе."))
         self.assertTrue(main.proactive_persona_violation("Я можу сказати: ти красачек, і нагадування живе."))
         self.assertTrue(main.reminder_persona_violation("Я можу допомогти перевірити факти."))
+        self.assertTrue(main.reminder_persona_violation("I could help with that."))
+        self.assertTrue(main.reminder_persona_violation("I will help with that."))
+
+    def test_reminder_persona_guard_checks_needs_context_question(self) -> None:
+        self.assertTrue(main.reminder_persona_violation("NEEDS_CONTEXT: Я бот, уточни деталі."))
+        self.assertEqual("", main.reminder_persona_violation("NEEDS_CONTEXT: кого саме привітати?"))
 
     def test_reminder_model_allows_harmless_first_person_draft(self) -> None:
         with patch.object(main, "run_agent", new=AsyncMock(return_value="Я можу сказати: ти красачек, і нагадування живе.")):
@@ -8523,6 +8529,25 @@ class LivingReminderTests(unittest.TestCase):
             )
 
         self.assertEqual("Я можу сказати: ти красачек, і нагадування живе.", response)
+        self.assertEqual("", category)
+
+    def test_reminder_model_rewrites_unsafe_needs_context_question(self) -> None:
+        with patch.object(
+            main,
+            "run_agent",
+            new=AsyncMock(side_effect=["NEEDS_CONTEXT: Я бот, уточни деталі.", "NEEDS_CONTEXT: кого саме привітати?"]),
+        ) as model:
+            response, category = asyncio.run(
+                main.run_reminder_model(
+                    "wake reminder",
+                    chat_id=-1001,
+                    event_message="reminder:1",
+                    user_id=407892151,
+                )
+            )
+
+        self.assertEqual(2, model.await_count)
+        self.assertEqual("NEEDS_CONTEXT: кого саме привітати?", response)
         self.assertEqual("", category)
 
     def test_scheduler_is_not_blocked_by_proactive_cooldown_state(self) -> None:
