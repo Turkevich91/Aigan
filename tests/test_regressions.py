@@ -8259,6 +8259,42 @@ class LivingReminderTests(unittest.TestCase):
         self.assertEqual(first[0].fire.id, second[0].fire.id)
         self.assertEqual(2, second[0].fire.attempt_count)
 
+    def test_stale_claim_completion_cannot_overwrite_reclaimed_fire(self) -> None:
+        reminder = self.create_due_reminder()
+        now = datetime.now(timezone.utc)
+
+        first = main.REMINDERS.claim_due_fires(now=now, limit=1, claim_ttl_seconds=900)[0]
+        second = main.REMINDERS.claim_due_fires(
+            now=now + timedelta(minutes=16),
+            limit=1,
+            claim_ttl_seconds=900,
+        )[0]
+
+        self.assertFalse(main.REMINDERS.is_claim_current(first.fire.id, expected_claimed_at=first.fire.claimed_at))
+        self.assertTrue(main.REMINDERS.is_claim_current(second.fire.id, expected_claimed_at=second.fire.claimed_at))
+
+        main.REMINDERS.mark_failed(
+            first.fire.id,
+            category="send_or_model_failed",
+            expected_claimed_at=first.fire.claimed_at,
+        )
+        self.assertEqual("claimed", main.REMINDERS.fire_by_id(first.fire.id).status)
+
+        main.REMINDERS.mark_sent(first.fire.id, expected_claimed_at=first.fire.claimed_at)
+
+        still_claimed = main.REMINDERS.fire_by_id(first.fire.id)
+        still_active = main.REMINDERS.reminder_by_id(reminder.id)
+        self.assertEqual("claimed", still_claimed.status)
+        self.assertEqual(second.fire.claimed_at, still_claimed.claimed_at)
+        self.assertEqual("active", still_active.status)
+
+        main.REMINDERS.mark_sent(second.fire.id, expected_claimed_at=second.fire.claimed_at)
+
+        completed_fire = main.REMINDERS.fire_by_id(second.fire.id)
+        completed_reminder = main.REMINDERS.reminder_by_id(reminder.id)
+        self.assertEqual("sent", completed_fire.status)
+        self.assertEqual("completed", completed_reminder.status)
+
     def test_failed_claim_retries_before_terminal_failure(self) -> None:
         reminder = self.create_due_reminder()
         first = main.REMINDERS.claim_due_fires(limit=1)[0]
