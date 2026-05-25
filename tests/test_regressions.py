@@ -8295,6 +8295,28 @@ class LivingReminderTests(unittest.TestCase):
         self.assertEqual("sent", completed_fire.status)
         self.assertEqual("completed", completed_reminder.status)
 
+    def test_refresh_claim_extends_lease_before_send(self) -> None:
+        reminder = self.create_due_reminder()
+        now = datetime.now(timezone.utc)
+        claim = main.REMINDERS.claim_due_fires(now=now, limit=1, claim_ttl_seconds=900)[0]
+
+        refreshed = main.REMINDERS.refresh_claim(
+            claim.fire.id,
+            expected_claimed_at=claim.fire.claimed_at,
+            now=now + timedelta(minutes=16),
+        )
+        reclaimed = main.REMINDERS.claim_due_fires(
+            now=now + timedelta(minutes=17),
+            limit=1,
+            claim_ttl_seconds=900,
+        )
+
+        self.assertIsNotNone(refreshed)
+        self.assertEqual([], reclaimed)
+        main.REMINDERS.mark_sent(claim.fire.id, expected_claimed_at=refreshed)
+        self.assertEqual("sent", main.REMINDERS.fire_by_id(claim.fire.id).status)
+        self.assertEqual("completed", main.REMINDERS.reminder_by_id(reminder.id).status)
+
     def test_failed_claim_retries_before_terminal_failure(self) -> None:
         reminder = self.create_due_reminder()
         first = main.REMINDERS.claim_due_fires(limit=1)[0]

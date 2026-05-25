@@ -428,6 +428,26 @@ class ReminderStore:
             ).fetchone()
         return row is not None
 
+    def refresh_claim(
+        self,
+        fire_id: int,
+        *,
+        expected_claimed_at: str,
+        now: datetime | str | None = None,
+    ) -> str | None:
+        now_text = format_datetime(now or utc_now())
+        with self._lock:
+            cursor = self._conn.execute(
+                """
+                UPDATE reminder_fires
+                SET claimed_at = ?, updated_at = ?
+                WHERE id = ? AND status = 'claimed' AND claimed_at = ?
+                """,
+                (now_text, now_text, int(fire_id), str(expected_claimed_at)),
+            )
+            self._conn.commit()
+        return now_text if cursor.rowcount else None
+
     def resolve_context_request(
         self,
         chat_id: int,

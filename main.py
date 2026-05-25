@@ -8287,6 +8287,7 @@ async def run_reminder_scheduler_once(application: Application) -> int:
     sent_or_asked = 0
     for claim in claims:
         reminder = claim.reminder
+        claim_token = claim.fire.claimed_at
         prompt = build_scheduled_reminder_prompt(claim)
         try:
             response = await run_proactive_model(
@@ -8299,7 +8300,7 @@ async def run_reminder_scheduler_once(application: Application) -> int:
                 REMINDERS.mark_skipped_unsafe(
                     claim.fire.id,
                     category="model_skip",
-                    expected_claimed_at=claim.fire.claimed_at,
+                    expected_claimed_at=claim_token,
                 )
                 system_event_for_chat(
                     component="reminders",
@@ -8312,14 +8313,16 @@ async def run_reminder_scheduler_once(application: Application) -> int:
             question = needs_context_text(response)
             if question is not None:
                 question = f"Для нагадування #{reminder.id}: {question}"
-                if not REMINDERS.is_claim_current(claim.fire.id, expected_claimed_at=claim.fire.claimed_at):
+                refreshed_token = REMINDERS.refresh_claim(claim.fire.id, expected_claimed_at=claim_token)
+                if refreshed_token is None:
                     continue
+                claim_token = refreshed_token
                 await send_chat_text(application.bot, reminder.chat_id, question)
                 passive_contexts[reminder.chat_id].append(f"Aigan (reminder clarification): {clip_text(question, 700)}")
                 remember_bot_message(reminder.chat_id, question, label="Aigan (reminder clarification)")
                 REMINDERS.mark_needs_context(
                     claim.fire.id,
-                    expected_claimed_at=claim.fire.claimed_at,
+                    expected_claimed_at=claim_token,
                 )
                 system_event_for_chat(
                     component="reminders",
@@ -8331,12 +8334,14 @@ async def run_reminder_scheduler_once(application: Application) -> int:
                 sent_or_asked += 1
                 continue
 
-            if not REMINDERS.is_claim_current(claim.fire.id, expected_claimed_at=claim.fire.claimed_at):
+            refreshed_token = REMINDERS.refresh_claim(claim.fire.id, expected_claimed_at=claim_token)
+            if refreshed_token is None:
                 continue
+            claim_token = refreshed_token
             await send_chat_text(application.bot, reminder.chat_id, response)
             passive_contexts[reminder.chat_id].append(f"Aigan (reminder): {clip_text(response, 700)}")
             remember_bot_message(reminder.chat_id, response, label="Aigan (reminder)")
-            REMINDERS.mark_sent(claim.fire.id, expected_claimed_at=claim.fire.claimed_at)
+            REMINDERS.mark_sent(claim.fire.id, expected_claimed_at=claim_token)
             system_event_for_chat(
                 component="reminders",
                 event_type="reminder_sent",
@@ -8351,7 +8356,7 @@ async def run_reminder_scheduler_once(application: Application) -> int:
             REMINDERS.mark_failed(
                 claim.fire.id,
                 category="send_or_model_failed",
-                expected_claimed_at=claim.fire.claimed_at,
+                expected_claimed_at=claim_token,
             )
             system_event_for_chat(
                 level="error",
