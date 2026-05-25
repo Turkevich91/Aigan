@@ -8330,6 +8330,29 @@ class LivingReminderTests(unittest.TestCase):
         self.assertIn("missing_time", result["missing_fields"])
         self.assertEqual([], main.REMINDERS.list_reminders(-1001, user_id=407892151))
 
+    def test_tool_returns_confirmation_request_for_missing_instruction(self) -> None:
+        future = (datetime.now(timezone.utc) + timedelta(days=1)).isoformat(timespec="minutes")
+        token = main.REMINDER_TOOL_CONTEXT.set(
+            main.ReminderToolContext(chat_id=-1001, chat_type=ChatType.SUPERGROUP, user_id=407892151, message_id=557)
+        )
+        try:
+            result = main.create_living_reminder_from_tool(
+                kind="one_off",
+                due_at=future,
+                timezone_name="UTC",
+                target_label="@friend",
+                instruction="   ",
+                recurrence="none",
+                confidence=0.9,
+                missing_fields="",
+            )
+        finally:
+            main.REMINDER_TOOL_CONTEXT.reset(token)
+
+        self.assertEqual("needs_confirmation", result["status"])
+        self.assertIn("instruction", result["missing_fields"])
+        self.assertEqual([], main.REMINDERS.list_reminders(-1001, user_id=407892151))
+
     def test_scheduler_sends_model_generated_reminder_and_completes_fire(self) -> None:
         reminder = self.create_due_reminder()
         app = SimpleNamespace(bot=SimpleNamespace(send_message=AsyncMock()))

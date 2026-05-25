@@ -1324,6 +1324,9 @@ def create_living_reminder_from_tool(
         return {"status": "needs_confirmation", "missing_fields": [error or "due_at"], "confidence": confidence}
     if due < datetime.now(timezone.utc) - timedelta(minutes=5):
         return {"status": "needs_confirmation", "missing_fields": ["future_due_time"], "confidence": confidence}
+    instruction_text = clip_text(instruction or "", 800).strip()
+    if not instruction_text:
+        return {"status": "needs_confirmation", "missing_fields": ["instruction"], "confidence": confidence}
 
     reminder = REMINDERS.create_reminder(
         chat_id=context.chat_id,
@@ -1331,7 +1334,7 @@ def create_living_reminder_from_tool(
         created_from_message_id=context.message_id,
         target_label=clip_text(target_label or "", 160),
         kind=kind or "custom",
-        trusted_instruction=clip_text(instruction or "", 800),
+        trusted_instruction=instruction_text,
         due_at_utc=due,
         timezone_name=(timezone_name or CONFIG.bot_timezone or "UTC"),
         recurrence=recurrence or ("yearly" if (kind or "").casefold() == "birthday" else "none"),
