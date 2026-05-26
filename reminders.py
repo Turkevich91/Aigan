@@ -286,6 +286,95 @@ class ReminderStore:
             self._conn.commit()
             return bool(cursor.rowcount)
 
+    def update_reminder(
+        self,
+        chat_id: int,
+        reminder_id: int,
+        *,
+        user_id: int | None,
+        is_admin: bool = False,
+        due_at_utc: datetime | str | None = None,
+        timezone_name: str | None = None,
+        target_label: str | None = None,
+        trusted_instruction: str | None = None,
+        recurrence: str | None = None,
+        kind: str | None = None,
+    ) -> Reminder | None:
+        if not is_admin and user_id is None:
+            return None
+        conditions = ["id = ?", "chat_id = ?", "status IN ('active', 'paused')"]
+        params: list[Any] = [int(reminder_id), int(chat_id)]
+        if not is_admin:
+            conditions.append("created_by_user_id = ?")
+            params.append(int(user_id))
+
+        now = format_datetime()
+        due: str | None = format_datetime(due_at_utc) if due_at_utc is not None else None
+        assignments = ["updated_at = ?"]
+        update_params: list[Any] = [now]
+        if due is not None:
+            assignments.append("due_at_utc = ?")
+            update_params.append(due)
+        if timezone_name is not None:
+            assignments.append("timezone = ?")
+            update_params.append(timezone_name or "UTC")
+        if target_label is not None:
+            assignments.append("target_label = ?")
+            update_params.append(target_label or "")
+        if trusted_instruction is not None:
+            assignments.append("trusted_instruction = ?")
+            update_params.append(trusted_instruction or "")
+
+        normalized_kind = normalize_kind(kind) if kind is not None else None
+        normalized_recurrence = normalize_recurrence(recurrence) if recurrence is not None else None
+        if normalized_kind == "birthday":
+            normalized_recurrence = "yearly"
+        if normalized_recurrence is not None:
+            assignments.append("recurrence = ?")
+            update_params.append(normalized_recurrence)
+        if normalized_kind is not None:
+            assignments.append("kind = ?")
+            update_params.append(normalized_kind)
+
+        with self._lock:
+            due_changed = False
+            if due is not None:
+                row = self._conn.execute(
+                    f"""
+                    SELECT due_at_utc
+                    FROM reminders
+                    WHERE {' AND '.join(conditions)}
+                    """,
+                    params,
+                ).fetchone()
+                if row is None:
+                    self._conn.commit()
+                    return None
+                due_changed = str(row["due_at_utc"]) != due
+            cursor = self._conn.execute(
+                f"""
+                UPDATE reminders
+                SET {', '.join(assignments)}
+                WHERE {' AND '.join(conditions)}
+                """,
+                [*update_params, *params],
+            )
+            if not cursor.rowcount:
+                self._conn.commit()
+                return None
+            if due_changed:
+                self._conn.execute(
+                    """
+                    UPDATE reminder_fires
+                    SET status = 'canceled', completed_at = ?, updated_at = ?, failure_category = 'rescheduled'
+                    WHERE reminder_id = ? AND status IN ('pending', 'claimed', 'needs_context')
+                    """,
+                    (now, now, int(reminder_id)),
+                )
+                self._upsert_pending_fire_locked(int(reminder_id), due)
+            self._conn.commit()
+        return self.reminder_by_id(reminder_id)
+
     def claim_due_fires(
         self,
         *,
@@ -801,6 +890,27 @@ class ReminderStore:
             INSERT OR IGNORE INTO reminder_fires (
                 reminder_id, scheduled_for_utc, idempotency_key, status, created_at, updated_at
             ) VALUES (?, ?, ?, 'pending', ?, ?)
+            """,
+            (int(reminder_id), scheduled, key, now, now),
+        )
+
+    def _upsert_pending_fire_locked(self, reminder_id: int, scheduled_for_utc: str) -> None:
+        scheduled = format_datetime(scheduled_for_utc)
+        key = f"{int(reminder_id)}:{scheduled}"
+        now = format_datetime()
+        self._conn.execute(
+            """
+            INSERT INTO reminder_fires (
+                reminder_id, scheduled_for_utc, idempotency_key, status, created_at, updated_at
+            ) VALUES (?, ?, ?, 'pending', ?, ?)
+            ON CONFLICT(idempotency_key) DO UPDATE SET
+                status = 'pending',
+                claimed_at = '',
+                completed_at = '',
+                attempt_count = 0,
+                sent_message_id = NULL,
+                failure_category = '',
+                updated_at = excluded.updated_at
             """,
             (int(reminder_id), scheduled, key, now, now),
         )

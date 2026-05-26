@@ -64,10 +64,15 @@ os.environ["PROACTIVE_META_TOPIC_STRICT"] = "true"
 os.environ["PROACTIVE_RECENT_SEED_COOLDOWN_DAYS"] = "14"
 os.environ["REMINDERS_ENABLED"] = "false"
 os.environ["REMINDER_TOOL_ENABLED"] = "true"
+os.environ["REMINDER_CRUD_TOOLS_ENABLED"] = "true"
 os.environ["REMINDER_POLL_SECONDS"] = "60"
 os.environ["REMINDER_MAX_DUE_PER_TICK"] = "5"
 os.environ["REMINDER_MISFIRE_GRACE_SECONDS"] = "86400"
 os.environ["REMINDER_CONTEXT_REQUEST_TTL_SECONDS"] = "86400"
+os.environ["TOOL_ROUTER_ENABLED"] = "false"
+os.environ["TOOL_ROUTER_MODEL"] = "gpt-5.4-nano"
+os.environ["TOOL_ROUTER_MAX_OUTPUT_TOKENS"] = "120"
+os.environ["TOOL_ROUTER_CONFIDENCE_THRESHOLD"] = "0.65"
 os.environ["PROMPT_PRIVACY_GUARD_ENABLED"] = "true"
 os.environ["MEMORY_ENABLED"] = "true"
 os.environ["MEMORY_DB_PATH"] = TEST_DB_PATH
@@ -857,6 +862,29 @@ class TimeContextTests(unittest.TestCase):
         for kwargs in server_kwargs:
             self.assertEqual(42.0, kwargs["client_session_timeout_seconds"])
             self.assertIs(main.mcp_tool_failure_message, kwargs["failure_error_function"])
+
+    def test_run_agent_can_guard_reminder_claims_without_tool_context(self) -> None:
+        class FakeMCPServer:
+            def __init__(self, *args, **kwargs) -> None:
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb) -> None:
+                return None
+
+        with patch.object(main, "MCPServerStdio", FakeMCPServer):
+            with patch.object(main, "make_agent", return_value="agent"):
+                with patch.object(
+                    main.Runner,
+                    "run",
+                    new=AsyncMock(return_value=SimpleNamespace(final_output="I will remind you tomorrow.")),
+                ):
+                    output = asyncio.run(main.run_agent("prompt", guard_reminder_claims=True))
+
+        self.assertIn("I can't honestly confirm", output)
+        self.assertIn("reminder-tool", output)
 
     def test_mcp_failure_message_classifies_timeout_without_raw_error(self) -> None:
         message = main.mcp_tool_failure_message(None, RuntimeError("Timed out opening https://example.com/private"))
@@ -6389,10 +6417,16 @@ class PersistentMemoryTests(unittest.TestCase):
 
         with patch.object(main, "run_agent", new=AsyncMock(return_value="переклад")) as run_agent:
             with patch.object(main, "maybe_send_internet_image", new=AsyncMock()) as image_send:
-                asyncio.run(main.handle_prompt(message, context, "переведи українською"))
+                with patch.object(
+                    main,
+                    "route_tool_capabilities_for_message",
+                    new=AsyncMock(side_effect=AssertionError("translation should not route tools")),
+                ) as tool_route:
+                    asyncio.run(main.handle_prompt(message, context, "переведи українською"))
 
         self.assertEqual("translate_reference", main.classify_request(message, "переведи українською"))
         image_send.assert_not_awaited()
+        tool_route.assert_not_awaited()
         agent_input = run_agent.await_args.args[0]
         self.assertIn("Request route: translate_reference", agent_input)
         self.assertIn("Structure and Details", agent_input)
@@ -6413,6 +6447,29 @@ class PersistentMemoryTests(unittest.TestCase):
 
         self.assertTrue(main.is_internet_image_request(prompt))
         self.assertEqual("internet_image_send", main.classify_request(FakeMessage(prompt), prompt))
+
+    def test_handled_image_send_route_skips_tool_router(self) -> None:
+        message = FakeMessage("покажи картинку кота", message_id=70)
+        context = SimpleNamespace(bot=SimpleNamespace(send_chat_action=AsyncMock()))
+
+        with patch.object(main, "maybe_send_internet_image", new=AsyncMock(return_value=True)) as image_send:
+            with patch.object(
+                main,
+                "route_tool_capabilities_for_message",
+                new=AsyncMock(side_effect=AssertionError("handled image route should not route tools")),
+            ) as tool_route:
+                with patch.object(main, "run_agent", new=AsyncMock(side_effect=AssertionError("agent should not run"))):
+                    asyncio.run(
+                        main.handle_prompt_generation(
+                            message,
+                            context,
+                            message.text,
+                            allow_pending_wait=False,
+                        )
+                    )
+
+        image_send.assert_awaited_once_with(message, message.text)
+        tool_route.assert_not_awaited()
 
     def test_slang_multi_image_prompt_routes_to_image_send(self) -> None:
         prompt = "знайди в інеті 3 фотки капібар і запость сюди"
@@ -8198,6 +8255,11 @@ class LivingReminderTests(unittest.TestCase):
             main.CONFIG,
             reminders_enabled=True,
             reminder_tool_enabled=True,
+            reminder_crud_tools_enabled=True,
+            tool_router_enabled=False,
+            tool_router_model="gpt-5.4-nano",
+            tool_router_max_output_tokens=120,
+            tool_router_confidence_threshold=0.65,
             reminder_poll_seconds=60,
             reminder_max_due_per_tick=5,
             reminder_misfire_grace_seconds=86400,
@@ -8227,6 +8289,20 @@ class LivingReminderTests(unittest.TestCase):
             due_at_utc=due,
             timezone_name="America/New_York",
             recurrence=recurrence,
+        )
+
+    def create_future_reminder(self, *, user_id: int = 407892151, target_label: str = "@tester"):
+        due = datetime.now(timezone.utc) + timedelta(days=1)
+        return main.REMINDERS.create_reminder(
+            chat_id=-1001,
+            created_by_user_id=user_id,
+            created_from_message_id=123,
+            target_label=target_label,
+            kind="one_off",
+            trusted_instruction="write a warm reminder",
+            due_at_utc=due,
+            timezone_name="America/New_York",
+            recurrence="none",
         )
 
     def test_reminder_store_claims_due_fire_once_and_survives_reopen(self) -> None:
@@ -8392,7 +8468,14 @@ class LivingReminderTests(unittest.TestCase):
     def test_tool_creates_complete_reminder_from_current_context(self) -> None:
         future = (datetime.now(timezone.utc) + timedelta(days=1)).isoformat(timespec="minutes")
         token = main.REMINDER_TOOL_CONTEXT.set(
-            main.ReminderToolContext(chat_id=-1001, chat_type=ChatType.SUPERGROUP, user_id=407892151, message_id=555)
+            main.ReminderToolContext(
+                chat_id=-1001,
+                chat_type=ChatType.SUPERGROUP,
+                user_id=407892151,
+                message_id=555,
+                allowed_toolsets=("reminder_crud",),
+                intent="create",
+            )
         )
         try:
             result = main.create_living_reminder_from_tool(
@@ -8413,9 +8496,887 @@ class LivingReminderTests(unittest.TestCase):
         self.assertEqual(1, len(items))
         self.assertEqual("@friend", items[0].target_label)
 
+    def test_deterministic_tool_route_attaches_only_list_for_list_request(self) -> None:
+        message = FakeMessage("what reminders do I have?")
+
+        decision = main.deterministic_tool_route_decision("what reminders do I have?")
+        context = main.reminder_tool_context_for_message(message, "what reminders do I have?", decision)
+
+        self.assertEqual("list", decision.intent)
+        self.assertIsNotNone(context)
+        token = main.REMINDER_TOOL_CONTEXT.set(context)
+        try:
+            names = {getattr(tool, "name", "") for tool in main.reminder_agent_tools()}
+        finally:
+            main.REMINDER_TOOL_CONTEXT.reset(token)
+        self.assertIn("list_living_reminders", names)
+        self.assertNotIn("cancel_living_reminder", names)
+        self.assertNotIn("update_living_reminder", names)
+        self.assertNotIn("create_living_reminder", names)
+
+    def test_reminder_agent_tools_are_scoped_to_routed_intent(self) -> None:
+        expected = {
+            "create": {"create_living_reminder"},
+            "list": {"list_living_reminders"},
+            "update": {"list_living_reminders", "update_living_reminder"},
+            "cancel": {"list_living_reminders", "cancel_living_reminder"},
+        }
+
+        for intent, expected_names in expected.items():
+            context = main.ReminderToolContext(
+                chat_id=-1001,
+                chat_type=ChatType.SUPERGROUP,
+                user_id=407892151,
+                message_id=555,
+                allowed_toolsets=("reminder_crud",),
+                intent=intent,
+                prompt=f"{intent} reminders",
+            )
+            token = main.REMINDER_TOOL_CONTEXT.set(context)
+            try:
+                names = {getattr(tool, "name", "") for tool in main.reminder_agent_tools()}
+            finally:
+                main.REMINDER_TOOL_CONTEXT.reset(token)
+
+            self.assertEqual(expected_names, names)
+
+    def test_config_from_env_preserves_unconfigured_tool_router_model(self) -> None:
+        with patch.dict(os.environ, {"TOOL_ROUTER_MODEL": "   "}):
+            blank_config = main.Config.from_env()
+
+        original_model = os.environ.pop("TOOL_ROUTER_MODEL", None)
+        try:
+            missing_config = main.Config.from_env()
+        finally:
+            if original_model is not None:
+                os.environ["TOOL_ROUTER_MODEL"] = original_model
+
+        self.assertEqual("", blank_config.tool_router_model)
+        self.assertEqual("", missing_config.tool_router_model)
+
+    def test_config_from_env_safely_parses_tool_router_confidence_threshold(self) -> None:
+        cases = {
+            "   ": 0.65,
+            "not-a-number": 0.65,
+            "nan": 0.65,
+            "Infinity": 0.65,
+            "-inf": 0.65,
+            "-1": 0.0,
+            "2": 1.0,
+            "0.42": 0.42,
+        }
+
+        for raw, expected in cases.items():
+            with self.subTest(raw=raw):
+                with patch.dict(os.environ, {"TOOL_ROUTER_CONFIDENCE_THRESHOLD": raw}):
+                    config = main.Config.from_env()
+
+                self.assertEqual(expected, config.tool_router_confidence_threshold)
+
+    def test_semantic_tool_router_can_enable_reminders_without_keyword_gate(self) -> None:
+        message = FakeMessage("please keep this on the living schedule for tomorrow morning")
+        original_config = main.CONFIG
+        try:
+            main.CONFIG = replace(main.CONFIG, tool_router_enabled=True)
+            router_json = json.dumps(
+                {
+                    "domains": ["reminders"],
+                    "intent": "create",
+                    "confidence": 0.91,
+                    "allowed_toolsets": ["reminder_crud"],
+                    "needs_main_model": True,
+                }
+            )
+            with patch.object(main, "run_tool_router_model", new=AsyncMock(return_value=router_json)) as router:
+                decision = asyncio.run(
+                    main.route_tool_capabilities_for_message(
+                        message,
+                        "please keep this on the living schedule for tomorrow morning",
+                    )
+                )
+        finally:
+            main.CONFIG = original_config
+
+        router.assert_awaited_once()
+        self.assertEqual("create", decision.intent)
+        self.assertEqual(("reminder_crud",), decision.allowed_toolsets)
+
+    def test_semantic_tool_router_denial_is_authoritative(self) -> None:
+        message = FakeMessage("remind me 2999-01-01 09:00 write in chat")
+        original_config = main.CONFIG
+        try:
+            main.CONFIG = replace(main.CONFIG, tool_router_enabled=True, tool_router_confidence_threshold=0.65)
+            router_json = json.dumps(
+                {
+                    "domains": ["reminders"],
+                    "intent": "create",
+                    "confidence": 0.4,
+                    "allowed_toolsets": ["reminder_crud"],
+                    "needs_main_model": True,
+                }
+            )
+            with patch.object(main, "run_tool_router_model", new=AsyncMock(return_value=router_json)):
+                decision = asyncio.run(
+                    main.route_tool_capabilities_for_message(
+                        message,
+                        "remind me 2999-01-01 09:00 write in chat",
+                    )
+                )
+        finally:
+            main.CONFIG = original_config
+
+        self.assertEqual("none", decision.intent)
+        self.assertEqual((), decision.allowed_toolsets)
+        self.assertEqual("semantic_router:below_threshold", decision.reason)
+
+    def test_reminder_claim_guard_is_enabled_for_intent_without_tools(self) -> None:
+        denied_route = main.ToolRouteDecision(intent="none", reason="semantic_router:below_threshold")
+        domain_route = main.ToolRouteDecision(domains=("reminders",), intent="none")
+
+        self.assertTrue(
+            main.should_guard_reminder_state_claims(
+                "remind me tomorrow at 09:00 to check deploy",
+                denied_route,
+                None,
+            )
+        )
+        self.assertTrue(main.should_guard_reminder_state_claims("ordinary date mention", domain_route, None))
+        self.assertFalse(main.should_guard_reminder_state_claims("ordinary date mention", main.ToolRouteDecision(), None))
+
+    def test_unconfigured_semantic_tool_router_uses_quiet_deterministic_fallback(self) -> None:
+        message = FakeMessage("what reminders do I have?")
+        original_config = main.CONFIG
+        try:
+            main.CONFIG = replace(main.CONFIG, tool_router_enabled=True, tool_router_model="")
+            with patch.object(main, "run_tool_router_model", new=AsyncMock()) as router:
+                decision = asyncio.run(
+                    main.route_tool_capabilities_for_message(
+                        message,
+                        "what reminders do I have?",
+                    )
+                )
+        finally:
+            main.CONFIG = original_config
+
+        router.assert_not_awaited()
+        self.assertTrue(decision.degraded)
+        self.assertEqual("list", decision.intent)
+        self.assertEqual(("reminder_crud",), decision.allowed_toolsets)
+        self.assertEqual("router_unconfigured_fallback", decision.reason)
+
+    def test_semantic_tool_router_reason_preserves_rejection_detail(self) -> None:
+        original_config = main.CONFIG
+        try:
+            main.CONFIG = replace(main.CONFIG, tool_router_confidence_threshold=0.65)
+            none = main.normalize_tool_route_decision(
+                {
+                    "domains": [],
+                    "intent": "none",
+                    "confidence": 0.9,
+                    "allowed_toolsets": [],
+                    "needs_main_model": True,
+                },
+                reason="semantic_router",
+            )
+            below = main.normalize_tool_route_decision(
+                {
+                    "domains": ["reminders"],
+                    "intent": "create",
+                    "confidence": 0.4,
+                    "allowed_toolsets": ["reminder_crud"],
+                    "needs_main_model": True,
+                },
+                reason="semantic_router",
+            )
+            missing_toolset = main.normalize_tool_route_decision(
+                {
+                    "domains": ["reminders"],
+                    "intent": "create",
+                    "confidence": 0.91,
+                    "allowed_toolsets": [],
+                    "needs_main_model": True,
+                },
+                reason="semantic_router",
+            )
+            invalid_payload = main.normalize_tool_route_decision([], reason="semantic_router")
+            invalid_intent = main.normalize_tool_route_decision(
+                {
+                    "domains": ["reminders"],
+                    "intent": "bogus",
+                    "confidence": 0.91,
+                    "allowed_toolsets": ["reminder_crud"],
+                    "needs_main_model": True,
+                },
+                reason="semantic_router",
+            )
+        finally:
+            main.CONFIG = original_config
+
+        self.assertEqual("semantic_router:intent_none", none.reason)
+        self.assertEqual("semantic_router:below_threshold", below.reason)
+        self.assertEqual("semantic_router:toolset_not_allowed", missing_toolset.reason)
+        self.assertEqual("semantic_router:invalid_router_payload", invalid_payload.reason)
+        self.assertEqual("semantic_router:invalid_router_intent", invalid_intent.reason)
+
+    def test_semantic_tool_router_rejects_non_finite_confidence(self) -> None:
+        original_config = main.CONFIG
+        try:
+            main.CONFIG = replace(main.CONFIG, tool_router_confidence_threshold=0.65)
+            for raw in (float("nan"), float("inf"), "-Infinity"):
+                with self.subTest(confidence=raw):
+                    decision = main.normalize_tool_route_decision(
+                        {
+                            "domains": ["reminders"],
+                            "intent": "create",
+                            "confidence": raw,
+                            "allowed_toolsets": ["reminder_crud"],
+                            "needs_main_model": True,
+                        },
+                        reason="semantic_router",
+                    )
+
+                    self.assertEqual("none", decision.intent)
+                    self.assertEqual(0.0, decision.confidence)
+                    self.assertEqual((), decision.allowed_toolsets)
+                    self.assertEqual("semantic_router:below_threshold", decision.reason)
+        finally:
+            main.CONFIG = original_config
+
+    def test_semantic_tool_router_diagnostics_show_unconfigured_when_model_missing(self) -> None:
+        original_config = main.CONFIG
+        try:
+            main.CONFIG = replace(main.CONFIG, tool_router_enabled=True, tool_router_model="")
+            rows = {row.name: row for row in main.configured_capability_rows()}
+        finally:
+            main.CONFIG = original_config
+
+        row = rows["semantic_tool_router"]
+        self.assertTrue(row.enabled)
+        self.assertFalse(row.configured)
+        self.assertFalse(row.available)
+        self.assertEqual("unconfigured", row.status)
+        self.assertEqual("set TOOL_ROUTER_MODEL", row.next_action)
+
+    def test_disabled_semantic_tool_router_reports_disabled(self) -> None:
+        original_config = main.CONFIG
+        try:
+            main.CONFIG = replace(main.CONFIG, tool_router_enabled=False, tool_router_model="gpt-5.4-nano")
+            rows = {row.name: row for row in main.configured_capability_rows()}
+        finally:
+            main.CONFIG = original_config
+
+        row = rows["semantic_tool_router"]
+        self.assertFalse(row.enabled)
+        self.assertFalse(row.configured)
+        self.assertFalse(row.available)
+        self.assertEqual("disabled", row.status)
+        self.assertEqual("", row.next_action)
+
+    def test_list_living_reminders_tool_is_owner_scoped_and_records_listed_ids(self) -> None:
+        mine = self.create_future_reminder(user_id=407892151, target_label="@mine")
+        self.create_future_reminder(user_id=123, target_label="@other")
+        context = main.ReminderToolContext(
+            chat_id=-1001,
+            chat_type=ChatType.SUPERGROUP,
+            user_id=407892151,
+            message_id=555,
+            allowed_toolsets=("reminder_crud",),
+            intent="list",
+            prompt="what reminders do I have?",
+        )
+        context_token = main.REMINDER_TOOL_CONTEXT.set(context)
+        listed_token = main.REMINDER_TOOL_LISTED_IDS.set(set())
+        try:
+            result = main.list_living_reminders_from_tool()
+            listed_ids = main.REMINDER_TOOL_LISTED_IDS.get()
+        finally:
+            main.REMINDER_TOOL_LISTED_IDS.reset(listed_token)
+            main.REMINDER_TOOL_CONTEXT.reset(context_token)
+
+        self.assertEqual("ok", result["status"])
+        self.assertEqual([mine.id], [item["id"] for item in result["reminders"]])
+        self.assertEqual(["active"], [item["status"] for item in result["reminders"]])
+        self.assertEqual({mine.id}, listed_ids)
+
+    def test_list_living_reminders_tool_includes_paused_status(self) -> None:
+        mine = self.create_future_reminder(user_id=407892151, target_label="@mine")
+        main.REMINDERS._conn.execute("UPDATE reminders SET status = 'paused' WHERE id = ?", (mine.id,))
+        main.REMINDERS._conn.commit()
+        context = main.ReminderToolContext(
+            chat_id=-1001,
+            chat_type=ChatType.SUPERGROUP,
+            user_id=407892151,
+            message_id=555,
+            allowed_toolsets=("reminder_crud",),
+            intent="list",
+            prompt="what reminders do I have?",
+        )
+        context_token = main.REMINDER_TOOL_CONTEXT.set(context)
+        listed_token = main.REMINDER_TOOL_LISTED_IDS.set(set())
+        try:
+            result = main.list_living_reminders_from_tool()
+        finally:
+            main.REMINDER_TOOL_LISTED_IDS.reset(listed_token)
+            main.REMINDER_TOOL_CONTEXT.reset(context_token)
+
+        self.assertEqual("ok", result["status"])
+        self.assertEqual([mine.id], [item["id"] for item in result["reminders"]])
+        self.assertEqual(["paused"], [item["status"] for item in result["reminders"]])
+
+    def test_list_living_reminders_tool_honors_zero_limit(self) -> None:
+        self.create_future_reminder(user_id=407892151, target_label="@mine")
+        context = main.ReminderToolContext(
+            chat_id=-1001,
+            chat_type=ChatType.SUPERGROUP,
+            user_id=407892151,
+            message_id=555,
+            allowed_toolsets=("reminder_crud",),
+            intent="list",
+            prompt="what reminders do I have?",
+        )
+        context_token = main.REMINDER_TOOL_CONTEXT.set(context)
+        listed_token = main.REMINDER_TOOL_LISTED_IDS.set(set())
+        try:
+            zero = main.list_living_reminders_from_tool(limit=0)
+            negative = main.list_living_reminders_from_tool(limit=-5)
+            listed_ids = main.REMINDER_TOOL_LISTED_IDS.get()
+        finally:
+            main.REMINDER_TOOL_LISTED_IDS.reset(listed_token)
+            main.REMINDER_TOOL_CONTEXT.reset(context_token)
+
+        self.assertEqual("ok", zero["status"])
+        self.assertEqual(0, zero["count"])
+        self.assertEqual([], zero["reminders"])
+        self.assertEqual(0, negative["count"])
+        self.assertEqual(set(), listed_ids)
+
+    def test_reminder_tools_reject_non_finite_confidence(self) -> None:
+        mine = self.create_future_reminder(user_id=407892151, target_label="@mine")
+        before_count = len(main.REMINDERS.list_reminders(-1001, user_id=407892151))
+        due_at = (datetime.now(timezone.utc) + timedelta(days=2)).isoformat(timespec="minutes")
+        create_context = main.ReminderToolContext(
+            chat_id=-1001,
+            chat_type=ChatType.SUPERGROUP,
+            user_id=407892151,
+            message_id=555,
+            allowed_toolsets=("reminder_crud",),
+            intent="create",
+            prompt=f"remind me at {due_at}",
+        )
+        cancel_context = main.ReminderToolContext(
+            chat_id=-1001,
+            chat_type=ChatType.SUPERGROUP,
+            user_id=407892151,
+            message_id=556,
+            allowed_toolsets=("reminder_crud",),
+            intent="cancel",
+            prompt=f"cancel reminder #{mine.id}",
+        )
+
+        context_token = main.REMINDER_TOOL_CONTEXT.set(create_context)
+        listed_token = main.REMINDER_TOOL_LISTED_IDS.set(set())
+        try:
+            created = main.create_living_reminder_from_tool(
+                kind="one_off",
+                due_at=due_at,
+                timezone_name="UTC",
+                target_label="@mine",
+                instruction="write a warm reminder",
+                recurrence="none",
+                confidence=float("nan"),
+                missing_fields="",
+            )
+        finally:
+            main.REMINDER_TOOL_LISTED_IDS.reset(listed_token)
+            main.REMINDER_TOOL_CONTEXT.reset(context_token)
+
+        context_token = main.REMINDER_TOOL_CONTEXT.set(cancel_context)
+        listed_token = main.REMINDER_TOOL_LISTED_IDS.set(set())
+        try:
+            canceled = main.cancel_living_reminder_from_tool(mine.id, confidence=float("inf"))
+        finally:
+            main.REMINDER_TOOL_LISTED_IDS.reset(listed_token)
+            main.REMINDER_TOOL_CONTEXT.reset(context_token)
+
+        self.assertEqual("needs_confirmation", created["status"])
+        self.assertEqual(["confidence"], created["missing_fields"])
+        self.assertEqual(0.0, created["confidence"])
+        self.assertEqual(before_count, len(main.REMINDERS.list_reminders(-1001, user_id=407892151)))
+        self.assertEqual("needs_confirmation", canceled["status"])
+        self.assertEqual(["confidence"], canceled["missing_fields"])
+        self.assertEqual("active", main.REMINDERS.reminder_by_id(mine.id).status)
+
+    def test_reminder_crud_tool_gate_rejects_disabled_direct_calls(self) -> None:
+        mine = self.create_future_reminder(user_id=407892151, target_label="@mine")
+        original_config = main.CONFIG
+        context = main.ReminderToolContext(
+            chat_id=-1001,
+            chat_type=ChatType.SUPERGROUP,
+            user_id=407892151,
+            message_id=555,
+            allowed_toolsets=("reminder_crud",),
+            intent="cancel",
+            prompt=f"cancel reminder #{mine.id}",
+        )
+        main.CONFIG = replace(main.CONFIG, reminder_crud_tools_enabled=False)
+        token = main.REMINDER_TOOL_CONTEXT.set(context)
+        listed_token = main.REMINDER_TOOL_LISTED_IDS.set(set())
+        try:
+            result = main.cancel_living_reminder_from_tool(mine.id)
+        finally:
+            main.REMINDER_TOOL_LISTED_IDS.reset(listed_token)
+            main.REMINDER_TOOL_CONTEXT.reset(token)
+            main.CONFIG = original_config
+
+        self.assertEqual("unavailable", result["status"])
+        self.assertEqual("reminder_crud_disabled", result["reason"])
+        self.assertEqual("active", main.REMINDERS.reminder_by_id(mine.id).status)
+
+    def test_reminder_crud_tool_gate_rejects_unrouted_direct_calls(self) -> None:
+        mine = self.create_future_reminder(user_id=407892151, target_label="@mine")
+        context = main.ReminderToolContext(
+            chat_id=-1001,
+            chat_type=ChatType.SUPERGROUP,
+            user_id=407892151,
+            message_id=555,
+            allowed_toolsets=(),
+            intent="cancel",
+            prompt=f"cancel reminder #{mine.id}",
+        )
+        token = main.REMINDER_TOOL_CONTEXT.set(context)
+        listed_token = main.REMINDER_TOOL_LISTED_IDS.set(set())
+        try:
+            result = main.cancel_living_reminder_from_tool(mine.id)
+        finally:
+            main.REMINDER_TOOL_LISTED_IDS.reset(listed_token)
+            main.REMINDER_TOOL_CONTEXT.reset(token)
+
+        self.assertEqual("unavailable", result["status"])
+        self.assertEqual("reminder_crud_not_allowed", result["reason"])
+        self.assertEqual("active", main.REMINDERS.reminder_by_id(mine.id).status)
+
+    def test_reminder_mutation_tools_reject_out_of_intent_direct_calls(self) -> None:
+        mine = self.create_future_reminder(user_id=407892151, target_label="@mine")
+        context = main.ReminderToolContext(
+            chat_id=-1001,
+            chat_type=ChatType.SUPERGROUP,
+            user_id=407892151,
+            message_id=555,
+            allowed_toolsets=("reminder_crud",),
+            intent="list",
+            prompt="what reminders do I have?",
+        )
+        token = main.REMINDER_TOOL_CONTEXT.set(context)
+        listed_token = main.REMINDER_TOOL_LISTED_IDS.set({mine.id})
+        try:
+            result = main.cancel_living_reminder_from_tool(mine.id)
+        finally:
+            main.REMINDER_TOOL_LISTED_IDS.reset(listed_token)
+            main.REMINDER_TOOL_CONTEXT.reset(token)
+
+        self.assertEqual("unavailable", result["status"])
+        self.assertEqual("reminder_cancel_intent_not_allowed", result["reason"])
+        self.assertEqual("active", main.REMINDERS.reminder_by_id(mine.id).status)
+
+    def test_cancel_living_reminder_tool_requires_owner_and_explicit_or_listed_id(self) -> None:
+        mine = self.create_future_reminder(user_id=407892151, target_label="@mine")
+        other = self.create_future_reminder(user_id=123, target_label="@other")
+        context = main.ReminderToolContext(
+            chat_id=-1001,
+            chat_type=ChatType.SUPERGROUP,
+            user_id=407892151,
+            message_id=555,
+            allowed_toolsets=("reminder_crud",),
+            intent="cancel",
+            prompt=f"cancel reminder #{mine.id} and reminder #{other.id}",
+        )
+        token = main.REMINDER_TOOL_CONTEXT.set(context)
+        listed_token = main.REMINDER_TOOL_LISTED_IDS.set(set())
+        try:
+            denied = main.cancel_living_reminder_from_tool(other.id)
+            canceled = main.cancel_living_reminder_from_tool(mine.id)
+        finally:
+            main.REMINDER_TOOL_LISTED_IDS.reset(listed_token)
+            main.REMINDER_TOOL_CONTEXT.reset(token)
+
+        self.assertEqual("permission_denied", denied["status"])
+        self.assertEqual("canceled", canceled["status"])
+        self.assertEqual("canceled", main.REMINDERS.reminder_by_id(mine.id).status)
+        self.assertEqual("active", main.REMINDERS.reminder_by_id(other.id).status)
+
+    def test_cancel_living_reminder_tool_hides_unlisted_foreign_id(self) -> None:
+        other = self.create_future_reminder(user_id=123, target_label="@other")
+        context = main.ReminderToolContext(
+            chat_id=-1001,
+            chat_type=ChatType.SUPERGROUP,
+            user_id=407892151,
+            message_id=555,
+            allowed_toolsets=("reminder_crud",),
+            intent="cancel",
+            prompt="cancel the morning one",
+        )
+        token = main.REMINDER_TOOL_CONTEXT.set(context)
+        listed_token = main.REMINDER_TOOL_LISTED_IDS.set(set())
+        try:
+            result = main.cancel_living_reminder_from_tool(other.id)
+        finally:
+            main.REMINDER_TOOL_LISTED_IDS.reset(listed_token)
+            main.REMINDER_TOOL_CONTEXT.reset(token)
+
+        self.assertEqual("needs_confirmation", result["status"])
+        self.assertEqual(["explicit_or_listed_reminder_id"], result["missing_fields"])
+        self.assertEqual("active", main.REMINDERS.reminder_by_id(other.id).status)
+
+    def test_cancel_living_reminder_tool_needs_list_when_id_not_in_prompt(self) -> None:
+        mine = self.create_future_reminder(user_id=407892151, target_label="@mine")
+        context = main.ReminderToolContext(
+            chat_id=-1001,
+            chat_type=ChatType.SUPERGROUP,
+            user_id=407892151,
+            message_id=555,
+            allowed_toolsets=("reminder_crud",),
+            intent="cancel",
+            prompt="cancel the morning one",
+        )
+        token = main.REMINDER_TOOL_CONTEXT.set(context)
+        listed_token = main.REMINDER_TOOL_LISTED_IDS.set(set())
+        try:
+            result = main.cancel_living_reminder_from_tool(mine.id)
+        finally:
+            main.REMINDER_TOOL_LISTED_IDS.reset(listed_token)
+            main.REMINDER_TOOL_CONTEXT.reset(token)
+
+        self.assertEqual("needs_confirmation", result["status"])
+        self.assertEqual("active", main.REMINDERS.reminder_by_id(mine.id).status)
+
+    def test_cancel_living_reminder_tool_ignores_bare_non_reminder_hash_id(self) -> None:
+        mine = self.create_future_reminder(user_id=407892151, target_label="@mine")
+        context = main.ReminderToolContext(
+            chat_id=-1001,
+            chat_type=ChatType.SUPERGROUP,
+            user_id=407892151,
+            message_id=555,
+            allowed_toolsets=("reminder_crud",),
+            intent="cancel",
+            prompt=f"cancel GitHub issue #{mine.id}",
+        )
+        token = main.REMINDER_TOOL_CONTEXT.set(context)
+        listed_token = main.REMINDER_TOOL_LISTED_IDS.set(set())
+        try:
+            result = main.cancel_living_reminder_from_tool(mine.id)
+        finally:
+            main.REMINDER_TOOL_LISTED_IDS.reset(listed_token)
+            main.REMINDER_TOOL_CONTEXT.reset(token)
+
+        self.assertEqual("needs_confirmation", result["status"])
+        self.assertEqual(["explicit_or_listed_reminder_id"], result["missing_fields"])
+        self.assertEqual("active", main.REMINDERS.reminder_by_id(mine.id).status)
+
+    def test_cancel_living_reminder_tool_allows_bare_listed_hash_id(self) -> None:
+        mine = self.create_future_reminder(user_id=407892151, target_label="@mine")
+        context = main.ReminderToolContext(
+            chat_id=-1001,
+            chat_type=ChatType.SUPERGROUP,
+            user_id=407892151,
+            message_id=555,
+            allowed_toolsets=("reminder_crud",),
+            intent="cancel",
+            prompt=f"cancel #{mine.id}",
+        )
+        token = main.REMINDER_TOOL_CONTEXT.set(context)
+        listed_token = main.REMINDER_TOOL_LISTED_IDS.set({mine.id})
+        try:
+            result = main.cancel_living_reminder_from_tool(mine.id)
+        finally:
+            main.REMINDER_TOOL_LISTED_IDS.reset(listed_token)
+            main.REMINDER_TOOL_CONTEXT.reset(token)
+
+        self.assertEqual("canceled", result["status"])
+        self.assertEqual("canceled", main.REMINDERS.reminder_by_id(mine.id).status)
+
+    def test_cancel_living_reminder_tool_allows_ukrainian_explicit_id(self) -> None:
+        mine = self.create_future_reminder(user_id=407892151, target_label="@mine")
+        context = main.ReminderToolContext(
+            chat_id=-1001,
+            chat_type=ChatType.SUPERGROUP,
+            user_id=407892151,
+            message_id=555,
+            allowed_toolsets=("reminder_crud",),
+            intent="cancel",
+            prompt=f"скасуй нагадування #{mine.id}",
+        )
+        token = main.REMINDER_TOOL_CONTEXT.set(context)
+        listed_token = main.REMINDER_TOOL_LISTED_IDS.set(set())
+        try:
+            result = main.cancel_living_reminder_from_tool(mine.id)
+        finally:
+            main.REMINDER_TOOL_LISTED_IDS.reset(listed_token)
+            main.REMINDER_TOOL_CONTEXT.reset(token)
+
+        self.assertEqual("canceled", result["status"])
+        self.assertEqual("canceled", main.REMINDERS.reminder_by_id(mine.id).status)
+
+    def test_update_living_reminder_tool_reschedules_owned_reminder(self) -> None:
+        mine = self.create_future_reminder(user_id=407892151, target_label="@mine")
+        new_due = (datetime.now(timezone.utc) + timedelta(days=2)).isoformat(timespec="minutes")
+        context = main.ReminderToolContext(
+            chat_id=-1001,
+            chat_type=ChatType.SUPERGROUP,
+            user_id=407892151,
+            message_id=555,
+            allowed_toolsets=("reminder_crud",),
+            intent="update",
+            prompt=f"move reminder #{mine.id} to {new_due}",
+        )
+        token = main.REMINDER_TOOL_CONTEXT.set(context)
+        listed_token = main.REMINDER_TOOL_LISTED_IDS.set(set())
+        try:
+            result = main.update_living_reminder_from_tool(
+                reminder_id=mine.id,
+                due_at=new_due,
+                timezone_name="UTC",
+                confidence=0.9,
+            )
+        finally:
+            main.REMINDER_TOOL_LISTED_IDS.reset(listed_token)
+            main.REMINDER_TOOL_CONTEXT.reset(token)
+
+        self.assertEqual("updated", result["status"])
+        self.assertIn("due_at", result["updated_fields"])
+        self.assertEqual(format_datetime(new_due), main.REMINDERS.reminder_by_id(mine.id).due_at_utc)
+
+    def test_update_living_reminder_tool_uses_existing_birthday_kind_for_date_only_due(self) -> None:
+        original_due = datetime.now(timezone.utc) + timedelta(days=1)
+        mine = main.REMINDERS.create_reminder(
+            chat_id=-1001,
+            created_by_user_id=407892151,
+            created_from_message_id=123,
+            target_label="@mine",
+            kind="birthday",
+            trusted_instruction="write a warm birthday reminder",
+            due_at_utc=original_due,
+            timezone_name="Europe/Kyiv",
+            recurrence="yearly",
+        )
+        new_due_date = (datetime.now(timezone.utc) + timedelta(days=400)).date().isoformat()
+        context = main.ReminderToolContext(
+            chat_id=-1001,
+            chat_type=ChatType.SUPERGROUP,
+            user_id=407892151,
+            message_id=555,
+            allowed_toolsets=("reminder_crud",),
+            intent="update",
+            prompt=f"move reminder #{mine.id} to {new_due_date}",
+        )
+        token = main.REMINDER_TOOL_CONTEXT.set(context)
+        listed_token = main.REMINDER_TOOL_LISTED_IDS.set(set())
+        try:
+            result = main.update_living_reminder_from_tool(
+                reminder_id=mine.id,
+                due_at=new_due_date,
+                confidence=0.9,
+            )
+        finally:
+            main.REMINDER_TOOL_LISTED_IDS.reset(listed_token)
+            main.REMINDER_TOOL_CONTEXT.reset(token)
+
+        expected_zone = main.reminder_timezone("Europe/Kyiv")
+        expected_due = datetime.fromisoformat(new_due_date).replace(hour=9, minute=0, tzinfo=expected_zone)
+        self.assertEqual("updated", result["status"])
+        self.assertIn("due_at", result["updated_fields"])
+        self.assertEqual(format_datetime(expected_due), main.REMINDERS.reminder_by_id(mine.id).due_at_utc)
+        self.assertEqual("Europe/Kyiv", main.REMINDERS.reminder_by_id(mine.id).timezone)
+        self.assertEqual("yearly", main.REMINDERS.reminder_by_id(mine.id).recurrence)
+
+    def test_update_living_reminder_tool_hides_unlisted_foreign_id(self) -> None:
+        other = self.create_future_reminder(user_id=123, target_label="@other")
+        new_due = (datetime.now(timezone.utc) + timedelta(days=2)).isoformat(timespec="minutes")
+        context = main.ReminderToolContext(
+            chat_id=-1001,
+            chat_type=ChatType.SUPERGROUP,
+            user_id=407892151,
+            message_id=555,
+            allowed_toolsets=("reminder_crud",),
+            intent="update",
+            prompt=f"move the morning one to {new_due}",
+        )
+        token = main.REMINDER_TOOL_CONTEXT.set(context)
+        listed_token = main.REMINDER_TOOL_LISTED_IDS.set(set())
+        try:
+            result = main.update_living_reminder_from_tool(
+                reminder_id=other.id,
+                due_at=new_due,
+                timezone_name="UTC",
+                confidence=0.9,
+            )
+        finally:
+            main.REMINDER_TOOL_LISTED_IDS.reset(listed_token)
+            main.REMINDER_TOOL_CONTEXT.reset(token)
+
+        self.assertEqual("needs_confirmation", result["status"])
+        self.assertEqual(["explicit_or_listed_reminder_id"], result["missing_fields"])
+        self.assertEqual("active", main.REMINDERS.reminder_by_id(other.id).status)
+
+    def test_update_living_reminder_forces_birthday_recurrence_yearly(self) -> None:
+        mine = self.create_future_reminder(user_id=407892151, target_label="@mine")
+
+        updated = main.REMINDERS.update_reminder(
+            mine.chat_id,
+            mine.id,
+            user_id=mine.created_by_user_id,
+            kind="birthday",
+            recurrence="none",
+        )
+
+        self.assertIsNotNone(updated)
+        self.assertEqual("birthday", updated.kind)
+        self.assertEqual("yearly", updated.recurrence)
+
+    def test_update_living_reminder_tool_reports_implied_birthday_recurrence(self) -> None:
+        mine = self.create_future_reminder(user_id=407892151, target_label="@mine")
+        context = main.ReminderToolContext(
+            chat_id=-1001,
+            chat_type=ChatType.SUPERGROUP,
+            user_id=407892151,
+            message_id=555,
+            allowed_toolsets=("reminder_crud",),
+            intent="update",
+            prompt=f"make reminder #{mine.id} a birthday reminder",
+        )
+        token = main.REMINDER_TOOL_CONTEXT.set(context)
+        listed_token = main.REMINDER_TOOL_LISTED_IDS.set(set())
+        try:
+            result = main.update_living_reminder_from_tool(
+                reminder_id=mine.id,
+                kind="birthday",
+                confidence=0.9,
+            )
+        finally:
+            main.REMINDER_TOOL_LISTED_IDS.reset(listed_token)
+            main.REMINDER_TOOL_CONTEXT.reset(token)
+
+        self.assertEqual("updated", result["status"])
+        self.assertEqual(["kind", "recurrence"], result["updated_fields"])
+        self.assertEqual("yearly", result["recurrence"])
+
+    def test_update_living_reminder_cancels_claimed_old_fire(self) -> None:
+        mine = self.create_due_reminder()
+        claim = main.REMINDERS.claim_due_fires(limit=1)[0]
+        new_due = (datetime.now(timezone.utc) + timedelta(days=2)).isoformat(timespec="minutes")
+        context = main.ReminderToolContext(
+            chat_id=-1001,
+            chat_type=ChatType.SUPERGROUP,
+            user_id=407892151,
+            message_id=555,
+            allowed_toolsets=("reminder_crud",),
+            intent="update",
+            prompt=f"move reminder #{mine.id} to {new_due}",
+        )
+        token = main.REMINDER_TOOL_CONTEXT.set(context)
+        listed_token = main.REMINDER_TOOL_LISTED_IDS.set(set())
+        try:
+            result = main.update_living_reminder_from_tool(
+                reminder_id=mine.id,
+                due_at=new_due,
+                timezone_name="UTC",
+                confidence=0.9,
+            )
+        finally:
+            main.REMINDER_TOOL_LISTED_IDS.reset(listed_token)
+            main.REMINDER_TOOL_CONTEXT.reset(token)
+
+        self.assertEqual("updated", result["status"])
+        self.assertEqual("canceled", main.REMINDERS.fire_by_id(claim.fire.id).status)
+        self.assertIsNone(main.REMINDERS.refresh_claim(claim.fire.id, expected_claimed_at=claim.fire.claimed_at))
+
+    def test_update_living_reminder_same_due_preserves_claimed_fire(self) -> None:
+        mine = self.create_due_reminder()
+        claim = main.REMINDERS.claim_due_fires(limit=1)[0]
+
+        updated = main.REMINDERS.update_reminder(
+            mine.chat_id,
+            mine.id,
+            user_id=mine.created_by_user_id,
+            due_at_utc=main.parse_reminder_datetime(mine.due_at_utc),
+            target_label="@renamed",
+        )
+
+        self.assertIsNotNone(updated)
+        self.assertEqual("@renamed", updated.target_label)
+        fire = main.REMINDERS.fire_by_id(claim.fire.id)
+        self.assertEqual("claimed", fire.status)
+        self.assertEqual(claim.fire.claimed_at, fire.claimed_at)
+        self.assertEqual(1, fire.attempt_count)
+        self.assertTrue(main.REMINDERS.is_claim_current(claim.fire.id, expected_claimed_at=claim.fire.claimed_at))
+
+    def test_update_living_reminder_reschedule_back_reopens_canceled_fire(self) -> None:
+        first_due = datetime.now(timezone.utc) + timedelta(days=1)
+        second_due = first_due + timedelta(days=1)
+        mine = main.REMINDERS.create_reminder(
+            chat_id=-1001,
+            created_by_user_id=407892151,
+            created_from_message_id=123,
+            target_label="@mine",
+            kind="one_off",
+            trusted_instruction="write a warm reminder",
+            due_at_utc=first_due,
+            timezone_name="UTC",
+            recurrence="none",
+        )
+        first_fire = main.REMINDERS.fire_by_id(1)
+
+        updated = main.REMINDERS.update_reminder(
+            mine.chat_id,
+            mine.id,
+            user_id=mine.created_by_user_id,
+            due_at_utc=second_due,
+        )
+        self.assertIsNotNone(updated)
+        self.assertEqual("canceled", main.REMINDERS.fire_by_id(first_fire.id).status)
+
+        updated = main.REMINDERS.update_reminder(
+            mine.chat_id,
+            mine.id,
+            user_id=mine.created_by_user_id,
+            due_at_utc=first_due,
+        )
+
+        self.assertIsNotNone(updated)
+        reopened = main.REMINDERS.fire_by_id(first_fire.id)
+        self.assertEqual("pending", reopened.status)
+        self.assertEqual("", reopened.claimed_at)
+        self.assertEqual("", reopened.completed_at)
+        self.assertEqual(0, reopened.attempt_count)
+        self.assertEqual("", reopened.failure_category)
+        claims = main.REMINDERS.claim_due_fires(now=first_due + timedelta(minutes=1), limit=5)
+        self.assertEqual([first_fire.id], [claim.fire.id for claim in claims])
+
+    def test_reminder_state_change_claim_guard_blocks_unproven_confirmation(self) -> None:
+        guarded = main.guard_reminder_state_change_claims("I will remind you tomorrow.", [])
+
+        self.assertNotIn("I will remind", guarded)
+        self.assertIn("reminder-tool", guarded)
+
+    def test_reminder_state_change_claim_guard_matches_mutation_action(self) -> None:
+        created = main.guard_reminder_state_change_claims("I will remind you tomorrow.", [{"action": "created"}])
+        mismatched = main.guard_reminder_state_change_claims("I canceled reminder #1.", [{"action": "created"}])
+        canceled = main.guard_reminder_state_change_claims("I canceled reminder #1.", [{"action": "canceled"}])
+
+        self.assertEqual("I will remind you tomorrow.", created)
+        self.assertNotIn("I canceled", mismatched)
+        self.assertIn("I can't honestly confirm", mismatched)
+        self.assertEqual("I canceled reminder #1.", canceled)
+
     def test_tool_returns_confirmation_request_for_missing_time(self) -> None:
         token = main.REMINDER_TOOL_CONTEXT.set(
-            main.ReminderToolContext(chat_id=-1001, chat_type=ChatType.SUPERGROUP, user_id=407892151, message_id=556)
+            main.ReminderToolContext(
+                chat_id=-1001,
+                chat_type=ChatType.SUPERGROUP,
+                user_id=407892151,
+                message_id=556,
+                allowed_toolsets=("reminder_crud",),
+                intent="create",
+            )
         )
         try:
             result = main.create_living_reminder_from_tool(
@@ -8438,7 +9399,14 @@ class LivingReminderTests(unittest.TestCase):
     def test_tool_returns_confirmation_request_for_missing_instruction(self) -> None:
         future = (datetime.now(timezone.utc) + timedelta(days=1)).isoformat(timespec="minutes")
         token = main.REMINDER_TOOL_CONTEXT.set(
-            main.ReminderToolContext(chat_id=-1001, chat_type=ChatType.SUPERGROUP, user_id=407892151, message_id=557)
+            main.ReminderToolContext(
+                chat_id=-1001,
+                chat_type=ChatType.SUPERGROUP,
+                user_id=407892151,
+                message_id=557,
+                allowed_toolsets=("reminder_crud",),
+                intent="create",
+            )
         )
         try:
             result = main.create_living_reminder_from_tool(
