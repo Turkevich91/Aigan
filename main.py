@@ -1402,7 +1402,18 @@ REMINDER_UPDATE_INTENT_RE = re.compile(
     r")",
     re.UNICODE,
 )
-TOOL_ROUTE_INTENTS = {"create", "list", "update", "cancel", "none"}
+REMINDER_CONTEXTUAL_MUTATION_FOLLOWUP_RE = re.compile(
+    r"(?i)(?:"
+    r"\b(?:undo|revert|roll\s+back|move|shift|change)\b.{0,80}\b(?:back|earlier|previous|touched)\b|"
+    r"\b(?:back|earlier)\b.{0,80}\b(?:what|that|those|ones)\b.{0,80}\b(?:touched|changed|moved)\b|"
+    r"\b(?:\u043f\u043e\u0432\u0435\u0440\u043d\u0438|\u0432\u0456\u0434\u043a\u043e\u0442\u0438|\u0432\u0435\u0440\u043d\u0438|\u043e\u0442\u043a\u0430\u0442\u0438)\b.{0,80}"
+    r"\b(?:\u043d\u0430\u0437\u0430\u0434|\u0440\u0430\u043d\u0456\u0448\u0435|\u0442\u0435\s+\u0449\u043e|\u0442\u0456\s+\u0449\u043e|\u0447\u0456\u043f(?:\u0430\u0432|\u0430\u043d\u0456)|\u0447\u0438\u043f(?:\u0430\u0432|\u0430\u043d\u0456))\b|"
+    r"\b(?:\u043d\u0430\u0437\u0430\u0434|\u0440\u0430\u043d\u0456\u0448\u0435)\b.{0,80}"
+    r"\b(?:\u0442\u0435\s+\u0449\u043e|\u0442\u0456\s+\u0449\u043e|\u0447\u0456\u043f(?:\u0430\u0432|\u0430\u043d\u0456)|\u0447\u0438\u043f(?:\u0430\u0432|\u0430\u043d\u0456)|\u0445\u0432\u0438\u043b\u0438\u043d)\b"
+    r")",
+    re.UNICODE,
+)
+TOOL_ROUTE_INTENTS = {"create", "list", "update", "cancel", "manage", "none"}
 TOOL_ROUTE_DOMAINS = {"reminders"}
 TOOL_ROUTE_TOOLSETS = {"reminder_crud"}
 
@@ -1451,6 +1462,48 @@ def deterministic_tool_route_decision(prompt: str | None) -> ToolRouteDecision:
     )
 
 
+def recent_reminder_mutation_context(chat_id: int, user_id: int | None, *, seconds: int = 900) -> bool:
+    if SYSTEM_LOG is None:
+        return False
+    cutoff = datetime.now(timezone.utc) - timedelta(seconds=max(1, int(seconds)))
+    for event_type in ("reminder_updated", "reminder_canceled", "reminder_created"):
+        event = SYSTEM_LOG.latest_event(
+            component="reminders",
+            event_type=event_type,
+            chat_id=chat_id,
+            user_id=user_id,
+        )
+        if event is None:
+            continue
+        try:
+            created_at = datetime.fromisoformat(event.created_at)
+        except ValueError:
+            continue
+        if created_at.tzinfo is None:
+            created_at = created_at.replace(tzinfo=timezone.utc)
+        if created_at.astimezone(timezone.utc) >= cutoff:
+            return True
+    return False
+
+
+def contextual_reminder_tool_route_decision(message: Message, prompt: str | None) -> ToolRouteDecision:
+    text = (prompt or "").strip()
+    if not text or not REMINDER_CONTEXTUAL_MUTATION_FOLLOWUP_RE.search(text):
+        return no_tool_route("no_contextual_reminder_followup")
+    user_id = message_user_id(message)
+    if not recent_reminder_mutation_context(message.chat_id, user_id):
+        return no_tool_route("no_recent_reminder_mutation_context")
+    if not CONFIG.reminder_crud_tools_enabled:
+        return no_tool_route("reminder_crud_disabled")
+    return ToolRouteDecision(
+        domains=("reminders",),
+        intent="update",
+        confidence=0.72,
+        allowed_toolsets=("reminder_crud",),
+        reason="recent_reminder_mutation_followup",
+    )
+
+
 def build_tool_router_metadata(message: Message, prompt: str) -> dict[str, Any]:
     return {
         "trusted_text": clip_text(prompt or "", 600),
@@ -1475,7 +1528,7 @@ def tool_router_schema() -> dict[str, Any]:
                 "items": {"type": "string", "enum": ["reminders"]},
                 "maxItems": 1,
             },
-            "intent": {"type": "string", "enum": ["create", "list", "update", "cancel", "none"]},
+            "intent": {"type": "string", "enum": ["create", "list", "update", "cancel", "manage", "none"]},
             "confidence": {"type": "number", "minimum": 0, "maximum": 1},
             "allowed_toolsets": {
                 "type": "array",
@@ -1498,13 +1551,16 @@ def run_tool_router_model_sync(metadata: dict[str, Any]) -> str:
                     {
                         "type": "input_text",
                         "text": (
-                            "Classify whether this trusted Telegram request needs Aigan reminder tools. "
-                            "Return none unless the user is intentionally asking to create, list, update, "
-                            "or cancel their reminders. Passive facts and ordinary date mentions are none. "
+                            "Classify whether this trusted Telegram request needs Aigan reminder CRUD tools. "
+                            "This is a domain gate, not an exact action gate: if the user is managing reminders "
+                            "in any way, allow the reminder_crud toolset. Return none only when the request is not "
+                            "about managing reminder records. Passive facts and ordinary date mentions are none. "
                             "Ukrainian cues: 'нагадування' and 'ремайндери' mean reminders; "
                             "'які в мене є нагадування', 'покажи мої ремайндери', or requests to read/list "
                             "reminder records are intent=list; 'перенеси нагадування #5' is intent=update; "
                             "'скасуй нагадування #5' is intent=cancel; 'нагадай мені завтра...' is intent=create. "
+                            "When the reminder domain is clear but the exact action is ambiguous or multi-step, use intent=manage. "
+                            "For follow-ups like 'поверни назад те, що ти чіпав' in reminder context, choose update. "
                             "If a prompt asks to use a tool to read existing reminder records, choose list even "
                             "when it contains the phrase 'нагадати мені які'."
                         ),
@@ -1610,7 +1666,12 @@ def log_tool_route_decision(message: Message, decision: ToolRouteDecision) -> No
 
 
 async def route_tool_capabilities_for_message(message: Message, prompt: str) -> ToolRouteDecision:
-    fallback = deterministic_tool_route_decision(prompt)
+    contextual_fallback = contextual_reminder_tool_route_decision(message, prompt)
+    fallback = (
+        contextual_fallback
+        if contextual_fallback.allowed_toolsets
+        else deterministic_tool_route_decision(prompt)
+    )
     if message.from_user is None:
         decision = no_tool_route("missing_user_identity")
         log_tool_route_decision(message, decision)
@@ -1641,6 +1702,15 @@ async def route_tool_capabilities_for_message(message: Message, prompt: str) -> 
     try:
         raw = await run_tool_router_model(build_tool_router_metadata(message, prompt))
         decision = normalize_tool_route_decision(json.loads(raw), reason="semantic_router")
+        if not decision.allowed_toolsets and contextual_fallback.allowed_toolsets:
+            decision = ToolRouteDecision(
+                domains=contextual_fallback.domains,
+                intent=contextual_fallback.intent,
+                confidence=contextual_fallback.confidence,
+                allowed_toolsets=contextual_fallback.allowed_toolsets,
+                needs_main_model=contextual_fallback.needs_main_model,
+                reason=f"{decision.reason}:contextual_override",
+            )
     except Exception as exc:
         LOGGER.warning("Tool router failed: %s", type(exc).__name__)
         system_event(
@@ -1811,8 +1881,6 @@ def reminder_tool_unavailable_result(required_intent: str | None = None) -> dict
         return {"status": "unavailable", "reason": "reminder_crud_not_allowed"}
     if context.user_id is None:
         return {"status": "permission_denied", "reason": "missing_user_identity"}
-    if required_intent is not None and (context.intent or "none").strip().lower() != required_intent:
-        return {"status": "unavailable", "reason": f"reminder_{required_intent}_intent_not_allowed"}
     return None
 
 
@@ -2226,16 +2294,12 @@ def reminder_agent_tools() -> list[Any]:
         return []
     if not CONFIG.reminder_crud_tools_enabled:
         return []
-    intent = (context.intent or "none").strip().lower()
-    if intent == "create":
-        return [create_living_reminder]
-    if intent == "list":
-        return [list_living_reminders]
-    if intent == "update":
-        return [list_living_reminders, update_living_reminder]
-    if intent == "cancel":
-        return [list_living_reminders, cancel_living_reminder]
-    return []
+    return [
+        create_living_reminder,
+        list_living_reminders,
+        update_living_reminder,
+        cancel_living_reminder,
+    ]
 
 
 REMINDER_CREATE_CLAIM_RE = re.compile(
