@@ -8267,6 +8267,8 @@ class LivingReminderTests(unittest.TestCase):
         )
         main.REMINDERS = ReminderStore(self.db_path)
         main.passive_contexts.clear()
+        if main.SYSTEM_LOG is not None:
+            main.SYSTEM_LOG.clear_all()
         if main.MEMORY is not None:
             main.MEMORY.clear_all()
 
@@ -8496,7 +8498,7 @@ class LivingReminderTests(unittest.TestCase):
         self.assertEqual(1, len(items))
         self.assertEqual("@friend", items[0].target_label)
 
-    def test_deterministic_tool_route_attaches_only_list_for_list_request(self) -> None:
+    def test_deterministic_tool_route_exposes_full_crud_for_list_request(self) -> None:
         message = FakeMessage("what reminders do I have?")
 
         decision = main.deterministic_tool_route_decision("what reminders do I have?")
@@ -8509,10 +8511,15 @@ class LivingReminderTests(unittest.TestCase):
             names = {getattr(tool, "name", "") for tool in main.reminder_agent_tools()}
         finally:
             main.REMINDER_TOOL_CONTEXT.reset(token)
-        self.assertIn("list_living_reminders", names)
-        self.assertNotIn("cancel_living_reminder", names)
-        self.assertNotIn("update_living_reminder", names)
-        self.assertNotIn("create_living_reminder", names)
+        self.assertEqual(
+            {
+                "create_living_reminder",
+                "list_living_reminders",
+                "update_living_reminder",
+                "cancel_living_reminder",
+            },
+            names,
+        )
 
     def test_deterministic_tool_route_handles_ukrainian_list_field_phrases(self) -> None:
         prompts = [
@@ -8541,15 +8548,15 @@ class LivingReminderTests(unittest.TestCase):
         self.assertEqual("update", decision.intent)
         self.assertEqual(("reminder_crud",), decision.allowed_toolsets)
 
-    def test_reminder_agent_tools_are_scoped_to_routed_intent(self) -> None:
-        expected = {
-            "create": {"create_living_reminder"},
-            "list": {"list_living_reminders"},
-            "update": {"list_living_reminders", "update_living_reminder"},
-            "cancel": {"list_living_reminders", "cancel_living_reminder"},
+    def test_reminder_agent_tools_expose_full_crud_for_any_routed_intent(self) -> None:
+        expected_names = {
+            "create_living_reminder",
+            "list_living_reminders",
+            "update_living_reminder",
+            "cancel_living_reminder",
         }
 
-        for intent, expected_names in expected.items():
+        for intent in ("create", "list", "update", "cancel"):
             context = main.ReminderToolContext(
                 chat_id=-1001,
                 chat_type=ChatType.SUPERGROUP,
@@ -8656,6 +8663,51 @@ class LivingReminderTests(unittest.TestCase):
         self.assertEqual((), decision.allowed_toolsets)
         self.assertEqual("semantic_router:below_threshold", decision.reason)
 
+    def test_passive_date_statement_does_not_expose_reminder_tools(self) -> None:
+        decision = main.deterministic_tool_route_decision(
+            "\u0437\u0430\u0432\u0442\u0440\u0430 \u043e 10:00 \u0431\u0443\u0434\u0443 \u0437\u0430\u0439\u043d\u044f\u0442\u0438\u0439"
+        )
+
+        self.assertEqual("none", decision.intent)
+        self.assertEqual((), decision.allowed_toolsets)
+
+    def test_recent_reminder_mutation_followup_exposes_crud_when_semantic_denies(self) -> None:
+        if main.SYSTEM_LOG is None:
+            self.skipTest("system log disabled")
+        message = FakeMessage("\u043f\u043e\u0432\u0435\u0440\u043d\u0438 \u043d\u0430\u0437\u0430\u0434 \u0442\u0435, \u0449\u043e \u0442\u0438 \u0447\u0456\u043f\u0430\u0432")
+        main.SYSTEM_LOG.record_event(
+            component="reminders",
+            event_type="reminder_updated",
+            chat_id=message.chat_id,
+            user_id=message.from_user.id,
+            message="42",
+        )
+        original_config = main.CONFIG
+        try:
+            main.CONFIG = replace(main.CONFIG, tool_router_enabled=True, tool_router_confidence_threshold=0.65)
+            router_json = json.dumps(
+                {
+                    "domains": [],
+                    "intent": "none",
+                    "confidence": 0.92,
+                    "allowed_toolsets": [],
+                    "needs_main_model": True,
+                }
+            )
+            with patch.object(main, "run_tool_router_model", new=AsyncMock(return_value=router_json)):
+                decision = asyncio.run(
+                    main.route_tool_capabilities_for_message(
+                        message,
+                        message.text,
+                    )
+                )
+        finally:
+            main.CONFIG = original_config
+
+        self.assertEqual("update", decision.intent)
+        self.assertEqual(("reminder_crud",), decision.allowed_toolsets)
+        self.assertEqual("semantic_router:intent_none:contextual_override", decision.reason)
+
     def test_reminder_claim_guard_is_enabled_for_intent_without_tools(self) -> None:
         denied_route = main.ToolRouteDecision(intent="none", reason="semantic_router:below_threshold")
         domain_route = main.ToolRouteDecision(domains=("reminders",), intent="none")
@@ -8736,6 +8788,16 @@ class LivingReminderTests(unittest.TestCase):
                 },
                 reason="semantic_router",
             )
+            manage = main.normalize_tool_route_decision(
+                {
+                    "domains": ["reminders"],
+                    "intent": "manage",
+                    "confidence": 0.91,
+                    "allowed_toolsets": ["reminder_crud"],
+                    "needs_main_model": True,
+                },
+                reason="semantic_router",
+            )
         finally:
             main.CONFIG = original_config
 
@@ -8744,6 +8806,8 @@ class LivingReminderTests(unittest.TestCase):
         self.assertEqual("semantic_router:toolset_not_allowed", missing_toolset.reason)
         self.assertEqual("semantic_router:invalid_router_payload", invalid_payload.reason)
         self.assertEqual("semantic_router:invalid_router_intent", invalid_intent.reason)
+        self.assertEqual("manage", manage.intent)
+        self.assertEqual(("reminder_crud",), manage.allowed_toolsets)
 
     def test_semantic_tool_router_rejects_non_finite_confidence(self) -> None:
         original_config = main.CONFIG
@@ -8982,7 +9046,7 @@ class LivingReminderTests(unittest.TestCase):
         self.assertEqual("reminder_crud_not_allowed", result["reason"])
         self.assertEqual("active", main.REMINDERS.reminder_by_id(mine.id).status)
 
-    def test_reminder_mutation_tools_reject_out_of_intent_direct_calls(self) -> None:
+    def test_reminder_mutation_tools_allow_list_context_after_id_was_listed(self) -> None:
         mine = self.create_future_reminder(user_id=407892151, target_label="@mine")
         context = main.ReminderToolContext(
             chat_id=-1001,
@@ -9001,9 +9065,8 @@ class LivingReminderTests(unittest.TestCase):
             main.REMINDER_TOOL_LISTED_IDS.reset(listed_token)
             main.REMINDER_TOOL_CONTEXT.reset(token)
 
-        self.assertEqual("unavailable", result["status"])
-        self.assertEqual("reminder_cancel_intent_not_allowed", result["reason"])
-        self.assertEqual("active", main.REMINDERS.reminder_by_id(mine.id).status)
+        self.assertEqual("canceled", result["status"])
+        self.assertEqual("canceled", main.REMINDERS.reminder_by_id(mine.id).status)
 
     def test_cancel_living_reminder_tool_requires_owner_and_explicit_or_listed_id(self) -> None:
         mine = self.create_future_reminder(user_id=407892151, target_label="@mine")
