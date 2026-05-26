@@ -8635,15 +8635,43 @@ class LivingReminderTests(unittest.TestCase):
         self.assertEqual("create", decision.intent)
         self.assertEqual(("reminder_crud",), decision.allowed_toolsets)
 
-    def test_semantic_tool_router_denial_is_authoritative(self) -> None:
-        message = FakeMessage("remind me 2999-01-01 09:00 write in chat")
+    def test_semantic_tool_router_false_negative_uses_deterministic_override(self) -> None:
+        message = FakeMessage("які у мене ремайндери?")
+        original_config = main.CONFIG
+        try:
+            main.CONFIG = replace(main.CONFIG, tool_router_enabled=True, tool_router_confidence_threshold=0.65)
+            router_json = json.dumps(
+                {
+                    "domains": [],
+                    "intent": "none",
+                    "confidence": 0.92,
+                    "allowed_toolsets": [],
+                    "needs_main_model": True,
+                }
+            )
+            with patch.object(main, "run_tool_router_model", new=AsyncMock(return_value=router_json)):
+                decision = asyncio.run(
+                    main.route_tool_capabilities_for_message(
+                        message,
+                        "які у мене ремайндери?",
+                    )
+                )
+        finally:
+            main.CONFIG = original_config
+
+        self.assertEqual("list", decision.intent)
+        self.assertEqual(("reminder_crud",), decision.allowed_toolsets)
+        self.assertEqual("semantic_router:intent_none:deterministic_override", decision.reason)
+
+    def test_semantic_tool_router_below_threshold_uses_deterministic_override(self) -> None:
+        message = FakeMessage("перенеси ремайндер #5 на годину пізніше")
         original_config = main.CONFIG
         try:
             main.CONFIG = replace(main.CONFIG, tool_router_enabled=True, tool_router_confidence_threshold=0.65)
             router_json = json.dumps(
                 {
                     "domains": ["reminders"],
-                    "intent": "create",
+                    "intent": "update",
                     "confidence": 0.4,
                     "allowed_toolsets": ["reminder_crud"],
                     "needs_main_model": True,
@@ -8653,15 +8681,15 @@ class LivingReminderTests(unittest.TestCase):
                 decision = asyncio.run(
                     main.route_tool_capabilities_for_message(
                         message,
-                        "remind me 2999-01-01 09:00 write in chat",
+                        "перенеси ремайндер #5 на годину пізніше",
                     )
                 )
         finally:
             main.CONFIG = original_config
 
-        self.assertEqual("none", decision.intent)
-        self.assertEqual((), decision.allowed_toolsets)
-        self.assertEqual("semantic_router:below_threshold", decision.reason)
+        self.assertEqual("update", decision.intent)
+        self.assertEqual(("reminder_crud",), decision.allowed_toolsets)
+        self.assertEqual("semantic_router:below_threshold:deterministic_override", decision.reason)
 
     def test_passive_date_statement_does_not_expose_reminder_tools(self) -> None:
         decision = main.deterministic_tool_route_decision(

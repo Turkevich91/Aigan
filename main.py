@@ -1702,14 +1702,15 @@ async def route_tool_capabilities_for_message(message: Message, prompt: str) -> 
     try:
         raw = await run_tool_router_model(build_tool_router_metadata(message, prompt))
         decision = normalize_tool_route_decision(json.loads(raw), reason="semantic_router")
-        if not decision.allowed_toolsets and contextual_fallback.allowed_toolsets:
+        if not decision.allowed_toolsets and fallback.allowed_toolsets:
+            override_reason = "contextual_override" if contextual_fallback.allowed_toolsets else "deterministic_override"
             decision = ToolRouteDecision(
-                domains=contextual_fallback.domains,
-                intent=contextual_fallback.intent,
-                confidence=contextual_fallback.confidence,
-                allowed_toolsets=contextual_fallback.allowed_toolsets,
-                needs_main_model=contextual_fallback.needs_main_model,
-                reason=f"{decision.reason}:contextual_override",
+                domains=fallback.domains,
+                intent=fallback.intent,
+                confidence=fallback.confidence,
+                allowed_toolsets=fallback.allowed_toolsets,
+                needs_main_model=fallback.needs_main_model,
+                reason=f"{decision.reason}:{override_reason}",
             )
     except Exception as exc:
         LOGGER.warning("Tool router failed: %s", type(exc).__name__)
