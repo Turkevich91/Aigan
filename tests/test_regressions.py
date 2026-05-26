@@ -8514,6 +8514,33 @@ class LivingReminderTests(unittest.TestCase):
         self.assertNotIn("update_living_reminder", names)
         self.assertNotIn("create_living_reminder", names)
 
+    def test_deterministic_tool_route_handles_ukrainian_list_field_phrases(self) -> None:
+        prompts = [
+            "які в мене є нагадування?",
+            "що в мене є з ремайндерів?",
+            "покажи мої ремайндери",
+            "скористайся тулзом щоб по записам нагадати мені які у мене ремайндери є",
+        ]
+
+        for prompt in prompts:
+            with self.subTest(prompt=prompt):
+                decision = main.deterministic_tool_route_decision(prompt)
+
+                self.assertEqual("list", decision.intent)
+                self.assertEqual(("reminder_crud",), decision.allowed_toolsets)
+
+    def test_deterministic_tool_route_does_not_list_for_meta_reminder_question(self) -> None:
+        decision = main.deterministic_tool_route_decision("що таке нагадування?")
+
+        self.assertEqual("none", decision.intent)
+        self.assertEqual((), decision.allowed_toolsets)
+
+    def test_deterministic_tool_route_handles_ukrainian_translit_update(self) -> None:
+        decision = main.deterministic_tool_route_decision("перенеси ремайндер #5 на годину пізніше")
+
+        self.assertEqual("update", decision.intent)
+        self.assertEqual(("reminder_crud",), decision.allowed_toolsets)
+
     def test_reminder_agent_tools_are_scoped_to_routed_intent(self) -> None:
         expected = {
             "create": {"create_living_reminder"},

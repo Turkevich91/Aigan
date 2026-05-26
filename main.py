@@ -1362,10 +1362,23 @@ REMINDER_DATE_HINT_RE = re.compile(
     r"\b\d{4}-\d{1,2}-\d{1,2}\b|\b\d{1,2}[./-]\d{1,2}(?:[./-]\d{2,4})?\b"
 )
 REMINDER_TIME_HINT_RE = re.compile(r"\b\d{1,2}:\d{2}\b|\b\d{1,2}\s*(?:am|pm)\b", re.IGNORECASE)
+REMINDER_META_QUERY_RE = re.compile(
+    r"(?i)(?:"
+    r"\bwhat\s+(?:is|are)\s+(?:a\s+)?reminders?\b|"
+    r"\b(?:\u0449\u043e\s+\u0442\u0430\u043a\u0435|\u0449\u043e\s+\u043e\u0437\u043d\u0430\u0447\u0430\u0454|\u0449\u043e\s+\u0437\u043d\u0430\u0447\u0438\u0442\u044c)\s+"
+    r"(?:\u043d\u0430\u0433\u0430\u0434\u0443\u0432\u0430\u043d\u043d\u044f|\u0440\u0435\u043c\u0430\u0439\u043d\u0434\u0435\u0440(?:\u0438|\u0456\u0432|\u0430)?|reminders?)\b"
+    r")",
+    re.UNICODE,
+)
 REMINDER_LIST_INTENT_RE = re.compile(
     r"(?i)(?:"
     r"\b(?:list|show|what|which)\b.{0,40}\breminders?\b|"
     r"\breminders?\b.{0,30}\b(?:list|have|active)\b|"
+    r"\b(?:show|list|read)\b.{0,60}\b(?:reminders?|\u0440\u0435\u043c\u0430\u0439\u043d\u0434\u0435\u0440(?:\u0438|\u0456\u0432|\u0430)?|\u043d\u0430\u0433\u0430\u0434\u0443\u0432\u0430\u043d\u043d\u044f)\b|"
+    r"\b(?:\u043f\u043e\u043a\u0430\u0436\u0438|\u043f\u0440\u043e\u0447\u0438\u0442\u0430\u0439|\u043f\u0435\u0440\u0435\u043b\u0456\u0447\u0438|\u0441\u043f\u0438\u0441\u043e\u043a|\u043f\u0435\u0440\u0435\u043b\u0456\u043a)\b.{0,60}\b(?:\u043d\u0430\u0433\u0430\u0434\u0443\u0432\u0430\u043d\u043d\u044f|\u0440\u0435\u043c\u0430\u0439\u043d\u0434\u0435\u0440(?:\u0438|\u0456\u0432|\u0430)?|reminders?)\b|"
+    r"\b\u044f\u043a\u0456\b.{0,70}\b(?:\u043d\u0430\u0433\u0430\u0434\u0443\u0432\u0430\u043d\u043d\u044f|\u0440\u0435\u043c\u0430\u0439\u043d\u0434\u0435\u0440(?:\u0438|\u0456\u0432|\u0430)?|reminders?)\b|"
+    r"\b\u0449\u043e\b.{0,30}\b(?:\u0443|\u0432)\s+\u043c\u0435\u043d\u0435\b.{0,40}\b(?:\u043d\u0430\u0433\u0430\u0434\u0443\u0432\u0430\u043d\u043d\u044f|\u0440\u0435\u043c\u0430\u0439\u043d\u0434\u0435\u0440(?:\u0438|\u0456\u0432|\u0430)?|reminders?)\b|"
+    r"\b(?:\u043c\u043e\u0457|\u043c\u043e\u0438|my)\b.{0,30}\b(?:\u043d\u0430\u0433\u0430\u0434\u0443\u0432\u0430\u043d\u043d\u044f|\u0440\u0435\u043c\u0430\u0439\u043d\u0434\u0435\u0440(?:\u0438|\u0456\u0432|\u0430)?|reminders?)\b|"
     r"(?:мої|мои|my)\s+(?:нагадування|напоминания|reminders)|"
     r"(?:які|какие|what)\s+(?:нагадування|напоминания|reminders)"
     r")",
@@ -1384,6 +1397,7 @@ REMINDER_UPDATE_INTENT_RE = re.compile(
     r"(?i)(?:"
     r"\b(?:move|shift|reschedule|update|change|edit)\b.{0,60}\breminders?\b|"
     r"\breminders?\b.{0,60}\b(?:move|shift|reschedule|update|change|edit)\b|"
+    r"\b(?:\u043f\u0435\u0440\u0435\u043d\u0435\u0441\u0438|\u0437\u043c\u0456\u043d\u0438|\u043f\u0435\u0440\u0435\u0434\u0432\u0438\u043d\u044c|\u043f\u0435\u0440\u0435\u0441\u0442\u0430\u0432)\b.{0,60}\b(?:\u0440\u0435\u043c\u0430\u0439\u043d\u0434\u0435\u0440(?:\u0438|\u0456\u0432|\u0430)?|reminder)\b|"
     r"\b(?:перенеси|зміни|измени|передвинь|переставь)\b.{0,60}\b(?:нагадування|напоминание|reminder)"
     r")",
     re.UNICODE,
@@ -1408,6 +1422,8 @@ def has_living_reminder_create_intent(prompt: str | None) -> bool:
 def deterministic_reminder_intent(prompt: str | None) -> str:
     text = (prompt or "").strip()
     if not text:
+        return "none"
+    if REMINDER_META_QUERY_RE.search(text):
         return "none"
     if REMINDER_CANCEL_INTENT_RE.search(text):
         return "cancel"
@@ -1484,7 +1500,13 @@ def run_tool_router_model_sync(metadata: dict[str, Any]) -> str:
                         "text": (
                             "Classify whether this trusted Telegram request needs Aigan reminder tools. "
                             "Return none unless the user is intentionally asking to create, list, update, "
-                            "or cancel their reminders. Passive facts and ordinary date mentions are none."
+                            "or cancel their reminders. Passive facts and ordinary date mentions are none. "
+                            "Ukrainian cues: 'нагадування' and 'ремайндери' mean reminders; "
+                            "'які в мене є нагадування', 'покажи мої ремайндери', or requests to read/list "
+                            "reminder records are intent=list; 'перенеси нагадування #5' is intent=update; "
+                            "'скасуй нагадування #5' is intent=cancel; 'нагадай мені завтра...' is intent=create. "
+                            "If a prompt asks to use a tool to read existing reminder records, choose list even "
+                            "when it contains the phrase 'нагадати мені які'."
                         ),
                     }
                 ],
