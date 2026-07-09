@@ -1361,7 +1361,7 @@ REMINDER_EXPLICIT_CREATE_INTENT_RE = re.compile(
     r"\b(?:create|set|add|schedule|save)\s+(?:a\s+)?reminder\b|"
     r"\bremember\s+to\b|\bdon['’]?t\s+forget\b|"
     r"\bнагадай\b|\bнагадати\b|\bне\s+забудь\b|\bзапам['’]?ятай\b|\bпривітай\b|"
-    r"\bнапомни\b|\bнапомнить\b|\bне\s+забудь\b|\bзапомни\b|\bпоздравь\b"
+    r"\bнапомни\b|\bнапомнить\b|\bзапомни\b|\bпоздравь\b"
     r")"
 )
 REMINDER_BIRTHDAY_INTENT_RE = re.compile(
