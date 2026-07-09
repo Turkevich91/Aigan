@@ -1,0 +1,111 @@
+name: Compatibility
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: compatibility-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  compatibility:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12.13"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Check dependency lock
+        run: |
+          python -m pip install "pip-tools==7.5.3"
+          PYTHON=python ./scripts/compile_requirements.sh
+          git diff --exit-code -- requirements.txt
+
+      - name: Install locked environment
+        run: |
+          python -m venv .venv-ci
+          .venv-ci/bin/python -m pip install --require-hashes -r requirements.txt
+          .venv-ci/bin/python -m pip check
+
+      - name: Import compatibility smoke
+        run: |
+          .venv-ci/bin/python - <<'PY'
+          from agents import Agent, ModelSettings, RunHooks, Runner
+          from agents.mcp import MCPServerStdio
+          from mcp.server.fastmcp import FastMCP
+          from telegram import Bot
+          from telegram.ext import Application, MessageReactionHandler
+          import bs4
+          import ddgs
+          import httpx
+          import openai
+          import yt_dlp
+
+          assert callable(getattr(Bot, "send_message_draft", None))
+          PY
+
+      - name: MCP stdio handshake smoke
+        run: |
+          .venv-ci/bin/python - <<'PY'
+          import asyncio
+          import sys
+          from pathlib import Path
+
+          from agents.mcp import MCPServerStdio
+
+
+          async def check(name: str, path: str, expected: set[str]) -> None:
+              server = MCPServerStdio(
+                  name=name,
+                  params={"command": sys.executable, "args": [str(Path(path).resolve())]},
+                  cache_tools_list=True,
+                  client_session_timeout_seconds=15,
+              )
+              async with server:
+                  tools = await server.list_tools()
+              names = {tool.name for tool in tools}
+              missing = expected - names
+              if missing:
+                  raise SystemExit(f"{name} MCP server is missing tools: {sorted(missing)}")
+
+
+          async def main() -> None:
+              await check(
+                  "web",
+                  "mcp_servers/web.py",
+                  {"search_web", "search_images", "fetch_url"},
+              )
+              await check(
+                  "youtube_transcript",
+                  "mcp_servers/youtube_transcript.py",
+                  {"get_youtube_transcript"},
+              )
+
+
+          asyncio.run(main())
+          PY
+
+      - name: Unit tests
+        run: .venv-ci/bin/python -m unittest discover -s tests -p "test_*.py"
+
+      - name: Docker compatibility
+        run: |
+          docker build --pull --tag aigan:ci .
+          docker run --rm --entrypoint python aigan:ci -c "import agents, openai, telegram, mcp, yt_dlp"
+          docker run --rm --entrypoint sh aigan:ci -c "python -m yt_dlp --version && deno --version >/dev/null && ffmpeg -version >/dev/null"
+          docker run --rm --entrypoint python aigan:ci -m unittest discover -s tests -p "test_*.py"

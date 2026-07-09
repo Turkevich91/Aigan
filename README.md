@@ -37,6 +37,21 @@ docker compose up -d --build
 docker compose logs -f
 ```
 
+### Dependency maintenance
+
+Direct Python dependencies are declared in `requirements.in`; the fully pinned,
+hashed Linux/Python 3.12 lock is `requirements.txt`. Regenerate the lock with the
+same pinned compiler used by CI:
+
+```bash
+python3.12 -m venv /tmp/aigan-lock-venv
+/tmp/aigan-lock-venv/bin/python -m pip install pip-tools==7.5.3
+PYTHON=/tmp/aigan-lock-venv/bin/python ./scripts/compile_requirements.sh
+```
+
+Do not hand-edit `requirements.txt`. Run the compatibility workflow before
+rebuilding the live service.
+
 In a group chat, use:
 
 ```text

@@ -1,0 +1,51 @@
+version: 2
+
+updates:
+  - package-ecosystem: pip
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "09:00"
+      timezone: America/New_York
+    open-pull-requests-limit: 5
+    allow:
+      - dependency-type: direct
+    groups:
+      openai-stack:
+        patterns:
+          - openai
+          - openai-agents
+      telegram:
+        patterns:
+          - python-telegram-bot
+      mcp-web:
+        patterns:
+          - mcp
+          - httpx
+          - beautifulsoup4
+          - ddgs
+          - youtube-transcript-api
+      media:
+        patterns:
+          - yt-dlp
+
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "09:15"
+      timezone: America/New_York
+    groups:
+      github-actions:
+        patterns:
+          - "*"
+
+  - package-ecosystem: docker
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "09:30"
+      timezone: America/New_York

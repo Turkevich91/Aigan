@@ -1,0 +1,10 @@
+openai==2.45.0
+openai-agents==0.18.0
+python-telegram-bot==22.8
+mcp==1.28.1
+httpx==0.28.1
+beautifulsoup4==4.15.0
+ddgs==9.14.4
+youtube-transcript-api==1.2.4
+yt-dlp[default,deno]==2026.7.4
+tzdata==2026.2

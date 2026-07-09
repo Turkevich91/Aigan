@@ -6089,7 +6089,7 @@ class PersistentMemoryTests(unittest.TestCase):
             self.assertIn("Ukraine Online", item.source_text)
             self.assertEqual("Ukraine Online", item.forward_origin)
             self.assertEqual([251], [stat_item.message_id for stat_item in stats_items])
-            self.assertTrue(store.fts_search(chat_id=-1001, query="viral repost body", lookback_days=30, limit=3))
+            self.assertTrue(store.fts_search(chat_id=-1001, query="viral repost body", lookback_days=3650, limit=3))
             store.close()
 
     def test_html_forward_without_author_comment_is_source_only(self) -> None:
@@ -6121,7 +6121,7 @@ class PersistentMemoryTests(unittest.TestCase):
             self.assertEqual("channel only text subscribe online", item.source_text)
             self.assertEqual([], store.user_stats(-1001, label_aliases=("Sergey",)))
             self.assertEqual(1, store.user_source_count(-1001, label_aliases=("Sergey",)))
-            self.assertTrue(store.fts_search(chat_id=-1001, query="subscribe online", lookback_days=30, limit=3))
+            self.assertTrue(store.fts_search(chat_id=-1001, query="subscribe online", lookback_days=3650, limit=3))
             store.close()
 
     def test_html_export_user_map_adds_user_id_and_username(self) -> None:
