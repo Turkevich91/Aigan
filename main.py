@@ -1355,15 +1355,6 @@ REMINDER_ACTION_INTENT_RE = re.compile(
     r"\bнапомни\b|\bнапомнить\b|\bне\s+забудь\b|\bзапомни\b|\bпоздравь\b"
     r")"
 )
-REMINDER_EXPLICIT_CREATE_INTENT_RE = re.compile(
-    r"(?i)(?:"
-    r"(?:^|\s)/remind\b|\bremind\s+(?:me|us|him|her|them|@[\w_]+)\b|"
-    r"\b(?:create|set|add|schedule|save)\s+(?:a\s+)?reminder\b|"
-    r"\bremember\s+to\b|\bdon['’]?t\s+forget\b|"
-    r"\bнагадай\b|\bнагадати\b|\bне\s+забудь\b|\bзапам['’]?ятай\b|\bпривітай\b|"
-    r"\bнапомни\b|\bнапомнить\b|\bзапомни\b|\bпоздравь\b"
-    r")"
-)
 REMINDER_BIRTHDAY_INTENT_RE = re.compile(
     r"(?i)(?:\bbirthday\b|\bbday\b|\bд[нр]\b|день\s+народження|день\s+рожд(?:ення|ения))"
 )
@@ -1460,15 +1451,6 @@ def deterministic_reminder_intent(prompt: str | None) -> str:
         return "list"
     if has_living_reminder_create_intent(text):
         return "create"
-    return "none"
-
-
-def explicit_reminder_mutation_intent(prompt: str | None) -> str:
-    intent = deterministic_reminder_intent(prompt)
-    if intent in {"update", "cancel"}:
-        return intent
-    if intent == "create" and REMINDER_EXPLICIT_CREATE_INTENT_RE.search(prompt or ""):
-        return intent
     return "none"
 
 
@@ -1796,12 +1778,19 @@ def should_guard_reminder_state_claims(
 ) -> bool:
     if reminder_tool_context is not None:
         return reminder_tool_context.intent in REMINDER_MUTATION_INTENTS
-    if route_decision is not None:
-        if route_decision.intent in REMINDER_MUTATION_INTENTS:
-            return True
-        if route_decision.reason not in REMINDER_UNAVAILABLE_ROUTE_REASONS:
-            return False
-    return explicit_reminder_mutation_intent(prompt) != "none"
+    return route_decision is not None and route_decision.intent in REMINDER_MUTATION_INTENTS
+
+
+def should_guard_specific_reminder_state_claims(
+    prompt: str | None,
+    route_decision: ToolRouteDecision | None,
+    reminder_tool_context: ReminderToolContext | None,
+) -> bool:
+    if reminder_tool_context is not None:
+        return False
+    if route_decision is not None and route_decision.reason not in REMINDER_UNAVAILABLE_ROUTE_REASONS:
+        return False
+    return deterministic_reminder_intent(prompt) in REMINDER_MUTATION_INTENTS
 
 
 def reminder_tool_guidance() -> str:
@@ -2374,6 +2363,40 @@ REMINDER_CANCEL_CLAIM_RE = re.compile(
     r")",
     re.UNICODE,
 )
+REMINDER_SPECIFIC_CREATE_CLAIM_RE = re.compile(
+    r"(?i)(?:"
+    r"\bi(?:'ll| will)\s+remind\b|"
+    r"\b(?:i(?:'ve| have)\s+)?(?:created|scheduled|saved)\s+(?:(?:a|the|this)\s+)?reminder\b|"
+    r"\breminder\s+(?:was\s+)?(?:created|scheduled|saved)\b|"
+    r"\b(?:нагадаю|напомню)\b|"
+    r"\b(?:створив|запланував)\s+(?:це\s+)?нагадування\b|"
+    r"\bнагадування\s+(?:створено|заплановано|збережено)\b|"
+    r"\b(?:создал|запланировал)\s+(?:это\s+)?напоминание\b"
+    r")",
+    re.UNICODE,
+)
+REMINDER_SPECIFIC_UPDATE_CLAIM_RE = re.compile(
+    r"(?i)(?:"
+    r"\b(?:i(?:'ve| have)\s+)?(?:updated|moved|rescheduled|changed)\s+"
+    r"(?:(?:the|this)\s+)?reminder\b|"
+    r"\breminder\s+(?:was\s+)?(?:updated|moved|rescheduled|changed)\b|"
+    r"\b(?:переніс|змінив)\s+(?:це\s+)?нагадування\b|"
+    r"\bнагадування\s+(?:перенесено|змінено)\b|"
+    r"\b(?:перенес|изменил)\s+(?:это\s+)?напоминание\b"
+    r")",
+    re.UNICODE,
+)
+REMINDER_SPECIFIC_CANCEL_CLAIM_RE = re.compile(
+    r"(?i)(?:"
+    r"\b(?:i(?:'ve| have)\s+)?(?:canceled|cancelled|deleted|removed)\s+"
+    r"(?:(?:the|this)\s+)?reminder\b|"
+    r"\breminder\s+(?:was\s+)?(?:canceled|cancelled|deleted|removed)\b|"
+    r"\b(?:скасував|видалив)\s+(?:це\s+)?нагадування\b|"
+    r"\bнагадування\s+(?:скасовано|видалено)\b|"
+    r"\b(?:отменил|удалил)\s+(?:это\s+)?напоминание\b"
+    r")",
+    re.UNICODE,
+)
 
 
 def reminder_claim_actions(output: str) -> set[str]:
@@ -2384,6 +2407,18 @@ def reminder_claim_actions(output: str) -> set[str]:
     if REMINDER_UPDATE_CLAIM_RE.search(text):
         actions.add("updated")
     if REMINDER_CANCEL_CLAIM_RE.search(text):
+        actions.add("canceled")
+    return actions
+
+
+def specific_reminder_claim_actions(output: str) -> set[str]:
+    text = output or ""
+    actions: set[str] = set()
+    if REMINDER_SPECIFIC_CREATE_CLAIM_RE.search(text):
+        actions.add("created")
+    if REMINDER_SPECIFIC_UPDATE_CLAIM_RE.search(text):
+        actions.add("updated")
+    if REMINDER_SPECIFIC_CANCEL_CLAIM_RE.search(text):
         actions.add("canceled")
     return actions
 
@@ -2405,8 +2440,17 @@ def reminder_mutation_tool_attempted(items: Sequence[Any] | None) -> bool:
     )
 
 
-def guard_reminder_state_change_claims(output: str, mutations: Sequence[dict[str, Any]] | None) -> str:
-    claimed_actions = reminder_claim_actions(output)
+def guard_reminder_state_change_claims(
+    output: str,
+    mutations: Sequence[dict[str, Any]] | None,
+    *,
+    specific_only: bool = False,
+) -> str:
+    claimed_actions = (
+        specific_reminder_claim_actions(output)
+        if specific_only
+        else reminder_claim_actions(output)
+    )
     if not claimed_actions:
         return output
     successful_actions = successful_reminder_mutation_actions(mutations)
@@ -2420,6 +2464,7 @@ def guard_reminder_state_change_claims(output: str, mutations: Sequence[dict[str
         details={
             "claimed_actions": sorted(claimed_actions),
             "successful_actions": sorted(successful_actions),
+            "claim_scope": "specific" if specific_only else "broad",
         },
     )
     if not re.search(r"[\u0400-\u04FF]", output or ""):
@@ -4638,6 +4683,7 @@ async def run_agent(
     reminder_tool_context: ReminderToolContext | None = None,
     *,
     guard_reminder_claims: bool = False,
+    guard_specific_reminder_claims: bool = False,
 ) -> str:
     started = time.monotonic()
     system_event(
@@ -4668,7 +4714,11 @@ async def run_agent(
     listed_ids_token = REMINDER_TOOL_LISTED_IDS.set(set()) if reminder_tool_context is not None else None
     mutations_token = (
         REMINDER_TOOL_MUTATIONS.set([])
-        if guard_reminder_claims or reminder_tool_context is not None
+        if (
+            guard_reminder_claims
+            or guard_specific_reminder_claims
+            or reminder_tool_context is not None
+        )
         else None
     )
     try:
@@ -4690,6 +4740,12 @@ async def run_agent(
         mutation_attempted = reminder_mutation_tool_attempted(getattr(result, "new_items", None))
         if guard_reminder_claims or mutation_attempted or bool(mutation_results):
             output = guard_reminder_state_change_claims(output, mutation_results)
+        elif guard_specific_reminder_claims:
+            output = guard_reminder_state_change_claims(
+                output,
+                mutation_results,
+                specific_only=True,
+            )
     finally:
         if mutations_token is not None:
             REMINDER_TOOL_MUTATIONS.reset(mutations_token)
@@ -8471,11 +8527,21 @@ async def handle_prompt_generation(
             tool_route_decision,
             reminder_context,
         )
-        if reminder_context is not None or guard_reminder_claims:
+        guard_specific_reminder_claims = should_guard_specific_reminder_state_claims(
+            prompt,
+            tool_route_decision,
+            reminder_context,
+        )
+        if (
+            reminder_context is not None
+            or guard_reminder_claims
+            or guard_specific_reminder_claims
+        ):
             agent_coro = run_agent(
                 agent_input,
                 reminder_tool_context=reminder_context,
                 guard_reminder_claims=guard_reminder_claims,
+                guard_specific_reminder_claims=guard_specific_reminder_claims,
             )
         else:
             agent_coro = run_agent(agent_input)

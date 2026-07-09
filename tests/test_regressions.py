@@ -886,6 +886,31 @@ class TimeContextTests(unittest.TestCase):
         self.assertIn("I can't honestly confirm", output)
         self.assertIn("reminder-tool", output)
 
+    def test_run_agent_specific_guard_blocks_named_target_without_tool_context(self) -> None:
+        class FakeMCPServer:
+            def __init__(self, *args, **kwargs) -> None:
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb) -> None:
+                return None
+
+        fake_result = SimpleNamespace(final_output="I will remind Alex tomorrow.", new_items=[])
+        with patch.object(main, "MCPServerStdio", FakeMCPServer):
+            with patch.object(main, "make_agent", return_value="agent"):
+                with patch.object(main.Runner, "run", new=AsyncMock(return_value=fake_result)):
+                    output = asyncio.run(
+                        main.run_agent(
+                            "prompt",
+                            guard_specific_reminder_claims=True,
+                        )
+                    )
+
+        self.assertIn("I can't honestly confirm", output)
+        self.assertIn("reminder-tool", output)
+
     def test_run_agent_guards_structured_mutation_attempt_in_list_context(self) -> None:
         class FakeMCPServer:
             def __init__(self, *args, **kwargs) -> None:
@@ -8797,7 +8822,7 @@ class LivingReminderTests(unittest.TestCase):
         self.assertEqual(("reminder_crud",), decision.allowed_toolsets)
         self.assertEqual("semantic_router:intent_none:contextual_override", decision.reason)
 
-    def test_reminder_claim_guard_is_enabled_for_intent_without_tools(self) -> None:
+    def test_reminder_claim_guard_scopes_intent_without_tools(self) -> None:
         denied_route = main.ToolRouteDecision(intent="none", reason="reminder_tool_disabled")
         domain_route = main.ToolRouteDecision(
             domains=("reminders",),
@@ -8815,9 +8840,16 @@ class LivingReminderTests(unittest.TestCase):
         )
         update_context = replace(list_context, intent="update")
 
-        self.assertTrue(
+        self.assertFalse(
             main.should_guard_reminder_state_claims(
                 "remind me tomorrow at 09:00 to check deploy",
+                denied_route,
+                None,
+            )
+        )
+        self.assertTrue(
+            main.should_guard_specific_reminder_state_claims(
+                "remind Alex tomorrow at 09:00 to check deploy",
                 denied_route,
                 None,
             )
@@ -8841,6 +8873,22 @@ class LivingReminderTests(unittest.TestCase):
         self.assertFalse(main.should_guard_reminder_state_claims("list my reminders", domain_route, list_context))
         self.assertTrue(main.should_guard_reminder_state_claims("update reminder #7", mutation_route, update_context))
         self.assertFalse(main.should_guard_reminder_state_claims("ordinary date mention", main.ToolRouteDecision(), None))
+
+    def test_specific_reminder_claim_guard_blocks_named_target_but_not_generic_change(self) -> None:
+        blocked = main.guard_reminder_state_change_claims(
+            "I will remind Alex tomorrow.",
+            [],
+            specific_only=True,
+        )
+        generic = "I've changed the model tier in this example."
+        unchanged = main.guard_reminder_state_change_claims(
+            generic,
+            [],
+            specific_only=True,
+        )
+
+        self.assertIn("I can't honestly confirm", blocked)
+        self.assertEqual(generic, unchanged)
 
     def test_reminder_claim_guard_does_not_rewrite_unrelated_agent_answer(self) -> None:
         route = main.ToolRouteDecision(
