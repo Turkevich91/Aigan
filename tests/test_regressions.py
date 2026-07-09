@@ -927,7 +927,7 @@ class TimeContextTests(unittest.TestCase):
             async def __aexit__(self, exc_type, exc, tb) -> None:
                 return None
 
-        answer = "I changed the display format for the reminder list."
+        answer = "I've changed the display format for the reminder list."
         reminder_context = main.ReminderToolContext(
             chat_id=-1001,
             chat_type=ChatType.SUPERGROUP,
@@ -8850,7 +8850,7 @@ class LivingReminderTests(unittest.TestCase):
             reason="semantic_router:intent_none",
         )
         prompt = "How should we schedule expensive AI agents?"
-        answer = "If you changed the model tier, compare answer quality before scaling."
+        answer = "I've changed the model tier in this example; compare answer quality before scaling."
 
         should_guard = main.should_guard_reminder_state_claims(prompt, route, None)
         actual = main.guard_reminder_state_change_claims(answer, []) if should_guard else answer
