@@ -28,6 +28,9 @@ This repository is maintained by humans and coding agents such as Codex, Google 
 - Never put secrets, `.env` contents, raw prompts, private chat text, API keys, Telegram tokens, or full user messages into GitHub issues, project cards, commits, or logs.
 - Use sanitized summaries and short redacted previews only.
 - Prefer behavior-level descriptions and reproduction notes over private payloads.
+- Treat every GitHub surface as public and durable, including issues, PRs, comments, reviews, Project fields, releases, commits, branch names, Actions output and artifacts, and edit history.
+- Before every GitHub write or push, inspect the exact outgoing text and diff for operator-private data. Do not publish `file://` URLs; machine-specific absolute Windows, Unix, UNC, or home-directory paths; OS account names; host or device names; SSH aliases; local IDE, workspace, tool, or MCP links and metadata; internal URLs; chat or user identifiers; database or media locations; raw prompts, chat, logs, terminal or browser dumps; or secrets. Replace them with repository-relative paths, canonical GitHub links, sanitized labels, redacted previews, or synthetic examples.
+- If private data reaches GitHub, stop further publishing, sanitize the current item and every accessible retained revision, then re-scan current content and history. Cleanup is incomplete while an old revision remains readable. If a revision cannot be removed, or a commit/history is affected, escalate for the appropriate history-remediation or credential-rotation decision rather than claiming completion.
 
 ## Runtime Environment
 
