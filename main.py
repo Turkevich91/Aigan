@@ -1355,6 +1355,15 @@ REMINDER_ACTION_INTENT_RE = re.compile(
     r"\bнапомни\b|\bнапомнить\b|\bне\s+забудь\b|\bзапомни\b|\bпоздравь\b"
     r")"
 )
+REMINDER_EXPLICIT_CREATE_INTENT_RE = re.compile(
+    r"(?i)(?:"
+    r"(?:^|\s)/remind\b|\bremind\s+(?:me|us|him|her|them|@[\w_]+)\b|"
+    r"\b(?:create|set|add|schedule|save)\s+(?:a\s+)?reminder\b|"
+    r"\bremember\s+to\b|\bdon['’]?t\s+forget\b|"
+    r"\bнагадай\b|\bнагадати\b|\bне\s+забудь\b|\bзапам['’]?ятай\b|\bпривітай\b|"
+    r"\bнапомни\b|\bнапомнить\b|\bне\s+забудь\b|\bзапомни\b|\bпоздравь\b"
+    r")"
+)
 REMINDER_BIRTHDAY_INTENT_RE = re.compile(
     r"(?i)(?:\bbirthday\b|\bbday\b|\bд[нр]\b|день\s+народження|день\s+рожд(?:ення|ения))"
 )
@@ -1416,6 +1425,13 @@ REMINDER_CONTEXTUAL_MUTATION_FOLLOWUP_RE = re.compile(
 TOOL_ROUTE_INTENTS = {"create", "list", "update", "cancel", "manage", "none"}
 TOOL_ROUTE_DOMAINS = {"reminders"}
 TOOL_ROUTE_TOOLSETS = {"reminder_crud"}
+REMINDER_MUTATION_INTENTS = frozenset({"create", "update", "cancel", "manage"})
+REMINDER_MUTATION_TOOL_NAMES = frozenset(
+    {"create_living_reminder", "update_living_reminder", "cancel_living_reminder"}
+)
+REMINDER_UNAVAILABLE_ROUTE_REASONS = frozenset(
+    {"missing_user_identity", "reminder_tool_disabled", "reminder_crud_disabled"}
+)
 
 
 def no_tool_route(reason: str = "") -> ToolRouteDecision:
@@ -1444,6 +1460,15 @@ def deterministic_reminder_intent(prompt: str | None) -> str:
         return "list"
     if has_living_reminder_create_intent(text):
         return "create"
+    return "none"
+
+
+def explicit_reminder_mutation_intent(prompt: str | None) -> str:
+    intent = deterministic_reminder_intent(prompt)
+    if intent in {"update", "cancel"}:
+        return intent
+    if intent == "create" and REMINDER_EXPLICIT_CREATE_INTENT_RE.search(prompt or ""):
+        return intent
     return "none"
 
 
@@ -1770,10 +1795,13 @@ def should_guard_reminder_state_claims(
     reminder_tool_context: ReminderToolContext | None,
 ) -> bool:
     if reminder_tool_context is not None:
-        return True
-    if route_decision is not None and (route_decision.intent != "none" or "reminders" in route_decision.domains):
-        return True
-    return deterministic_reminder_intent(prompt) != "none"
+        return reminder_tool_context.intent in REMINDER_MUTATION_INTENTS
+    if route_decision is not None:
+        if route_decision.intent in REMINDER_MUTATION_INTENTS:
+            return True
+        if route_decision.reason not in REMINDER_UNAVAILABLE_ROUTE_REASONS:
+            return False
+    return explicit_reminder_mutation_intent(prompt) != "none"
 
 
 def reminder_tool_guidance() -> str:
@@ -1904,10 +1932,21 @@ def remember_listed_reminder_ids(items: Sequence[Reminder]) -> None:
         listed.update(item.id for item in items)
 
 
-def record_reminder_tool_mutation(action: str, reminder_id: int) -> None:
+def record_reminder_tool_result(action: str, result: dict[str, Any]) -> None:
     mutations = REMINDER_TOOL_MUTATIONS.get()
-    if mutations is not None:
-        mutations.append({"action": action, "reminder_id": int(reminder_id)})
+    if mutations is None:
+        return
+    item: dict[str, Any] = {
+        "action": action,
+        "status": str(result.get("status") or "").strip().lower(),
+    }
+    reminder_id = result.get("reminder_id")
+    if reminder_id is not None:
+        try:
+            item["reminder_id"] = int(reminder_id)
+        except (TypeError, ValueError):
+            pass
+    mutations.append(item)
 
 
 def reminder_access_reminder(reminder_id: int) -> tuple[Reminder | None, dict[str, Any] | None]:
@@ -1992,7 +2031,6 @@ def create_living_reminder_from_tool(
             "due_at_utc_set": bool(reminder.due_at_utc),
         },
     )
-    record_reminder_tool_mutation("created", reminder.id)
     return {
         "status": "created",
         "reminder_id": reminder.id,
@@ -2045,6 +2083,7 @@ def create_living_reminder(
         confidence=confidence,
         missing_fields=missing_fields,
     )
+    record_reminder_tool_result("created", result)
     return json.dumps(result, ensure_ascii=False, sort_keys=True)
 
 
@@ -2114,7 +2153,6 @@ def cancel_living_reminder_from_tool(reminder_id: int, confidence: float = 1.0) 
         message=str(int(reminder_id)),
         details={"via": "tool", "admin": False},
     )
-    record_reminder_tool_mutation("canceled", int(reminder_id))
     return {"status": "canceled", "reminder_id": int(reminder_id)}
 
 
@@ -2135,6 +2173,7 @@ def cancel_living_reminder(reminder_id: int, confidence: float = 1.0) -> str:
     """
 
     result = cancel_living_reminder_from_tool(reminder_id=reminder_id, confidence=confidence)
+    record_reminder_tool_result("canceled", result)
     return json.dumps(result, ensure_ascii=False, sort_keys=True)
 
 
@@ -2226,7 +2265,6 @@ def update_living_reminder_from_tool(
         message=str(updated.id),
         details={"via": "tool", "updated_fields": sorted(set(updated_fields))},
     )
-    record_reminder_tool_mutation("updated", updated.id)
     return {
         "status": "updated",
         "reminder_id": updated.id,
@@ -2282,6 +2320,7 @@ def update_living_reminder(
         confidence=confidence,
         missing_fields=missing_fields,
     )
+    record_reminder_tool_result("updated", result)
     return json.dumps(result, ensure_ascii=False, sort_keys=True)
 
 
@@ -2353,9 +2392,17 @@ def successful_reminder_mutation_actions(mutations: Sequence[dict[str, Any]] | N
     actions: set[str] = set()
     for mutation in mutations or ():
         action = str(mutation.get("action") or "").strip().lower()
-        if action in {"created", "updated", "canceled"}:
+        status = str(mutation.get("status") or "").strip().lower()
+        if action in {"created", "updated", "canceled"} and status == action:
             actions.add(action)
     return actions
+
+
+def reminder_mutation_tool_attempted(items: Sequence[Any] | None) -> bool:
+    return any(
+        str(getattr(item, "tool_name", "") or "").strip() in REMINDER_MUTATION_TOOL_NAMES
+        for item in items or ()
+    )
 
 
 def guard_reminder_state_change_claims(output: str, mutations: Sequence[dict[str, Any]] | None) -> str:
@@ -4619,7 +4666,11 @@ async def run_agent(
 
     token = REMINDER_TOOL_CONTEXT.set(reminder_tool_context) if reminder_tool_context is not None else None
     listed_ids_token = REMINDER_TOOL_LISTED_IDS.set(set()) if reminder_tool_context is not None else None
-    mutations_token = REMINDER_TOOL_MUTATIONS.set([]) if guard_reminder_claims else None
+    mutations_token = (
+        REMINDER_TOOL_MUTATIONS.set([])
+        if guard_reminder_claims or reminder_tool_context is not None
+        else None
+    )
     try:
         async with web_server as web, youtube_server as youtube:
             agent = make_agent([web, youtube])
@@ -4635,8 +4686,10 @@ async def run_agent(
                 )
                 raise
         output = str(result.final_output).strip()
-        if guard_reminder_claims:
-            output = guard_reminder_state_change_claims(output, REMINDER_TOOL_MUTATIONS.get())
+        mutation_results = REMINDER_TOOL_MUTATIONS.get()
+        mutation_attempted = reminder_mutation_tool_attempted(getattr(result, "new_items", None))
+        if guard_reminder_claims or mutation_attempted or bool(mutation_results):
+            output = guard_reminder_state_change_claims(output, mutation_results)
     finally:
         if mutations_token is not None:
             REMINDER_TOOL_MUTATIONS.reset(mutations_token)

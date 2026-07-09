@@ -886,6 +886,67 @@ class TimeContextTests(unittest.TestCase):
         self.assertIn("I can't honestly confirm", output)
         self.assertIn("reminder-tool", output)
 
+    def test_run_agent_guards_structured_mutation_attempt_in_list_context(self) -> None:
+        class FakeMCPServer:
+            def __init__(self, *args, **kwargs) -> None:
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb) -> None:
+                return None
+
+        reminder_context = main.ReminderToolContext(
+            chat_id=-1001,
+            chat_type=ChatType.SUPERGROUP,
+            user_id=407892151,
+            message_id=557,
+            allowed_toolsets=("reminder_crud",),
+            intent="list",
+        )
+        fake_result = SimpleNamespace(
+            final_output="I updated reminder #1.",
+            new_items=[SimpleNamespace(tool_name="update_living_reminder")],
+        )
+        with patch.object(main, "MCPServerStdio", FakeMCPServer):
+            with patch.object(main, "make_agent", return_value="agent"):
+                with patch.object(main.Runner, "run", new=AsyncMock(return_value=fake_result)):
+                    output = asyncio.run(main.run_agent("list my reminders", reminder_context))
+
+        self.assertIn("I can't honestly confirm", output)
+
+    def test_run_agent_does_not_guard_list_only_attempt(self) -> None:
+        class FakeMCPServer:
+            def __init__(self, *args, **kwargs) -> None:
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb) -> None:
+                return None
+
+        answer = "I changed the display format for the reminder list."
+        reminder_context = main.ReminderToolContext(
+            chat_id=-1001,
+            chat_type=ChatType.SUPERGROUP,
+            user_id=407892151,
+            message_id=558,
+            allowed_toolsets=("reminder_crud",),
+            intent="list",
+        )
+        fake_result = SimpleNamespace(
+            final_output=answer,
+            new_items=[SimpleNamespace(tool_name="list_living_reminders")],
+        )
+        with patch.object(main, "MCPServerStdio", FakeMCPServer):
+            with patch.object(main, "make_agent", return_value="agent"):
+                with patch.object(main.Runner, "run", new=AsyncMock(return_value=fake_result)):
+                    output = asyncio.run(main.run_agent("list my reminders", reminder_context))
+
+        self.assertEqual(answer, output)
+
     def test_mcp_failure_message_classifies_timeout_without_raw_error(self) -> None:
         message = main.mcp_tool_failure_message(None, RuntimeError("Timed out opening https://example.com/private"))
 
@@ -8737,8 +8798,22 @@ class LivingReminderTests(unittest.TestCase):
         self.assertEqual("semantic_router:intent_none:contextual_override", decision.reason)
 
     def test_reminder_claim_guard_is_enabled_for_intent_without_tools(self) -> None:
-        denied_route = main.ToolRouteDecision(intent="none", reason="semantic_router:below_threshold")
-        domain_route = main.ToolRouteDecision(domains=("reminders",), intent="none")
+        denied_route = main.ToolRouteDecision(intent="none", reason="reminder_tool_disabled")
+        domain_route = main.ToolRouteDecision(
+            domains=("reminders",),
+            intent="none",
+            reason="semantic_router:intent_none",
+        )
+        mutation_route = main.ToolRouteDecision(domains=("reminders",), intent="update")
+        list_context = main.ReminderToolContext(
+            chat_id=-1001,
+            chat_type=ChatType.SUPERGROUP,
+            user_id=407892151,
+            message_id=557,
+            allowed_toolsets=("reminder_crud",),
+            intent="list",
+        )
+        update_context = replace(list_context, intent="update")
 
         self.assertTrue(
             main.should_guard_reminder_state_claims(
@@ -8747,8 +8822,72 @@ class LivingReminderTests(unittest.TestCase):
                 None,
             )
         )
-        self.assertTrue(main.should_guard_reminder_state_claims("ordinary date mention", domain_route, None))
+        self.assertFalse(main.should_guard_reminder_state_claims("ordinary date mention", domain_route, None))
+        self.assertFalse(
+            main.should_guard_reminder_state_claims(
+                "How should we schedule expensive AI agents?",
+                denied_route,
+                None,
+            )
+        )
+        self.assertFalse(
+            main.should_guard_reminder_state_claims(
+                "Explain how a reminder architecture works",
+                denied_route,
+                None,
+            )
+        )
+        self.assertTrue(main.should_guard_reminder_state_claims("update reminder #7", mutation_route, None))
+        self.assertFalse(main.should_guard_reminder_state_claims("list my reminders", domain_route, list_context))
+        self.assertTrue(main.should_guard_reminder_state_claims("update reminder #7", mutation_route, update_context))
         self.assertFalse(main.should_guard_reminder_state_claims("ordinary date mention", main.ToolRouteDecision(), None))
+
+    def test_reminder_claim_guard_does_not_rewrite_unrelated_agent_answer(self) -> None:
+        route = main.ToolRouteDecision(
+            domains=("reminders",),
+            intent="none",
+            allowed_toolsets=(),
+            reason="semantic_router:intent_none",
+        )
+        prompt = "How should we schedule expensive AI agents?"
+        answer = "If you changed the model tier, compare answer quality before scaling."
+
+        should_guard = main.should_guard_reminder_state_claims(prompt, route, None)
+        actual = main.guard_reminder_state_change_claims(answer, []) if should_guard else answer
+
+        self.assertFalse(should_guard)
+        self.assertEqual(answer, actual)
+
+    def test_reminder_mutation_attempt_detection_uses_structured_tool_items(self) -> None:
+        self.assertFalse(
+            main.reminder_mutation_tool_attempted(
+                [SimpleNamespace(tool_name="list_living_reminders")]
+            )
+        )
+        self.assertTrue(
+            main.reminder_mutation_tool_attempted(
+                [SimpleNamespace(tool_name="cancel_living_reminder")]
+            )
+        )
+
+    def test_reminder_tool_result_ledger_requires_success_status(self) -> None:
+        token = main.REMINDER_TOOL_MUTATIONS.set([])
+        try:
+            main.record_reminder_tool_result(
+                "created",
+                {"status": "needs_confirmation"},
+            )
+            main.record_reminder_tool_result(
+                "updated",
+                {"status": "updated", "reminder_id": 7},
+            )
+            results = list(main.REMINDER_TOOL_MUTATIONS.get() or ())
+        finally:
+            main.REMINDER_TOOL_MUTATIONS.reset(token)
+
+        self.assertEqual({"updated"}, main.successful_reminder_mutation_actions(results))
+        self.assertEqual("needs_confirmation", results[0]["status"])
+        self.assertEqual(7, results[1]["reminder_id"])
 
     def test_unconfigured_semantic_tool_router_uses_quiet_deterministic_fallback(self) -> None:
         message = FakeMessage("what reminders do I have?")
@@ -9476,11 +9615,21 @@ class LivingReminderTests(unittest.TestCase):
         self.assertIn("reminder-tool", guarded)
 
     def test_reminder_state_change_claim_guard_matches_mutation_action(self) -> None:
-        created = main.guard_reminder_state_change_claims("I will remind you tomorrow.", [{"action": "created"}])
-        mismatched = main.guard_reminder_state_change_claims("I canceled reminder #1.", [{"action": "created"}])
-        canceled = main.guard_reminder_state_change_claims("I canceled reminder #1.", [{"action": "canceled"}])
+        created = main.guard_reminder_state_change_claims(
+            "I will remind you tomorrow.", [{"action": "created", "status": "created"}]
+        )
+        failed = main.guard_reminder_state_change_claims(
+            "I will remind you tomorrow.", [{"action": "created", "status": "needs_confirmation"}]
+        )
+        mismatched = main.guard_reminder_state_change_claims(
+            "I canceled reminder #1.", [{"action": "created", "status": "created"}]
+        )
+        canceled = main.guard_reminder_state_change_claims(
+            "I canceled reminder #1.", [{"action": "canceled", "status": "canceled"}]
+        )
 
         self.assertEqual("I will remind you tomorrow.", created)
+        self.assertIn("I can't honestly confirm", failed)
         self.assertNotIn("I canceled", mismatched)
         self.assertIn("I can't honestly confirm", mismatched)
         self.assertEqual("I canceled reminder #1.", canceled)
