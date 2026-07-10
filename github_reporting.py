@@ -169,7 +169,9 @@ class GitHubReporter:
             ) from None
         except (TimeoutError, socket.timeout):
             raise GitHubReportingError("request_timeout") from None
-        except urllib.error.URLError:
+        except urllib.error.URLError as exc:
+            if isinstance(exc.reason, (TimeoutError, socket.timeout)):
+                raise GitHubReportingError("request_timeout") from None
             raise GitHubReportingError("transport_error") from None
         try:
             decoded = json.loads(raw_response.decode("utf-8"))

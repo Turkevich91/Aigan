@@ -439,7 +439,7 @@ class SystemLogStore:
         fingerprint: str,
         temperature: int,
     ) -> ComplaintReportClaim | None:
-        clean_fingerprint = sanitize_text(fingerprint, 128)
+        exact_fingerprint = str(fingerprint)
         claim_id = secrets.token_hex(16)
         attempted_at = format_datetime()
         with self._lock:
@@ -460,7 +460,7 @@ class SystemLogStore:
                         completed_at = ''
                     WHERE complaint_report_claims.state = 'retryable'
                     """,
-                    (clean_fingerprint, claim_id, attempted_at, max(1, int(temperature))),
+                    (exact_fingerprint, claim_id, attempted_at, max(1, int(temperature))),
                 )
                 if cursor.rowcount:
                     self._conn.execute(
@@ -472,7 +472,7 @@ class SystemLogStore:
                         (
                             REPORT_ATTEMPTED_SENTINEL,
                             REPORT_BLOCKING_TEMPERATURE,
-                            clean_fingerprint,
+                            exact_fingerprint,
                         ),
                     )
                 self._conn.commit()
@@ -481,13 +481,13 @@ class SystemLogStore:
                 raise
             if not cursor.rowcount:
                 return None
-            return self.get_complaint_report_claim(clean_fingerprint)
+            return self.get_complaint_report_claim(exact_fingerprint)
 
     def get_complaint_report_claim(self, fingerprint: str) -> ComplaintReportClaim | None:
         with self._lock:
             row = self._conn.execute(
                 "SELECT * FROM complaint_report_claims WHERE fingerprint = ?",
-                (sanitize_text(fingerprint, 128),),
+                (str(fingerprint),),
             ).fetchone()
         return row_to_complaint_report_claim(row) if row is not None else None
 

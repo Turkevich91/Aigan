@@ -10367,6 +10367,29 @@ class SystemHealthTests(unittest.TestCase):
         self.assertFalse(raised.exception.retry_safe)
         self.assertNotIn(canary, "".join(traceback.format_exception(raised.exception)))
 
+    def test_github_url_error_wrapping_timeout_keeps_timeout_category(self) -> None:
+        reporter = GitHubReporter(
+            enabled=True,
+            token="fine-grained-token",
+            repository="Turkevich91/Aigan",
+            project_add_enabled=False,
+            fingerprint_secret="stable-private-secret",
+        )
+        canary = "synthetic private timeout detail"
+        wrapped_timeout = urllib.error.URLError(socket.timeout(canary))
+
+        with patch("urllib.request.urlopen", side_effect=wrapped_timeout):
+            with self.assertRaises(GitHubReportingError) as raised:
+                reporter.create_self_report_issue(
+                    title="[Aigan] self-report",
+                    body="behavior-only body",
+                    dedupe_key="cluster-key",
+                )
+
+        self.assertEqual("request_timeout", raised.exception.category)
+        self.assertFalse(raised.exception.retry_safe)
+        self.assertNotIn(canary, "".join(traceback.format_exception(raised.exception)))
+
     def test_system_log_writes_reads_and_sanitizes_details(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             store = SystemLogStore(Path(tmpdir) / "health.sqlite3", retention_days=14)
@@ -10746,6 +10769,30 @@ class SystemHealthTests(unittest.TestCase):
             self.assertEqual("sent", reopened.get_complaint_report_claim("legacy-sent").state)
             self.assertEqual("unknown", reopened.get_complaint_report_claim("legacy-unknown").state)
             reopened.close()
+
+    def test_report_claim_uses_exact_internal_fingerprint_identity(self) -> None:
+        fingerprint = "  " + "sk-" + "syntheticidentity123" + "\t"
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = SystemLogStore(Path(tmpdir) / "health.sqlite3", retention_days=14)
+            cluster = store.upsert_complaint(
+                fingerprint=fingerprint,
+                category="web_search",
+                sample="private sample",
+                window_seconds=86400,
+            )
+
+            claim = store.claim_complaint_report(
+                fingerprint=cluster.fingerprint,
+                temperature=cluster.temperature,
+            )
+
+            self.assertIsNotNone(claim)
+            self.assertEqual(fingerprint, claim.fingerprint)
+            self.assertEqual(claim, store.get_complaint_report_claim(fingerprint))
+            self.assertEqual(REPORT_ATTEMPTED_SENTINEL, store.active_complaints(1)[0].github_issue_url)
+            self.assertTrue(store.release_complaint_report_claim(claim, "validation_failed"))
+            self.assertEqual("", store.active_complaints(1)[0].github_issue_url)
+            store.close()
 
     def test_retry_safe_failure_releases_claim_and_retries_once(self) -> None:
         class RetryThenSuccessReporter:
