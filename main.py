@@ -9793,7 +9793,7 @@ async def handle_prompt_generation(
         if delivered := delivered_text(delivery):
             histories[message.chat_id].append(f"Aigan: {delivered[:500]}")
             passive_contexts[message.chat_id].append(f"Aigan: {clip_text(delivered, 700)}")
-        record_chat_answer(message, prompt, route)
+            record_chat_answer(message, prompt, route)
         return
 
     tool_route_decision = await route_tool_capabilities_for_message(message, prompt)
@@ -9899,7 +9899,7 @@ async def handle_prompt_generation(
     if delivered := delivered_text(delivery):
         histories[message.chat_id].append(f"Aigan: {delivered[:500]}")
         passive_contexts[message.chat_id].append(f"Aigan: {clip_text(delivered, 700)}")
-    record_chat_answer(message, prompt, route)
+        record_chat_answer(message, prompt, route)
 
 
 def coalesced_payload_context(messages: Sequence[Message]) -> str:
@@ -10101,7 +10101,7 @@ Explain the image(s) according to the current request. Ukrainian by default; Eng
     if delivered := delivered_text(delivery):
         histories[message.chat_id].append(f"Aigan: {delivered[:500]}")
         passive_contexts[message.chat_id].append(f"Aigan: {clip_text(delivered, 700)}")
-    record_chat_answer(message, dedupe_prompt, "vision")
+        record_chat_answer(message, dedupe_prompt, "vision")
 
 
 def auto_react_due(message: Message) -> bool:

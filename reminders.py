@@ -455,32 +455,39 @@ class ReminderStore:
         with self._lock:
             rows = self._conn.execute(
                 """
-                SELECT id, reminder_id
-                FROM reminder_fires
-                WHERE status = 'claimed' AND delivery_attempted_at != ''
-                ORDER BY delivery_attempted_at ASC, id ASC
+                SELECT
+                    r.id AS r_id, r.chat_id AS r_chat_id, r.created_by_user_id AS r_created_by_user_id,
+                    r.created_from_message_id AS r_created_from_message_id, r.target_user_id AS r_target_user_id,
+                    r.target_username AS r_target_username, r.target_label AS r_target_label, r.kind AS r_kind,
+                    r.trusted_instruction AS r_trusted_instruction, r.source_message_id AS r_source_message_id,
+                    r.due_at_utc AS r_due_at_utc, r.timezone AS r_timezone, r.recurrence AS r_recurrence,
+                    r.status AS r_status, r.created_at AS r_created_at, r.updated_at AS r_updated_at,
+                    f.id AS f_id, f.reminder_id AS f_reminder_id, f.scheduled_for_utc AS f_scheduled_for_utc,
+                    f.idempotency_key AS f_idempotency_key, f.status AS f_status, f.claimed_at AS f_claimed_at,
+                    f.completed_at AS f_completed_at, f.attempt_count AS f_attempt_count,
+                    f.sent_message_id AS f_sent_message_id, f.failure_category AS f_failure_category,
+                    f.delivery_revision AS f_delivery_revision,
+                    f.delivery_attempted_at AS f_delivery_attempted_at,
+                    f.delivery_kind AS f_delivery_kind,
+                    f.created_at AS f_created_at, f.updated_at AS f_updated_at
+                FROM reminder_fires f
+                JOIN reminders r ON r.id = f.reminder_id
+                WHERE f.status = 'claimed' AND f.delivery_attempted_at != ''
+                ORDER BY f.delivery_attempted_at ASC, f.id ASC
                 LIMIT ?
                 """,
                 (max(1, int(limit)),),
             ).fetchall()
-            attempts: list[ClaimedReminderFire] = []
-            for row in rows:
-                reminder_row = self._conn.execute(
-                    "SELECT * FROM reminders WHERE id = ?",
-                    (int(row["reminder_id"]),),
-                ).fetchone()
-                fire_row = self._conn.execute(
-                    "SELECT * FROM reminder_fires WHERE id = ?",
-                    (int(row["id"]),),
-                ).fetchone()
-                if reminder_row is not None and fire_row is not None:
-                    attempts.append(
-                        ClaimedReminderFire(
-                            reminder=row_to_reminder(reminder_row),
-                            fire=row_to_fire(fire_row),
-                        )
-                    )
-        return attempts
+        return [
+            row_to_claim(
+                row,
+                status=str(row["f_status"]),
+                claimed_at=str(row["f_claimed_at"] or ""),
+                increment_attempt=False,
+                updated_at=str(row["f_updated_at"]),
+            )
+            for row in rows
+        ]
 
     def mark_delivery_attempted(
         self,
@@ -1074,7 +1081,14 @@ def row_to_fire(row: sqlite3.Row) -> ReminderFire:
     )
 
 
-def row_to_claim(row: sqlite3.Row, *, status: str, claimed_at: str) -> ClaimedReminderFire:
+def row_to_claim(
+    row: sqlite3.Row,
+    *,
+    status: str,
+    claimed_at: str,
+    increment_attempt: bool = True,
+    updated_at: str | None = None,
+) -> ClaimedReminderFire:
     reminder_values = {
         "id": row["r_id"],
         "chat_id": row["r_chat_id"],
@@ -1101,14 +1115,14 @@ def row_to_claim(row: sqlite3.Row, *, status: str, claimed_at: str) -> ClaimedRe
         "status": status,
         "claimed_at": claimed_at,
         "completed_at": row["f_completed_at"],
-        "attempt_count": int(row["f_attempt_count"] or 0) + 1,
+        "attempt_count": int(row["f_attempt_count"] or 0) + int(increment_attempt),
         "sent_message_id": row["f_sent_message_id"],
         "failure_category": row["f_failure_category"],
         "delivery_revision": int(row["f_delivery_revision"] or 0),
         "delivery_attempted_at": row["f_delivery_attempted_at"],
         "delivery_kind": row["f_delivery_kind"],
         "created_at": row["f_created_at"],
-        "updated_at": claimed_at,
+        "updated_at": updated_at or claimed_at,
     }
     return ClaimedReminderFire(
         reminder=Reminder(**reminder_values),

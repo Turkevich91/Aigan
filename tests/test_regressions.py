@@ -2769,6 +2769,7 @@ class OutboundIdentityAndProvenanceTests(unittest.TestCase):
         main.MEMORY.clear_all()
         main.histories.clear()
         main.passive_contexts.clear()
+        main.recent_chat_answers.clear()
         if main.REACTION_MEMORY is not None:
             main.REACTION_MEMORY.clear_all()
         if main.SYSTEM_LOG is not None:
@@ -2965,6 +2966,122 @@ class OutboundIdentityAndProvenanceTests(unittest.TestCase):
         passive = main.passive_contexts[message.chat_id][-1]
         self.assertNotIn(response, passive)
         self.assertNotIn("B" * 80, passive)
+        records = main.recent_chat_answers[message.chat_id]
+        self.assertEqual(1, len(records))
+        self.assertEqual("translate_reference", records[0].route)
+
+    def test_ambiguous_translation_delivery_does_not_mark_prompt_answered(self) -> None:
+        message = FakeMessage("translate this", message_id=2815)
+        context = SimpleNamespace(bot=message.bot)
+        presence = SimpleNamespace(start=AsyncMock(), stop=AsyncMock())
+        ambiguous = main.TextDeliveryResult((), False, 1, (), ambiguous=True)
+
+        with patch.object(main, "maybe_resolve_reminder_context_response", new=AsyncMock(return_value=False)):
+            with patch.object(
+                main,
+                "classify_request_with_intent",
+                new=AsyncMock(return_value=("translate_reference", None)),
+            ):
+                with patch.object(main, "activity_presence_for_message", return_value=presence):
+                    with patch.object(main, "send_activity_action", new=AsyncMock()):
+                        with patch.object(main, "run_agent_for_outbound", new=AsyncMock(return_value="answer")):
+                            with patch.object(main, "send_reply", new=AsyncMock(return_value=ambiguous)):
+                                with patch.object(main, "record_chat_answer") as record_answer:
+                                    asyncio.run(
+                                        main.handle_prompt_generation(
+                                            message,
+                                            context,
+                                            message.text,
+                                            allow_pending_wait=False,
+                                            skip_cooldown=True,
+                                        )
+                                    )
+
+        record_answer.assert_not_called()
+
+    def test_ambiguous_normal_delivery_does_not_mark_prompt_answered(self) -> None:
+        message = FakeMessage("answer this", message_id=2816)
+        context = SimpleNamespace(bot=message.bot)
+        presence = SimpleNamespace(start=AsyncMock(), stop=AsyncMock())
+        ambiguous = main.TextDeliveryResult((), False, 1, (), ambiguous=True)
+        memory_stats = main.MemoryContextCompilationStats(
+            duplicate_items=0,
+            budget_dropped_items=0,
+            selected_item_ids=frozenset(),
+        )
+
+        with patch.object(main, "maybe_resolve_reminder_context_response", new=AsyncMock(return_value=False)):
+            with patch.object(
+                main,
+                "classify_request_with_intent",
+                new=AsyncMock(return_value=("normal", None)),
+            ):
+                with patch.object(
+                    main,
+                    "route_tool_capabilities_for_message",
+                    new=AsyncMock(return_value=main.no_tool_route("test")),
+                ):
+                    with patch.object(main, "activity_presence_for_message", return_value=presence):
+                        with patch.object(main, "send_activity_action", new=AsyncMock()):
+                            with patch.object(main, "maybe_prefetch_web_context", new=AsyncMock(return_value=None)):
+                                with patch.object(
+                                    main,
+                                    "prepare_agent_memory_context",
+                                    new=AsyncMock(return_value=("(memory)", "(not active)", memory_stats)),
+                                ):
+                                    with patch.object(
+                                        main,
+                                        "prepare_semantic_memory_context",
+                                        new=AsyncMock(return_value=None),
+                                    ):
+                                        with patch.object(
+                                            main,
+                                            "run_agent_for_outbound",
+                                            new=AsyncMock(return_value="answer"),
+                                        ):
+                                            with patch.object(
+                                                main,
+                                                "send_reply",
+                                                new=AsyncMock(return_value=ambiguous),
+                                            ):
+                                                with patch.object(main, "record_chat_answer") as record_answer:
+                                                    asyncio.run(
+                                                        main.handle_prompt_generation(
+                                                            message,
+                                                            context,
+                                                            message.text,
+                                                            allow_pending_wait=False,
+                                                            skip_cooldown=True,
+                                                        )
+                                                    )
+
+        record_answer.assert_not_called()
+
+    def test_ambiguous_vision_delivery_does_not_mark_prompt_answered(self) -> None:
+        message = FakeMessage("describe this", message_id=2817)
+        context_message = FakeMessage("source", message_id=2818)
+        presence = SimpleNamespace(start=AsyncMock(), stop=AsyncMock())
+        ambiguous = main.TextDeliveryResult((), False, 1, (), ambiguous=True)
+
+        with patch.object(main, "MEMORY", None):
+            with patch.object(main, "activity_presence_for_message", return_value=presence):
+                with patch.object(main, "extract_image_data_urls", new=AsyncMock(return_value=["data:image/jpeg;base64,AA=="])):
+                    with patch.object(main, "prepare_memory_context", new=AsyncMock(return_value="(memory)")):
+                        with patch.object(main, "run_vision", new=AsyncMock(return_value="vision answer")):
+                            with patch.object(main, "send_reply", new=AsyncMock(return_value=ambiguous)):
+                                with patch.object(main, "record_chat_answer") as record_answer:
+                                    asyncio.run(
+                                        main.handle_image_prompt_generation(
+                                            message,
+                                            message.text,
+                                            (message,),
+                                            (context_message,),
+                                            "vision-dedupe-key",
+                                            skip_cooldown=True,
+                                        )
+                                    )
+
+        record_answer.assert_not_called()
 
     def test_provenance_failure_after_send_never_resends(self) -> None:
         message = FakeMessage("trigger", message_id=2803)
@@ -10976,6 +11093,33 @@ class LivingReminderTests(unittest.TestCase):
         self.assertEqual(0, fire.delivery_revision)
         self.assertEqual("", fire.delivery_attempted_at)
         self.assertEqual("", fire.delivery_kind)
+
+    def test_delivery_attempts_load_multiple_rows_with_one_join_query(self) -> None:
+        self.create_due_reminder()
+        self.create_due_reminder()
+        claimed = main.REMINDERS.claim_due_fires(limit=2, misfire_grace_seconds=86400)
+        self.assertEqual(2, len(claimed))
+        for item in claimed:
+            self.assertTrue(
+                main.REMINDERS.mark_delivery_attempted(
+                    item.fire.id,
+                    expected_claimed_at=item.fire.claimed_at,
+                    delivery_kind="reminder_delivery",
+                )
+            )
+
+        queries: list[str] = []
+        main.REMINDERS._conn.set_trace_callback(queries.append)
+        try:
+            attempts = main.REMINDERS.delivery_attempts(limit=20)
+        finally:
+            main.REMINDERS._conn.set_trace_callback(None)
+
+        selects = [query for query in queries if query.lstrip().upper().startswith("SELECT")]
+        self.assertEqual(2, len(attempts))
+        self.assertEqual([1, 1], [item.fire.attempt_count for item in attempts])
+        self.assertEqual(1, len(selects))
+        self.assertIn("JOIN reminders", selects[0])
 
     def test_reminder_store_claims_due_fire_once_and_survives_reopen(self) -> None:
         self.create_due_reminder()
