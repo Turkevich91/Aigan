@@ -419,8 +419,13 @@ class PendingFlowTests(unittest.TestCase):
         self.assertIn((message.chat_id, message.from_user.id), main.pending_requests)
 
     def test_existing_pending_is_consumed_by_next_message(self) -> None:
-        request = FakeMessage("поясни")
-        followup = FakeMessage("forwarded payload")
+        timestamp = datetime(2026, 7, 1, 11, 0, tzinfo=timezone.utc)
+        request = FakeMessage("поясни", message_id=410)
+        followup = FakeMessage("forwarded payload", message_id=411)
+        request.date = timestamp
+        followup.date = timestamp
+        followup.forward_date = timestamp - timedelta(hours=1)
+        followup.forward_origin = SimpleNamespace(type="channel")
         main.store_pending_request(request, "поясни", "context")
 
         with patch.object(main, "handle_prompt", new=AsyncMock()) as handle_prompt:
@@ -442,9 +447,11 @@ class PendingFlowTests(unittest.TestCase):
             with patch.object(main, "handle_prompt", new=AsyncMock()) as handle_prompt:
                 asyncio.run(main.resolve_pending_after_debounce(message, SimpleNamespace(), "поясни", token))
 
-        sleep.assert_awaited_once_with(0.5)
+        sleep.assert_awaited_once()
+        self.assertGreaterEqual(sleep.await_args.args[0], main.CONFIG.followup_debounce_seconds)
+        self.assertLessEqual(sleep.await_args.args[0], main.pending_coalesce_window_seconds())
         handle_prompt.assert_awaited_once_with(message, ANY, "поясни", allow_pending_wait=False)
-        self.assertTrue(main.has_pending_request(message))
+        self.assertFalse(main.has_pending_request(message))
 
     def test_followup_during_debounce_suppresses_original_prompt(self) -> None:
         message = FakeMessage("поясни")
@@ -620,8 +627,11 @@ class PendingFlowTests(unittest.TestCase):
         self.assertNotIn("frame extraction", message.reply_calls[-1]["text"])
 
     def test_pending_followup_with_video_uses_agent_context_not_frames(self) -> None:
-        request = FakeMessage("what is this?")
+        timestamp = datetime(2026, 7, 1, 11, 1, tzinfo=timezone.utc)
+        request = FakeMessage("what is this?", message_id=432)
         followup = FakeMessage("", message_id=433)
+        request.date = timestamp
+        followup.date = timestamp
         followup.video = FakeVideo()
         main.store_pending_request(request, "what is this?", "context")
 
@@ -881,6 +891,50 @@ class TelegramTurnCoalescingTests(unittest.TestCase):
         self.assertEqual(prompt, prompt_dispatch.await_args.args[2])
         self.assertEqual(1, len(text_part.reply_calls) + len(forward_part.reply_calls))
 
+    def test_text_forward_and_photo_wait_for_one_complete_vision_turn(self) -> None:
+        timestamp = datetime(2026, 7, 1, 12, 1, tzinfo=timezone.utc)
+        prompt = "Assess the following source and the next photo together."
+        text_part = FakeMessage(
+            prompt,
+            chat_type=ChatType.PRIVATE,
+            chat_id=407892151,
+            message_id=12013,
+        )
+        forward_part = FakeMessage(
+            "Sanitized forwarded source claim.",
+            chat_type=ChatType.PRIVATE,
+            chat_id=407892151,
+            message_id=12014,
+        )
+        photo_part = FakeMessage(
+            "",
+            chat_type=ChatType.PRIVATE,
+            chat_id=407892151,
+            message_id=12015,
+        )
+        for part in (text_part, forward_part, photo_part):
+            part.date = timestamp
+        forward_part.forward_date = timestamp - timedelta(hours=1)
+        forward_part.forward_origin = SimpleNamespace(type="channel")
+        photo_part.photo = [FakePhoto(file_id="three-part-photo", unique_id="three-part-unique")]
+        context = self.prompt_context(FakeApplication())
+        prompt_dispatch = AsyncMock(side_effect=self.reply_from_prompt)
+        image_dispatch = AsyncMock(side_effect=self.reply_from_image)
+        patches = self.ingress_patches(prompt_dispatch, image_dispatch)
+
+        with patches[0], patches[1], patches[2], patches[3]:
+            asyncio.run(self.deliver_parts((text_part, forward_part, photo_part), context))
+
+        prompt_dispatch.assert_not_awaited()
+        image_dispatch.assert_awaited_once()
+        self.assertIs(photo_part, image_dispatch.await_args.args[0])
+        self.assertEqual(prompt, image_dispatch.await_args.args[1])
+        self.assertEqual([forward_part], image_dispatch.await_args.kwargs["context_messages"])
+        self.assertEqual(
+            1,
+            len(text_part.reply_calls) + len(forward_part.reply_calls) + len(photo_part.reply_calls),
+        )
+
     def test_resolved_pending_is_removed_before_dispatch_and_cannot_capture_unrelated_message(self) -> None:
         request = FakeMessage("поясни", message_id=12021)
         unrelated = FakeMessage("нова незалежна тема", message_id=12022)
@@ -1012,6 +1066,52 @@ class TelegramTurnCoalescingTests(unittest.TestCase):
         self.assertEqual(prompt, image_dispatch.await_args.args[1])
         self.assertEqual(1, len(text_part.reply_calls) + len(photo_part.reply_calls))
 
+    def test_resolver_waits_for_full_coalescing_window_not_shorter_debounce(self) -> None:
+        timestamp = datetime(2026, 7, 1, 12, 3, tzinfo=timezone.utc)
+        prompt = "Assess the device shown in the next photo."
+        text_part = FakeMessage(
+            prompt,
+            chat_type=ChatType.PRIVATE,
+            chat_id=407892151,
+            message_id=12043,
+        )
+        photo_part = FakeMessage(
+            "",
+            chat_type=ChatType.PRIVATE,
+            chat_id=407892151,
+            message_id=12044,
+        )
+        text_part.date = timestamp
+        photo_part.date = timestamp
+        photo_part.photo = [FakePhoto(file_id="late-photo", unique_id="late-photo-unique")]
+        application = FakeApplication()
+        context = self.prompt_context(application)
+        prompt_dispatch = AsyncMock(side_effect=self.reply_from_prompt)
+        image_dispatch = AsyncMock(side_effect=self.reply_from_image)
+        patches = self.ingress_patches(prompt_dispatch, image_dispatch)
+
+        async def scenario() -> None:
+            with patches[0], patches[1], patches[2], patches[3]:
+                with patch.object(
+                    main,
+                    "CONFIG",
+                    replace(main.CONFIG, followup_debounce_seconds=0.02),
+                ):
+                    with patch.object(main, "pending_coalesce_window_seconds", return_value=0.15):
+                        await main.text_message(SimpleNamespace(effective_message=text_part), context)
+                        # This arrives after the legacy 20 ms debounce but
+                        # before the declared 150 ms coalescing deadline.
+                        await asyncio.sleep(0.06)
+                        await main.text_message(SimpleNamespace(effective_message=photo_part), context)
+                        await application.drain()
+
+        asyncio.run(scenario())
+
+        prompt_dispatch.assert_not_awaited()
+        image_dispatch.assert_awaited_once()
+        self.assertEqual(prompt, image_dispatch.await_args.args[1])
+        self.assertEqual(1, len(text_part.reply_calls) + len(photo_part.reply_calls))
+
     def test_same_second_text_and_photo_with_different_reply_targets_are_not_merged(self) -> None:
         timestamp = datetime(2026, 7, 1, 12, 4, tzinfo=timezone.utc)
         text_part = FakeMessage(
@@ -1046,6 +1146,1179 @@ class TelegramTurnCoalescingTests(unittest.TestCase):
         self.assertIs(photo_part, image_dispatch.await_args.args[0])
         self.assertEqual(2, len(text_part.reply_calls) + len(photo_part.reply_calls))
 
+    def test_media_group_aggregates_every_image_into_one_vision_run(self) -> None:
+        timestamp = datetime(2026, 7, 1, 12, 5, tzinfo=timezone.utc)
+        prompt = "Compare the images in the next attachment."
+        invocation = FakeMessage(
+            prompt,
+            chat_type=ChatType.PRIVATE,
+            chat_id=407892151,
+            message_id=12061,
+        )
+        first_photo = FakeMessage(
+            "",
+            chat_type=ChatType.PRIVATE,
+            chat_id=407892151,
+            message_id=12062,
+        )
+        second_photo = FakeMessage(
+            "",
+            chat_type=ChatType.PRIVATE,
+            chat_id=407892151,
+            message_id=12063,
+        )
+        for message in (invocation, first_photo, second_photo):
+            message.date = timestamp
+        first_photo.media_group_id = "album-123"
+        second_photo.media_group_id = "album-123"
+        first_photo.photo = [FakePhoto(file_id="album-photo-a", unique_id="album-unique-a")]
+        second_photo.photo = [FakePhoto(file_id="album-photo-b", unique_id="album-unique-b")]
+        application = FakeApplication()
+        context = self.prompt_context(application)
+        persistence = AsyncMock()
+        prompt_dispatch = AsyncMock()
+        run_vision = AsyncMock(return_value="combined album answer")
+        presence = SimpleNamespace(start=AsyncMock(), stop=AsyncMock())
+
+        async def image_urls(message) -> list[str]:
+            return [f"data:image/jpeg;base64,{message.message_id}"]
+
+        with patch.object(main, "remember_message_persistently", new=persistence):
+            with patch.object(main, "remember_self_complaint_signal", return_value=None):
+                with patch.object(main, "handle_prompt", new=prompt_dispatch):
+                    with patch.object(main, "activity_presence_for_message", return_value=presence):
+                        with patch.object(main, "extract_image_data_urls", new=AsyncMock(side_effect=image_urls)):
+                            with patch.object(main, "prepare_memory_context", new=AsyncMock(return_value="(memory)")):
+                                with patch.object(main, "run_vision", new=run_vision):
+                                    with patch.object(main, "MEMORY", None):
+                                        asyncio.run(
+                                            self.deliver_parts(
+                                                (invocation, first_photo, second_photo),
+                                                context,
+                                            )
+                                        )
+
+        prompt_dispatch.assert_not_awaited()
+        run_vision.assert_awaited_once()
+        vision_prompt, image_data_urls = run_vision.await_args.args
+        self.assertIn(prompt, vision_prompt)
+        self.assertIn("Image parts in this Telegram turn: 2", vision_prompt)
+        self.assertEqual(
+            [
+                "data:image/jpeg;base64,12062",
+                "data:image/jpeg;base64,12063",
+            ],
+            image_data_urls,
+        )
+        self.assertEqual(3, persistence.await_count)
+        self.assertEqual(
+            1,
+            len(invocation.reply_calls) + len(first_photo.reply_calls) + len(second_photo.reply_calls),
+        )
+
+    def test_direct_image_and_text_generation_share_one_chat_lock(self) -> None:
+        text_message = FakeMessage(
+            "Give one concise architecture answer.",
+            chat_type=ChatType.PRIVATE,
+            chat_id=407892151,
+            message_id=12071,
+        )
+        image_message = FakeMessage(
+            "",
+            chat_type=ChatType.PRIVATE,
+            chat_id=407892151,
+            message_id=12072,
+        )
+        image_message.photo = [FakePhoto(file_id="lock-photo", unique_id="lock-photo-unique")]
+        context = self.prompt_context(FakeApplication())
+        events = []
+
+        async def scenario() -> bool:
+            text_started = asyncio.Event()
+            release_text = asyncio.Event()
+            image_started = asyncio.Event()
+
+            async def generate_text(*args, **kwargs) -> None:
+                events.append("text_start")
+                text_started.set()
+                await release_text.wait()
+                events.append("text_end")
+
+            async def generate_image(*args, **kwargs) -> None:
+                events.append("image_start")
+                image_started.set()
+                events.append("image_end")
+
+            with patch.object(main, "handle_prompt_generation", new=AsyncMock(side_effect=generate_text)):
+                with patch.object(
+                    main,
+                    "handle_image_prompt_generation",
+                    new=AsyncMock(side_effect=generate_image),
+                ):
+                    text_task = asyncio.create_task(
+                        main.handle_prompt(
+                            text_message,
+                            context,
+                            text_message.text,
+                            allow_pending_wait=False,
+                        )
+                    )
+                    await text_started.wait()
+                    image_task = asyncio.create_task(
+                        main.handle_image_prompt(image_message, "Describe this image.")
+                    )
+                    await asyncio.sleep(0)
+                    overlapped = image_started.is_set()
+                    release_text.set()
+                    await asyncio.gather(text_task, image_task)
+                    return overlapped
+
+        overlapped = asyncio.run(scenario())
+
+        self.assertFalse(overlapped)
+        self.assertEqual(["text_start", "text_end", "image_start", "image_end"], events)
+
+    def test_image_dedupe_uses_unique_id_not_prompt_alone(self) -> None:
+        prompt = "Describe this image."
+        first = FakeMessage("", chat_type=ChatType.PRIVATE, chat_id=407892151, message_id=12081)
+        duplicate = FakeMessage("", chat_type=ChatType.PRIVATE, chat_id=407892151, message_id=12082)
+        distinct = FakeMessage("", chat_type=ChatType.PRIVATE, chat_id=407892151, message_id=12083)
+        first.photo = [FakePhoto(file_id="image-a-1", unique_id="image-unique-a")]
+        duplicate.photo = [FakePhoto(file_id="image-a-2", unique_id="image-unique-a")]
+        distinct.photo = [FakePhoto(file_id="image-b-1", unique_id="image-unique-b")]
+        generated_messages = []
+
+        async def generate(message, _prompt, _parts, _context_parts, dedupe_prompt, **kwargs) -> None:
+            generated_messages.append(message)
+            main.record_chat_answer(message, dedupe_prompt, "vision")
+
+        generation = AsyncMock(side_effect=generate)
+
+        async def scenario() -> None:
+            with patch.object(main, "handle_image_prompt_generation", new=generation):
+                await main.handle_image_prompt(first, prompt)
+                await main.handle_image_prompt(duplicate, prompt)
+                await main.handle_image_prompt(distinct, prompt)
+
+        asyncio.run(scenario())
+
+        self.assertEqual([first, distinct], generated_messages)
+        self.assertEqual(2, generation.await_count)
+
+    def test_image_exact_dedupe_preserves_materially_different_urls(self) -> None:
+        first = FakeMessage("", chat_type=ChatType.PRIVATE, chat_id=407892151, message_id=12084)
+        second = FakeMessage("", chat_type=ChatType.PRIVATE, chat_id=407892151, message_id=12085)
+        first.photo = [FakePhoto(file_id="url-photo-a", unique_id="url-photo-unique")]
+        second.photo = [FakePhoto(file_id="url-photo-b", unique_id="url-photo-unique")]
+        prompts = (
+            "Compare this with https://example.com/first",
+            "Compare this with https://example.org/second",
+        )
+
+        async def generate(message, _prompt, _parts, _context_parts, dedupe_prompt, **kwargs) -> None:
+            main.record_chat_answer(message, dedupe_prompt, "vision")
+
+        generation = AsyncMock(side_effect=generate)
+
+        async def scenario() -> None:
+            with patch.object(main, "handle_image_prompt_generation", new=generation):
+                await main.handle_image_prompt(first, prompts[0])
+                await main.handle_image_prompt(second, prompts[1])
+
+        asyncio.run(scenario())
+
+        self.assertEqual(2, generation.await_count)
+
+    def test_text_dedupe_keeps_same_prompt_with_different_forward_context(self) -> None:
+        prompt = "Explain this."
+        timestamp = datetime(2026, 7, 1, 12, 5, tzinfo=timezone.utc)
+        first = FakeMessage("first sanitized source", message_id=12088)
+        second = FakeMessage("second sanitized source", message_id=12089)
+        duplicate = FakeMessage("first sanitized source", message_id=12090)
+        for message in (first, second, duplicate):
+            message.date = timestamp
+            message.forward_date = timestamp - timedelta(hours=1)
+            message.forward_origin = SimpleNamespace(type="channel")
+
+        main.record_chat_answer(first, prompt, "normal")
+
+        self.assertEqual("", main.duplicate_prompt_reason(second, prompt))
+        self.assertEqual("exact_prompt", main.duplicate_prompt_reason(duplicate, prompt))
+
+    def test_concurrent_identical_image_is_suppressed_after_chat_lock(self) -> None:
+        prompt = "Describe this image."
+        first = FakeMessage("", chat_type=ChatType.PRIVATE, chat_id=407892151, message_id=12086)
+        duplicate = FakeMessage("", chat_type=ChatType.PRIVATE, chat_id=407892151, message_id=12087)
+        first.photo = [FakePhoto(file_id="concurrent-a", unique_id="concurrent-unique")]
+        duplicate.photo = [FakePhoto(file_id="concurrent-b", unique_id="concurrent-unique")]
+        first_started = asyncio.Event()
+        release_first = asyncio.Event()
+
+        async def generate(message, _prompt, _parts, _context_parts, dedupe_prompt, **kwargs) -> None:
+            first_started.set()
+            await release_first.wait()
+            main.record_chat_answer(message, dedupe_prompt, "vision")
+
+        generation = AsyncMock(side_effect=generate)
+
+        async def scenario() -> None:
+            with patch.object(main, "handle_image_prompt_generation", new=generation):
+                first_task = asyncio.create_task(main.handle_image_prompt(first, prompt))
+                await first_started.wait()
+                duplicate_task = asyncio.create_task(main.handle_image_prompt(duplicate, prompt))
+                await asyncio.sleep(0)
+                release_first.set()
+                await asyncio.gather(first_task, duplicate_task)
+
+        asyncio.run(scenario())
+
+        generation.assert_awaited_once()
+
+    def test_image_failure_produces_one_user_visible_fallback(self) -> None:
+        message = FakeMessage(
+            "",
+            chat_type=ChatType.PRIVATE,
+            chat_id=407892151,
+            message_id=12091,
+        )
+        message.photo = [FakePhoto(file_id="broken-photo", unique_id="broken-photo-unique")]
+        presence = SimpleNamespace(start=AsyncMock(), stop=AsyncMock())
+
+        with patch.object(main, "activity_presence_for_message", return_value=presence):
+            with patch.object(
+                main,
+                "extract_image_data_urls",
+                new=AsyncMock(return_value=["data:image/jpeg;base64,broken"]),
+            ):
+                with patch.object(main, "prepare_memory_context", new=AsyncMock(return_value="(memory)")):
+                    with patch.object(main, "run_vision", new=AsyncMock(side_effect=RuntimeError("vision failed"))):
+                        asyncio.run(main.handle_image_prompt(message, "Describe this image."))
+
+        self.assertEqual(1, len(message.reply_calls))
+        self.assertIn("Не зміг проаналізувати зображення", message.reply_calls[0]["text"])
+        presence.start.assert_awaited_once()
+        presence.stop.assert_awaited_once()
+
+    def test_mismatched_sender_date_or_reply_target_cannot_consume_pending(self) -> None:
+        timestamp = datetime(2026, 7, 1, 12, 6, tzinfo=timezone.utc)
+
+        for mismatch in ("sender", "date", "reply"):
+            with self.subTest(mismatch=mismatch):
+                main.pending_requests.clear()
+                request = FakeMessage("explain the next source", message_id=12101)
+                payload = FakeMessage("forwarded source", message_id=12102)
+                request.date = timestamp
+                payload.date = timestamp
+                payload.forward_date = timestamp - timedelta(hours=1)
+                payload.forward_origin = SimpleNamespace(type="channel")
+                if mismatch == "sender":
+                    payload.from_user = FakeUser(user_id=999001, username="other")
+                elif mismatch == "date":
+                    payload.date = timestamp + timedelta(seconds=3)
+                else:
+                    request.reply_to_message = FakeMessage("first target", message_id=12201)
+                    payload.reply_to_message = FakeMessage("other target", message_id=12202)
+
+                token = main.store_pending_request(
+                    request,
+                    request.text,
+                    "same_turn_payload",
+                    role="invocation",
+                )
+                self.assertIsNotNone(token)
+                prompt_dispatch = AsyncMock()
+                image_dispatch = AsyncMock()
+                with patch.object(main, "handle_prompt", new=prompt_dispatch):
+                    with patch.object(main, "handle_image_prompt", new=image_dispatch):
+                        with patch.object(main, "maybe_auto_react", new=AsyncMock()):
+                            consumed = asyncio.run(
+                                main.handle_pending_or_observe(payload, SimpleNamespace())
+                            )
+
+                self.assertFalse(consumed)
+                prompt_dispatch.assert_not_awaited()
+                image_dispatch.assert_not_awaited()
+                self.assertTrue(main.has_pending_request(request))
+
+    def test_self_contained_prompt_does_not_reference_adjacent_payload(self) -> None:
+        timestamp = datetime(2026, 7, 1, 12, 6, tzinfo=timezone.utc)
+        cases = (
+            ("How does image compression work?", "image"),
+            ("Translate hello to Ukrainian", "translate"),
+            ("Translate this sentence: Hello world", "inline_translation"),
+            ("Explain quantum mechanics", "explain"),
+            ("It is raining today; should I take an umbrella?", "pronoun_statement"),
+        )
+
+        for prompt, label in cases:
+            with self.subTest(label=label):
+                main.pending_requests.clear()
+                self.assertFalse(main.is_explicit_payload_reference_request(prompt))
+                self.assertFalse(main.is_context_dependent_request(prompt))
+                forwarded = FakeMessage("sanitized source", message_id=12103)
+                invocation = FakeMessage(prompt, message_id=12104)
+                forwarded.date = timestamp
+                invocation.date = timestamp
+                forwarded.forward_date = timestamp - timedelta(hours=1)
+                forwarded.forward_origin = SimpleNamespace(type="channel")
+
+                token = main.store_pending_request(
+                    forwarded,
+                    main.DEFAULT_CONTEXT_PROMPT,
+                    "forwarded_payload",
+                    role="payload",
+                    payload_messages=(forwarded,),
+                )
+                self.assertIsNotNone(token)
+                self.assertIsNone(main.claim_correlated_pending_request(invocation))
+                self.assertTrue(main.has_pending_request(forwarded))
+
+                main.pending_requests.clear()
+                photo = FakeMessage("", message_id=12105)
+                photo.date = timestamp
+                photo.photo = [FakePhoto(file_id=f"{label}-photo", unique_id=f"{label}-unique")]
+                token = main.store_pending_request(
+                    invocation,
+                    prompt,
+                    "image" if label == "image" else "context",
+                    role="invocation",
+                )
+                self.assertIsNotNone(token)
+                self.assertIsNone(main.claim_correlated_pending_request(photo))
+                self.assertTrue(main.has_pending_request(invocation))
+
+    def test_explicit_ukrainian_payload_requests_remain_correlatable(self) -> None:
+        self.assertTrue(main.is_explicit_payload_reference_request("Переклади повідомлення"))
+        self.assertTrue(main.is_explicit_payload_reference_request("Що на фото?"))
+        self.assertTrue(main.is_explicit_payload_reference_request("Поясни це"))
+        self.assertTrue(main.is_explicit_payload_reference_request("Хто це?"))
+        self.assertTrue(main.is_explicit_payload_reference_request("Who is this?"))
+        self.assertTrue(main.is_explicit_payload_reference_request("Це правда?"))
+        self.assertTrue(main.is_explicit_payload_reference_request("Is this real?"))
+        self.assertTrue(main.is_explicit_payload_reference_request("Переклади це українською"))
+        self.assertTrue(main.is_explicit_payload_reference_request("Переклади повідомлення англійською"))
+        self.assertTrue(main.is_explicit_payload_reference_request("Переклади українською"))
+        self.assertTrue(main.is_explicit_payload_reference_request("Переклади, будь ласка, українською"))
+        self.assertTrue(main.is_explicit_payload_reference_request("Translate this, please"))
+        self.assertTrue(main.is_explicit_payload_reference_request("Переклади це, будь ласка"))
+
+        timestamp = datetime(2026, 7, 1, 12, 6, tzinfo=timezone.utc)
+        reference_prompts = (
+            "Хто це?",
+            "Who is this?",
+            "Це правда?",
+            "Is this real?",
+            "Переклади це українською",
+            "Переклади повідомлення англійською",
+            "Переклади українською",
+            "Переклади, будь ласка, українською",
+            "Translate this, please",
+            "Переклади це, будь ласка",
+        )
+        for index, prompt in enumerate(reference_prompts):
+            with self.subTest(prompt=prompt):
+                main.pending_requests.clear()
+                invocation = FakeMessage(prompt, message_id=12108 + index * 2)
+                photo = FakeMessage("", message_id=12109 + index * 2)
+                invocation.date = timestamp
+                photo.date = timestamp
+                photo.photo = [FakePhoto(file_id=f"question-{index}", unique_id=f"question-unique-{index}")]
+                self.assertTrue(main.should_wait_for_followup_context(invocation, invocation.text))
+                token = main.store_pending_request(
+                    invocation,
+                    invocation.text,
+                    "followup_context",
+                    role="invocation",
+                )
+                self.assertIsNotNone(token)
+                self.assertIsNotNone(main.claim_correlated_pending_request(photo))
+
+                main.pending_requests.clear()
+                forwarded = FakeMessage("sanitized adjacent source", message_id=12200 + index * 2)
+                followup = FakeMessage(prompt, message_id=12201 + index * 2)
+                forwarded.date = timestamp
+                followup.date = timestamp
+                forwarded.forward_date = timestamp - timedelta(hours=1)
+                forwarded.forward_origin = SimpleNamespace(type="channel")
+                token = main.store_pending_request(
+                    forwarded,
+                    main.DEFAULT_CONTEXT_PROMPT,
+                    "forwarded_payload",
+                    role="payload",
+                    payload_messages=(forwarded,),
+                )
+                self.assertIsNotNone(token)
+                self.assertIsNotNone(main.claim_correlated_pending_request(followup))
+
+    def test_album_pending_does_not_capture_standalone_photo(self) -> None:
+        timestamp = datetime(2026, 7, 1, 12, 6, tzinfo=timezone.utc)
+        album_part = FakeMessage("", message_id=12106)
+        standalone = FakeMessage("", message_id=12107)
+        album_part.date = timestamp
+        standalone.date = timestamp
+        album_part.media_group_id = "album-a"
+        album_part.photo = [FakePhoto(file_id="album-a-photo", unique_id="album-a-unique")]
+        standalone.photo = [FakePhoto(file_id="standalone-photo", unique_id="standalone-unique")]
+
+        token = main.store_pending_request(
+            album_part,
+            main.DEFAULT_CONTEXT_PROMPT,
+            "media_group",
+            role="payload",
+            payload_messages=(album_part,),
+        )
+
+        self.assertIsNotNone(token)
+        self.assertIsNone(main.claim_correlated_pending_request(standalone))
+        self.assertTrue(main.has_pending_request(album_part))
+
+    def test_ordinary_group_forward_and_photo_stay_silent(self) -> None:
+        timestamp = datetime(2026, 7, 1, 12, 7, tzinfo=timezone.utc)
+        forwarded = FakeMessage("ordinary forwarded source", message_id=12111)
+        photo = FakeMessage("", message_id=12112)
+        forwarded.date = timestamp
+        photo.date = timestamp
+        forwarded.forward_date = timestamp - timedelta(hours=1)
+        forwarded.forward_origin = SimpleNamespace(type="channel")
+        photo.caption = "ordinary image caption"
+        photo.photo = [FakePhoto(file_id="group-photo", unique_id="group-photo-unique")]
+        context = self.prompt_context(FakeApplication())
+        persistence = AsyncMock()
+        prompt_dispatch = AsyncMock()
+        image_dispatch = AsyncMock()
+
+        with patch.object(main, "remember_message_persistently", new=persistence):
+            with patch.object(main, "remember_self_complaint_signal", return_value=None):
+                with patch.object(main, "handle_prompt", new=prompt_dispatch):
+                    with patch.object(main, "handle_image_prompt", new=image_dispatch):
+                        with patch.object(main, "maybe_auto_react", new=AsyncMock()):
+                            asyncio.run(
+                                self.deliver_parts((forwarded, photo), context)
+                            )
+
+        self.assertEqual(2, persistence.await_count)
+        prompt_dispatch.assert_not_awaited()
+        image_dispatch.assert_not_awaited()
+        self.assertEqual(0, len(forwarded.reply_calls) + len(photo.reply_calls))
+
+    def test_ordinary_group_stays_silent_even_when_auto_react_config_is_enabled(self) -> None:
+        message = FakeMessage(
+            "ordinary group message long enough to match the legacy auto-react route",
+            message_id=12113,
+        )
+        context = self.prompt_context(FakeApplication())
+        persistence = AsyncMock()
+        run_agent = AsyncMock(return_value="unsolicited response")
+
+        with patch.object(
+            main,
+            "CONFIG",
+            replace(
+                main.CONFIG,
+                auto_react_enabled=True,
+                auto_react_min_chars=1,
+                auto_react_keywords=("ordinary",),
+                auto_react_probability=1.0,
+            ),
+        ):
+            with patch.object(main, "remember_message_persistently", new=persistence):
+                with patch.object(main, "remember_self_complaint_signal", return_value=None):
+                    with patch.object(main, "run_agent", new=run_agent):
+                        asyncio.run(
+                            main.text_message(SimpleNamespace(effective_message=message), context)
+                        )
+
+        persistence.assert_awaited_once()
+        run_agent.assert_not_awaited()
+        self.assertEqual([], message.reply_calls)
+
+    def test_pending_event_details_never_include_prompt_or_forward_payload(self) -> None:
+        invocation_marker = "PRIVATE_INVOCATION_MARKER_73"
+        invocation = FakeMessage(
+            f"Assess the next photo {invocation_marker}",
+            chat_type=ChatType.PRIVATE,
+            chat_id=407892151,
+            message_id=12121,
+        )
+
+        with patch.object(main, "system_event") as invocation_event:
+            token = main.buffer_ingress_invocation(invocation, "same_turn_payload")
+
+        self.assertIsNotNone(token)
+        invocation_kwargs = invocation_event.call_args.kwargs
+        invocation_record = {
+            "message": invocation_kwargs["message"],
+            "details": invocation_kwargs["details"],
+        }
+        self.assertNotIn(invocation_marker, json.dumps(invocation_record, sort_keys=True))
+        self.assertNotIn(invocation_marker, invocation_kwargs["details"]["correlation_id"])
+        self.assertEqual(1, invocation_kwargs["details"]["part_count"])
+        self.assertEqual(
+            {"debounce_seconds", "prompt_chars", "part_count", "correlation_id"},
+            set(invocation_kwargs["details"]),
+        )
+
+        main.pending_requests.clear()
+        forward_marker = "PRIVATE_FORWARD_MARKER_91"
+        forwarded = FakeMessage(
+            forward_marker,
+            chat_type=ChatType.PRIVATE,
+            chat_id=407892151,
+            message_id=12122,
+        )
+        forwarded.forward_date = datetime(2026, 7, 1, 10, 0, tzinfo=timezone.utc)
+        forwarded.forward_origin = SimpleNamespace(type="channel")
+
+        with patch.object(main, "system_event") as payload_event:
+            token = main.buffer_ingress_payload(forwarded)
+
+        self.assertIsNotNone(token)
+        payload_kwargs = payload_event.call_args.kwargs
+        payload_record = {
+            "message": payload_kwargs["message"],
+            "details": payload_kwargs["details"],
+        }
+        self.assertNotIn(forward_marker, json.dumps(payload_record, sort_keys=True))
+        self.assertNotIn(forward_marker, payload_kwargs["details"]["correlation_id"])
+        self.assertEqual(1, payload_kwargs["details"]["part_count"])
+        self.assertEqual(
+            {"part_count", "has_media_group", "correlation_id"},
+            set(payload_kwargs["details"]),
+        )
+
+    def test_correlation_id_is_stable_opaque_and_counts_restaged_album_parts(self) -> None:
+        timestamp = datetime(2026, 7, 1, 12, 8, tzinfo=timezone.utc)
+        private_marker = "PRIVATE_CORRELATION_MARKER_44"
+        prompt = f"Compare the images in the next attachment {private_marker}"
+        invocation = FakeMessage(
+            prompt,
+            chat_type=ChatType.PRIVATE,
+            chat_id=407892151,
+            message_id=12131,
+        )
+        first_photo = FakeMessage(
+            "",
+            chat_type=ChatType.PRIVATE,
+            chat_id=407892151,
+            message_id=12132,
+        )
+        second_photo = FakeMessage(
+            "",
+            chat_type=ChatType.PRIVATE,
+            chat_id=407892151,
+            message_id=12133,
+        )
+        for message in (invocation, first_photo, second_photo):
+            message.date = timestamp
+        first_photo.media_group_id = "private-album-marker"
+        second_photo.media_group_id = "private-album-marker"
+        first_photo.photo = [FakePhoto(file_id="correlation-a", unique_id="correlation-unique-a")]
+        second_photo.photo = [FakePhoto(file_id="correlation-b", unique_id="correlation-unique-b")]
+        context = self.prompt_context(FakeApplication())
+        prompt_dispatch = AsyncMock()
+        image_dispatch = AsyncMock(side_effect=self.reply_from_image)
+        patches = self.ingress_patches(prompt_dispatch, image_dispatch)
+        captured_events = []
+
+        def capture_event(**kwargs) -> None:
+            captured_events.append(kwargs)
+
+        with patches[0], patches[1], patches[2], patches[3]:
+            with patch.object(main, "system_event", side_effect=capture_event):
+                asyncio.run(
+                    self.deliver_parts(
+                        (invocation, first_photo, second_photo),
+                        context,
+                    )
+                )
+
+        lifecycle_types = {
+            "pending_created",
+            "pending_media_group_extended",
+            "pending_debounce_elapsed",
+            "pending_flushed",
+        }
+        lifecycle = [
+            event
+            for event in captured_events
+            if event.get("event_type") in lifecycle_types
+        ]
+        self.assertEqual(
+            [
+                "pending_created",
+                "pending_media_group_extended",
+                "pending_media_group_extended",
+                "pending_debounce_elapsed",
+                "pending_flushed",
+            ],
+            [event["event_type"] for event in lifecycle],
+        )
+        correlation_ids = [event["details"]["correlation_id"] for event in lifecycle]
+        self.assertEqual(1, len(set(correlation_ids)))
+        self.assertRegex(correlation_ids[0], r"^[A-Za-z0-9_-]{8,64}$")
+        public_diagnostics = json.dumps(
+            [
+                {
+                    "event_type": event["event_type"],
+                    "message": event.get("message", ""),
+                    "details": event["details"],
+                }
+                for event in lifecycle
+            ],
+            sort_keys=True,
+        )
+        self.assertNotIn(private_marker, public_diagnostics)
+        self.assertNotIn(prompt, public_diagnostics)
+        extension_counts = [
+            event["details"]["part_count"]
+            for event in lifecycle
+            if event["event_type"] == "pending_media_group_extended"
+        ]
+        self.assertEqual([2, 3], extension_counts)
+        self.assertEqual(1, lifecycle[0]["details"]["part_count"])
+        self.assertEqual(3, lifecycle[-1]["details"]["part_count"])
+        prompt_dispatch.assert_not_awaited()
+        image_dispatch.assert_awaited_once()
+
+    def test_partial_album_failure_still_analyzes_every_valid_image_once(self) -> None:
+        bad = FakeMessage(
+            "",
+            chat_type=ChatType.PRIVATE,
+            chat_id=407892151,
+            message_id=12141,
+        )
+        good = FakeMessage(
+            "",
+            chat_type=ChatType.PRIVATE,
+            chat_id=407892151,
+            message_id=12142,
+        )
+        bad.photo = [FakePhoto(file_id="bad-album-photo", unique_id="bad-album-unique")]
+        good.photo = [FakePhoto(file_id="good-album-photo", unique_id="good-album-unique")]
+        presence = SimpleNamespace(start=AsyncMock(), stop=AsyncMock())
+        extract_images = AsyncMock(
+            side_effect=[
+                RuntimeError("one Telegram image failed"),
+                ["data:image/jpeg;base64,valid-part"],
+            ]
+        )
+        run_vision = AsyncMock(return_value="partial album success")
+        vision_updates = []
+
+        class MemoryProbe:
+            @staticmethod
+            def message_by_message_id(_chat_id, message_id):
+                return SimpleNamespace(id=message_id)
+
+            @staticmethod
+            def update_vision_summary(item_id, summary) -> None:
+                vision_updates.append((item_id, summary))
+
+            @staticmethod
+            def save_message(*args, **kwargs):
+                return 999001
+
+        with patch.object(main, "activity_presence_for_message", return_value=presence):
+            with patch.object(main, "extract_image_data_urls", new=extract_images):
+                with patch.object(main, "prepare_memory_context", new=AsyncMock(return_value="(memory)")):
+                    with patch.object(main, "run_vision", new=run_vision):
+                        with patch.object(main, "MEMORY", MemoryProbe()):
+                            asyncio.run(
+                                main.handle_image_prompt(
+                                    bad,
+                                    "Compare this album.",
+                                    image_messages=(bad, good),
+                                )
+                            )
+
+        self.assertEqual(2, extract_images.await_count)
+        run_vision.assert_awaited_once()
+        self.assertEqual(
+            ["data:image/jpeg;base64,valid-part"],
+            run_vision.await_args.args[1],
+        )
+        self.assertEqual(1, len(bad.reply_calls))
+        self.assertEqual("partial album success", bad.reply_calls[0]["text"])
+        self.assertEqual([], good.reply_calls)
+        self.assertEqual([(good.message_id, "partial album success")], vision_updates)
+
+    def test_all_album_parts_failing_produces_one_safe_fallback(self) -> None:
+        private_exception_marker = "PRIVATE_IMAGE_EXCEPTION_MARKER_52"
+        first = FakeMessage("", chat_type=ChatType.PRIVATE, chat_id=407892151, message_id=12143)
+        second = FakeMessage("", chat_type=ChatType.PRIVATE, chat_id=407892151, message_id=12144)
+        first.photo = [FakePhoto(file_id="failed-a", unique_id="failed-unique-a")]
+        second.photo = [FakePhoto(file_id="failed-b", unique_id="failed-unique-b")]
+        presence = SimpleNamespace(start=AsyncMock(), stop=AsyncMock())
+        extract_images = AsyncMock(
+            side_effect=[
+                RuntimeError(private_exception_marker),
+                ValueError(private_exception_marker),
+            ]
+        )
+        run_vision = AsyncMock()
+        captured_events = []
+
+        with patch.object(main, "activity_presence_for_message", return_value=presence):
+            with patch.object(main, "extract_image_data_urls", new=extract_images):
+                with patch.object(main, "run_vision", new=run_vision):
+                    with patch.object(main, "system_event", side_effect=lambda **kwargs: captured_events.append(kwargs)):
+                        asyncio.run(
+                            main.handle_image_prompt(
+                                first,
+                                "Compare this album.",
+                                image_messages=(first, second),
+                            )
+                        )
+
+        self.assertEqual(2, extract_images.await_count)
+        run_vision.assert_not_awaited()
+        self.assertEqual(1, len(first.reply_calls))
+        self.assertIn("Не зміг проаналізувати зображення", first.reply_calls[0]["text"])
+        unavailable_events = [
+            event for event in captured_events if event.get("event_type") == "image_part_unavailable"
+        ]
+        self.assertEqual(2, len(unavailable_events))
+        self.assertNotIn(
+            private_exception_marker,
+            json.dumps(unavailable_events, sort_keys=True, default=str),
+        )
+
+    def test_hard_expired_pending_is_removed_and_does_not_block_new_pending(self) -> None:
+        original = FakeMessage("explain the next source", message_id=12151)
+        replacement = FakeMessage("analyze the next photo", message_id=12152)
+        first_token = main.store_pending_request(
+            original,
+            original.text,
+            "same_turn_payload",
+            role="invocation",
+        )
+        self.assertIsNotNone(first_token)
+        key = main.pending_key(original)
+        self.assertIsNotNone(key)
+        main.pending_requests[key]["created_at"] = time.monotonic() - 86400
+
+        with patch.object(
+            main,
+            "CONFIG",
+            replace(main.CONFIG, pending_request_seconds=1_000_000_000),
+        ):
+            self.assertFalse(main.has_pending_request(original))
+            replacement_token = main.store_pending_request(
+                replacement,
+                replacement.text,
+                "same_turn_payload",
+                role="invocation",
+            )
+
+        self.assertIsNotNone(replacement_token)
+        self.assertNotEqual(first_token, replacement_token)
+        self.assertIs(replacement, main.pending_requests[key]["origin_message"])
+
+    def test_owner_token_can_mark_ready_and_claim_after_slow_persistence(self) -> None:
+        message = FakeMessage("explain the next source", message_id=12153)
+        token = main.store_pending_request(
+            message,
+            message.text,
+            "same_turn_payload",
+            role="invocation",
+        )
+        self.assertIsNotNone(token)
+        key = main.pending_key(message)
+        self.assertIsNotNone(key)
+
+        # Ingress persistence may take longer than the coalescing window. The
+        # owning handler must be able to start a fresh window and its resolver
+        # must still claim the exact token it scheduled.
+        main.pending_requests[key]["created_at"] = time.monotonic() - 86400
+        ready = main.mark_pending_ready(message, token)
+        self.assertIsNotNone(ready)
+        self.assertFalse(main.pending_expired(ready))
+
+        main.pending_requests[key]["created_at"] = time.monotonic() - 86400
+        claimed = main.claim_pending_request(message, token)
+
+        self.assertIs(ready, claimed)
+        self.assertNotIn(key, main.pending_requests)
+
+    def test_stale_resolver_token_never_removes_newer_pending_turn(self) -> None:
+        first = FakeMessage("explain the next source", message_id=12154)
+        second = FakeMessage("analyze the next photo", message_id=12155)
+        first_token = main.store_pending_request(
+            first,
+            first.text,
+            "same_turn_payload",
+            role="invocation",
+        )
+        self.assertIsNotNone(first_token)
+        key = main.pending_key(first)
+        self.assertIsNotNone(key)
+        self.assertIsNotNone(main.claim_pending_request(first, first_token))
+
+        second_token = main.store_pending_request(
+            second,
+            second.text,
+            "same_turn_payload",
+            role="invocation",
+        )
+        self.assertIsNotNone(second_token)
+        self.assertNotEqual(first_token, second_token)
+        main.pending_requests[key]["created_at"] = time.monotonic() - 86400
+
+        self.assertIsNone(main.claim_pending_request(first, first_token))
+        self.assertEqual(second_token, main.pending_requests[key]["token"])
+        self.assertIs(second, main.pending_requests[key]["origin_message"])
+
+    def test_payload_first_does_not_capture_unrelated_text_containing_it(self) -> None:
+        timestamp = datetime(2026, 7, 1, 12, 9, tzinfo=timezone.utc)
+        payload = FakeMessage(
+            "sanitized forwarded source",
+            chat_type=ChatType.PRIVATE,
+            chat_id=407892151,
+            message_id=12161,
+        )
+        unrelated = FakeMessage(
+            "Write a unit test for retry backoff.",
+            chat_type=ChatType.PRIVATE,
+            chat_id=407892151,
+            message_id=12162,
+        )
+        payload.date = timestamp
+        unrelated.date = timestamp
+        payload.forward_date = timestamp - timedelta(hours=1)
+        payload.forward_origin = SimpleNamespace(type="channel")
+        context = self.prompt_context(FakeApplication())
+        persistence = AsyncMock()
+        prompt_dispatch = AsyncMock(side_effect=self.reply_from_prompt)
+        image_dispatch = AsyncMock(side_effect=self.reply_from_image)
+        patches = self.ingress_patches(prompt_dispatch, image_dispatch, persistence)
+
+        with patches[0], patches[1], patches[2], patches[3]:
+            asyncio.run(self.deliver_parts((payload, unrelated), context))
+
+        self.assertEqual(2, persistence.await_count)
+        self.assertEqual(2, prompt_dispatch.await_count)
+        image_dispatch.assert_not_awaited()
+        routed = {
+            (call.args[0].message_id, call.args[2])
+            for call in prompt_dispatch.await_args_list
+        }
+        self.assertEqual(
+            {
+                (payload.message_id, main.DEFAULT_CONTEXT_PROMPT),
+                (unrelated.message_id, unrelated.text),
+            },
+            routed,
+        )
+        self.assertEqual(1, len(payload.reply_calls))
+        self.assertEqual(1, len(unrelated.reply_calls))
+
+    def test_payload_first_merges_explicit_context_reference(self) -> None:
+        timestamp = datetime(2026, 7, 1, 12, 9, tzinfo=timezone.utc)
+        payload = FakeMessage(
+            "sanitized forwarded source",
+            chat_type=ChatType.PRIVATE,
+            chat_id=407892151,
+            message_id=12163,
+        )
+        invocation = FakeMessage(
+            "Explain it.",
+            chat_type=ChatType.PRIVATE,
+            chat_id=407892151,
+            message_id=12164,
+        )
+        payload.date = timestamp
+        invocation.date = timestamp
+        payload.forward_date = timestamp - timedelta(hours=1)
+        payload.forward_origin = SimpleNamespace(type="channel")
+        context = self.prompt_context(FakeApplication())
+        persistence = AsyncMock()
+        prompt_dispatch = AsyncMock(side_effect=self.reply_from_prompt)
+        image_dispatch = AsyncMock(side_effect=self.reply_from_image)
+        patches = self.ingress_patches(prompt_dispatch, image_dispatch, persistence)
+
+        with patches[0], patches[1], patches[2], patches[3]:
+            asyncio.run(self.deliver_parts((payload, invocation), context))
+
+        self.assertEqual(2, persistence.await_count)
+        prompt_dispatch.assert_awaited_once()
+        image_dispatch.assert_not_awaited()
+        self.assertIs(payload, prompt_dispatch.await_args.args[0])
+        self.assertEqual(invocation.text, prompt_dispatch.await_args.args[2])
+        self.assertEqual(1, len(payload.reply_calls) + len(invocation.reply_calls))
+
+    def test_forward_then_referential_captioned_photo_is_one_vision_turn(self) -> None:
+        timestamp = datetime(2026, 7, 1, 12, 9, tzinfo=timezone.utc)
+        forwarded = FakeMessage(
+            "sanitized forwarded source",
+            chat_type=ChatType.PRIVATE,
+            chat_id=407892151,
+            message_id=12165,
+        )
+        photo = FakeMessage(
+            "",
+            chat_type=ChatType.PRIVATE,
+            chat_id=407892151,
+            message_id=12166,
+        )
+        forwarded.date = timestamp
+        photo.date = timestamp
+        forwarded.forward_date = timestamp - timedelta(hours=1)
+        forwarded.forward_origin = SimpleNamespace(type="channel")
+        photo.caption = "Compare this with the forwarded claim."
+        photo.photo = [FakePhoto(file_id="caption-photo", unique_id="caption-photo-unique")]
+        context = self.prompt_context(FakeApplication())
+        persistence = AsyncMock()
+        prompt_dispatch = AsyncMock(side_effect=self.reply_from_prompt)
+        image_dispatch = AsyncMock(side_effect=self.reply_from_image)
+        patches = self.ingress_patches(prompt_dispatch, image_dispatch, persistence)
+
+        with patches[0], patches[1], patches[2], patches[3]:
+            asyncio.run(self.deliver_parts((forwarded, photo), context))
+
+        self.assertEqual(2, persistence.await_count)
+        prompt_dispatch.assert_not_awaited()
+        image_dispatch.assert_awaited_once()
+        self.assertIs(photo, image_dispatch.await_args.args[0])
+        self.assertEqual(photo.caption, image_dispatch.await_args.args[1])
+        self.assertEqual([forwarded], image_dispatch.await_args.kwargs["context_messages"])
+        self.assertEqual(1, len(forwarded.reply_calls) + len(photo.reply_calls))
+
+    def test_forwarded_source_caption_is_never_promoted_to_trusted_invocation(self) -> None:
+        timestamp = datetime(2026, 7, 1, 12, 9, tzinfo=timezone.utc)
+        first_forward = FakeMessage("first sanitized source", message_id=12167)
+        forwarded_photo = FakeMessage("", message_id=12168)
+        first_forward.date = timestamp
+        forwarded_photo.date = timestamp
+        first_forward.forward_date = timestamp - timedelta(hours=1)
+        first_forward.forward_origin = SimpleNamespace(type="channel")
+        forwarded_photo.forward_date = timestamp - timedelta(hours=1)
+        forwarded_photo.forward_origin = SimpleNamespace(type="channel")
+        forwarded_photo.caption = "Explain this."
+        forwarded_photo.photo = [FakePhoto(file_id="forwarded-caption", unique_id="forwarded-caption-unique")]
+
+        token = main.store_pending_request(
+            first_forward,
+            main.DEFAULT_CONTEXT_PROMPT,
+            "forwarded_payload",
+            role="payload",
+            payload_messages=(first_forward,),
+        )
+
+        self.assertIsNotNone(token)
+        self.assertFalse(main.has_authored_payload_invocation_caption(forwarded_photo))
+        self.assertIsNone(main.claim_correlated_pending_request(forwarded_photo))
+        self.assertTrue(main.has_pending_request(first_forward))
+
+        main.pending_requests.clear()
+        generated_photo = FakeMessage("", message_id=12169)
+        generated_photo.date = timestamp
+        generated_photo.caption = "Explain this."
+        generated_photo.photo = [FakePhoto(file_id="generated-caption", unique_id="generated-caption-unique")]
+        generated_photo.via_bot = SimpleNamespace(id=88001)
+        token = main.store_pending_request(
+            first_forward,
+            main.DEFAULT_CONTEXT_PROMPT,
+            "forwarded_payload",
+            role="payload",
+            payload_messages=(first_forward,),
+        )
+
+        self.assertIsNotNone(token)
+        self.assertFalse(main.has_authored_payload_invocation_caption(generated_photo))
+        self.assertIsNone(main.claim_correlated_pending_request(generated_photo))
+        self.assertTrue(main.has_pending_request(first_forward))
+
+    def test_different_non_null_media_group_ids_are_never_merged(self) -> None:
+        timestamp = datetime(2026, 7, 1, 12, 10, tzinfo=timezone.utc)
+        first = FakeMessage(
+            "",
+            chat_type=ChatType.PRIVATE,
+            chat_id=407892151,
+            message_id=12171,
+        )
+        second = FakeMessage(
+            "",
+            chat_type=ChatType.PRIVATE,
+            chat_id=407892151,
+            message_id=12172,
+        )
+        first.date = timestamp
+        second.date = timestamp
+        first.media_group_id = "album-a"
+        second.media_group_id = "album-b"
+        first.photo = [FakePhoto(file_id="different-group-a", unique_id="different-group-unique-a")]
+        second.photo = [FakePhoto(file_id="different-group-b", unique_id="different-group-unique-b")]
+        context = self.prompt_context(FakeApplication())
+        prompt_dispatch = AsyncMock(side_effect=self.reply_from_prompt)
+        image_dispatch = AsyncMock(side_effect=self.reply_from_image)
+        patches = self.ingress_patches(prompt_dispatch, image_dispatch)
+
+        with patches[0], patches[1], patches[2], patches[3]:
+            asyncio.run(self.deliver_parts((first, second), context))
+
+        prompt_dispatch.assert_not_awaited()
+        self.assertEqual(2, image_dispatch.await_count)
+        self.assertEqual(
+            {first.message_id, second.message_id},
+            {call.args[0].message_id for call in image_dispatch.await_args_list},
+        )
+        for call in image_dispatch.await_args_list:
+            image_messages = call.kwargs.get("image_messages") or (call.args[0],)
+            self.assertEqual(1, len(image_messages))
+        self.assertEqual(2, len(first.reply_calls) + len(second.reply_calls))
+
+    def test_triggered_group_album_buffers_all_parts_while_ordinary_album_stays_silent(self) -> None:
+        timestamp = datetime(2026, 7, 1, 12, 11, tzinfo=timezone.utc)
+        triggered_first = FakeMessage("", message_id=12181)
+        triggered_second = FakeMessage("", message_id=12182)
+        triggered_first.date = timestamp
+        triggered_second.date = timestamp
+        triggered_first.caption = "@thrd_ua_bot compare this album"
+        triggered_first.media_group_id = "triggered-group-album"
+        triggered_second.media_group_id = "triggered-group-album"
+        triggered_first.photo = [FakePhoto(file_id="triggered-a", unique_id="triggered-unique-a")]
+        triggered_second.photo = [FakePhoto(file_id="triggered-b", unique_id="triggered-unique-b")]
+
+        ordinary_first = FakeMessage("", message_id=12191)
+        ordinary_second = FakeMessage("", message_id=12192)
+        ordinary_first.date = timestamp + timedelta(seconds=5)
+        ordinary_second.date = timestamp + timedelta(seconds=5)
+        ordinary_first.caption = "ordinary album caption"
+        ordinary_first.media_group_id = "ordinary-group-album"
+        ordinary_second.media_group_id = "ordinary-group-album"
+        ordinary_first.photo = [FakePhoto(file_id="ordinary-a", unique_id="ordinary-unique-a")]
+        ordinary_second.photo = [FakePhoto(file_id="ordinary-b", unique_id="ordinary-unique-b")]
+
+        triggered_context = self.prompt_context(FakeApplication())
+        ordinary_context = self.prompt_context(FakeApplication())
+        persistence = AsyncMock()
+        prompt_dispatch = AsyncMock(side_effect=self.reply_from_prompt)
+        image_dispatch = AsyncMock(side_effect=self.reply_from_image)
+        patches = self.ingress_patches(prompt_dispatch, image_dispatch, persistence)
+
+        async def scenario() -> None:
+            await self.deliver_parts(
+                (triggered_first, triggered_second),
+                triggered_context,
+            )
+            await self.deliver_parts(
+                (ordinary_first, ordinary_second),
+                ordinary_context,
+            )
+
+        with patches[0], patches[1], patches[2], patches[3]:
+            with patch.object(main, "maybe_auto_react", new=AsyncMock()):
+                asyncio.run(scenario())
+
+        self.assertEqual(4, persistence.await_count)
+        prompt_dispatch.assert_not_awaited()
+        image_dispatch.assert_awaited_once()
+        call = image_dispatch.await_args
+        self.assertIs(triggered_first, call.args[0])
+        self.assertEqual("compare this album", call.args[1])
+        self.assertEqual(
+            [triggered_first, triggered_second],
+            call.kwargs["image_messages"],
+        )
+        self.assertEqual(
+            1,
+            sum(
+                len(message.reply_calls)
+                for message in (
+                    triggered_first,
+                    triggered_second,
+                    ordinary_first,
+                    ordinary_second,
+                )
+            ),
+        )
+
+    def test_video_media_group_produces_one_agent_run_and_reply(self) -> None:
+        timestamp = datetime(2026, 7, 1, 12, 12, tzinfo=timezone.utc)
+        prompt = "Compare these videos."
+        first = FakeMessage(
+            "",
+            chat_type=ChatType.PRIVATE,
+            chat_id=407892151,
+            message_id=12201,
+        )
+        second = FakeMessage(
+            "",
+            chat_type=ChatType.PRIVATE,
+            chat_id=407892151,
+            message_id=12202,
+        )
+        first.date = timestamp
+        second.date = timestamp
+        first.caption = prompt
+        first.media_group_id = "video-album"
+        second.media_group_id = "video-album"
+        first.video = SimpleNamespace(mime_type="video/mp4")
+        second.video = SimpleNamespace(mime_type="video/mp4")
+        context = self.prompt_context(FakeApplication())
+        persistence = AsyncMock()
+        prompt_dispatch = AsyncMock(side_effect=self.reply_from_prompt)
+        image_dispatch = AsyncMock(side_effect=self.reply_from_image)
+        patches = self.ingress_patches(prompt_dispatch, image_dispatch, persistence)
+
+        with patches[0], patches[1], patches[2], patches[3]:
+            asyncio.run(self.deliver_parts((first, second), context))
+
+        self.assertEqual(2, persistence.await_count)
+        prompt_dispatch.assert_awaited_once()
+        image_dispatch.assert_not_awaited()
+        self.assertEqual(prompt, prompt_dispatch.await_args.args[2])
+        self.assertEqual(1, len(first.reply_calls) + len(second.reply_calls))
+
+
+class VisionLifecycleTests(unittest.TestCase):
+    def test_run_vision_emits_success_lifecycle_without_private_payloads(self) -> None:
+        prompt = "PRIVATE_VISION_PROMPT_MARKER_27"
+        image_url = "data:image/jpeg;base64,PRIVATE_IMAGE_MARKER_38"
+        output_marker = "PRIVATE_VISION_OUTPUT_MARKER_49"
+        events = []
+
+        def capture_event(**kwargs) -> None:
+            events.append(kwargs)
+
+        with patch.object(main, "system_event", side_effect=capture_event):
+            with patch.object(main.asyncio, "to_thread", new=AsyncMock(return_value=output_marker)):
+                output = asyncio.run(main.run_vision(prompt, [image_url]))
+
+        self.assertEqual(output_marker, output)
+        self.assertEqual(
+            ["agent_start", "llm_start", "llm_end", "agent_end"],
+            [event["event_type"] for event in events],
+        )
+        serialized = json.dumps(events, sort_keys=True)
+        self.assertNotIn(prompt, serialized)
+        self.assertNotIn(image_url, serialized)
+        self.assertNotIn(output_marker, serialized)
+
+    def test_run_vision_failure_emits_only_start_lifecycle(self) -> None:
+        events = []
+
+        def capture_event(**kwargs) -> None:
+            events.append(kwargs)
+
+        with patch.object(main, "system_event", side_effect=capture_event):
+            with patch.object(
+                main.asyncio,
+                "to_thread",
+                new=AsyncMock(side_effect=RuntimeError("vision backend failed")),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "vision backend failed"):
+                    asyncio.run(
+                        main.run_vision(
+                            "PRIVATE_FAILURE_PROMPT_MARKER",
+                            ["data:image/jpeg;base64,PRIVATE_FAILURE_IMAGE_MARKER"],
+                        )
+                    )
+
+        self.assertEqual(
+            ["agent_start", "llm_start"],
+            [event["event_type"] for event in events],
+        )
 
 class WebSafetyTests(unittest.TestCase):
     @staticmethod
