@@ -322,6 +322,40 @@ class FakeSticker:
         }
 
 
+class AgentsSdkCompatibilityTests(unittest.TestCase):
+    def test_runner_reaches_offline_model_boundary(self) -> None:
+        from agents import Agent, RunConfig, Runner
+        from agents.models.interface import Model
+
+        class OfflineBoundaryModel(Model):
+            def __init__(self) -> None:
+                self.called = False
+
+            async def get_response(self, *args, **kwargs):
+                self.called = True
+                raise AssertionError("offline model boundary reached")
+
+            async def stream_response(self, *args, **kwargs):
+                self.called = True
+                if False:
+                    yield
+                raise AssertionError("offline model boundary reached")
+
+        model = OfflineBoundaryModel()
+
+        async def run_probe() -> None:
+            await Runner.run(
+                Agent(name="offline-compatibility-probe", model=model),
+                "offline compatibility probe",
+                run_config=RunConfig(tracing_disabled=True),
+            )
+
+        with self.assertRaisesRegex(AssertionError, "offline model boundary reached"):
+            asyncio.run(run_probe())
+
+        self.assertTrue(model.called)
+
+
 class PendingFlowTests(unittest.TestCase):
     def setUp(self) -> None:
         main.pending_requests.clear()
