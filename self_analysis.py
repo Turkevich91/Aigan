@@ -3,8 +3,10 @@ from __future__ import annotations
 import hashlib
 import re
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any, Protocol
 
+from github_reporting import GitHubReportingError
 from system_log import ComplaintCluster, SystemLogStore, redact_secrets, sanitize_text
 
 
@@ -12,7 +14,14 @@ class Reporter(Protocol):
     @property
     def is_configured(self) -> bool: ...
 
-    def create_self_report_issue(self, *, title: str, body: str, labels: list[str] | None = None) -> Any: ...
+    def create_self_report_issue(
+        self,
+        *,
+        title: str,
+        body: str,
+        labels: list[str] | None = None,
+        dedupe_key: str,
+    ) -> Any: ...
 
 
 @dataclass(frozen=True)
@@ -84,6 +93,27 @@ CATEGORY_PATTERNS = [
     ("telegram_delivery", ("telegram", "телеграм", "відпов", "ответ", "повідом", "сообщ")),
     ("agent_quality", ("галюцин", "hallucin", "бреше", "врет", "туп", "клоун")),
 ]
+PUBLIC_COMPLAINT_CATEGORIES = (
+    {category for category, _markers in CATEGORY_PATTERNS}
+    | REACTION_HEALTH_CATEGORIES
+    | {"general"}
+)
+REPORT_FAILURE_CATEGORIES = {
+    "authentication_failed",
+    "claim_failed",
+    "client_error",
+    "finalize_failed",
+    "invalid_response",
+    "not_found",
+    "outcome_unknown",
+    "permission_denied",
+    "rate_limited",
+    "reporter_returned_none",
+    "request_timeout",
+    "server_error",
+    "transport_error",
+    "validation_failed",
+}
 REACTION_TERMS = (
     "reaction",
     "react",
@@ -629,7 +659,7 @@ class SelfAnalysisService:
             return
         if cluster.temperature < self.complaint_report_temperature:
             return
-        if cluster.github_issue_url and cluster.last_reported_temperature >= cluster.temperature:
+        if cluster.github_issue_url:
             return
         if self.reporter is None or not getattr(self.reporter, "is_configured", False):
             self.store.record_event(
@@ -641,35 +671,120 @@ class SelfAnalysisService:
             )
             return
 
-        title = f"[Aigan] self-report: {cluster.category} temperature {cluster.temperature}"
+        try:
+            claim = self.store.claim_complaint_report(
+                fingerprint=cluster.fingerprint,
+                temperature=cluster.temperature,
+            )
+        except Exception:
+            self.store.record_event(
+                level="error",
+                component="github_reporting",
+                event_type="self_report_claim_failed",
+                message="claim_failed",
+                details={"fingerprint": cluster.fingerprint, "temperature": cluster.temperature},
+            )
+            return
+        if claim is None:
+            return
+
+        public_category = public_complaint_category(cluster.category)
+        public_temperature = public_complaint_temperature(cluster.temperature)
+        title = f"[Aigan] self-report: {public_category} temperature {public_temperature}"
         body = build_self_report_issue_body(cluster)
         try:
-            issue = self.reporter.create_self_report_issue(title=title, body=body, labels=None)
-        except Exception as exc:
+            issue = self.reporter.create_self_report_issue(
+                title=title,
+                body=body,
+                labels=None,
+                dedupe_key=cluster.fingerprint,
+            )
+        except GitHubReportingError as exc:
+            failure_category = report_failure_category(exc.category)
+            try:
+                if exc.retry_safe:
+                    self.store.release_complaint_report_claim(claim, failure_category)
+                else:
+                    self.store.mark_complaint_report_unknown(claim, failure_category)
+            except Exception:
+                pass
             self.store.record_event(
                 level="error",
                 component="github_reporting",
                 event_type="self_report_failed",
-                message=str(exc),
+                message=failure_category,
+                details={
+                    "fingerprint": cluster.fingerprint,
+                    "temperature": cluster.temperature,
+                    "retry_safe": exc.retry_safe,
+                },
+            )
+            return
+        except Exception:
+            try:
+                self.store.mark_complaint_report_unknown(claim, "outcome_unknown")
+            except Exception:
+                pass
+            self.store.record_event(
+                level="error",
+                component="github_reporting",
+                event_type="self_report_failed",
+                message="outcome_unknown",
                 details={"fingerprint": cluster.fingerprint, "temperature": cluster.temperature},
             )
             return
         if issue is None:
+            try:
+                self.store.mark_complaint_report_unknown(claim, "reporter_returned_none")
+            except Exception:
+                pass
             self.store.record_event(
-                level="info",
+                level="error",
                 component="github_reporting",
-                event_type="self_report_skipped",
-                message="GitHub reporter returned no issue",
+                event_type="self_report_failed",
+                message="reporter_returned_none",
                 details={"fingerprint": cluster.fingerprint, "temperature": cluster.temperature},
             )
             return
-        self.store.mark_complaint_reported(cluster.fingerprint, issue.url, cluster.temperature)
+        try:
+            finalized = self.store.mark_complaint_reported(claim, issue.url)
+        except Exception:
+            self.store.record_event(
+                level="error",
+                component="github_reporting",
+                event_type="self_report_finalize_failed",
+                message="finalize_failed",
+                details={"fingerprint": cluster.fingerprint, "temperature": cluster.temperature},
+            )
+            return
+        if not finalized:
+            self.store.record_event(
+                level="error",
+                component="github_reporting",
+                event_type="self_report_finalize_failed",
+                message="finalize_failed",
+                details={"fingerprint": cluster.fingerprint, "temperature": cluster.temperature},
+            )
+            return
+        project_status = str(getattr(issue, "project_status", "disabled") or "disabled")
+        if project_status == "failed":
+            self.store.record_event(
+                level="warning",
+                component="github_reporting",
+                event_type="self_report_project_add_failed",
+                message="project_add_failed",
+                details={"fingerprint": cluster.fingerprint, "temperature": cluster.temperature},
+            )
         self.store.record_event(
             level="warning",
             component="github_reporting",
             event_type="self_report_created",
             message=issue.url,
-            details={"fingerprint": cluster.fingerprint, "temperature": cluster.temperature},
+            details={
+                "fingerprint": cluster.fingerprint,
+                "temperature": cluster.temperature,
+                "project_status": project_status,
+            },
         )
 
     def health_text(self, lookback_seconds: int = 21600) -> str:
@@ -745,27 +860,60 @@ class SelfAnalysisService:
 
 
 def build_self_report_issue_body(cluster: ComplaintCluster) -> str:
+    category = public_complaint_category(cluster.category)
+    temperature = public_complaint_temperature(cluster.temperature)
+    first_seen = public_utc_date(cluster.first_seen)
+    last_seen = public_utc_date(cluster.last_seen)
     return "\n".join(
         [
             "## Aigan self-report",
             "",
             "This issue was created from repeated user complaint signals. It is not a confirmed bug yet.",
             "",
-            f"- category: `{cluster.category}`",
-            f"- temperature: `{cluster.temperature}`",
-            f"- fingerprint: `{cluster.fingerprint}`",
-            f"- first seen: `{cluster.first_seen}`",
-            f"- last seen: `{cluster.last_seen}`",
+            f"- category: `{category}`",
+            f"- temperature: `{temperature}`",
+            f"- first observed (UTC date): `{first_seen}`",
+            f"- last observed (UTC date): `{last_seen}`",
             "",
-            "## Sanitized sample",
+            "## Private evidence handoff",
             "",
-            cluster.sample or "(empty)",
+            "Raw chat text, identities, internal correlation keys, links, and exact timestamps are intentionally omitted.",
+            "Use private deployment diagnostics to correlate this behavior-level signal.",
             "",
             "## Triage checklist",
             "",
-            "- Check container logs around `last_seen`.",
+            "- Check private deployment diagnostics for the observed UTC dates.",
             "- Reproduce the route with a minimal Telegram update or unit test.",
             "- Confirm whether this is product behavior, Telegram delivery, web/image tooling, or model quality.",
             "- Add a regression test before fixing if the behavior is a bug.",
         ]
     )
+
+
+def public_complaint_category(value: str) -> str:
+    category = str(value or "").strip()
+    return category if category in PUBLIC_COMPLAINT_CATEGORIES else "general"
+
+
+def public_complaint_temperature(value: int) -> int:
+    try:
+        temperature = int(value)
+    except (TypeError, ValueError):
+        return 1
+    return max(1, min(temperature, 999))
+
+
+def public_utc_date(value: str) -> str:
+    text = str(value or "").strip()
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return "unknown"
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc).date().isoformat()
+
+
+def report_failure_category(value: str) -> str:
+    category = str(value or "").strip().casefold()
+    return category if category in REPORT_FAILURE_CATEGORIES else "outcome_unknown"

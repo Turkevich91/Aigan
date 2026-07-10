@@ -357,7 +357,13 @@ Ukrainian aliases:
 
 The system log stores metadata such as route decisions, tool failures, Telegram delivery fallbacks, image-search failures, pending/debounce events, and command usage. It must not store secrets, raw prompts, `.env`, private chat dumps, or full user messages.
 
-User complaints about the bot are treated as temperature signals, not confirmed bugs. A first similar complaint starts at `temperature=1`; repeated similar complaints inside `COMPLAINT_LOOKBACK_SECONDS` raise the temperature. Reaction-specific criticism is classified into psychological-health categories such as `insensitive_reaction`, `reaction_reasoning_gap`, `tone_boundary`, `fake_empathy`, and `sycophancy`, with only behavior-level reaction decision metadata and a keyed non-reversible target fingerprint stored in self-reports when a reaction target is linked. `/health` and `/complaints` include a compact `Reaction health` summary with sent/skipped decision counts, emotion/reason counts, shadow score/context/model-gate counters, and reaction complaint temperatures; `/tool_health reactions` includes bounded reaction-memory decision counts. These diagnostics intentionally avoid raw message text, usernames, paths, source URLs, OCR/frame text, transcripts, and reaction rationale bodies. When `COMPLAINT_REPORT_TEMPERATURE` is reached and GitHub reporting is enabled, Aigan creates a sanitized `[Aigan] self-report: ...` issue and adds it to the configured GitHub Project.
+User complaints about the bot are treated as temperature signals, not confirmed bugs. A first similar complaint starts at `temperature=1`; repeated similar complaints inside `COMPLAINT_LOOKBACK_SECONDS` raise the temperature. Reaction-specific criticism is classified into psychological-health categories such as `insensitive_reaction`, `reaction_reasoning_gap`, `tone_boundary`, `fake_empathy`, and `sycophancy`; behavior-level reaction metadata and keyed target fingerprints remain private deployment diagnostics. `/health` and `/complaints` include a compact `Reaction health` summary with sent/skipped decision counts, emotion/reason counts, shadow score/context/model-gate counters, and reaction complaint temperatures; `/tool_health reactions` includes bounded reaction-memory decision counts. These diagnostics intentionally avoid raw message text, usernames, paths, source URLs, OCR/frame text, transcripts, and reaction rationale bodies.
+
+When `COMPLAINT_REPORT_TEMPERATURE` is reached and GitHub reporting is enabled, Aigan creates at most one `[Aigan] self-report: ...` issue for that complaint fingerprint. The public issue contains only an allowlisted behavior category, bounded temperature, and coarse UTC dates; it omits chat samples, identities, source URLs, internal fingerprints, paths, and exact timestamps. A durable local claim blocks duplicate creation after concurrent triggers, restarts, timeouts, malformed responses, or a local finalization failure. Ambiguous outcomes intentionally remain terminal instead of retrying automatically.
+
+For a fine-grained PAT, select only this repository and grant repository permission `Issues: Read and write`; GitHub adds required `Metadata: Read-only` automatically. `Discussions` is not required. Direct Project addition is optional and disabled by default because fine-grained PATs do not support this user-owned Project. Prefer the GitHub Project built-in auto-add workflow; a Project-add failure never invalidates an issue that was already created.
+
+Before rolling back to a release that predates the durable report ledger, set `GITHUB_REPORTING_ENABLED=false`. A compatibility tombstone also blocks the previous temperature-growth path, but disabling outbound reporting remains the rollback gate.
 
 ```env
 SYSTEM_LOG_ENABLED=true
@@ -365,6 +371,7 @@ SYSTEM_LOG_RETENTION_DAYS=14
 GITHUB_REPORTING_ENABLED=false
 GITHUB_TOKEN=
 GITHUB_REPOSITORY=Turkevich91/Aigan
+GITHUB_PROJECT_ADD_ENABLED=false
 GITHUB_PROJECT_OWNER=Turkevich91
 GITHUB_PROJECT_NUMBER=4
 COMPLAINT_LOOKBACK_SECONDS=86400

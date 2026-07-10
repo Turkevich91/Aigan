@@ -1,5 +1,13 @@
 # Aigan Changelog
 
+## 2026-07-10 - Privacy-bounded at-most-once self-reporting
+
+- Added a durable SQLite report-claim ledger so concurrent threshold crossings, restarts, timeouts, and local finalization failures cannot automatically duplicate a GitHub issue.
+- Added a scrubbed compatibility tombstone so rollback to the previous temperature-growth logic remains duplicate-safe; outbound reporting must still be disabled before a pre-ledger rollback.
+- Removed chat samples, identities, internal fingerprints, paths, links, and exact timestamps from public self-report bodies; public correlation uses an opaque keyed marker.
+- Decoupled core Issues reporting from optional GitHub Project access and made Project-add failures non-blocking after issue creation.
+- Documented the minimal fine-grained token scope: repository `Issues: Read and write` plus GitHub-required read-only metadata.
+
 ## 2026-07-09 - Persistent outbound identity and provenance
 
 - Persist Telegram bot text chunks and web images only after successful delivery, using the real returned message ids and ordered per-run chunk mappings.

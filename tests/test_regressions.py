@@ -1,4 +1,5 @@
 import asyncio
+import io
 import json
 import os
 import shutil
@@ -6,8 +7,11 @@ import socket
 import sqlite3
 import subprocess
 import tempfile
+import threading
 import time
+import traceback
 import unittest
+import urllib.error
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -97,6 +101,7 @@ os.environ["WEB_SEARCH_TIMEOUT_SECONDS"] = "15"
 os.environ["SYSTEM_LOG_ENABLED"] = "true"
 os.environ["SYSTEM_LOG_RETENTION_DAYS"] = "14"
 os.environ["GITHUB_REPORTING_ENABLED"] = "false"
+os.environ["GITHUB_PROJECT_ADD_ENABLED"] = "false"
 os.environ["COMPLAINT_LOOKBACK_SECONDS"] = "86400"
 os.environ["COMPLAINT_REPORT_TEMPERATURE"] = "3"
 os.environ["SOCIAL_MEMORY_ENABLED"] = "true"
@@ -126,6 +131,7 @@ from telegram.constants import ChatType, ParseMode
 from telegram.error import BadRequest, TimedOut
 
 import main
+from github_reporting import GitHubIssue, GitHubReporter, GitHubReportingError
 from outbound_reactions import EmotionPolicyDecision
 from provenance import extract_tool_provenance, make_tool_provenance
 from media_acquisition import (
@@ -153,12 +159,20 @@ from scripts import import_telegram_export
 from scripts.import_telegram_export import ImportOptions
 from self_analysis import (
     SelfAnalysisService,
+    build_self_report_issue_body,
     classify_complaint,
     classify_reaction_complaint,
     has_marker,
     has_reaction_complaint_hint,
 )
-from system_log import SystemEvent, SystemLogStore, redact_secrets
+from system_log import (
+    REPORT_ATTEMPTED_SENTINEL,
+    REPORT_BLOCKING_TEMPERATURE,
+    ComplaintCluster,
+    SystemEvent,
+    SystemLogStore,
+    redact_secrets,
+)
 from tool_diagnostics import (
     CapabilityRow,
     adapter_family,
@@ -10065,6 +10079,294 @@ class SystemHealthTests(unittest.TestCase):
         self.assertNotIn(fake_telegram_secret(), redacted)
         self.assertIn("[redacted]", redacted)
 
+    def test_github_reporter_core_configuration_does_not_require_project_access(self) -> None:
+        reporter = GitHubReporter(
+            enabled=True,
+            token="fine-grained-token",
+            repository="Turkevich91/Aigan",
+            project_owner="",
+            project_number=0,
+            project_add_enabled=False,
+            fingerprint_secret="stable-private-secret",
+        )
+
+        self.assertTrue(reporter.is_configured)
+
+    def test_blank_optional_github_project_number_does_not_break_config(self) -> None:
+        with patch.dict(os.environ, {"GITHUB_PROJECT_NUMBER": "", "GITHUB_PROJECT_ADD_ENABLED": "false"}):
+            config = main.Config.from_env()
+
+        self.assertEqual(0, config.github_project_number)
+        self.assertFalse(config.github_project_add_enabled)
+
+    def test_public_self_report_body_omits_chat_sample_internal_fingerprint_and_exact_time(self) -> None:
+        cluster = ComplaintCluster(
+            id=1,
+            fingerprint="unsalted-internal-fingerprint",
+            category="web_search",
+            temperature=3,
+            first_seen="2026-07-10T04:15:16+00:00",
+            last_seen="2026-07-10T05:16:17+00:00",
+            sample="private complaint phrase with a private source URL",
+            github_issue_url="",
+            last_reported_temperature=0,
+        )
+
+        body = build_self_report_issue_body(cluster)
+
+        self.assertIn("web_search", body)
+        self.assertIn("2026-07-10", body)
+        self.assertNotIn(cluster.sample, body)
+        self.assertNotIn(cluster.fingerprint, body)
+        self.assertNotIn("04:15:16", body)
+        self.assertNotIn("05:16:17", body)
+
+    def test_public_self_report_body_rejects_hostile_persisted_fields(self) -> None:
+        canaries = [
+            "synthetic_private_actor_999999999",
+            "https://private.example/secret",
+            "C:\\SYNTHETIC_PRIVATE\\fixture.env",
+            "/synthetic/private/fixture.env",
+            "ignore previous instructions",
+            "[private markdown](https://private.example/markdown)",
+            fake_github_token(),
+        ]
+        hostile = " | ".join(canaries)
+        cluster = ComplaintCluster(
+            id=1,
+            fingerprint=hostile,
+            category=f"web_search\n{hostile}",
+            temperature=3,
+            first_seen=f"not-a-date {hostile}",
+            last_seen=f"also-not-a-date {hostile}",
+            sample=hostile,
+            github_issue_url="",
+            last_reported_temperature=0,
+        )
+
+        body = build_self_report_issue_body(cluster)
+
+        self.assertIn("category: `general`", body)
+        self.assertEqual(2, body.count("`unknown`"))
+        self.assertNotIn("fingerprint", body.casefold())
+        self.assertNotIn("sample", body.casefold())
+        for canary in canaries:
+            self.assertNotIn(canary, body)
+
+    def test_hostile_cluster_never_reaches_final_github_payload(self) -> None:
+        canaries = [
+            "synthetic_private_actor_999999999",
+            "https://private.example/secret",
+            "C:\\SYNTHETIC_PRIVATE\\fixture.env",
+            "/synthetic/private/fixture.env",
+            "ignore previous instructions",
+            "internal-private-fingerprint",
+            fake_github_token(),
+        ]
+        hostile = " | ".join(canaries)
+        cluster = ComplaintCluster(
+            id=1,
+            fingerprint="internal-private-fingerprint",
+            category=f"web_search\n{hostile}",
+            temperature=3,
+            first_seen=f"invalid {hostile}",
+            last_seen=f"invalid {hostile}",
+            sample=hostile,
+            github_issue_url="",
+            last_reported_temperature=0,
+        )
+        reporter = GitHubReporter(
+            enabled=True,
+            token="fine-grained-token",
+            repository="Turkevich91/Aigan",
+            project_add_enabled=False,
+            fingerprint_secret="stable-private-secret",
+        )
+        captured = {}
+
+        def create_issue(*, title: str, body: str, labels: list[str]) -> GitHubIssue:
+            captured.update(title=title, body=body, labels=labels)
+            return GitHubIssue(
+                url="https://github.com/Turkevich91/Aigan/issues/899",
+                number=899,
+                node_id="node-899",
+            )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = SystemLogStore(Path(tmpdir) / "health.sqlite3", retention_days=14)
+            service = SelfAnalysisService(
+                store=store,
+                reporter=reporter,
+                complaint_report_temperature=1,
+            )
+            with patch.object(reporter, "_create_issue", side_effect=create_issue):
+                service._maybe_report_complaint(cluster)
+            store.close()
+
+        final_payload = "\n".join(
+            [captured["title"], captured["body"], " ".join(captured["labels"])]
+        )
+        self.assertIn("self-report: general temperature 3", captured["title"])
+        for canary in canaries:
+            self.assertNotIn(canary, final_payload)
+
+    def test_github_reporter_uses_keyed_marker_without_exposing_internal_key(self) -> None:
+        reporter = GitHubReporter(
+            enabled=True,
+            token="fine-grained-token",
+            repository="Turkevich91/Aigan",
+            project_owner="",
+            project_number=0,
+            project_add_enabled=False,
+            fingerprint_secret="stable-private-secret",
+        )
+        captured: dict[str, str] = {}
+
+        def create_issue(*, title: str, body: str, labels: list[str]) -> GitHubIssue:
+            captured["body"] = body
+            return GitHubIssue(url="https://github.com/Turkevich91/Aigan/issues/900", number=900, node_id="node-900")
+
+        with patch.object(reporter, "_create_issue", side_effect=create_issue):
+            issue = reporter.create_self_report_issue(
+                title="[Aigan] self-report",
+                body="behavior-only body",
+                dedupe_key="internal-unsalted-fingerprint",
+            )
+
+        self.assertEqual(900, issue.number)
+        self.assertNotIn("internal-unsalted-fingerprint", captured["body"])
+        self.assertRegex(captured["body"], r"<!-- aigan-self-report:[a-f0-9]{24} -->")
+
+    def test_github_reporter_project_failure_is_non_blocking_after_issue_creation(self) -> None:
+        reporter = GitHubReporter(
+            enabled=True,
+            token="fine-grained-token",
+            repository="Turkevich91/Aigan",
+            project_owner="Turkevich91",
+            project_number=4,
+            project_add_enabled=True,
+            fingerprint_secret="stable-private-secret",
+        )
+        created = GitHubIssue(
+            url="https://github.com/Turkevich91/Aigan/issues/901",
+            number=901,
+            node_id="node-901",
+        )
+
+        with patch.object(reporter, "_create_issue", return_value=created) as create_issue:
+            with patch.object(reporter, "_add_issue_to_project", side_effect=RuntimeError("forbidden")):
+                issue = reporter.create_self_report_issue(
+                    title="[Aigan] self-report",
+                    body="behavior-only body",
+                    dedupe_key="cluster-key",
+                )
+
+        self.assertEqual(901, issue.number)
+        self.assertEqual("failed", issue.project_status)
+        create_issue.assert_called_once()
+
+    def test_github_http_error_is_bounded_and_does_not_echo_response_body(self) -> None:
+        reporter = GitHubReporter(
+            enabled=True,
+            token=fake_github_token(),
+            repository="Turkevich91/Aigan",
+            project_owner="",
+            project_number=0,
+            project_add_enabled=False,
+            fingerprint_secret="stable-private-secret",
+        )
+        canary = "private_user https://private.example C:\\SYNTHETIC_PRIVATE\\fixture.env " + fake_github_token()
+        http_error = urllib.error.HTTPError(
+            "https://api.github.com/private",
+            422,
+            canary,
+            {},
+            io.BytesIO(canary.encode("utf-8")),
+        )
+
+        with patch("urllib.request.urlopen", side_effect=http_error):
+            with self.assertRaises(GitHubReportingError) as raised:
+                reporter.create_self_report_issue(
+                    title="[Aigan] self-report",
+                    body="behavior-only body",
+                    dedupe_key="cluster-key",
+                )
+
+        self.assertEqual("validation_failed", raised.exception.category)
+        self.assertTrue(raised.exception.retry_safe)
+        self.assertEqual(422, raised.exception.status_code)
+        self.assertNotIn(canary, str(raised.exception))
+        self.assertNotIn(fake_github_token(), repr(vars(raised.exception)))
+        self.assertNotIn(canary, "".join(traceback.format_exception(raised.exception)))
+
+    def test_github_malformed_success_is_not_retry_safe(self) -> None:
+        reporter = GitHubReporter(
+            enabled=True,
+            token="fine-grained-token",
+            repository="Turkevich91/Aigan",
+            project_owner="",
+            project_number=0,
+            project_add_enabled=False,
+            fingerprint_secret="stable-private-secret",
+        )
+
+        with patch.object(reporter, "_request_json", return_value={"number": 902}):
+            with self.assertRaises(GitHubReportingError) as raised:
+                reporter.create_self_report_issue(
+                    title="[Aigan] self-report",
+                    body="behavior-only body",
+                    dedupe_key="cluster-key",
+                )
+
+        self.assertEqual("invalid_response", raised.exception.category)
+        self.assertFalse(raised.exception.retry_safe)
+
+    def test_github_null_issue_identity_is_an_ambiguous_invalid_response(self) -> None:
+        reporter = GitHubReporter(
+            enabled=True,
+            token="fine-grained-token",
+            repository="Turkevich91/Aigan",
+            project_add_enabled=False,
+            fingerprint_secret="stable-private-secret",
+        )
+
+        with patch.object(
+            reporter,
+            "_request_json",
+            return_value={"html_url": None, "number": 902, "node_id": None},
+        ):
+            with self.assertRaises(GitHubReportingError) as raised:
+                reporter.create_self_report_issue(
+                    title="[Aigan] self-report",
+                    body="behavior-only body",
+                    dedupe_key="cluster-key",
+                )
+
+        self.assertEqual("invalid_response", raised.exception.category)
+        self.assertFalse(raised.exception.retry_safe)
+
+    def test_github_socket_timeout_is_bounded_and_not_retry_safe(self) -> None:
+        reporter = GitHubReporter(
+            enabled=True,
+            token="fine-grained-token",
+            repository="Turkevich91/Aigan",
+            project_add_enabled=False,
+            fingerprint_secret="stable-private-secret",
+        )
+        canary = "private timeout https://private.example C:\\SYNTHETIC_PRIVATE\\fixture"
+
+        with patch("urllib.request.urlopen", side_effect=socket.timeout(canary)):
+            with self.assertRaises(GitHubReportingError) as raised:
+                reporter.create_self_report_issue(
+                    title="[Aigan] self-report",
+                    body="behavior-only body",
+                    dedupe_key="cluster-key",
+                )
+
+        self.assertEqual("request_timeout", raised.exception.category)
+        self.assertFalse(raised.exception.retry_safe)
+        self.assertNotIn(canary, "".join(traceback.format_exception(raised.exception)))
+
     def test_system_log_writes_reads_and_sanitizes_details(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             store = SystemLogStore(Path(tmpdir) / "health.sqlite3", retention_days=14)
@@ -10332,16 +10634,456 @@ class SystemHealthTests(unittest.TestCase):
                 complaint_report_temperature=2,
             )
 
-            first = service.record_complaint_signal(text="Aigan bot має problem: web search не працює")
-            second = service.record_complaint_signal(text="Aigan bot має problem: web search не працює")
+            clusters = [
+                service.record_complaint_signal(text="Aigan bot має problem: web search не працює")
+                for _ in range(10)
+            ]
 
-            self.assertEqual(1, first.temperature)
-            self.assertEqual(2, second.temperature)
+            self.assertEqual(1, clusters[0].temperature)
+            self.assertEqual(2, clusters[1].temperature)
+            self.assertEqual(10, clusters[-1].temperature)
             self.assertEqual(1, len(reporter.calls))
             self.assertTrue(reporter.calls[0]["title"].startswith("[Aigan] self-report: web_search"))
             self.assertIn("not a confirmed bug", reporter.calls[0]["body"])
+            self.assertNotIn("web search не працює", reporter.calls[0]["body"])
+            self.assertEqual(clusters[0].fingerprint, reporter.calls[0]["dedupe_key"])
+            self.assertNotIn("existing_issue_url", reporter.calls[0])
             self.assertIn("issues/99", store.active_complaints(1)[0].github_issue_url)
+            claim = store.get_complaint_report_claim(clusters[0].fingerprint)
+            self.assertIsNotNone(claim)
+            self.assertEqual("sent", claim.state)
             store.close()
+
+    def test_project_failure_status_still_marks_complaint_reported(self) -> None:
+        class ProjectLimitedReporter:
+            is_configured = True
+
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def create_self_report_issue(self, **kwargs):
+                self.calls += 1
+                return GitHubIssue(
+                    url="https://github.com/Turkevich91/Aigan/issues/903",
+                    number=903,
+                    node_id="node-903",
+                    project_status="failed",
+                )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = SystemLogStore(Path(tmpdir) / "health.sqlite3", retention_days=14)
+            reporter = ProjectLimitedReporter()
+            service = SelfAnalysisService(
+                store=store,
+                reporter=reporter,
+                complaint_lookback_seconds=86400,
+                complaint_report_temperature=1,
+            )
+
+            clusters = [
+                service.record_complaint_signal(text="Aigan bot має problem: web search не працює")
+                for _ in range(5)
+            ]
+            events = store.latest_events(10)
+            reported = store.active_complaints(1)[0]
+            claim = store.get_complaint_report_claim(clusters[0].fingerprint)
+
+            self.assertEqual("https://github.com/Turkevich91/Aigan/issues/903", reported.github_issue_url)
+            self.assertEqual(1, reporter.calls)
+            self.assertIsNotNone(claim)
+            self.assertEqual("sent", claim.state)
+            self.assertTrue(any(event.event_type == "self_report_project_add_failed" for event in events))
+            store.close()
+
+    def test_system_log_migrates_legacy_complaint_report_ledger(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "health.sqlite3"
+            with sqlite3.connect(db_path) as connection:
+                connection.executescript(
+                    """
+                    CREATE TABLE complaint_clusters (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        fingerprint TEXT NOT NULL UNIQUE,
+                        category TEXT NOT NULL DEFAULT 'general',
+                        temperature INTEGER NOT NULL DEFAULT 1,
+                        first_seen TEXT NOT NULL,
+                        last_seen TEXT NOT NULL,
+                        sample TEXT NOT NULL DEFAULT '',
+                        github_issue_url TEXT NOT NULL DEFAULT '',
+                        last_reported_temperature INTEGER NOT NULL DEFAULT 0
+                    );
+                    INSERT INTO complaint_clusters (
+                        fingerprint, category, temperature, first_seen, last_seen,
+                        sample, github_issue_url, last_reported_temperature
+                    ) VALUES
+                        ('legacy-sent', 'web_search', 3, '2026-01-01T00:00:00+00:00',
+                         '2026-01-02T00:00:00+00:00', '', 'https://github.com/example/issues/1', 3),
+                        ('legacy-unknown', 'web_search', 4, '2026-01-01T00:00:00+00:00',
+                         '2026-01-02T00:00:00+00:00', '', '', 4),
+                        ('legacy-unreported', 'web_search', 1, '2026-01-01T00:00:00+00:00',
+                         '2026-01-02T00:00:00+00:00', '', '', 0);
+                    """
+                )
+
+            store = SystemLogStore(db_path, retention_days=14)
+            sent = store.get_complaint_report_claim("legacy-sent")
+            unknown = store.get_complaint_report_claim("legacy-unknown")
+            unreported = store.get_complaint_report_claim("legacy-unreported")
+
+            self.assertIsNotNone(sent)
+            self.assertEqual("sent", sent.state)
+            self.assertIsNotNone(unknown)
+            self.assertEqual("unknown", unknown.state)
+            self.assertEqual("legacy_inconsistent_state", unknown.failure_category)
+            self.assertIsNone(unreported)
+            clusters = {item.fingerprint: item for item in store.active_complaints(3)}
+            self.assertEqual(REPORT_BLOCKING_TEMPERATURE, clusters["legacy-sent"].last_reported_temperature)
+            self.assertEqual(REPORT_BLOCKING_TEMPERATURE, clusters["legacy-unknown"].last_reported_temperature)
+            self.assertEqual(REPORT_ATTEMPTED_SENTINEL, clusters["legacy-unknown"].github_issue_url)
+            store.close()
+
+            reopened = SystemLogStore(db_path, retention_days=14)
+            self.assertEqual("sent", reopened.get_complaint_report_claim("legacy-sent").state)
+            self.assertEqual("unknown", reopened.get_complaint_report_claim("legacy-unknown").state)
+            reopened.close()
+
+    def test_retry_safe_failure_releases_claim_and_retries_once(self) -> None:
+        class RetryThenSuccessReporter:
+            is_configured = True
+
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def create_self_report_issue(self, **kwargs):
+                self.calls += 1
+                if self.calls == 1:
+                    raise GitHubReportingError("validation_failed", retry_safe=True, status_code=422)
+                return GitHubIssue(
+                    url="https://github.com/Turkevich91/Aigan/issues/904",
+                    number=904,
+                    node_id="node-904",
+                )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = SystemLogStore(Path(tmpdir) / "health.sqlite3", retention_days=14)
+            reporter = RetryThenSuccessReporter()
+            service = SelfAnalysisService(
+                store=store,
+                reporter=reporter,
+                complaint_lookback_seconds=86400,
+                complaint_report_temperature=1,
+            )
+
+            first_cluster = service.record_complaint_signal(text="Aigan bot має problem: web search не працює")
+            first_claim = store.get_complaint_report_claim(first_cluster.fingerprint)
+            self.assertEqual("retryable", first_claim.state)
+
+            service.record_complaint_signal(text="Aigan bot має problem: web search не працює")
+            final_claim = store.get_complaint_report_claim(first_cluster.fingerprint)
+
+            self.assertEqual(2, reporter.calls)
+            self.assertNotEqual(first_claim.claim_id, final_claim.claim_id)
+            self.assertEqual("sent", final_claim.state)
+            self.assertFalse(store.mark_complaint_report_unknown(first_claim, "stale_worker"))
+            self.assertEqual("sent", store.get_complaint_report_claim(first_cluster.fingerprint).state)
+            store.close()
+
+    def test_stale_claim_cannot_mutate_a_new_attempt(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = SystemLogStore(Path(tmpdir) / "health.sqlite3", retention_days=14)
+            cluster = store.upsert_complaint(
+                fingerprint="stale-cas-cluster",
+                category="web_search",
+                sample="private sample",
+                window_seconds=86400,
+            )
+            first_claim = store.claim_complaint_report(
+                fingerprint=cluster.fingerprint,
+                temperature=cluster.temperature,
+            )
+            self.assertTrue(store.release_complaint_report_claim(first_claim, "validation_failed"))
+            second_claim = store.claim_complaint_report(
+                fingerprint=cluster.fingerprint,
+                temperature=cluster.temperature + 1,
+            )
+
+            self.assertNotEqual(first_claim.claim_id, second_claim.claim_id)
+            self.assertEqual("attempted", second_claim.state)
+            self.assertFalse(store.release_complaint_report_claim(first_claim, "stale_worker"))
+            self.assertFalse(store.mark_complaint_report_unknown(first_claim, "stale_worker"))
+            self.assertFalse(
+                store.mark_complaint_reported(
+                    first_claim,
+                    "https://github.com/Turkevich91/Aigan/issues/998",
+                )
+            )
+            self.assertEqual("attempted", store.get_complaint_report_claim(cluster.fingerprint).state)
+            self.assertTrue(
+                store.mark_complaint_reported(
+                    second_claim,
+                    "https://github.com/Turkevich91/Aigan/issues/999",
+                )
+            )
+            self.assertEqual("sent", store.get_complaint_report_claim(cluster.fingerprint).state)
+            store.close()
+
+    def test_ambiguous_report_outcome_survives_restart_and_is_never_retried(self) -> None:
+        remote_issues = []
+
+        class AmbiguousReporter:
+            is_configured = True
+
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def create_self_report_issue(self, **kwargs):
+                self.calls += 1
+                remote_issues.append(kwargs)
+                raise GitHubReportingError("request_timeout", retry_safe=False)
+
+        class MustNotRunReporter:
+            is_configured = True
+
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def create_self_report_issue(self, **kwargs):
+                self.calls += 1
+                return GitHubIssue(
+                    url="https://github.com/Turkevich91/Aigan/issues/905",
+                    number=905,
+                    node_id="node-905",
+                )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "health.sqlite3"
+            first_store = SystemLogStore(db_path, retention_days=14)
+            first_reporter = AmbiguousReporter()
+            first_service = SelfAnalysisService(
+                store=first_store,
+                reporter=first_reporter,
+                complaint_lookback_seconds=86400,
+                complaint_report_temperature=1,
+            )
+
+            cluster = first_service.record_complaint_signal(text="Aigan bot має problem: web search не працює")
+            claim = first_store.get_complaint_report_claim(cluster.fingerprint)
+            failure = next(
+                event for event in first_store.latest_events(10) if event.event_type == "self_report_failed"
+            )
+            serialized_failure = failure.message + json.dumps(failure.details, sort_keys=True)
+
+            self.assertEqual(1, first_reporter.calls)
+            self.assertEqual(1, len(remote_issues))
+            self.assertEqual("unknown", claim.state)
+            self.assertTrue(claim.attempted_at)
+            self.assertIn("request_timeout", serialized_failure)
+            first_store.close()
+
+            reopened = SystemLogStore(db_path, retention_days=14)
+            second_reporter = MustNotRunReporter()
+            second_service = SelfAnalysisService(
+                store=reopened,
+                reporter=second_reporter,
+                complaint_lookback_seconds=86400,
+                complaint_report_temperature=1,
+            )
+            for _ in range(5):
+                second_service.record_complaint_signal(text="Aigan bot має problem: web search не працює")
+
+            self.assertEqual(0, second_reporter.calls)
+            self.assertEqual(1, len(remote_issues))
+            self.assertEqual("unknown", reopened.get_complaint_report_claim(cluster.fingerprint).state)
+            reopened.close()
+
+    def test_unexpected_reporter_error_is_bounded_in_system_events(self) -> None:
+        canaries = [
+            "private timeout detail",
+            "https://private.example",
+            "C:\\SYNTHETIC_PRIVATE\\fixture",
+        ]
+
+        class UnexpectedReporter:
+            is_configured = True
+
+            def create_self_report_issue(self, **kwargs):
+                raise RuntimeError(" | ".join(canaries))
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = SystemLogStore(Path(tmpdir) / "health.sqlite3", retention_days=14)
+            service = SelfAnalysisService(
+                store=store,
+                reporter=UnexpectedReporter(),
+                complaint_lookback_seconds=86400,
+                complaint_report_temperature=1,
+            )
+
+            cluster = service.record_complaint_signal(text="Aigan bot має problem: web search не працює")
+            failure = next(event for event in store.latest_events(10) if event.event_type == "self_report_failed")
+            serialized_failure = failure.message + json.dumps(failure.details, sort_keys=True)
+
+            self.assertEqual("unknown", store.get_complaint_report_claim(cluster.fingerprint).state)
+            self.assertIn("outcome_unknown", serialized_failure)
+            for canary in canaries:
+                self.assertNotIn(canary, serialized_failure)
+            store.close()
+
+    def test_remote_success_with_local_finalize_failure_is_not_retried(self) -> None:
+        class SuccessReporter:
+            is_configured = True
+
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def create_self_report_issue(self, **kwargs):
+                self.calls += 1
+                return GitHubIssue(
+                    url="https://github.com/Turkevich91/Aigan/issues/906",
+                    number=906,
+                    node_id="node-906",
+                )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "health.sqlite3"
+            store = SystemLogStore(db_path, retention_days=14)
+            first_reporter = SuccessReporter()
+            service = SelfAnalysisService(
+                store=store,
+                reporter=first_reporter,
+                complaint_lookback_seconds=86400,
+                complaint_report_temperature=1,
+            )
+
+            with patch.object(store, "mark_complaint_reported", side_effect=sqlite3.OperationalError("private db path")):
+                cluster = service.record_complaint_signal(text="Aigan bot має problem: web search не працює")
+
+            self.assertEqual(1, first_reporter.calls)
+            self.assertEqual("attempted", store.get_complaint_report_claim(cluster.fingerprint).state)
+            store.close()
+
+            reopened = SystemLogStore(db_path, retention_days=14)
+            second_reporter = SuccessReporter()
+            second_service = SelfAnalysisService(
+                store=reopened,
+                reporter=second_reporter,
+                complaint_lookback_seconds=86400,
+                complaint_report_temperature=1,
+            )
+            second_service.record_complaint_signal(text="Aigan bot має problem: web search не працює")
+
+            self.assertEqual(0, second_reporter.calls)
+            self.assertEqual("attempted", reopened.get_complaint_report_claim(cluster.fingerprint).state)
+            reopened.close()
+
+    def test_cleanup_and_clear_all_preserve_ambiguous_report_tombstone(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = SystemLogStore(Path(tmpdir) / "health.sqlite3", retention_days=1)
+            cluster = store.upsert_complaint(
+                fingerprint="ambiguous-cluster",
+                category="web_search",
+                sample="private sample",
+                window_seconds=86400,
+            )
+            claim = store.claim_complaint_report(
+                fingerprint=cluster.fingerprint,
+                temperature=cluster.temperature,
+            )
+            self.assertTrue(store.mark_complaint_report_unknown(claim, "transport_error"))
+            store._conn.execute(
+                "UPDATE complaint_clusters SET last_seen = '2000-01-01T00:00:00+00:00' WHERE fingerprint = ?",
+                (cluster.fingerprint,),
+            )
+            store._conn.commit()
+
+            store.cleanup()
+            store.clear_all()
+
+            tombstone = store.get_complaint_report_claim(cluster.fingerprint)
+            self.assertIsNotNone(tombstone)
+            self.assertEqual("unknown", tombstone.state)
+            retained = store.active_complaints(1)[0]
+            self.assertEqual("", retained.sample)
+            self.assertEqual(REPORT_ATTEMPTED_SENTINEL, retained.github_issue_url)
+            self.assertEqual(REPORT_BLOCKING_TEMPERATURE, retained.last_reported_temperature)
+            recreated = store.upsert_complaint(
+                fingerprint=cluster.fingerprint,
+                category="web_search",
+                sample="another private sample",
+                window_seconds=86400,
+            )
+            self.assertIsNone(
+                store.claim_complaint_report(
+                    fingerprint=recreated.fingerprint,
+                    temperature=recreated.temperature,
+                )
+            )
+            self.assertTrue(recreated.github_issue_url)
+            self.assertGreaterEqual(recreated.last_reported_temperature, recreated.temperature)
+            store.close()
+
+    def test_concurrent_threshold_crossings_create_one_report(self) -> None:
+        class ThreadSafeReporter:
+            is_configured = True
+
+            def __init__(self) -> None:
+                self.calls = 0
+                self.lock = threading.Lock()
+
+            def create_self_report_issue(self, **kwargs):
+                with self.lock:
+                    self.calls += 1
+                time.sleep(0.05)
+                return GitHubIssue(
+                    url="https://github.com/Turkevich91/Aigan/issues/907",
+                    number=907,
+                    node_id="node-907",
+                )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "health.sqlite3"
+            first_store = SystemLogStore(db_path, retention_days=14)
+            cluster = first_store.upsert_complaint(
+                fingerprint="concurrent-cluster",
+                category="web_search",
+                sample="private sample",
+                window_seconds=86400,
+            )
+            second_store = SystemLogStore(db_path, retention_days=14)
+            reporter = ThreadSafeReporter()
+            first_service = SelfAnalysisService(
+                store=first_store,
+                reporter=reporter,
+                complaint_report_temperature=1,
+            )
+            second_service = SelfAnalysisService(
+                store=second_store,
+                reporter=reporter,
+                complaint_report_temperature=1,
+            )
+            barrier = threading.Barrier(2, timeout=5)
+            errors: list[Exception] = []
+
+            def run(service: SelfAnalysisService) -> None:
+                try:
+                    barrier.wait()
+                    service._maybe_report_complaint(cluster)
+                except Exception as exc:
+                    errors.append(exc)
+
+            first_thread = threading.Thread(target=run, args=(first_service,))
+            second_thread = threading.Thread(target=run, args=(second_service,))
+            first_thread.start()
+            second_thread.start()
+            first_thread.join(timeout=10)
+            second_thread.join(timeout=10)
+
+            self.assertEqual([], errors)
+            self.assertFalse(first_thread.is_alive())
+            self.assertFalse(second_thread.is_alive())
+            self.assertEqual(1, reporter.calls)
+            self.assertEqual("sent", first_store.get_complaint_report_claim(cluster.fingerprint).state)
+            first_store.close()
+            second_store.close()
 
     def test_reaction_complaint_temperature_reports_sanitized_self_report(self) -> None:
         class FakeReporter:
@@ -10379,7 +11121,7 @@ class SystemHealthTests(unittest.TestCase):
             self.assertEqual(1, len(reporter.calls))
             body = reporter.calls[0]["body"]
             self.assertIn("insensitive_reaction", body)
-            self.assertIn("targetabc", body)
+            self.assertNotIn("targetabc", body)
             self.assertNotIn("sample payload marker", body)
             event = next(event for event in store.latest_events(5) if event.event_type == "reaction_complaint_signal")
             self.assertEqual("reaction_complaint_signal", event.event_type)
