@@ -164,11 +164,10 @@ For current-looking forwarded news or political claims, Aigan may run a safe web
 If the user asks first and forwards content immediately after, the bot keeps a short pending request window:
 
 ```env
-PENDING_REQUEST_SECONDS=180
 FOLLOWUP_DEBOUNCE_SECONDS=0.5
 ```
 
-`FOLLOWUP_DEBOUNCE_SECONDS` is a short input-lag buffer before the bot starts generating an answer for context-dependent requests. `PENDING_REQUEST_SECONDS` is the longer expiry window for a pending request that is waiting for follow-up context.
+`FOLLOWUP_DEBOUNCE_SECONDS` defines the base input-lag buffer. The coalescer derives a small bounded quiet window from it, restarts that window when another correlated part arrives, and expires the turn automatically.
 
 Image analysis is enabled by default for photos and image documents that Telegram actually delivers to the bot:
 
