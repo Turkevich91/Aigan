@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import secrets
 import sqlite3
 import threading
 from dataclasses import dataclass
@@ -17,6 +18,8 @@ SECRET_PATTERNS = [
     re.compile(r"\b([A-Z][A-Z0-9_]*(?:TOKEN|SECRET|KEY|PASSWORD))=([^\s]+)", re.IGNORECASE),
 ]
 MAX_TEXT_DETAIL = 500
+REPORT_ATTEMPTED_SENTINEL = "urn:aigan:github-self-report-attempted"
+REPORT_BLOCKING_TEMPERATURE = 2_147_483_647
 
 
 @dataclass(frozen=True)
@@ -45,6 +48,18 @@ class ComplaintCluster:
     sample: str
     github_issue_url: str
     last_reported_temperature: int
+
+
+@dataclass(frozen=True)
+class ComplaintReportClaim:
+    fingerprint: str
+    claim_id: str
+    state: str
+    attempted_at: str
+    attempted_temperature: int
+    issue_url: str
+    failure_category: str
+    completed_at: str
 
 
 def utc_now() -> datetime:
@@ -153,7 +168,64 @@ class SystemLogStore:
             );
             CREATE INDEX IF NOT EXISTS idx_complaint_clusters_last_seen
                 ON complaint_clusters(last_seen, id);
+
+            CREATE TABLE IF NOT EXISTS complaint_report_claims (
+                fingerprint TEXT PRIMARY KEY,
+                claim_id TEXT NOT NULL UNIQUE,
+                state TEXT NOT NULL CHECK(state IN ('attempted', 'retryable', 'unknown', 'sent')),
+                attempted_at TEXT NOT NULL,
+                attempted_temperature INTEGER NOT NULL,
+                issue_url TEXT NOT NULL DEFAULT '',
+                failure_category TEXT NOT NULL DEFAULT '',
+                completed_at TEXT NOT NULL DEFAULT ''
+            );
             """
+        )
+        self._conn.execute(
+            """
+            INSERT OR IGNORE INTO complaint_report_claims (
+                fingerprint, claim_id, state, attempted_at, attempted_temperature,
+                issue_url, failure_category, completed_at
+            )
+            SELECT
+                fingerprint, lower(hex(randomblob(16))), 'sent', last_seen,
+                last_reported_temperature, github_issue_url, '', last_seen
+            FROM complaint_clusters
+            WHERE github_issue_url != ''
+            """
+        )
+        self._conn.execute(
+            """
+            INSERT OR IGNORE INTO complaint_report_claims (
+                fingerprint, claim_id, state, attempted_at, attempted_temperature,
+                issue_url, failure_category, completed_at
+            )
+            SELECT
+                fingerprint, lower(hex(randomblob(16))), 'unknown', last_seen,
+                last_reported_temperature, '', 'legacy_inconsistent_state', last_seen
+            FROM complaint_clusters
+            WHERE github_issue_url = '' AND last_reported_temperature > 0
+            """
+        )
+        self._conn.execute(
+            """
+            UPDATE complaint_clusters
+            SET github_issue_url = COALESCE(
+                    NULLIF((
+                        SELECT report.issue_url
+                        FROM complaint_report_claims report
+                        WHERE report.fingerprint = complaint_clusters.fingerprint
+                    ), ''),
+                    ?
+                ),
+                last_reported_temperature = ?
+            WHERE EXISTS (
+                SELECT 1 FROM complaint_report_claims report
+                WHERE report.fingerprint = complaint_clusters.fingerprint
+                  AND report.state IN ('attempted', 'unknown', 'sent')
+            )
+            """,
+            (REPORT_ATTEMPTED_SENTINEL, REPORT_BLOCKING_TEMPERATURE),
         )
         self._conn.commit()
 
@@ -361,17 +433,154 @@ class SystemLogStore:
             raise KeyError(row_id)
         return row_to_cluster(row)
 
-    def mark_complaint_reported(self, fingerprint: str, issue_url: str, temperature: int) -> None:
+    def claim_complaint_report(
+        self,
+        *,
+        fingerprint: str,
+        temperature: int,
+    ) -> ComplaintReportClaim | None:
+        exact_fingerprint = str(fingerprint)
+        claim_id = secrets.token_hex(16)
+        attempted_at = format_datetime()
         with self._lock:
-            self._conn.execute(
-                """
-                UPDATE complaint_clusters
-                SET github_issue_url = ?, last_reported_temperature = ?
-                WHERE fingerprint = ?
-                """,
-                (sanitize_text(issue_url, 300), int(temperature), fingerprint),
-            )
-            self._conn.commit()
+            try:
+                cursor = self._conn.execute(
+                    """
+                    INSERT INTO complaint_report_claims (
+                        fingerprint, claim_id, state, attempted_at, attempted_temperature,
+                        issue_url, failure_category, completed_at
+                    ) VALUES (?, ?, 'attempted', ?, ?, '', '', '')
+                    ON CONFLICT(fingerprint) DO UPDATE SET
+                        claim_id = excluded.claim_id,
+                        state = 'attempted',
+                        attempted_at = excluded.attempted_at,
+                        attempted_temperature = excluded.attempted_temperature,
+                        issue_url = '',
+                        failure_category = '',
+                        completed_at = ''
+                    WHERE complaint_report_claims.state = 'retryable'
+                    """,
+                    (exact_fingerprint, claim_id, attempted_at, max(1, int(temperature))),
+                )
+                if cursor.rowcount:
+                    self._conn.execute(
+                        """
+                        UPDATE complaint_clusters
+                        SET github_issue_url = ?, last_reported_temperature = ?
+                        WHERE fingerprint = ? AND github_issue_url = ''
+                        """,
+                        (
+                            REPORT_ATTEMPTED_SENTINEL,
+                            REPORT_BLOCKING_TEMPERATURE,
+                            exact_fingerprint,
+                        ),
+                    )
+                self._conn.commit()
+            except Exception:
+                self._conn.rollback()
+                raise
+            if not cursor.rowcount:
+                return None
+            return self.get_complaint_report_claim(exact_fingerprint)
+
+    def get_complaint_report_claim(self, fingerprint: str) -> ComplaintReportClaim | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM complaint_report_claims WHERE fingerprint = ?",
+                (str(fingerprint),),
+            ).fetchone()
+        return row_to_complaint_report_claim(row) if row is not None else None
+
+    def release_complaint_report_claim(
+        self,
+        claim: ComplaintReportClaim,
+        failure_category: str,
+    ) -> bool:
+        completed_at = format_datetime()
+        with self._lock:
+            try:
+                cursor = self._conn.execute(
+                    """
+                    UPDATE complaint_report_claims
+                    SET state = 'retryable', failure_category = ?, completed_at = ?
+                    WHERE fingerprint = ? AND claim_id = ? AND state = 'attempted'
+                    """,
+                    (
+                        normalize_failure_category(failure_category),
+                        completed_at,
+                        claim.fingerprint,
+                        claim.claim_id,
+                    ),
+                )
+                if cursor.rowcount:
+                    self._conn.execute(
+                        """
+                        UPDATE complaint_clusters
+                        SET github_issue_url = '', last_reported_temperature = 0
+                        WHERE fingerprint = ? AND github_issue_url = ?
+                        """,
+                        (claim.fingerprint, REPORT_ATTEMPTED_SENTINEL),
+                    )
+                self._conn.commit()
+            except Exception:
+                self._conn.rollback()
+                raise
+        return bool(cursor.rowcount)
+
+    def mark_complaint_report_unknown(
+        self,
+        claim: ComplaintReportClaim,
+        failure_category: str,
+    ) -> bool:
+        completed_at = format_datetime()
+        with self._lock:
+            try:
+                cursor = self._conn.execute(
+                    """
+                    UPDATE complaint_report_claims
+                    SET state = 'unknown', failure_category = ?, completed_at = ?
+                    WHERE fingerprint = ? AND claim_id = ? AND state = 'attempted'
+                    """,
+                    (
+                        normalize_failure_category(failure_category),
+                        completed_at,
+                        claim.fingerprint,
+                        claim.claim_id,
+                    ),
+                )
+                self._conn.commit()
+            except Exception:
+                self._conn.rollback()
+                raise
+        return bool(cursor.rowcount)
+
+    def mark_complaint_reported(self, claim: ComplaintReportClaim, issue_url: str) -> bool:
+        completed_at = format_datetime()
+        clean_url = sanitize_text(issue_url, 300)
+        with self._lock:
+            try:
+                cursor = self._conn.execute(
+                    """
+                    UPDATE complaint_report_claims
+                    SET state = 'sent', issue_url = ?, failure_category = '', completed_at = ?
+                    WHERE fingerprint = ? AND claim_id = ? AND state = 'attempted'
+                    """,
+                    (clean_url, completed_at, claim.fingerprint, claim.claim_id),
+                )
+                if cursor.rowcount:
+                    self._conn.execute(
+                        """
+                        UPDATE complaint_clusters
+                        SET github_issue_url = ?, last_reported_temperature = ?
+                        WHERE fingerprint = ?
+                        """,
+                        (clean_url, REPORT_BLOCKING_TEMPERATURE, claim.fingerprint),
+                    )
+                self._conn.commit()
+            except Exception:
+                self._conn.rollback()
+                raise
+        return bool(cursor.rowcount)
 
     def active_complaints(self, limit: int = 10) -> list[ComplaintCluster]:
         limit = max(1, min(int(limit), 50))
@@ -393,7 +602,13 @@ class SystemLogStore:
             cluster_cursor = self._conn.execute(
                 """
                 DELETE FROM complaint_clusters
-                WHERE last_seen < ? AND github_issue_url = ''
+                WHERE last_seen < ?
+                  AND github_issue_url = ''
+                  AND NOT EXISTS (
+                      SELECT 1 FROM complaint_report_claims report
+                      WHERE report.fingerprint = complaint_clusters.fingerprint
+                        AND report.state IN ('attempted', 'unknown', 'sent')
+                  )
                 """,
                 (cutoff,),
             )
@@ -401,9 +616,45 @@ class SystemLogStore:
             return int(event_cursor.rowcount or 0) + int(cluster_cursor.rowcount or 0)
 
     def clear_all(self) -> None:
+        """Clear diagnostics while retaining minimal at-most-once report tombstones."""
+        now = format_datetime()
         with self._lock:
             self._conn.execute("DELETE FROM system_events")
-            self._conn.execute("DELETE FROM complaint_clusters")
+            self._conn.execute(
+                """
+                DELETE FROM complaint_clusters
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM complaint_report_claims report
+                    WHERE report.fingerprint = complaint_clusters.fingerprint
+                      AND report.state IN ('attempted', 'unknown', 'sent')
+                )
+                """
+            )
+            self._conn.execute(
+                """
+                UPDATE complaint_clusters
+                SET category = 'general',
+                    temperature = 1,
+                    first_seen = ?,
+                    last_seen = ?,
+                    sample = '',
+                    github_issue_url = COALESCE(
+                        NULLIF((
+                            SELECT report.issue_url
+                            FROM complaint_report_claims report
+                            WHERE report.fingerprint = complaint_clusters.fingerprint
+                        ), ''),
+                        ?
+                    ),
+                    last_reported_temperature = ?
+                WHERE EXISTS (
+                    SELECT 1 FROM complaint_report_claims report
+                    WHERE report.fingerprint = complaint_clusters.fingerprint
+                      AND report.state IN ('attempted', 'unknown', 'sent')
+                )
+                """,
+                (now, now, REPORT_ATTEMPTED_SENTINEL, REPORT_BLOCKING_TEMPERATURE),
+            )
             self._conn.commit()
 
     def close(self) -> None:
@@ -414,6 +665,11 @@ class SystemLogStore:
 def normalize_level(level: str) -> str:
     normalized = (level or "info").strip().casefold()
     return normalized if normalized in {"info", "warning", "error", "critical"} else "info"
+
+
+def normalize_failure_category(value: str) -> str:
+    normalized = re.sub(r"[^a-z0-9_]+", "_", str(value or "").casefold()).strip("_")
+    return normalized[:80] or "outcome_unknown"
 
 
 def allowed_levels(min_level: str) -> list[str]:
@@ -453,6 +709,19 @@ def row_to_cluster(row: sqlite3.Row) -> ComplaintCluster:
         sample=str(row["sample"]),
         github_issue_url=str(row["github_issue_url"]),
         last_reported_temperature=int(row["last_reported_temperature"]),
+    )
+
+
+def row_to_complaint_report_claim(row: sqlite3.Row) -> ComplaintReportClaim:
+    return ComplaintReportClaim(
+        fingerprint=str(row["fingerprint"]),
+        claim_id=str(row["claim_id"]),
+        state=str(row["state"]),
+        attempted_at=str(row["attempted_at"]),
+        attempted_temperature=int(row["attempted_temperature"]),
+        issue_url=str(row["issue_url"]),
+        failure_category=str(row["failure_category"]),
+        completed_at=str(row["completed_at"]),
     )
 
 

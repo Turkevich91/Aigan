@@ -265,6 +265,7 @@ class Config:
     github_repository: str
     github_project_owner: str
     github_project_number: int
+    github_project_add_enabled: bool
     complaint_lookback_seconds: int
     complaint_report_temperature: int
     social_memory_enabled: bool
@@ -438,7 +439,8 @@ class Config:
             github_token=os.getenv("GITHUB_TOKEN", "").strip(),
             github_repository=os.getenv("GITHUB_REPOSITORY", "Turkevich91/Aigan").strip(),
             github_project_owner=os.getenv("GITHUB_PROJECT_OWNER", "Turkevich91").strip(),
-            github_project_number=int(os.getenv("GITHUB_PROJECT_NUMBER", "4")),
+            github_project_number=optional_int(os.getenv("GITHUB_PROJECT_NUMBER", "4")) or 0,
+            github_project_add_enabled=_env_bool("GITHUB_PROJECT_ADD_ENABLED", False),
             complaint_lookback_seconds=int(os.getenv("COMPLAINT_LOOKBACK_SECONDS", "86400")),
             complaint_report_temperature=int(os.getenv("COMPLAINT_REPORT_TEMPERATURE", "3")),
             social_memory_enabled=_env_bool("SOCIAL_MEMORY_ENABLED", True),
@@ -787,6 +789,8 @@ GITHUB_REPORTER = GitHubReporter(
     repository=CONFIG.github_repository,
     project_owner=CONFIG.github_project_owner,
     project_number=CONFIG.github_project_number,
+    project_add_enabled=CONFIG.github_project_add_enabled,
+    fingerprint_secret=provenance_hash_secret(),
 )
 SELF_ANALYSIS = SelfAnalysisService(
     store=SYSTEM_LOG,
