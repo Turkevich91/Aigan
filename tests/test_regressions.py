@@ -11025,14 +11025,16 @@ class SystemHealthTests(unittest.TestCase):
         class ThreadSafeReporter:
             is_configured = True
 
-            def __init__(self) -> None:
+            def __init__(self, competing_claim_finished: threading.Event) -> None:
                 self.calls = 0
                 self.lock = threading.Lock()
+                self.competing_claim_finished = competing_claim_finished
 
             def create_self_report_issue(self, **kwargs):
                 with self.lock:
                     self.calls += 1
-                time.sleep(0.05)
+                if not self.competing_claim_finished.wait(timeout=5):
+                    raise RuntimeError("competing claim did not finish")
                 return GitHubIssue(
                     url="https://github.com/Turkevich91/Aigan/issues/907",
                     number=907,
@@ -11049,7 +11051,8 @@ class SystemHealthTests(unittest.TestCase):
                 window_seconds=86400,
             )
             second_store = SystemLogStore(db_path, retention_days=14)
-            reporter = ThreadSafeReporter()
+            competing_claim_finished = threading.Event()
+            reporter = ThreadSafeReporter(competing_claim_finished)
             first_service = SelfAnalysisService(
                 store=first_store,
                 reporter=reporter,
@@ -11062,6 +11065,13 @@ class SystemHealthTests(unittest.TestCase):
             )
             barrier = threading.Barrier(2, timeout=5)
             errors: list[Exception] = []
+            original_second_claim = second_store.claim_complaint_report
+
+            def tracked_second_claim(**kwargs):
+                try:
+                    return original_second_claim(**kwargs)
+                finally:
+                    competing_claim_finished.set()
 
             def run(service: SelfAnalysisService) -> None:
                 try:
@@ -11070,12 +11080,13 @@ class SystemHealthTests(unittest.TestCase):
                 except Exception as exc:
                     errors.append(exc)
 
-            first_thread = threading.Thread(target=run, args=(first_service,))
-            second_thread = threading.Thread(target=run, args=(second_service,))
-            first_thread.start()
-            second_thread.start()
-            first_thread.join(timeout=10)
-            second_thread.join(timeout=10)
+            with patch.object(second_store, "claim_complaint_report", side_effect=tracked_second_claim):
+                first_thread = threading.Thread(target=run, args=(first_service,))
+                second_thread = threading.Thread(target=run, args=(second_service,))
+                first_thread.start()
+                second_thread.start()
+                first_thread.join(timeout=10)
+                second_thread.join(timeout=10)
 
             self.assertEqual([], errors)
             self.assertFalse(first_thread.is_alive())
