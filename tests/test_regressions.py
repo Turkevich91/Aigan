@@ -1897,18 +1897,13 @@ class TelegramTurnCoalescingTests(unittest.TestCase):
         self.assertIsNotNone(key)
         main.pending_requests[key]["created_at"] = time.monotonic() - 86400
 
-        with patch.object(
-            main,
-            "CONFIG",
-            replace(main.CONFIG, pending_request_seconds=1_000_000_000),
-        ):
-            self.assertFalse(main.has_pending_request(original))
-            replacement_token = main.store_pending_request(
-                replacement,
-                replacement.text,
-                "same_turn_payload",
-                role="invocation",
-            )
+        self.assertFalse(main.has_pending_request(original))
+        replacement_token = main.store_pending_request(
+            replacement,
+            replacement.text,
+            "same_turn_payload",
+            role="invocation",
+        )
 
         self.assertIsNotNone(replacement_token)
         self.assertNotEqual(first_token, replacement_token)
@@ -1939,6 +1934,31 @@ class TelegramTurnCoalescingTests(unittest.TestCase):
 
         self.assertIs(ready, claimed)
         self.assertNotIn(key, main.pending_requests)
+
+    def test_restage_refreshes_arrival_deadline_before_persistence(self) -> None:
+        invocation = FakeMessage("explain the next photo", message_id=12156)
+        photo = FakeMessage("", message_id=12157)
+        photo.photo = [FakePhoto(file_id="restage-photo", unique_id="restage-photo-unique")]
+        token = main.store_pending_request(
+            invocation,
+            invocation.text,
+            "same_turn_payload",
+            role="invocation",
+        )
+        self.assertIsNotNone(token)
+        pending = main.claim_pending_request(invocation, token)
+        self.assertIsNotNone(pending)
+        pending["created_at"] = time.monotonic() - 86400
+        before_restage = time.monotonic()
+
+        restaged_token = main.restage_correlated_pending(pending, photo)
+
+        self.assertIsNotNone(restaged_token)
+        key = main.pending_key(invocation)
+        self.assertIsNotNone(key)
+        restaged = main.pending_requests[key]
+        self.assertGreaterEqual(restaged["created_at"], before_restage)
+        self.assertFalse(main.pending_expired(restaged))
 
     def test_stale_resolver_token_never_removes_newer_pending_turn(self) -> None:
         first = FakeMessage("explain the next source", message_id=12154)

@@ -212,7 +212,6 @@ class Config:
     image_analysis_enabled: bool
     vision_model: str
     image_max_bytes: int
-    pending_request_seconds: int
     followup_debounce_seconds: float
     memory_enabled: bool
     memory_db_path: str
@@ -385,7 +384,6 @@ class Config:
             image_analysis_enabled=_env_bool("IMAGE_ANALYSIS_ENABLED", True),
             vision_model=os.getenv("VISION_MODEL", os.getenv("OPENAI_MODEL", "gpt-5.4-mini")).strip(),
             image_max_bytes=int(os.getenv("IMAGE_MAX_BYTES", "6000000")),
-            pending_request_seconds=int(os.getenv("PENDING_REQUEST_SECONDS", "180")),
             followup_debounce_seconds=max(0.0, float(os.getenv("FOLLOWUP_DEBOUNCE_SECONDS", "0.5"))),
             memory_enabled=_env_bool("MEMORY_ENABLED", True),
             memory_db_path=os.getenv("MEMORY_DB_PATH", str(APP_DIR / "data" / "aigan.sqlite3")).strip(),
@@ -8685,7 +8683,7 @@ def restage_correlated_pending(pending: dict[str, Any], message: Message) -> int
         role=role,
         payload_messages=payload_messages,
         correlation_id=pending_correlation_id(pending),
-        created_at=float(pending.get("created_at", time.monotonic())),
+        created_at=time.monotonic(),
         part_count=pending_part_count(pending) + 1,
     )
     if token is not None:

@@ -203,7 +203,7 @@ stateDiagram-v2
     Consumed --> Generating: use follow-up as context
     Generating --> Delivered
     Delivered --> Idle
-    Pending --> Expired: PENDING_REQUEST_SECONDS elapsed
+    Pending --> Expired: bounded coalescing window elapsed
     Expired --> Idle
 ```
 
@@ -417,4 +417,3 @@ Current quality:
 - Memory tests do not need fake Telegram messages except at service-boundary tests.
 - Expected fallbacks do not produce stack traces in normal logs.
 - `/version` and changelog remain updated for every release.
-
