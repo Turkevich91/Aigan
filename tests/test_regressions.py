@@ -337,8 +337,9 @@ class AgentsSdkCompatibilityTests(unittest.TestCase):
 
             async def stream_response(self, *args, **kwargs):
                 self.called = True
+                if False:
+                    yield
                 raise AssertionError("offline model boundary reached")
-                yield
 
         model = OfflineBoundaryModel()
 
