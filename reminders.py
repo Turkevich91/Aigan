@@ -47,6 +47,9 @@ class ReminderFire:
     attempt_count: int
     sent_message_id: int | None
     failure_category: str
+    delivery_revision: int
+    delivery_attempted_at: str
+    delivery_kind: str
     created_at: str
     updated_at: str
 
@@ -164,6 +167,9 @@ class ReminderStore:
                 attempt_count INTEGER NOT NULL DEFAULT 0,
                 sent_message_id INTEGER,
                 failure_category TEXT NOT NULL DEFAULT '',
+                delivery_revision INTEGER NOT NULL DEFAULT 0,
+                delivery_attempted_at TEXT NOT NULL DEFAULT '',
+                delivery_kind TEXT NOT NULL DEFAULT '',
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
@@ -173,7 +179,18 @@ class ReminderStore:
                 ON reminder_fires(reminder_id, status, scheduled_for_utc, id);
             """
         )
+        self._ensure_column("reminder_fires", "delivery_revision", "INTEGER NOT NULL DEFAULT 0")
+        self._ensure_column("reminder_fires", "delivery_attempted_at", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column("reminder_fires", "delivery_kind", "TEXT NOT NULL DEFAULT ''")
         self._conn.commit()
+
+    def _ensure_column(self, table: str, column: str, definition: str) -> None:
+        existing = {
+            str(row["name"])
+            for row in self._conn.execute(f"PRAGMA table_info({table})").fetchall()
+        }
+        if column not in existing:
+            self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
     def create_reminder(
         self,
@@ -405,6 +422,9 @@ class ReminderStore:
                     f.idempotency_key AS f_idempotency_key, f.status AS f_status, f.claimed_at AS f_claimed_at,
                     f.completed_at AS f_completed_at, f.attempt_count AS f_attempt_count,
                     f.sent_message_id AS f_sent_message_id, f.failure_category AS f_failure_category,
+                    f.delivery_revision AS f_delivery_revision,
+                    f.delivery_attempted_at AS f_delivery_attempted_at,
+                    f.delivery_kind AS f_delivery_kind,
                     f.created_at AS f_created_at, f.updated_at AS f_updated_at
                 FROM reminder_fires f
                 JOIN reminders r ON r.id = f.reminder_id
@@ -430,6 +450,80 @@ class ReminderStore:
                 claimed.append(row_to_claim(row, status="claimed", claimed_at=now_text))
             self._conn.commit()
         return claimed
+
+    def delivery_attempts(self, *, limit: int = 20) -> list[ClaimedReminderFire]:
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT id, reminder_id
+                FROM reminder_fires
+                WHERE status = 'claimed' AND delivery_attempted_at != ''
+                ORDER BY delivery_attempted_at ASC, id ASC
+                LIMIT ?
+                """,
+                (max(1, int(limit)),),
+            ).fetchall()
+            attempts: list[ClaimedReminderFire] = []
+            for row in rows:
+                reminder_row = self._conn.execute(
+                    "SELECT * FROM reminders WHERE id = ?",
+                    (int(row["reminder_id"]),),
+                ).fetchone()
+                fire_row = self._conn.execute(
+                    "SELECT * FROM reminder_fires WHERE id = ?",
+                    (int(row["id"]),),
+                ).fetchone()
+                if reminder_row is not None and fire_row is not None:
+                    attempts.append(
+                        ClaimedReminderFire(
+                            reminder=row_to_reminder(reminder_row),
+                            fire=row_to_fire(fire_row),
+                        )
+                    )
+        return attempts
+
+    def mark_delivery_attempted(
+        self,
+        fire_id: int,
+        *,
+        expected_claimed_at: str,
+        delivery_kind: str,
+        now: datetime | str | None = None,
+    ) -> bool:
+        kind = str(delivery_kind or "").strip()
+        if kind not in {"reminder_delivery", "reminder_clarification"}:
+            raise ValueError("unsupported reminder delivery kind")
+        now_text = format_datetime(now or utc_now())
+        with self._lock:
+            cursor = self._conn.execute(
+                """
+                UPDATE reminder_fires
+                SET delivery_attempted_at = ?, delivery_kind = ?, updated_at = ?
+                WHERE id = ?
+                  AND status = 'claimed'
+                  AND claimed_at = ?
+                  AND delivery_attempted_at = ''
+                """,
+                (now_text, kind, now_text, int(fire_id), str(expected_claimed_at)),
+            )
+            self._conn.commit()
+        return bool(cursor.rowcount)
+
+    def mark_delivery_unknown(
+        self,
+        fire_id: int,
+        *,
+        expected_claimed_at: str,
+        now: datetime | str | None = None,
+    ) -> None:
+        self._finish_fire(
+            fire_id,
+            status="failed",
+            failure_category="delivery_outcome_unknown",
+            sent_message_id=None,
+            now=now,
+            expected_claimed_at=expected_claimed_at,
+        )
 
     def expire_context_requests(self, *, now: datetime | str | None = None, ttl_seconds: int = 86400) -> int:
         now_dt = parse_datetime(now or utc_now())
@@ -586,7 +680,13 @@ class ReminderStore:
             self._conn.execute(
                 """
                 UPDATE reminder_fires
-                SET status = 'pending', claimed_at = '', updated_at = ?, failure_category = 'context_resolved'
+                SET status = 'pending',
+                    claimed_at = '',
+                    updated_at = ?,
+                    failure_category = 'context_resolved',
+                    delivery_revision = delivery_revision + 1,
+                    delivery_attempted_at = '',
+                    delivery_kind = ''
                 WHERE id = ? AND status = 'needs_context'
                 """,
                 (now_text, int(row["fire_id"])),
@@ -619,7 +719,12 @@ class ReminderStore:
                 cursor = self._conn.execute(
                     """
                     UPDATE reminder_fires
-                    SET status = 'pending', claimed_at = '', updated_at = ?, failure_category = ?
+                    SET status = 'pending',
+                        claimed_at = '',
+                        updated_at = ?,
+                        failure_category = ?,
+                        delivery_attempted_at = '',
+                        delivery_kind = ''
                     WHERE id = ? AND status = 'claimed' AND claimed_at = ?
                     """,
                     (now_text, category, int(fire_id), str(expected_claimed_at)),
@@ -659,6 +764,9 @@ class ReminderStore:
             active = self._scalar("SELECT COUNT(*) FROM reminders WHERE status = 'active'")
             pending = self._scalar("SELECT COUNT(*) FROM reminder_fires WHERE status = 'pending'")
             claimed = self._scalar("SELECT COUNT(*) FROM reminder_fires WHERE status = 'claimed'")
+            delivery_attempted = self._scalar(
+                "SELECT COUNT(*) FROM reminder_fires WHERE status = 'claimed' AND delivery_attempted_at != ''"
+            )
             needs_context = self._scalar("SELECT COUNT(*) FROM reminder_fires WHERE status = 'needs_context'")
             failed = self._scalar("SELECT COUNT(*) FROM reminder_fires WHERE status = 'failed'")
             skipped_unsafe = self._scalar("SELECT COUNT(*) FROM reminder_fires WHERE status = 'skipped_unsafe'")
@@ -674,6 +782,7 @@ class ReminderStore:
             "active": active,
             "pending": pending,
             "claimed": claimed,
+            "delivery_attempted": delivery_attempted,
             "needs_context": needs_context,
             "failed": failed,
             "skipped_unsafe": skipped_unsafe,
@@ -757,6 +866,7 @@ class ReminderStore:
                 failure_category = 'claim_reclaimed'
             WHERE status = 'claimed'
               AND claimed_at != ''
+              AND delivery_attempted_at = ''
               AND claimed_at < ?
             """,
             (now_text, claim_cutoff_text),
@@ -910,6 +1020,9 @@ class ReminderStore:
                 attempt_count = 0,
                 sent_message_id = NULL,
                 failure_category = '',
+                delivery_revision = delivery_revision + 1,
+                delivery_attempted_at = '',
+                delivery_kind = '',
                 updated_at = excluded.updated_at
             """,
             (int(reminder_id), scheduled, key, now, now),
@@ -953,6 +1066,9 @@ def row_to_fire(row: sqlite3.Row) -> ReminderFire:
         attempt_count=int(row["attempt_count"] or 0),
         sent_message_id=row["sent_message_id"],
         failure_category=str(row["failure_category"] or ""),
+        delivery_revision=int(row["delivery_revision"] or 0),
+        delivery_attempted_at=str(row["delivery_attempted_at"] or ""),
+        delivery_kind=str(row["delivery_kind"] or ""),
         created_at=str(row["created_at"]),
         updated_at=str(row["updated_at"]),
     )
@@ -988,6 +1104,9 @@ def row_to_claim(row: sqlite3.Row, *, status: str, claimed_at: str) -> ClaimedRe
         "attempt_count": int(row["f_attempt_count"] or 0) + 1,
         "sent_message_id": row["f_sent_message_id"],
         "failure_category": row["f_failure_category"],
+        "delivery_revision": int(row["f_delivery_revision"] or 0),
+        "delivery_attempted_at": row["f_delivery_attempted_at"],
+        "delivery_kind": row["f_delivery_kind"],
         "created_at": row["f_created_at"],
         "updated_at": claimed_at,
     }

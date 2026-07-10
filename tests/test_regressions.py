@@ -3,6 +3,7 @@ import json
 import os
 import shutil
 import socket
+import sqlite3
 import subprocess
 import tempfile
 import time
@@ -122,10 +123,11 @@ os.environ["MEDIA_ACQUISITION_SOCKET_TIMEOUT_SECONDS"] = "12"
 import httpx
 from telegram import InputMediaPhoto, ReactionTypeCustomEmoji, ReactionTypeEmoji
 from telegram.constants import ChatType, ParseMode
-from telegram.error import BadRequest
+from telegram.error import BadRequest, TimedOut
 
 import main
 from outbound_reactions import EmotionPolicyDecision
+from provenance import extract_tool_provenance, make_tool_provenance
 from media_acquisition import (
     MediaAcquisitionLimits,
     MediaAcquisitionRequest,
@@ -216,15 +218,27 @@ class FakeMessage:
         self.media_group_failures = 0
         self.bot = SimpleNamespace(send_chat_action=AsyncMock(), set_message_reaction=AsyncMock(return_value=True))
 
-    async def reply_text(self, text: str, **kwargs) -> None:
+    async def reply_text(self, text: str, **kwargs):
         self.last_reply = text
         self.reply_calls.append({"text": text, **kwargs})
+        return SimpleNamespace(
+            message_id=self.message_id + 10_000 + len(self.reply_calls),
+            chat=self.chat,
+            date=datetime.now(timezone.utc),
+            reply_to_message=self,
+        )
 
-    async def reply_photo(self, photo, **kwargs) -> None:
+    async def reply_photo(self, photo, **kwargs):
         if self.photo_failures > 0:
             self.photo_failures -= 1
             raise BadRequest("failed to send photo")
         self.photo_calls.append({"photo": photo, **kwargs})
+        return SimpleNamespace(
+            message_id=self.message_id + 20_000 + len(self.photo_calls),
+            chat=self.chat,
+            date=datetime.now(timezone.utc),
+            reply_to_message=self,
+        )
 
     async def reply_media_group(self, media, **kwargs):
         self.media_group_attempts += 1
@@ -232,7 +246,15 @@ class FakeMessage:
             self.media_group_failures -= 1
             raise BadRequest("failed to send media group")
         self.media_group_calls.append({"media": tuple(media), **kwargs})
-        return tuple(SimpleNamespace(message_id=self.message_id + index) for index, _ in enumerate(media, start=1))
+        return tuple(
+            SimpleNamespace(
+                message_id=self.message_id + 30_000 + index,
+                chat=self.chat,
+                date=datetime.now(timezone.utc),
+                reply_to_message=self,
+            )
+            for index, _ in enumerate(media, start=1)
+        )
 
     def get_bot(self):
         return self.bot
@@ -1818,6 +1840,10 @@ class TelegramTurnCoalescingTests(unittest.TestCase):
             def save_message(*args, **kwargs):
                 return 999001
 
+            @staticmethod
+            def record_provenance_output(**kwargs) -> None:
+                return None
+
         with patch.object(main, "activity_presence_for_message", return_value=presence):
             with patch.object(main, "extract_image_data_urls", new=extract_images):
                 with patch.object(main, "prepare_memory_context", new=AsyncMock(return_value="(memory)")):
@@ -2493,7 +2519,11 @@ class TimeContextTests(unittest.TestCase):
             main.CONFIG = replace(main.CONFIG, mcp_tool_timeout_seconds=42.0)
             with patch.object(main, "MCPServerStdio", FakeMCPServer):
                 with patch.object(main, "make_agent", return_value="agent"):
-                    with patch.object(main.Runner, "run", new=AsyncMock(return_value=SimpleNamespace(final_output="ok"))):
+                    with patch.object(
+                        main.Runner,
+                        "run",
+                        new=AsyncMock(return_value=SimpleNamespace(final_output="ok")),
+                    ) as runner:
                         self.assertEqual("ok", asyncio.run(main.run_agent("prompt")))
         finally:
             main.CONFIG = original_config
@@ -2502,6 +2532,7 @@ class TimeContextTests(unittest.TestCase):
         for kwargs in server_kwargs:
             self.assertEqual(42.0, kwargs["client_session_timeout_seconds"])
             self.assertIs(main.mcp_tool_failure_message, kwargs["failure_error_function"])
+        self.assertTrue(runner.await_args.kwargs["run_config"].tracing_disabled)
 
     def test_run_agent_can_guard_reminder_claims_without_tool_context(self) -> None:
         class FakeMCPServer:
@@ -2642,7 +2673,7 @@ class TimeContextTests(unittest.TestCase):
         self.assertIsNone(main.classify_tool_result_failure("Timed out is a phrase in this article title."))
 
     def test_agent_tool_end_logs_counts_and_category_not_raw_result(self) -> None:
-        hook = main.AiganRunHooks()
+        hook = main.AiganRunHooks("b" * 32)
         result = "Fetch failed: tool_timeout for https://example.com/private"
 
         asyncio.run(hook.on_tool_end(None, SimpleNamespace(name="agent"), SimpleNamespace(name="fetch_url"), result))
@@ -2652,7 +2683,9 @@ class TimeContextTests(unittest.TestCase):
         self.assertEqual("tool_end", latest.event_type)
         self.assertEqual(len(result), latest.details["result_chars"])
         self.assertEqual("tool_timeout", latest.details["failure_category"])
+        self.assertEqual("b" * 32, latest.details["run_id"])
         self.assertNotIn("result_preview", latest.details)
+        self.assertNotIn("example.com", json.dumps(latest.details))
 
 
 class TelegramFormattingTests(unittest.TestCase):
@@ -2728,6 +2761,820 @@ class TelegramFormattingTests(unittest.TestCase):
 
         self.assertEqual(2, len(chunks))
         self.assertIn("[...] скорочено", chunks[-1])
+
+
+class OutboundIdentityAndProvenanceTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.original_config = main.CONFIG
+        main.MEMORY.clear_all()
+        main.histories.clear()
+        main.passive_contexts.clear()
+        if main.REACTION_MEMORY is not None:
+            main.REACTION_MEMORY.clear_all()
+        if main.SYSTEM_LOG is not None:
+            main.SYSTEM_LOG.clear_all()
+
+    def tearDown(self) -> None:
+        main.CONFIG = self.original_config
+        main.MEMORY.clear_all()
+        if main.REACTION_MEMORY is not None:
+            main.REACTION_MEMORY.clear_all()
+
+    @staticmethod
+    def save_trigger(message: FakeMessage) -> int:
+        return main.MEMORY.save_message(
+            chat_id=message.chat_id,
+            message_id=message.message_id,
+            chat_type=str(message.chat.type),
+            created_at=message.date,
+            sender_label="Tester",
+            user_id=message.from_user.id,
+            username=message.from_user.username,
+            text=message.text,
+        )
+
+    def test_bot_output_is_absent_until_telegram_returns_real_message(self) -> None:
+        message = FakeMessage("trigger", message_id=2801)
+        self.save_trigger(message)
+
+        async def scenario() -> None:
+            entered = asyncio.Event()
+            release = asyncio.Event()
+
+            async def delayed_sender(text: str, **kwargs):
+                entered.set()
+                await release.wait()
+                return SimpleNamespace(message_id=8801, chat=message.chat, date=datetime.now(timezone.utc))
+
+            message.reply_text = delayed_sender
+            task = asyncio.create_task(
+                main.send_reply(message, "delivered answer", memory_label="Aigan", route="test_delivery")
+            )
+            await entered.wait()
+            self.assertIsNone(main.MEMORY.message_by_message_id(message.chat_id, 8801))
+            self.assertFalse(any(item.is_bot for item in main.MEMORY.latest(message.chat_id, 10)))
+            release.set()
+            await task
+
+        asyncio.run(scenario())
+        stored = main.MEMORY.message_by_message_id(message.chat_id, 8801)
+        self.assertIsNotNone(stored)
+        self.assertTrue(stored.is_bot)
+        self.assertEqual("delivered answer", stored.text)
+
+    def test_two_chunks_persist_real_ids_and_reopen_reply_chain_as_one_group(self) -> None:
+        main.CONFIG = replace(
+            main.CONFIG,
+            telegram_text_chunk_chars=60,
+            max_reply_chunks=4,
+            max_reply_chars=500,
+        )
+        message = FakeMessage("trigger", message_id=2802)
+        self.save_trigger(message)
+        provenance = main.provenance_for_message(message, "chunked_test")
+        main.append_tool_provenance(
+            provenance,
+            "search_web",
+            {"query": "private restart query"},
+            "private restart result",
+            status="ok",
+        )
+
+        delivery = asyncio.run(
+            main.send_reply(
+                message,
+                "A" * 95,
+                memory_label="Aigan",
+                route="chunked_test",
+                outbound_provenance=provenance,
+            )
+        )
+
+        self.assertTrue(delivery.complete)
+        self.assertEqual(2, len(delivery.message_ids))
+        first = main.MEMORY.message_by_message_id(message.chat_id, delivery.message_ids[0])
+        second = main.MEMORY.message_by_message_id(message.chat_id, delivery.message_ids[1])
+        self.assertIsNotNone(first)
+        self.assertIsNotNone(second)
+        self.assertEqual([first.id, second.id], [item.id for item in main.MEMORY.delivery_siblings(second.id)])
+
+        followup_id = 9802
+        main.MEMORY.save_message(
+            chat_id=message.chat_id,
+            message_id=followup_id,
+            sender_label="Tester",
+            text="what about that?",
+            reply_to_message_id=delivery.message_ids[1],
+            created_at=datetime.now(timezone.utc),
+        )
+        reopened = MemoryStore(TEST_DB_PATH, retention_days=30)
+        try:
+            chain = reopened.reply_chain(message.chat_id, followup_id, depth=4)
+            reopened_provenance = reopened.provenance_for_output(second.id)
+        finally:
+            reopened.close()
+
+        self.assertEqual(
+            [message.message_id, delivery.message_ids[0], delivery.message_ids[1], followup_id],
+            [item.message_id for item in chain],
+        )
+        self.assertEqual("chunked_test", reopened_provenance.route)
+        self.assertEqual(["search_web"], [tool.tool_kind for tool in reopened_provenance.tools])
+        self.assertNotIn("private restart", reopened_provenance.tools[0].result_digest)
+
+    def test_partial_send_does_not_resend_first_chunk(self) -> None:
+        main.CONFIG = replace(
+            main.CONFIG,
+            telegram_text_chunk_chars=60,
+            max_reply_chunks=4,
+            max_reply_chars=500,
+        )
+        calls = []
+
+        async def sender(text: str, **kwargs):
+            calls.append(text)
+            if len(calls) == 2:
+                raise RuntimeError("second chunk failed")
+            return SimpleNamespace(message_id=8810)
+
+        result = asyncio.run(main.send_text_chunks(sender, "A" * 95))
+
+        self.assertFalse(result.complete)
+        self.assertEqual((8810,), result.message_ids)
+        self.assertEqual(2, len(calls))
+
+    def test_first_chunk_timeout_is_reported_as_ambiguous_without_retry(self) -> None:
+        sender = AsyncMock(side_effect=TimedOut("outcome unknown"))
+
+        result = asyncio.run(main.send_text_chunks(sender, "answer"))
+
+        self.assertTrue(result.ambiguous)
+        self.assertFalse(result.complete)
+        self.assertEqual((), result.message_ids)
+        self.assertEqual((), result.delivered_chunks)
+        sender.assert_awaited_once()
+
+    def test_partial_handler_delivery_adds_only_delivered_text_to_runtime_context(self) -> None:
+        main.CONFIG = replace(
+            main.CONFIG,
+            telegram_text_chunk_chars=60,
+            max_reply_chunks=4,
+            max_reply_chars=500,
+        )
+        message = FakeMessage("translate this", message_id=2814)
+        response = "B" * 95
+        calls = []
+
+        async def sender(text: str, **kwargs):
+            calls.append(text)
+            if len(calls) == 2:
+                raise RuntimeError("second chunk failed")
+            return SimpleNamespace(
+                message_id=8814,
+                chat=message.chat,
+                date=datetime.now(timezone.utc),
+            )
+
+        message.reply_text = sender
+        context = SimpleNamespace(bot=message.bot)
+        presence = SimpleNamespace(start=AsyncMock(), stop=AsyncMock())
+        with patch.object(main, "maybe_resolve_reminder_context_response", new=AsyncMock(return_value=False)):
+            with patch.object(
+                main,
+                "classify_request_with_intent",
+                new=AsyncMock(return_value=("translate_reference", None)),
+            ):
+                with patch.object(main, "activity_presence_for_message", return_value=presence):
+                    with patch.object(main, "send_activity_action", new=AsyncMock()):
+                        with patch.object(main, "run_agent_for_outbound", new=AsyncMock(return_value=response)):
+                            asyncio.run(
+                                main.handle_prompt_generation(
+                                    message,
+                                    context,
+                                    message.text,
+                                    allow_pending_wait=False,
+                                    skip_cooldown=True,
+                                )
+                            )
+
+        self.assertEqual(2, len(calls))
+        bot_history = [entry for entry in main.histories[message.chat_id] if entry.startswith("Aigan:")]
+        self.assertEqual(1, len(bot_history))
+        self.assertNotIn(response, bot_history[0])
+        self.assertNotIn("B" * 80, bot_history[0])
+        passive = main.passive_contexts[message.chat_id][-1]
+        self.assertNotIn(response, passive)
+        self.assertNotIn("B" * 80, passive)
+
+    def test_provenance_failure_after_send_never_resends(self) -> None:
+        message = FakeMessage("trigger", message_id=2803)
+        self.save_trigger(message)
+
+        with patch.object(main.MEMORY, "record_provenance_output", side_effect=RuntimeError("db unavailable")):
+            result = asyncio.run(
+                main.send_reply(message, "one answer", memory_label="Aigan", route="failure_test")
+            )
+
+        self.assertTrue(result.complete)
+        self.assertTrue(result.persistence_failed)
+        self.assertEqual(1, len(message.reply_calls))
+        self.assertIsNotNone(main.MEMORY.message_by_message_id(message.chat_id, result.message_ids[0]))
+
+    def test_first_send_failure_creates_no_output_or_provenance(self) -> None:
+        async def failing_sender(text: str, **kwargs):
+            raise RuntimeError("telegram unavailable")
+
+        with self.assertRaisesRegex(RuntimeError, "telegram unavailable"):
+            asyncio.run(main.send_text_chunks(failing_sender, "answer"))
+
+        run_count = main.MEMORY._conn.execute("SELECT COUNT(*) FROM provenance_runs").fetchone()[0]
+        self.assertEqual(0, run_count)
+        self.assertFalse(any(item.is_bot for item in main.MEMORY.latest(-1001, 10)))
+
+    def test_tool_items_pair_by_call_id_and_omit_private_payloads(self) -> None:
+        private_query = "private marker alpha"
+        private_url = "https://user:pass@example.com/private?token=secret#fragment"
+        items = [
+            SimpleNamespace(
+                type="tool_call_item",
+                call_id="call-a",
+                tool_name="search_web",
+                raw_item={"arguments": json.dumps({"query": private_query})},
+            ),
+            SimpleNamespace(
+                type="tool_call_item",
+                call_id="call-b",
+                tool_name="fetch_url",
+                raw_item={"arguments": json.dumps({"url": private_url})},
+            ),
+            SimpleNamespace(type="tool_call_output_item", call_id="call-b", output="private page body"),
+            SimpleNamespace(type="tool_call_output_item", call_id="call-a", output="private search result"),
+        ]
+
+        observations = extract_tool_provenance(
+            items,
+            secret="fixed-test-secret",
+            failure_classifier=main.classify_tool_result_failure,
+        )
+
+        self.assertEqual(["search_web", "fetch_url"], [item.tool_kind for item in observations])
+        self.assertTrue(all(item.source_fingerprint for item in observations))
+        persisted_shape = json.dumps([item.__dict__ for item in observations], sort_keys=True)
+        for private_marker in (private_query, private_url, "private page body", "private search result", "token=secret"):
+            self.assertNotIn(private_marker, persisted_shape)
+
+    def test_semantic_search_telemetry_keeps_private_queries_out_of_details(self) -> None:
+        main.CONFIG = replace(main.CONFIG, memory_vector_enabled=False)
+        message = FakeMessage("private recall marker", message_id=2815)
+        private_query = "private recall marker alpha"
+        private_extra = "private extra marker beta"
+
+        asyncio.run(
+            main.semantic_memory_search_outcome(
+                message,
+                private_query,
+                route="memory_recall",
+                extra_queries=(private_extra,),
+            )
+        )
+        asyncio.run(
+            main.prepare_recalled_memory_context(
+                message,
+                private_extra,
+                main.MemoryRecallIntent(
+                    is_recall=True,
+                    confidence=0.9,
+                    query=private_query,
+                    reason="semantic_strong",
+                ),
+            )
+        )
+
+        events = [
+            item
+            for item in main.SYSTEM_LOG.latest_events(30)
+            if item.event_type in {"semantic_search", "memory_recall_search"}
+        ]
+        self.assertTrue(events)
+        for event in events:
+            serialized = json.dumps(event.details, sort_keys=True)
+            self.assertNotIn(private_query, serialized)
+            self.assertNotIn(private_extra, serialized)
+        semantic_event = next(item for item in events if item.event_type == "semantic_search")
+        self.assertGreaterEqual(semantic_event.details["topic_term_count"], 1)
+
+    def test_unknown_tool_arguments_never_get_a_source_fingerprint(self) -> None:
+        observation = make_tool_provenance(
+            "unknown_private_tool",
+            {"prompt": "do not persist this private prompt"},
+            "private output",
+            secret="fixed-test-secret",
+            status="ok",
+        )
+
+        self.assertEqual("", observation.source_fingerprint)
+        self.assertLessEqual(len(observation.result_digest), 256)
+        self.assertNotIn("private", observation.result_digest)
+
+    def test_memory_store_reduces_untrusted_digest_before_persisting(self) -> None:
+        message = FakeMessage("trigger", message_id=2804)
+        input_memory_id = self.save_trigger(message)
+        output_memory_id = main.MEMORY.save_message(
+            chat_id=message.chat_id,
+            message_id=8804,
+            chat_type=str(message.chat.type),
+            created_at=datetime.now(timezone.utc),
+            sender_label="Aigan",
+            is_bot=True,
+            text="answer",
+            reply_to_message_id=message.message_id,
+        )
+        injected = SimpleNamespace(
+            ordinal=0,
+            tool_kind="fetch_url",
+            source_fingerprint="a" * 24,
+            result_status="ok",
+            result_digest=json.dumps({"chars": "small", "private": "secret page body"}),
+        )
+
+        main.MEMORY.record_provenance_output(
+            run_id="a" * 32,
+            chat_id=message.chat_id,
+            trigger_message_id=message.message_id,
+            input_memory_id=input_memory_id,
+            route="test",
+            started_at=datetime.now(timezone.utc),
+            output_memory_id=output_memory_id,
+            output_ordinal=0,
+            output_part_count=1,
+            tools=[injected],
+        )
+
+        stored = main.MEMORY._conn.execute(
+            "SELECT result_digest FROM provenance_tools WHERE run_id = ?",
+            ("a" * 32,),
+        ).fetchone()[0]
+        self.assertEqual('{"chars":"small","status":"ok"}', stored)
+        self.assertNotIn("secret", stored)
+
+    def test_run_id_cannot_join_outputs_from_different_chats(self) -> None:
+        started_at = datetime.now(timezone.utc)
+        first_trigger = main.MEMORY.save_message(
+            chat_id=101,
+            message_id=1,
+            sender_label="First user",
+            text="first request",
+            created_at=started_at,
+        )
+        first_output = main.MEMORY.save_message(
+            chat_id=101,
+            message_id=2,
+            sender_label="Aigan",
+            is_bot=True,
+            text="first output",
+            created_at=started_at,
+        )
+        second_trigger = main.MEMORY.save_message(
+            chat_id=202,
+            message_id=1,
+            sender_label="Second user",
+            text="second request",
+            created_at=started_at,
+        )
+        second_output = main.MEMORY.save_message(
+            chat_id=202,
+            message_id=2,
+            sender_label="Aigan",
+            is_bot=True,
+            text="second private output",
+            created_at=started_at,
+        )
+
+        main.MEMORY.record_provenance_output(
+            run_id="b" * 32,
+            chat_id=101,
+            trigger_message_id=1,
+            input_memory_id=first_trigger,
+            route="first_route",
+            started_at=started_at,
+            output_memory_id=first_output,
+            output_ordinal=0,
+            output_part_count=2,
+        )
+        with self.assertRaisesRegex(ValueError, "metadata mismatch"):
+            main.MEMORY.record_provenance_output(
+                run_id="b" * 32,
+                chat_id=202,
+                trigger_message_id=1,
+                input_memory_id=second_trigger,
+                route="second_route",
+                started_at=started_at,
+                output_memory_id=second_output,
+                output_ordinal=1,
+                output_part_count=2,
+            )
+
+        self.assertEqual([first_output], [item.id for item in main.MEMORY.delivery_siblings(first_output)])
+        self.assertIsNone(main.MEMORY.provenance_for_output(second_output))
+
+    def test_new_provenance_run_rejects_output_from_another_chat(self) -> None:
+        started_at = datetime.now(timezone.utc)
+        output = main.MEMORY.save_message(
+            chat_id=505,
+            message_id=1,
+            sender_label="Aigan",
+            is_bot=True,
+            text="other chat output",
+            created_at=started_at,
+        )
+
+        with self.assertRaisesRegex(ValueError, "output chat mismatch"):
+            main.MEMORY.record_provenance_output(
+                run_id="e" * 32,
+                chat_id=606,
+                trigger_message_id=None,
+                input_memory_id=None,
+                route="cross_chat_test",
+                started_at=started_at,
+                output_memory_id=output,
+                output_ordinal=0,
+                output_part_count=1,
+            )
+
+        self.assertIsNone(main.MEMORY.provenance_for_output(output))
+
+    def test_provenance_output_slots_are_exactly_idempotent_and_contiguous(self) -> None:
+        started_at = datetime.now(timezone.utc)
+        first_output = main.MEMORY.save_message(
+            chat_id=303,
+            message_id=1,
+            sender_label="Aigan",
+            is_bot=True,
+            text="first",
+            created_at=started_at,
+        )
+        conflicting_output = main.MEMORY.save_message(
+            chat_id=303,
+            message_id=2,
+            sender_label="Aigan",
+            is_bot=True,
+            text="conflict",
+            created_at=started_at,
+        )
+        kwargs = dict(
+            run_id="c" * 32,
+            chat_id=303,
+            trigger_message_id=None,
+            input_memory_id=None,
+            route="chunk_test",
+            started_at=started_at,
+            output_memory_id=first_output,
+            output_ordinal=0,
+            output_part_count=2,
+        )
+
+        main.MEMORY.record_provenance_output(**kwargs)
+        main.MEMORY.record_provenance_output(**kwargs)
+        with self.assertRaisesRegex(ValueError, "slot conflict"):
+            main.MEMORY.record_provenance_output(
+                **{**kwargs, "output_memory_id": conflicting_output}
+            )
+        with self.assertRaisesRegex(ValueError, "ordinal"):
+            main.MEMORY.record_provenance_output(
+                **{
+                    **kwargs,
+                    "output_memory_id": conflicting_output,
+                    "output_ordinal": 2,
+                }
+            )
+
+        self.assertEqual("partial_delivery", main.MEMORY.provenance_for_output(first_output).status)
+        self.assertIsNone(main.MEMORY.provenance_for_output(conflicting_output))
+
+    def test_memory_cleanup_removes_a_delivery_group_atomically(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = MemoryStore(Path(directory) / "memory.sqlite3", retention_days=30)
+            try:
+                now = datetime.now(timezone.utc)
+                old_output = store.save_message(
+                    chat_id=404,
+                    message_id=1,
+                    sender_label="Aigan",
+                    is_bot=True,
+                    text="old chunk",
+                    created_at=now - timedelta(days=31),
+                )
+                new_output = store.save_message(
+                    chat_id=404,
+                    message_id=2,
+                    sender_label="Aigan",
+                    is_bot=True,
+                    text="new chunk",
+                    created_at=now,
+                )
+                provenance_kwargs = dict(
+                    run_id="d" * 32,
+                    chat_id=404,
+                    trigger_message_id=None,
+                    input_memory_id=None,
+                    route="cleanup_test",
+                    started_at=now,
+                    output_part_count=2,
+                )
+                store.record_provenance_output(
+                    **provenance_kwargs,
+                    output_memory_id=old_output,
+                    output_ordinal=0,
+                )
+                store.record_provenance_output(
+                    **provenance_kwargs,
+                    output_memory_id=new_output,
+                    output_ordinal=1,
+                )
+
+                deleted = store.cleanup()
+
+                self.assertEqual(2, deleted)
+                self.assertIsNone(store.message_by_message_id(404, 1))
+                self.assertIsNone(store.message_by_message_id(404, 2))
+                self.assertIsNone(store.provenance_for_output(new_output))
+            finally:
+                store.close()
+
+    def test_youtube_failure_maps_to_low_cardinality_status(self) -> None:
+        observation = make_tool_provenance(
+            "get_youtube_transcript",
+            {"video": "https://youtu.be/dQw4w9WgXcQ"},
+            "No caption transcript available for dQw4w9WgXcQ: PrivateException: private details",
+            secret="fixed-test-secret",
+        )
+
+        self.assertEqual("no_results", observation.result_status)
+        self.assertNotIn("PrivateException", observation.result_digest)
+
+    def test_pending_reaction_links_when_delivered_output_is_persisted(self) -> None:
+        message = FakeMessage("trigger", message_id=2805)
+        self.save_trigger(message)
+        target_message_id = 8805
+        main.REACTION_MEMORY.record_message_reaction_update(
+            update_id=12805,
+            chat_id=message.chat_id,
+            target_message_id=target_message_id,
+            target_memory_id=None,
+            actor_key="user:407892151",
+            actor_kind="user",
+            actor_user_id=407892151,
+            old_specs=[],
+            new_specs=[ReactionSpec("emoji", "emoji:thumbsup", base_emoji="👍")],
+            received_at=datetime.now(timezone.utc),
+        )
+
+        async def sender(text: str, **kwargs):
+            return SimpleNamespace(message_id=target_message_id, chat=message.chat, date=datetime.now(timezone.utc))
+
+        message.reply_text = sender
+        asyncio.run(main.send_reply(message, "answer", memory_label="Aigan", route="reaction_link_test"))
+
+        target_item = main.MEMORY.message_by_message_id(message.chat_id, target_message_id)
+        linked = main.REACTION_MEMORY._conn.execute(
+            "SELECT target_memory_id FROM message_reaction_events WHERE update_id = ?",
+            (12805,),
+        ).fetchone()[0]
+        self.assertEqual(target_item.id, linked)
+
+    def test_web_image_cache_failure_keeps_delivered_identity_and_provenance(self) -> None:
+        message = FakeMessage("show image", message_id=2806)
+        self.save_trigger(message)
+        provenance = main.provenance_for_message(message, "internet_image_send")
+        delivered = SimpleNamespace(
+            message_id=8806,
+            chat=message.chat,
+            date=datetime.now(timezone.utc),
+        )
+
+        with patch.object(Path, "write_bytes", side_effect=OSError("disk unavailable")):
+            item_id = main.save_external_image_memory(
+                message,
+                delivered=delivered,
+                data=VALID_JPEG,
+                mime_type="image/jpeg",
+                source_url="https://example.com/image.jpg",
+                source_title="Example image",
+                outbound_provenance=provenance,
+                output_ordinal=0,
+                output_part_count=1,
+            )
+
+        item = main.MEMORY.message_by_message_id(message.chat_id, delivered.message_id)
+        self.assertEqual(item_id, item.id)
+        self.assertEqual("", item.local_media_path)
+        self.assertEqual("internet_image_send", main.MEMORY.provenance_for_output(item.id).route)
+
+    def test_web_image_cache_mkdir_failure_keeps_identity_and_provenance(self) -> None:
+        message = FakeMessage("show image", message_id=2810)
+        self.save_trigger(message)
+        provenance = main.provenance_for_message(message, "internet_image_send")
+        delivered = SimpleNamespace(message_id=8810, chat=message.chat, date=datetime.now(timezone.utc))
+
+        with patch.object(Path, "mkdir", side_effect=OSError("disk unavailable")):
+            item_id = main.save_external_image_memory(
+                message,
+                delivered=delivered,
+                data=VALID_JPEG,
+                mime_type="image/jpeg",
+                source_url="https://example.com/image.jpg",
+                source_title="Example image",
+                outbound_provenance=provenance,
+                output_ordinal=0,
+                output_part_count=1,
+            )
+
+        self.assertEqual(item_id, main.MEMORY.message_by_message_id(message.chat_id, 8810).id)
+        self.assertEqual("internet_image_send", main.MEMORY.provenance_for_output(item_id).route)
+
+    def test_web_image_cache_db_failure_removes_orphan_and_keeps_provenance(self) -> None:
+        message = FakeMessage("show image", message_id=2811)
+        self.save_trigger(message)
+        provenance = main.provenance_for_message(message, "internet_image_send")
+        delivered = SimpleNamespace(message_id=8811, chat=message.chat, date=datetime.now(timezone.utc))
+
+        with patch.object(main.MEMORY, "update_media", side_effect=RuntimeError("db unavailable")):
+            item_id = main.save_external_image_memory(
+                message,
+                delivered=delivered,
+                data=VALID_JPEG,
+                mime_type="image/jpeg",
+                source_url="https://example.com/image.jpg",
+                source_title="Example image",
+                outbound_provenance=provenance,
+                output_ordinal=0,
+                output_part_count=1,
+            )
+
+        item = main.MEMORY.message_by_message_id(message.chat_id, 8811)
+        self.assertEqual(item_id, item.id)
+        self.assertEqual("", item.local_media_path)
+        self.assertFalse((main.MEMORY.media_dir / str(message.chat_id) / f"{item_id}-web.jpg").exists())
+        self.assertEqual("internet_image_send", main.MEMORY.provenance_for_output(item_id).route)
+
+    def test_proactive_generation_tools_are_persisted_with_delivery(self) -> None:
+        message = FakeMessage("run proactive", message_id=2812)
+        self.save_trigger(message)
+        provenance = main.provenance_for_message(message, "manual_proactive")
+
+        async def model(prompt: str) -> str:
+            main.append_tool_provenance(
+                main.ACTIVE_OUTBOUND_PROVENANCE.get(),
+                "search_web",
+                {"query": "weather"},
+                "result",
+                status="ok",
+            )
+            return "proactive result"
+
+        with patch.object(main, "run_agent", new=model):
+            response = asyncio.run(
+                main.run_proactive_model(
+                    "prompt",
+                    chat_id=message.chat_id,
+                    outbound_provenance=provenance,
+                )
+            )
+        delivery = asyncio.run(
+            main.send_reply(
+                message,
+                response,
+                memory_label="Aigan (manual proactive)",
+                route="manual_proactive",
+                outbound_provenance=provenance,
+            )
+        )
+
+        output = main.MEMORY.message_by_message_id(message.chat_id, delivery.message_ids[0])
+        stored = main.MEMORY.provenance_for_output(output.id)
+        self.assertEqual(["search_web"], [tool.tool_kind for tool in stored.tools])
+
+    def test_auto_response_generation_tools_are_persisted_with_delivery(self) -> None:
+        main.CONFIG = replace(
+            main.CONFIG,
+            auto_react_enabled=True,
+            auto_react_min_chars=1,
+            auto_react_keywords=("auto",),
+            auto_react_cooldown_seconds=0,
+        )
+        message = FakeMessage("auto response candidate", message_id=2813)
+        self.save_trigger(message)
+        delivered = SimpleNamespace(
+            message_id=8813,
+            chat=message.chat,
+            date=datetime.now(timezone.utc),
+        )
+        context = SimpleNamespace(bot=SimpleNamespace(send_message=AsyncMock(return_value=delivered)))
+
+        async def model(prompt: str) -> str:
+            main.append_tool_provenance(
+                main.ACTIVE_OUTBOUND_PROVENANCE.get(),
+                "search_web",
+                {"query": "current topic"},
+                "result",
+                status="ok",
+            )
+            return "useful auto response"
+
+        with patch.object(main, "prepare_memory_context", new=AsyncMock(return_value="")):
+            with patch.object(main, "run_agent", new=model):
+                asyncio.run(main.maybe_auto_react(message, context))
+
+        output = main.MEMORY.message_by_message_id(message.chat_id, 8813)
+        stored = main.MEMORY.provenance_for_output(output.id)
+        self.assertEqual("auto_response", stored.route)
+        self.assertEqual(["search_web"], [tool.tool_kind for tool in stored.tools])
+
+    @staticmethod
+    def web_images(count: int) -> list[main.WebImageResult]:
+        return [
+            main.WebImageResult(
+                data=VALID_JPEG,
+                mime_type="image/jpeg",
+                source_url=f"https://example.com/source-{index}",
+                source_title=f"Image {index}",
+                final_url=f"https://example.com/image-{index}.jpg",
+            )
+            for index in range(count)
+        ]
+
+    def test_ambiguous_album_timeout_never_falls_back_to_duplicate_photos(self) -> None:
+        message = FakeMessage("show album", message_id=2807)
+        message.reply_media_group = AsyncMock(side_effect=TimedOut("outcome unknown"))
+
+        result = asyncio.run(main.send_web_image_results(message, self.web_images(3)))
+
+        self.assertTrue(result.ambiguous)
+        self.assertEqual((), result.deliveries)
+        self.assertEqual(3, result.intended_count)
+        self.assertEqual([], message.photo_calls)
+
+    def test_partial_individual_image_fallback_keeps_original_intended_count(self) -> None:
+        message = FakeMessage("show album", message_id=2808)
+        self.save_trigger(message)
+        message.media_group_failures = 1
+        message.photo_failures = 2
+        provenance = main.provenance_for_message(message, "internet_image_send")
+
+        result = asyncio.run(main.send_web_image_results(message, self.web_images(3)))
+        item_ids = main.save_sent_web_images(
+            message,
+            result.deliveries,
+            provenance,
+            intended_count=result.intended_count,
+        )
+
+        self.assertEqual(2, len(result.deliveries))
+        self.assertEqual(3, result.intended_count)
+        self.assertEqual("partial_delivery", main.MEMORY.provenance_for_output(item_ids[0]).status)
+
+    def test_web_image_analysis_reply_chain_includes_parent_image_group(self) -> None:
+        message = FakeMessage("analyze these images", message_id=2809)
+        self.save_trigger(message)
+        image_provenance = main.provenance_for_message(message, "internet_image_send")
+        delivery_result = asyncio.run(main.send_web_image_results(message, self.web_images(2)))
+        image_item_ids = main.save_sent_web_images(
+            message,
+            delivery_result.deliveries,
+            image_provenance,
+            intended_count=delivery_result.intended_count,
+        )
+
+        with patch.object(main, "run_vision", new=AsyncMock(return_value="image analysis")):
+            summary = asyncio.run(
+                main.maybe_analyze_found_images(message, message.text, delivery_result.deliveries)
+            )
+
+        self.assertEqual("image analysis", summary)
+        analysis_item = next(
+            item
+            for item in reversed(main.MEMORY.latest(message.chat_id, 20))
+            if item.sender_label == "Aigan (web image analysis)"
+        )
+        followup_id = 9809
+        main.MEMORY.save_message(
+            chat_id=message.chat_id,
+            message_id=followup_id,
+            sender_label="Tester",
+            text="what did that mean?",
+            reply_to_message_id=analysis_item.message_id,
+            created_at=datetime.now(timezone.utc),
+        )
+
+        reopened = MemoryStore(TEST_DB_PATH, retention_days=30)
+        try:
+            chain = reopened.reply_chain(message.chat_id, followup_id, depth=6)
+        finally:
+            reopened.close()
+        chain_ids = {item.id for item in chain}
+        self.assertTrue(set(image_item_ids).issubset(chain_ids))
+        self.assertIn(analysis_item.id, chain_ids)
+
 
 class ActivityPresenceTests(unittest.TestCase):
     def test_route_mapping_uses_typing_for_current_text_routes(self) -> None:
@@ -6522,7 +7369,17 @@ class PersistentMemoryTests(unittest.TestCase):
                 text="fresh message",
                 created_at=datetime.now(timezone.utc),
             )
-            app = SimpleNamespace(bot=SimpleNamespace(send_message=AsyncMock()))
+            app = SimpleNamespace(
+                bot=SimpleNamespace(
+                    send_message=AsyncMock(
+                        return_value=SimpleNamespace(
+                            message_id=16_111,
+                            chat=SimpleNamespace(type=ChatType.SUPERGROUP),
+                            date=datetime.now(timezone.utc),
+                        )
+                    )
+                )
+            )
             with patch.object(main, "run_agent", new=AsyncMock()) as run_agent:
                 sent = asyncio.run(main.run_proactive_once(app))
 
@@ -6556,7 +7413,17 @@ class PersistentMemoryTests(unittest.TestCase):
                 text="old message",
                 created_at=datetime.now(timezone.utc) - timedelta(hours=7),
             )
-            app = SimpleNamespace(bot=SimpleNamespace(send_message=AsyncMock()))
+            app = SimpleNamespace(
+                bot=SimpleNamespace(
+                    send_message=AsyncMock(
+                        return_value=SimpleNamespace(
+                            message_id=16_111,
+                            chat=SimpleNamespace(type=ChatType.SUPERGROUP),
+                            date=datetime.now(timezone.utc),
+                        )
+                    )
+                )
+            )
             with patch.object(main, "run_agent", new=AsyncMock(return_value="Тиша в чаті вже проходить техогляд.")) as run_agent:
                 sent = asyncio.run(main.run_proactive_once(app))
 
@@ -7020,7 +7887,15 @@ class PersistentMemoryTests(unittest.TestCase):
             main.CONFIG = original
 
     def test_bot_memory_is_marked_as_aigans_previous_output(self) -> None:
-        main.remember_bot_message(-1001, "previous bot answer")
+        message = FakeMessage("trigger", message_id=7001)
+        main.MEMORY.save_message(
+            chat_id=-1001,
+            message_id=message.message_id,
+            sender_label="Tester",
+            text="trigger",
+            created_at=message.date,
+        )
+        asyncio.run(main.send_reply(message, "previous bot answer", memory_label="Aigan", route="test"))
 
         context = main.format_memory_context(-1001, 5)
 
@@ -8194,7 +9069,8 @@ class PersistentMemoryTests(unittest.TestCase):
                         )
                     )
 
-        image_send.assert_awaited_once_with(message, message.text)
+        image_send.assert_awaited_once_with(message, message.text, outbound_provenance=ANY)
+        self.assertIsInstance(image_send.await_args.kwargs["outbound_provenance"], main.OutboundProvenance)
         tool_route.assert_not_awaited()
 
     def test_slang_multi_image_prompt_routes_to_image_send(self) -> None:
@@ -10033,6 +10909,74 @@ class LivingReminderTests(unittest.TestCase):
             recurrence="none",
         )
 
+    def test_reminder_store_migrates_delivery_attempt_columns_additively(self) -> None:
+        legacy_path = Path(self.tmpdir.name) / "legacy-reminders.sqlite3"
+        connection = sqlite3.connect(legacy_path)
+        connection.executescript(
+            """
+            CREATE TABLE reminders (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER NOT NULL,
+                created_by_user_id INTEGER,
+                created_from_message_id INTEGER,
+                target_user_id INTEGER,
+                target_username TEXT NOT NULL DEFAULT '',
+                target_label TEXT NOT NULL DEFAULT '',
+                kind TEXT NOT NULL DEFAULT 'custom',
+                trusted_instruction TEXT NOT NULL DEFAULT '',
+                source_message_id INTEGER,
+                due_at_utc TEXT NOT NULL,
+                timezone TEXT NOT NULL DEFAULT 'UTC',
+                recurrence TEXT NOT NULL DEFAULT 'none',
+                status TEXT NOT NULL DEFAULT 'active',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE reminder_fires (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                reminder_id INTEGER NOT NULL REFERENCES reminders(id) ON DELETE CASCADE,
+                scheduled_for_utc TEXT NOT NULL,
+                idempotency_key TEXT NOT NULL UNIQUE,
+                status TEXT NOT NULL DEFAULT 'pending',
+                claimed_at TEXT NOT NULL DEFAULT '',
+                completed_at TEXT NOT NULL DEFAULT '',
+                attempt_count INTEGER NOT NULL DEFAULT 0,
+                sent_message_id INTEGER,
+                failure_category TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            INSERT INTO reminders (
+                chat_id, trusted_instruction, due_at_utc, created_at, updated_at
+            ) VALUES (
+                -1001, 'legacy reminder', '2026-07-10T00:00:00+00:00',
+                '2026-07-09T00:00:00+00:00', '2026-07-09T00:00:00+00:00'
+            );
+            INSERT INTO reminder_fires (
+                reminder_id, scheduled_for_utc, idempotency_key, status, created_at, updated_at
+            ) VALUES (
+                1, '2026-07-10T00:00:00+00:00', '1:2026-07-10T00:00:00+00:00', 'pending',
+                '2026-07-09T00:00:00+00:00', '2026-07-09T00:00:00+00:00'
+            );
+            """
+        )
+        connection.close()
+
+        migrated = ReminderStore(legacy_path)
+        try:
+            columns = {
+                row["name"]
+                for row in migrated._conn.execute("PRAGMA table_info(reminder_fires)").fetchall()
+            }
+            fire = migrated.fire_by_id(1)
+        finally:
+            migrated.close()
+
+        self.assertTrue({"delivery_revision", "delivery_attempted_at", "delivery_kind"}.issubset(columns))
+        self.assertEqual(0, fire.delivery_revision)
+        self.assertEqual("", fire.delivery_attempted_at)
+        self.assertEqual("", fire.delivery_kind)
+
     def test_reminder_store_claims_due_fire_once_and_survives_reopen(self) -> None:
         self.create_due_reminder()
 
@@ -11418,7 +12362,17 @@ class LivingReminderTests(unittest.TestCase):
 
     def test_scheduler_sends_model_generated_reminder_and_completes_fire(self) -> None:
         reminder = self.create_due_reminder()
-        app = SimpleNamespace(bot=SimpleNamespace(send_message=AsyncMock()))
+        app = SimpleNamespace(
+            bot=SimpleNamespace(
+                send_message=AsyncMock(
+                    return_value=SimpleNamespace(
+                        message_id=18_001,
+                        chat=SimpleNamespace(type=ChatType.SUPERGROUP),
+                        date=datetime.now(timezone.utc),
+                    )
+                )
+            )
+        )
 
         with patch.object(main, "run_reminder_model", new=AsyncMock(return_value=("тепле живе нагадування", ""))) as model:
             sent = asyncio.run(main.run_reminder_scheduler_once(app))
@@ -11427,6 +12381,349 @@ class LivingReminderTests(unittest.TestCase):
         model.assert_awaited_once()
         app.bot.send_message.assert_awaited()
         self.assertEqual("тепле живе нагадування", app.bot.send_message.await_args.kwargs["text"])
+        self.assertEqual("completed", main.REMINDERS.reminder_by_id(reminder.id).status)
+
+    def test_scheduler_post_delivery_persistence_failure_does_not_retry_reminder(self) -> None:
+        reminder = self.create_due_reminder()
+        app = SimpleNamespace(
+            bot=SimpleNamespace(
+                send_message=AsyncMock(
+                    return_value=SimpleNamespace(
+                        message_id=18_002,
+                        chat=SimpleNamespace(type=ChatType.SUPERGROUP),
+                        date=datetime.now(timezone.utc),
+                    )
+                )
+            )
+        )
+
+        with patch.object(main, "run_reminder_model", new=AsyncMock(return_value=("нагадування", ""))):
+            with patch.object(
+                main.MEMORY,
+                "record_provenance_output",
+                side_effect=RuntimeError("provenance unavailable"),
+            ):
+                sent = asyncio.run(main.run_reminder_scheduler_once(app))
+
+        self.assertEqual(1, sent)
+        app.bot.send_message.assert_awaited_once()
+        self.assertEqual("completed", main.REMINDERS.reminder_by_id(reminder.id).status)
+        self.assertEqual([], main.REMINDERS.claim_due_fires(limit=5, misfire_grace_seconds=86400))
+
+    def test_scheduler_persists_generation_tools_and_original_trigger(self) -> None:
+        reminder = self.create_due_reminder()
+        input_memory_id = main.MEMORY.save_message(
+            chat_id=reminder.chat_id,
+            message_id=reminder.created_from_message_id,
+            sender_label="Tester",
+            user_id=reminder.created_by_user_id,
+            text="create this reminder",
+            created_at=datetime.now(timezone.utc),
+        )
+        app = SimpleNamespace(
+            bot=SimpleNamespace(
+                send_message=AsyncMock(
+                    return_value=SimpleNamespace(
+                        message_id=18_003,
+                        chat=SimpleNamespace(type=ChatType.SUPERGROUP),
+                        date=datetime.now(timezone.utc),
+                    )
+                )
+            )
+        )
+
+        async def model(prompt: str) -> str:
+            main.append_tool_provenance(
+                main.ACTIVE_OUTBOUND_PROVENANCE.get(),
+                "search_web",
+                {"query": "current context"},
+                "result",
+                status="ok",
+            )
+            return "тепле живе нагадування"
+
+        with patch.object(main, "run_agent", new=model):
+            sent = asyncio.run(main.run_reminder_scheduler_once(app))
+
+        self.assertEqual(1, sent)
+        output = main.MEMORY.message_by_message_id(reminder.chat_id, 18_003)
+        provenance = main.MEMORY.provenance_for_output(output.id)
+        self.assertEqual(reminder.created_from_message_id, provenance.trigger_message_id)
+        self.assertEqual(input_memory_id, provenance.input_memory_id)
+        self.assertEqual("reminder_delivery", provenance.subject_kind)
+        self.assertEqual(["search_web"], [tool.tool_kind for tool in provenance.tools])
+
+    def test_sent_reminder_receipt_reconciles_without_duplicate_after_finalization_failure(self) -> None:
+        reminder = self.create_due_reminder()
+        app = SimpleNamespace(
+            bot=SimpleNamespace(
+                send_message=AsyncMock(
+                    return_value=SimpleNamespace(
+                        message_id=18_004,
+                        chat=SimpleNamespace(type=ChatType.SUPERGROUP),
+                        date=datetime.now(timezone.utc),
+                    )
+                )
+            )
+        )
+        model = AsyncMock(return_value=("нагадування", ""))
+
+        with patch.object(main, "run_reminder_model", new=model):
+            with patch.object(main.REMINDERS, "mark_sent", side_effect=RuntimeError("db busy")):
+                first = asyncio.run(main.run_reminder_scheduler_once(app))
+
+            fire = main.REMINDERS.fire_by_id(1)
+            self.assertEqual("claimed", fire.status)
+            old_claim = (datetime.now(timezone.utc) - timedelta(minutes=20)).isoformat(timespec="seconds")
+            main.REMINDERS._conn.execute(
+                "UPDATE reminder_fires SET claimed_at = ?, updated_at = ? WHERE id = ?",
+                (old_claim, old_claim, fire.id),
+            )
+            main.REMINDERS._conn.commit()
+            second = asyncio.run(main.run_reminder_scheduler_once(app))
+
+        self.assertEqual(1, first)
+        self.assertEqual(0, second)
+        self.assertEqual(1, model.await_count)
+        self.assertEqual(1, app.bot.send_message.await_count)
+        self.assertEqual("completed", main.REMINDERS.reminder_by_id(reminder.id).status)
+        self.assertEqual("sent", main.REMINDERS.fire_by_id(1).status)
+
+    def test_clarification_receipt_reconciles_without_duplicate_after_finalization_failure(self) -> None:
+        reminder = self.create_due_reminder()
+        app = SimpleNamespace(
+            bot=SimpleNamespace(
+                send_message=AsyncMock(
+                    return_value=SimpleNamespace(
+                        message_id=18_005,
+                        chat=SimpleNamespace(type=ChatType.SUPERGROUP),
+                        date=datetime.now(timezone.utc),
+                    )
+                )
+            )
+        )
+        model = AsyncMock(return_value=("NEEDS_CONTEXT: кого саме привітати?", ""))
+
+        with patch.object(main, "run_reminder_model", new=model):
+            with patch.object(main.REMINDERS, "mark_needs_context", side_effect=RuntimeError("db busy")):
+                first = asyncio.run(main.run_reminder_scheduler_once(app))
+
+            fire = main.REMINDERS.fire_by_id(1)
+            self.assertEqual("claimed", fire.status)
+            old_claim = (datetime.now(timezone.utc) - timedelta(minutes=20)).isoformat(timespec="seconds")
+            main.REMINDERS._conn.execute(
+                "UPDATE reminder_fires SET claimed_at = ?, updated_at = ? WHERE id = ?",
+                (old_claim, old_claim, fire.id),
+            )
+            main.REMINDERS._conn.commit()
+            second = asyncio.run(main.run_reminder_scheduler_once(app))
+
+        self.assertEqual(1, first)
+        self.assertEqual(0, second)
+        self.assertEqual(1, model.await_count)
+        self.assertEqual(1, app.bot.send_message.await_count)
+        self.assertEqual("needs_context", main.REMINDERS.fire_by_id(1).status)
+
+    def test_reminder_receipt_key_survives_instruction_edit_and_token_rotation(self) -> None:
+        reminder = self.create_due_reminder()
+        app = SimpleNamespace(
+            bot=SimpleNamespace(
+                send_message=AsyncMock(
+                    return_value=SimpleNamespace(
+                        message_id=18_007,
+                        chat=SimpleNamespace(type=ChatType.SUPERGROUP),
+                        date=datetime.now(timezone.utc),
+                    )
+                )
+            )
+        )
+        model = AsyncMock(return_value=("нагадування", ""))
+
+        with patch.object(main, "run_reminder_model", new=model):
+            with patch.object(main.REMINDERS, "mark_sent", side_effect=RuntimeError("db busy")):
+                first = asyncio.run(main.run_reminder_scheduler_once(app))
+
+            fire = main.REMINDERS.fire_by_id(1)
+            before = main.reminder_delivery_subject_key(
+                main.REMINDERS.delivery_attempts(limit=1)[0]
+            )
+            updated = main.REMINDERS.update_reminder(
+                reminder.chat_id,
+                reminder.id,
+                user_id=reminder.created_by_user_id,
+                trusted_instruction="edited after Telegram delivery",
+            )
+            self.assertIsNotNone(updated)
+            with patch.dict(os.environ, {"PROVENANCE_HASH_SALT": "rotated-private-salt"}):
+                attempt = main.REMINDERS.delivery_attempts(limit=1)[0]
+                after = main.reminder_delivery_subject_key(attempt)
+                second = asyncio.run(main.run_reminder_scheduler_once(app))
+
+        self.assertEqual(before, after)
+        self.assertEqual(1, first)
+        self.assertEqual(0, second)
+        self.assertEqual(1, model.await_count)
+        self.assertEqual(1, app.bot.send_message.await_count)
+        self.assertEqual("sent", main.REMINDERS.fire_by_id(fire.id).status)
+
+    def test_first_send_timeout_is_terminal_unknown_and_never_retried(self) -> None:
+        reminder = self.create_due_reminder()
+        app = SimpleNamespace(bot=SimpleNamespace(send_message=AsyncMock(side_effect=TimedOut("outcome unknown"))))
+        model = AsyncMock(return_value=("нагадування", ""))
+
+        with patch.object(main, "run_reminder_model", new=model):
+            first = asyncio.run(main.run_reminder_scheduler_once(app))
+            second = asyncio.run(main.run_reminder_scheduler_once(app))
+
+        fire = main.REMINDERS.fire_by_id(1)
+        self.assertEqual(0, first)
+        self.assertEqual(0, second)
+        self.assertEqual(1, model.await_count)
+        self.assertEqual(1, app.bot.send_message.await_count)
+        self.assertEqual("failed", fire.status)
+        self.assertEqual("delivery_outcome_unknown", fire.failure_category)
+        self.assertEqual("failed", main.REMINDERS.reminder_by_id(reminder.id).status)
+
+    def test_pre_send_marker_blocks_duplicate_when_provenance_and_finalization_both_fail(self) -> None:
+        reminder = self.create_due_reminder()
+        app = SimpleNamespace(
+            bot=SimpleNamespace(
+                send_message=AsyncMock(
+                    return_value=SimpleNamespace(
+                        message_id=18_008,
+                        chat=SimpleNamespace(type=ChatType.SUPERGROUP),
+                        date=datetime.now(timezone.utc),
+                    )
+                )
+            )
+        )
+        model = AsyncMock(return_value=("нагадування", ""))
+
+        with patch.object(main, "run_reminder_model", new=model):
+            with patch.object(main.MEMORY, "record_provenance_output", side_effect=RuntimeError("db busy")):
+                with patch.object(main.REMINDERS, "mark_sent", side_effect=RuntimeError("db busy")):
+                    first = asyncio.run(main.run_reminder_scheduler_once(app))
+            old_claim = (datetime.now(timezone.utc) - timedelta(minutes=20)).isoformat(timespec="seconds")
+            main.REMINDERS._conn.execute(
+                "UPDATE reminder_fires SET claimed_at = ?, updated_at = ? WHERE id = 1",
+                (old_claim, old_claim),
+            )
+            main.REMINDERS._conn.commit()
+            second = asyncio.run(main.run_reminder_scheduler_once(app))
+
+        fire = main.REMINDERS.fire_by_id(1)
+        self.assertEqual(1, first)
+        self.assertEqual(0, second)
+        self.assertEqual(1, model.await_count)
+        self.assertEqual(1, app.bot.send_message.await_count)
+        self.assertEqual("claimed", fire.status)
+        self.assertTrue(fire.delivery_attempted_at)
+        self.assertEqual("reminder_delivery", fire.delivery_kind)
+        self.assertEqual("active", main.REMINDERS.reminder_by_id(reminder.id).status)
+
+    def test_pre_send_marker_survives_post_send_system_exit_without_duplicate(self) -> None:
+        self.create_due_reminder()
+        app = SimpleNamespace(
+            bot=SimpleNamespace(
+                send_message=AsyncMock(
+                    return_value=SimpleNamespace(
+                        message_id=18_009,
+                        chat=SimpleNamespace(type=ChatType.SUPERGROUP),
+                        date=datetime.now(timezone.utc),
+                    )
+                )
+            )
+        )
+        model = AsyncMock(return_value=("нагадування", ""))
+
+        with patch.object(main, "run_reminder_model", new=model):
+            with patch.object(main.MEMORY, "record_provenance_output", side_effect=SystemExit("crash")):
+                with self.assertRaises(SystemExit):
+                    asyncio.run(main.run_reminder_scheduler_once(app))
+            old_claim = (datetime.now(timezone.utc) - timedelta(minutes=20)).isoformat(timespec="seconds")
+            main.REMINDERS._conn.execute(
+                "UPDATE reminder_fires SET claimed_at = ?, updated_at = ? WHERE id = 1",
+                (old_claim, old_claim),
+            )
+            main.REMINDERS._conn.commit()
+            second = asyncio.run(main.run_reminder_scheduler_once(app))
+
+        fire = main.REMINDERS.fire_by_id(1)
+        self.assertEqual(0, second)
+        self.assertEqual(1, model.await_count)
+        self.assertEqual(1, app.bot.send_message.await_count)
+        self.assertEqual("claimed", fire.status)
+        self.assertTrue(fire.delivery_attempted_at)
+
+    def test_context_resolution_advances_delivery_revision_and_allows_final_message(self) -> None:
+        reminder = self.create_due_reminder()
+        delivered_messages = [
+            SimpleNamespace(
+                message_id=18_010 + index,
+                chat=SimpleNamespace(type=ChatType.SUPERGROUP),
+                date=datetime.now(timezone.utc),
+            )
+            for index in range(2)
+        ]
+        app = SimpleNamespace(bot=SimpleNamespace(send_message=AsyncMock(side_effect=delivered_messages)))
+        model = AsyncMock(
+            side_effect=[
+                ("NEEDS_CONTEXT: кого саме привітати?", ""),
+                ("готове нагадування після уточнення", ""),
+            ]
+        )
+
+        with patch.object(main, "run_reminder_model", new=model):
+            first = asyncio.run(main.run_reminder_scheduler_once(app))
+            first_fire = main.REMINDERS.fire_by_id(1)
+            resolved = main.REMINDERS.resolve_context_request(
+                reminder.chat_id,
+                reminder_id=reminder.id,
+                user_id=reminder.created_by_user_id,
+                clarification="привітати тестера",
+            )
+            second = asyncio.run(main.run_reminder_scheduler_once(app))
+
+        final_fire = main.REMINDERS.fire_by_id(1)
+        self.assertEqual(reminder.id, resolved)
+        self.assertEqual(1, first)
+        self.assertEqual(1, second)
+        self.assertEqual(2, model.await_count)
+        self.assertEqual(2, app.bot.send_message.await_count)
+        self.assertEqual(0, first_fire.delivery_revision)
+        self.assertEqual(1, final_fire.delivery_revision)
+        self.assertEqual("sent", final_fire.status)
+
+    def test_partial_reminder_delivery_adds_only_delivered_text_to_runtime_context(self) -> None:
+        reminder = self.create_due_reminder()
+        main.CONFIG = replace(
+            main.CONFIG,
+            telegram_text_chunk_chars=60,
+            max_reply_chunks=4,
+            max_reply_chars=500,
+        )
+        first_message = SimpleNamespace(
+            message_id=18_006,
+            chat=SimpleNamespace(type=ChatType.SUPERGROUP),
+            date=datetime.now(timezone.utc),
+        )
+        app = SimpleNamespace(
+            bot=SimpleNamespace(
+                send_message=AsyncMock(side_effect=[first_message, RuntimeError("second chunk failed")])
+            )
+        )
+        response = "A" * 95
+
+        with patch.object(main, "run_reminder_model", new=AsyncMock(return_value=(response, ""))):
+            sent = asyncio.run(main.run_reminder_scheduler_once(app))
+
+        self.assertEqual(1, sent)
+        self.assertEqual(2, app.bot.send_message.await_count)
+        context = main.passive_contexts[reminder.chat_id][-1]
+        self.assertNotIn(response, context)
+        self.assertNotIn("A" * 80, context)
+        output = main.MEMORY.message_by_message_id(reminder.chat_id, 18_006)
+        self.assertEqual("partial_delivery", main.MEMORY.provenance_for_output(output.id).status)
         self.assertEqual("completed", main.REMINDERS.reminder_by_id(reminder.id).status)
 
     def test_reminder_persona_guard_allows_harmless_first_person_phrase(self) -> None:
