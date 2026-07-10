@@ -727,9 +727,9 @@ openai==2.45.0 \
     # via
     #   -r requirements.in
     #   openai-agents
-openai-agents==0.18.0 \
-    --hash=sha256:4126b982b23598073e6e15305c4e515a80c0073e7beeb0895cd43611ea86f1b2 \
-    --hash=sha256:7971c7d2c3f4a1e14f552b288d83c24cca33f45cafa5821b2aaa12b77dbe24d9
+openai-agents==0.18.1 \
+    --hash=sha256:689ad88c8f64435413dde707ca45fb42d55217ff6ef63aab3d638c33f78e04bf \
+    --hash=sha256:d78b868911de3a202996dce1a333732c6f89e4dd11f83b7f2a7a62b9723dc360
     # via -r requirements.in
 primp==1.3.1 \
     --hash=sha256:0504de2901c97903a9c369856a4b186dc90a782d8320652c142b066e697d5a1a \
