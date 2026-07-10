@@ -20,19 +20,19 @@ from datetime import datetime, timedelta, timezone
 from functools import lru_cache
 from itertools import count
 from pathlib import Path
-from typing import AbstractSet, Any, Sequence, cast
+from typing import AbstractSet, Any, Callable, Sequence, cast
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from agents import Agent, ModelSettings, RunHooks, Runner, function_tool
+from agents import Agent, ModelSettings, RunConfig, RunHooks, Runner, function_tool
 from agents.mcp import MCPServerStdio
 from openai import OpenAI
 from telegram import Bot, InputMediaPhoto, Message, MessageEntity, Update
 from telegram.constants import ChatAction, ChatType, ParseMode
-from telegram.error import BadRequest
+from telegram.error import BadRequest, NetworkError
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, MessageReactionHandler, filters
 
 from mcp_servers.web import fetch_binary_url, fetch_url, search_image_candidates, search_web
-from memory import EmbeddingCandidate, MemoryItem, MemoryStore, SemanticMemoryResult
+from memory import DeliveryReceipt, EmbeddingCandidate, MemoryItem, MemoryStore, SemanticMemoryResult
 from media_acquisition import (
     MediaAcquisitionAdapter,
     MediaAcquisitionLimits,
@@ -41,6 +41,7 @@ from media_acquisition import (
 )
 from media_frames import FfmpegMediaFrameAdapter, MediaFrameAdapter, MediaFrameLimits, NullMediaFrameAdapter
 from outbound_reactions import NullReactionAdapter, OutboundReactionAdapter, OutboundReactionConfig, ReactionAdapter
+from provenance import ToolProvenance, extract_tool_provenance, make_tool_provenance, renumber_tool_provenance
 from reaction_memory import ReactionAsset, ReactionMemoryStore, ReactionPreference, ReactionSpec
 from reminders import ClaimedReminderFire, Reminder, ReminderStore, parse_datetime as parse_reminder_datetime
 from github_reporting import GitHubReporter
@@ -535,6 +536,106 @@ REACTION_MEMORY = (
     if CONFIG.memory_enabled and CONFIG.reactions_enabled
     else None
 )
+
+
+@dataclass
+class OutboundProvenance:
+    run_id: str
+    chat_id: int
+    trigger_message_id: int | None
+    input_memory_id: int | None
+    route: str
+    subject_kind: str
+    subject_id: int | None
+    subject_key: str
+    started_at: datetime
+    tools: list[ToolProvenance]
+
+
+@dataclass(frozen=True)
+class TextDeliveryResult:
+    message_ids: tuple[int, ...]
+    complete: bool
+    intended_part_count: int
+    delivered_chunks: tuple[str, ...]
+    persistence_failed: bool = False
+    ambiguous: bool = False
+
+
+def delivered_text(result: TextDeliveryResult) -> str:
+    return "\n".join(result.delivered_chunks).strip()
+
+
+ACTIVE_OUTBOUND_PROVENANCE: contextvars.ContextVar[OutboundProvenance | None] = contextvars.ContextVar(
+    "active_outbound_provenance",
+    default=None,
+)
+
+
+def provenance_hash_secret() -> str:
+    return (
+        os.getenv("PROVENANCE_HASH_SALT", "").strip()
+        or os.getenv("COMPLAINT_TARGET_HASH_SALT", "").strip()
+        or CONFIG.telegram_token
+    )
+
+
+def new_outbound_provenance(
+    *,
+    chat_id: int,
+    route: str,
+    trigger_message_id: int | None = None,
+    subject_kind: str = "",
+    subject_id: int | None = None,
+    subject_key: str = "",
+) -> OutboundProvenance:
+    input_memory_id = None
+    if MEMORY is not None and trigger_message_id is not None:
+        item = MEMORY.message_by_message_id(chat_id, trigger_message_id)
+        input_memory_id = item.id if item is not None else None
+    return OutboundProvenance(
+        run_id=secrets.token_hex(16),
+        chat_id=int(chat_id),
+        trigger_message_id=trigger_message_id,
+        input_memory_id=input_memory_id,
+        route=route,
+        subject_kind=subject_kind,
+        subject_id=subject_id,
+        subject_key=subject_key,
+        started_at=datetime.now(timezone.utc),
+        tools=[],
+    )
+
+
+def provenance_for_message(message: Message, route: str) -> OutboundProvenance:
+    return new_outbound_provenance(
+        chat_id=message.chat_id,
+        route=route,
+        trigger_message_id=getattr(message, "message_id", None),
+    )
+
+
+def append_tool_provenance(
+    provenance: OutboundProvenance | None,
+    tool_kind: str,
+    arguments: Any,
+    output: Any,
+    *,
+    status: str | None = None,
+) -> None:
+    if provenance is None:
+        return
+    provenance.tools.append(
+        make_tool_provenance(
+            tool_kind,
+            arguments,
+            output,
+            secret=provenance_hash_secret(),
+            ordinal=len(provenance.tools),
+            status=status,
+            failure_classifier=classify_tool_result_failure,
+        )
+    )
 
 
 def outbound_reaction_event(
@@ -2561,57 +2662,81 @@ def seconds_since_memory_item(item: MemoryItem | None) -> int | None:
     return max(0, int((datetime.now(timezone.utc) - parse_utc_datetime(item.created_at)).total_seconds()))
 
 
-def emit_agent_start_event(agent_name: str) -> None:
-    system_event(component="agent", event_type="agent_start", message=agent_name)
+def emit_agent_start_event(agent_name: str, run_id: str = "") -> None:
+    details = {"run_id": run_id} if run_id else None
+    system_event(component="agent", event_type="agent_start", message=agent_name, details=details)
 
 
-def emit_agent_end_event(agent_name: str) -> None:
-    system_event(component="agent", event_type="agent_end", message=agent_name)
+def emit_agent_end_event(agent_name: str, run_id: str = "") -> None:
+    details = {"run_id": run_id} if run_id else None
+    system_event(component="agent", event_type="agent_end", message=agent_name, details=details)
 
 
-def emit_llm_start_event(agent_name: str, *, input_item_count: int, has_system_prompt: bool) -> None:
+def emit_llm_start_event(
+    agent_name: str,
+    *,
+    input_item_count: int,
+    has_system_prompt: bool,
+    run_id: str = "",
+) -> None:
+    details: dict[str, Any] = {"input_items": input_item_count, "has_system_prompt": has_system_prompt}
+    if run_id:
+        details["run_id"] = run_id
     system_event(
         component="agent",
         event_type="llm_start",
         message=agent_name,
-        details={"input_items": input_item_count, "has_system_prompt": has_system_prompt},
+        details=details,
     )
 
 
-def emit_llm_end_event(agent_name: str) -> None:
-    system_event(component="agent", event_type="llm_end", message=agent_name)
+def emit_llm_end_event(agent_name: str, run_id: str = "") -> None:
+    details = {"run_id": run_id} if run_id else None
+    system_event(component="agent", event_type="llm_end", message=agent_name, details=details)
 
 
 class AiganRunHooks(RunHooks[Any]):
+    def __init__(self, run_id: str = "") -> None:
+        self.run_id = run_id
+
     async def on_agent_start(self, context: Any, agent: Agent) -> None:
-        emit_agent_start_event(agent.name)
+        emit_agent_start_event(agent.name, self.run_id)
 
     async def on_agent_end(self, context: Any, agent: Agent, output: Any) -> None:
-        emit_agent_end_event(agent.name)
+        emit_agent_end_event(agent.name, self.run_id)
 
     async def on_llm_start(self, context: Any, agent: Agent, system_prompt: str | None, input_items: list[Any]) -> None:
         emit_llm_start_event(
             agent.name,
             input_item_count=len(input_items),
             has_system_prompt=bool(system_prompt),
+            run_id=self.run_id,
         )
 
     async def on_llm_end(self, context: Any, agent: Agent, response: Any) -> None:
-        emit_llm_end_event(agent.name)
+        emit_llm_end_event(agent.name, self.run_id)
 
     async def on_tool_start(self, context: Any, agent: Agent, tool: Any) -> None:
-        system_event(component="agent_tool", event_type="tool_start", message=getattr(tool, "name", repr(tool)))
+        details = {"run_id": self.run_id} if self.run_id else None
+        system_event(
+            component="agent_tool",
+            event_type="tool_start",
+            message=getattr(tool, "name", type(tool).__name__),
+            details=details,
+        )
 
     async def on_tool_end(self, context: Any, agent: Agent, tool: Any, result: str) -> None:
         result_text = str(result)
         failure_category = classify_tool_result_failure(result_text)
         details: dict[str, Any] = {"result_chars": len(result_text)}
+        if self.run_id:
+            details["run_id"] = self.run_id
         if failure_category:
             details["failure_category"] = failure_category
         system_event(
             component="agent_tool",
             event_type="tool_end",
-            message=getattr(tool, "name", repr(tool)),
+            message=getattr(tool, "name", type(tool).__name__),
             details=details,
         )
 
@@ -3482,21 +3607,6 @@ def remember_social_observations(item_id: int | None) -> int:
             details={"count": count, "memory_item_id": item.id},
         )
     return count
-
-
-def remember_bot_message(chat_id: int, text: str, label: str = "Aigan") -> None:
-    if MEMORY is None:
-        return
-    MEMORY.save_message(
-        chat_id=chat_id,
-        message_id=None,
-        chat_type="bot",
-        created_at=datetime.now(timezone.utc),
-        sender_label=label,
-        is_bot=True,
-        text=clip_text(text, 3000),
-        content_kind="text",
-    )
 
 
 def cleanup_memory_if_due() -> None:
@@ -4781,6 +4891,10 @@ def format_memory_item_line(item: MemoryItem) -> str:
         parts.append("shared_source_text=" + clip_text(item.source_text, 900))
     if item.reply_to_message_id is not None:
         parts.append(f"reply_to_message_id={item.reply_to_message_id}")
+    if item.is_bot and MEMORY is not None:
+        provenance_summary = MEMORY.safe_provenance_summary(item.id)
+        if provenance_summary:
+            parts.append("safe_provenance=" + provenance_summary)
     if item.forward_origin:
         parts.append(f"source={clip_text(item.forward_origin, 200)}")
     if item.source_title:
@@ -5014,7 +5128,9 @@ async def run_agent(
     *,
     guard_reminder_claims: bool = False,
     guard_specific_reminder_claims: bool = False,
+    outbound_provenance: OutboundProvenance | None = None,
 ) -> str:
+    active_provenance = outbound_provenance or ACTIVE_OUTBOUND_PROVENANCE.get()
     started = time.monotonic()
     system_event(
         component="agent",
@@ -5055,7 +5171,13 @@ async def run_agent(
         async with web_server as web, youtube_server as youtube:
             agent = make_agent([web, youtube])
             try:
-                result = await Runner.run(agent, with_current_time_metadata(prompt), max_turns=6, hooks=AiganRunHooks())
+                result = await Runner.run(
+                    agent,
+                    with_current_time_metadata(prompt),
+                    max_turns=6,
+                    hooks=AiganRunHooks(active_provenance.run_id if active_provenance is not None else ""),
+                    run_config=RunConfig(tracing_disabled=True),
+                )
             except Exception as exc:
                 system_event(
                     level="error",
@@ -5066,6 +5188,14 @@ async def run_agent(
                 )
                 raise
         output = str(result.final_output).strip()
+        if active_provenance is not None:
+            sdk_observations = extract_tool_provenance(
+                getattr(result, "new_items", None),
+                secret=provenance_hash_secret(),
+                failure_classifier=classify_tool_result_failure,
+            )
+            active_provenance.tools.extend(sdk_observations)
+            active_provenance.tools[:] = renumber_tool_provenance(active_provenance.tools)
         mutation_results = REMINDER_TOOL_MUTATIONS.get()
         mutation_attempted = reminder_mutation_tool_attempted(getattr(result, "new_items", None))
         if guard_reminder_claims or mutation_attempted or bool(mutation_results):
@@ -5091,6 +5221,28 @@ async def run_agent(
         details={"output_chars": len(output)},
     )
     return output
+
+
+async def run_agent_for_outbound(
+    outbound_provenance: OutboundProvenance,
+    prompt: str,
+    reminder_tool_context: ReminderToolContext | None = None,
+    *,
+    guard_reminder_claims: bool = False,
+    guard_specific_reminder_claims: bool = False,
+) -> str:
+    token = ACTIVE_OUTBOUND_PROVENANCE.set(outbound_provenance)
+    try:
+        kwargs: dict[str, Any] = {}
+        if reminder_tool_context is not None:
+            kwargs["reminder_tool_context"] = reminder_tool_context
+        if guard_reminder_claims:
+            kwargs["guard_reminder_claims"] = True
+        if guard_specific_reminder_claims:
+            kwargs["guard_specific_reminder_claims"] = True
+        return await run_agent(prompt, **kwargs)
+    finally:
+        ACTIVE_OUTBOUND_PROVENANCE.reset(token)
 
 
 def run_plain_model_sync(prompt: str) -> str:
@@ -5161,12 +5313,12 @@ Request and Telegram context:
 VISION_AGENT_NAME = "Aigan Vision"
 
 
-async def run_vision(prompt: str, image_data_urls: list[str]) -> str:
-    emit_agent_start_event(VISION_AGENT_NAME)
-    emit_llm_start_event(VISION_AGENT_NAME, input_item_count=1, has_system_prompt=True)
+async def run_vision(prompt: str, image_data_urls: list[str], *, run_id: str = "") -> str:
+    emit_agent_start_event(VISION_AGENT_NAME, run_id)
+    emit_llm_start_event(VISION_AGENT_NAME, input_item_count=1, has_system_prompt=True, run_id=run_id)
     output = await asyncio.to_thread(run_vision_sync, prompt, image_data_urls)
-    emit_llm_end_event(VISION_AGENT_NAME)
-    emit_agent_end_event(VISION_AGENT_NAME)
+    emit_llm_end_event(VISION_AGENT_NAME, run_id)
+    emit_agent_end_event(VISION_AGENT_NAME, run_id)
     return output
 
 
@@ -5772,9 +5924,9 @@ async def semantic_memory_search_outcome(
                 )
         except Exception as exc:
             global last_embedding_error
-            embedding_error = f"{type(exc).__name__}: {exc}"
+            embedding_error = type(exc).__name__
             last_embedding_error = f"query {embedding_error}"
-            LOGGER.exception("Semantic memory query embedding failed")
+            LOGGER.warning("Semantic memory query embedding failed error=%s", embedding_error)
             system_event(
                 level="warning",
                 component="memory_vector",
@@ -5837,8 +5989,10 @@ async def semantic_memory_search_outcome(
             "returned": len(results),
             "embedding_indexed": embedding_indexed,
             "embeddings_used": embeddings_used,
-            "topic_terms": list(topic_terms),
-            "extra_queries": list(extra_queries),
+            "topic_term_count": len(topic_terms),
+            "extra_query_count": len(extra_queries),
+            "max_topic_term_chars": max((len(term) for term in topic_terms), default=0),
+            "max_extra_query_chars": max((len(item) for item in extra_queries), default=0),
             "exclude_message_id": exclude_message_id,
         },
     )
@@ -5921,8 +6075,9 @@ async def prepare_recalled_memory_context(
         details={
             "confidence": recall_intent.confidence if recall_intent else 0.0,
             "reason": recall_intent.reason if recall_intent else "",
-            "query": query,
-            "variants": list(variants),
+            "query_chars": len(query),
+            "variant_count": len(variants),
+            "max_variant_chars": max((len(variant) for variant in variants), default=0),
             "returned": outcome.returned,
             "semantic_results": outcome.semantic_results,
             "fts_results": outcome.fts_results,
@@ -6512,7 +6667,12 @@ def web_prefetch_query(message: Message, prompt: str) -> str:
     return ""
 
 
-async def maybe_prefetch_web_context(message: Message, prompt: str, route: str) -> str:
+async def maybe_prefetch_web_context(
+    message: Message,
+    prompt: str,
+    route: str,
+    outbound_provenance: OutboundProvenance | None = None,
+) -> str:
     if route != "time_sensitive":
         return "(none)"
     query = web_prefetch_query(message, prompt)
@@ -6526,8 +6686,22 @@ async def maybe_prefetch_web_context(message: Message, prompt: str, route: str) 
         if current_urls:
             direct_result = await asyncio.to_thread(fetch_url, current_urls[0], 12000)
             direct_status = classify_tool_result_failure(direct_result) or "ok"
+            append_tool_provenance(
+                outbound_provenance,
+                "fetch_url",
+                {"url": current_urls[0]},
+                direct_result,
+                status=direct_status,
+            )
         result = await asyncio.to_thread(search_web, query, 5)
         search_status = classify_tool_result_failure(result) or "ok"
+        append_tool_provenance(
+            outbound_provenance,
+            "search_web",
+            {"query": query},
+            result,
+            status=search_status,
+        )
         sections: list[str] = []
         if direct_result:
             sections.append(f"Direct URL fetch ({direct_status}):\n{direct_result}")
@@ -6550,8 +6724,17 @@ async def maybe_prefetch_web_context(message: Message, prompt: str, route: str) 
         )
         return context
     except Exception as exc:
-        LOGGER.exception("Current web prefetch failed")
         failure_category = classify_tool_result_failure(str(exc)) or "tool_failed"
+        LOGGER.warning("Current web prefetch failed category=%s", failure_category)
+        failed_tool_kind = "fetch_url" if current_urls and not direct_status else "search_web"
+        failed_arguments = {"url": current_urls[0]} if failed_tool_kind == "fetch_url" else {"query": query}
+        append_tool_provenance(
+            outbound_provenance,
+            failed_tool_kind,
+            failed_arguments,
+            str(exc),
+            status=failure_category,
+        )
         system_event(
             level="error",
             component="web",
@@ -6723,16 +6906,29 @@ class WebImageResult:
     vision_summary: str = ""
 
 
+@dataclass(frozen=True)
+class DeliveredWebImage:
+    image: WebImageResult
+    telegram_message: Any
+
+
+@dataclass(frozen=True)
+class WebImageDeliveryResult:
+    deliveries: tuple[DeliveredWebImage, ...]
+    intended_count: int
+    ambiguous: bool = False
+
+
 def image_stream(data: bytes, mime_type: str) -> io.BytesIO:
     stream = io.BytesIO(data)
     stream.name = "aigan" + image_suffix_for_mime(mime_type)
     return stream
 
 
-async def send_photo_reply(message: Message, data: bytes, mime_type: str, caption: str) -> None:
+async def send_photo_reply(message: Message, data: bytes, mime_type: str, caption: str) -> Any:
     stream = image_stream(data, mime_type)
     try:
-        await message.reply_photo(
+        return await message.reply_photo(
             photo=stream,
             caption=render_telegram_html(caption)[:1024],
             parse_mode=ParseMode.HTML,
@@ -6740,26 +6936,33 @@ async def send_photo_reply(message: Message, data: bytes, mime_type: str, captio
     except BadRequest as exc:
         LOGGER.warning("Telegram photo caption formatting rejected; retrying plain: %s", exc)
         stream.seek(0)
-        await message.reply_photo(photo=stream, caption=render_plain_fallback(caption)[:1024])
+        return await message.reply_photo(photo=stream, caption=render_plain_fallback(caption)[:1024])
 
 
 def save_external_image_memory(
     message: Message,
     *,
+    delivered: Any,
     data: bytes,
     mime_type: str,
     source_url: str,
     source_title: str,
+    outbound_provenance: OutboundProvenance,
+    output_ordinal: int,
+    output_part_count: int,
     vision_summary: str = "",
-) -> None:
+) -> int | None:
     if MEMORY is None:
-        return
+        return None
+    message_id = delivered_message_id(delivered)
+    if message_id is None:
+        raise ValueError("Telegram image delivery did not return a real message_id")
 
     item_id = MEMORY.save_message(
         chat_id=message.chat_id,
-        message_id=None,
+        message_id=message_id,
         chat_type=str(getattr(message.chat, "type", "")),
-        created_at=datetime.now(timezone.utc),
+        created_at=getattr(delivered, "date", None) or datetime.now(timezone.utc),
         sender_label="Aigan (web image)",
         is_bot=True,
         text=f"Знайдене зображення: {source_title or source_url}",
@@ -6769,29 +6972,58 @@ def save_external_image_memory(
         vision_summary=vision_summary,
         source_url=source_url,
         source_title=source_title,
+        reply_to_message_id=outbound_provenance.trigger_message_id,
         raw_note="web image search result",
     )
-    media_dir = MEMORY.media_dir / str(message.chat_id)
-    media_dir.mkdir(parents=True, exist_ok=True)
-    media_path = media_dir / f"{item_id}-web{image_suffix_for_mime(mime_type)}"
+    media_path = MEMORY.media_dir / str(message.chat_id) / f"{item_id}-web{image_suffix_for_mime(mime_type)}"
     try:
+        media_path.parent.mkdir(parents=True, exist_ok=True)
         media_path.write_bytes(data)
-    except OSError:
-        LOGGER.exception("Failed to cache web image item_id=%s", item_id)
-        return
-    MEMORY.update_media(
-        item_id,
-        attachment_type="web_image",
-        telegram_file_id="",
-        local_media_path=str(media_path),
-        mime_type=mime_type,
-        raw_note="web image search result",
-    )
+        MEMORY.update_media(
+            item_id,
+            attachment_type="web_image",
+            telegram_file_id="",
+            local_media_path=str(media_path),
+            mime_type=mime_type,
+            raw_note="web image search result",
+        )
+    except Exception as exc:
+        LOGGER.error("Failed to cache delivered web image item_id=%s error=%s", item_id, type(exc).__name__)
+        try:
+            media_path.unlink(missing_ok=True)
+        except OSError:
+            pass
     if vision_summary:
-        MEMORY.update_vision_summary(item_id, vision_summary)
+        try:
+            MEMORY.update_vision_summary(item_id, vision_summary)
+        except Exception as exc:
+            LOGGER.error("Failed to enrich delivered web image item_id=%s error=%s", item_id, type(exc).__name__)
+    try:
+        MEMORY.record_provenance_output(
+            run_id=outbound_provenance.run_id,
+            chat_id=outbound_provenance.chat_id,
+            trigger_message_id=outbound_provenance.trigger_message_id,
+            input_memory_id=outbound_provenance.input_memory_id,
+            route=outbound_provenance.route,
+            started_at=outbound_provenance.started_at,
+            output_memory_id=item_id,
+            output_ordinal=output_ordinal,
+            output_part_count=output_part_count,
+            tools=renumber_tool_provenance(outbound_provenance.tools),
+            subject_kind=outbound_provenance.subject_kind,
+            subject_id=outbound_provenance.subject_id,
+            subject_key=outbound_provenance.subject_key,
+        )
+    finally:
+        if REACTION_MEMORY is not None:
+            REACTION_MEMORY.link_pending_targets(MEMORY, message.chat_id)
+    return item_id
 
 
-async def load_web_image_result(candidate: dict[str, str]) -> WebImageResult | None:
+async def load_web_image_result(
+    candidate: dict[str, str],
+    outbound_provenance: OutboundProvenance | None = None,
+) -> WebImageResult | None:
     image_url = candidate.get("image") or ""
     source_url = candidate.get("source") or image_url
     title = candidate.get("title") or "Зображення"
@@ -6803,13 +7035,34 @@ async def load_web_image_result(candidate: dict[str, str]) -> WebImageResult | N
             ("image/",),
         )
     except Exception:
-        LOGGER.info("Skipping failed web image candidate url=%s", image_url, exc_info=True)
+        append_tool_provenance(
+            outbound_provenance,
+            "fetch_url",
+            {"url": image_url},
+            "fetch failed",
+            status="fetch_failed",
+        )
+        LOGGER.info("Skipping failed web image candidate")
         return None
     try:
         mime_type = validate_image_bytes(data, mime_type, min(CONFIG.image_max_bytes, 10_000_000))
     except ValueError as exc:
-        LOGGER.info("Skipping invalid web image candidate url=%s reason=%s", image_url, exc)
+        append_tool_provenance(
+            outbound_provenance,
+            "fetch_url",
+            {"url": image_url},
+            "invalid image",
+            status="fetch_failed",
+        )
+        LOGGER.info("Skipping invalid web image candidate reason=%s", type(exc).__name__)
         return None
+    append_tool_provenance(
+        outbound_provenance,
+        "fetch_url",
+        {"url": image_url},
+        f"image bytes {len(data)}",
+        status="ok",
+    )
     return WebImageResult(
         data=data,
         mime_type=mime_type,
@@ -6848,16 +7101,15 @@ async def send_single_web_image(
     *,
     index: int = 1,
     total: int = 1,
-) -> bool:
+) -> Any | None:
     try:
-        await send_photo_reply(message, image.data, image.mime_type, single_image_caption(image, index, total))
-        return True
-    except Exception:
-        LOGGER.info("Telegram rejected web image candidate url=%s", image.source_url, exc_info=True)
-        return False
+        return await send_photo_reply(message, image.data, image.mime_type, single_image_caption(image, index, total))
+    except BadRequest:
+        LOGGER.info("Telegram rejected web image candidate")
+        return None
 
 
-async def send_photo_album_reply(message: Message, images: list[WebImageResult]) -> None:
+async def send_photo_album_reply(message: Message, images: list[WebImageResult]) -> tuple[Any, ...]:
     media: list[InputMediaPhoto] = []
     caption = render_telegram_html(album_caption(images))[:1024]
     for index, image in enumerate(images):
@@ -6866,32 +7118,90 @@ async def send_photo_album_reply(message: Message, images: list[WebImageResult])
             kwargs["caption"] = caption
             kwargs["parse_mode"] = ParseMode.HTML
         media.append(InputMediaPhoto(media=image_stream(image.data, image.mime_type), **kwargs))
-    await message.reply_media_group(media=media)
+    return tuple(await message.reply_media_group(media=media))
 
 
-async def send_web_image_results(message: Message, images: list[WebImageResult]) -> list[WebImageResult]:
+async def send_web_image_results(
+    message: Message,
+    images: list[WebImageResult],
+    *,
+    delivery_run_id: str = "",
+) -> WebImageDeliveryResult:
     if not images:
-        return []
+        return WebImageDeliveryResult((), 0)
     if len(images) == 1:
-        return images if await send_single_web_image(message, images[0]) else []
+        try:
+            delivered = await send_single_web_image(message, images[0])
+        except Exception as exc:
+            LOGGER.warning("Telegram single-image delivery outcome is unknown error=%s", type(exc).__name__)
+            system_event(
+                level="warning",
+                component="telegram_delivery",
+                event_type="image_delivery_outcome_unknown",
+                telegram_message=message,
+                message=type(exc).__name__,
+                details={"intended_parts": 1, "run_id": delivery_run_id},
+            )
+            return WebImageDeliveryResult((), 1, ambiguous=True)
+        deliveries = (DeliveredWebImage(images[0], delivered),) if delivered is not None else ()
+        return WebImageDeliveryResult(deliveries, 1)
 
     try:
-        await send_photo_album_reply(message, images)
-        return images
+        delivered_messages = await send_photo_album_reply(message, images)
+        deliveries = tuple(
+            DeliveredWebImage(image, delivered)
+            for image, delivered in zip(images, delivered_messages)
+        )
+        return WebImageDeliveryResult(
+            deliveries,
+            len(images),
+            ambiguous=len(delivered_messages) != len(images),
+        )
     except BadRequest as exc:
         LOGGER.warning("Telegram rejected web image album; falling back to individual photos: %s", exc)
-    except Exception:
-        LOGGER.exception("Web image album send failed; falling back to individual photos")
+    except Exception as exc:
+        LOGGER.warning("Telegram album delivery outcome is unknown error=%s", type(exc).__name__)
+        system_event(
+            level="warning",
+            component="telegram_delivery",
+            event_type="album_delivery_outcome_unknown",
+            telegram_message=message,
+            message=type(exc).__name__,
+            details={"intended_parts": len(images), "run_id": delivery_run_id},
+        )
+        return WebImageDeliveryResult((), len(images), ambiguous=True)
 
-    sent: list[WebImageResult] = []
+    sent: list[DeliveredWebImage] = []
     total = len(images)
     for index, image in enumerate(images, start=1):
-        if await send_single_web_image(message, image, index=index, total=total):
-            sent.append(image)
-    return sent
+        try:
+            delivered = await send_single_web_image(message, image, index=index, total=total)
+        except Exception as exc:
+            LOGGER.warning("Telegram fallback image delivery outcome is unknown error=%s", type(exc).__name__)
+            system_event(
+                level="warning",
+                component="telegram_delivery",
+                event_type="image_delivery_outcome_unknown",
+                telegram_message=message,
+                message=type(exc).__name__,
+                details={
+                    "delivered_parts": len(sent),
+                    "intended_parts": total,
+                    "run_id": delivery_run_id,
+                },
+            )
+            return WebImageDeliveryResult(tuple(sent), total, ambiguous=True)
+        if delivered is not None:
+            sent.append(DeliveredWebImage(image, delivered))
+    return WebImageDeliveryResult(tuple(sent), total)
 
 
-async def maybe_analyze_found_images(message: Message, prompt: str, images: list[WebImageResult]) -> str:
+async def maybe_analyze_found_images(
+    message: Message,
+    prompt: str,
+    deliveries: Sequence[DeliveredWebImage],
+) -> str:
+    images = [delivery.image for delivery in deliveries]
     if not images or not is_found_image_analysis_request(prompt):
         return ""
     image_lines = "\n".join(
@@ -6906,31 +7216,101 @@ Untrusted found web images:
 
 Analyze the found web image or images according to the request. Reply in Ukrainian by default, English only if explicitly requested, never Russian.
 """
+    parent_message_id = next(
+        (
+            delivered_message_id(delivery.telegram_message)
+            for delivery in reversed(deliveries)
+            if delivered_message_id(delivery.telegram_message) is not None
+        ),
+        getattr(message, "message_id", None),
+    )
+    outbound_provenance = new_outbound_provenance(
+        chat_id=message.chat_id,
+        route="internet_image_analysis",
+        trigger_message_id=parent_message_id,
+    )
     try:
         summary = await asyncio.wait_for(
-            run_vision(vision_prompt, [data_url_from_bytes(image.data, image.mime_type) for image in images]),
+            run_vision(
+                vision_prompt,
+                [data_url_from_bytes(image.data, image.mime_type) for image in images],
+                run_id=outbound_provenance.run_id,
+            ),
             timeout=120,
         )
-        await send_reply(message, summary)
+        append_tool_provenance(
+            outbound_provenance,
+            "vision_analysis",
+            {},
+            summary,
+            status="ok",
+        )
+        reply_target = deliveries[-1].telegram_message
+        if not callable(getattr(reply_target, "reply_text", None)):
+            reply_target = message
+        await send_reply(
+            reply_target,
+            summary,
+            memory_label="Aigan (web image analysis)",
+            route="internet_image_analysis",
+            outbound_provenance=outbound_provenance,
+        )
         return summary
-    except Exception:
-        LOGGER.exception("Found image analysis failed")
+    except Exception as exc:
+        LOGGER.warning("Found image analysis failed error=%s", type(exc).__name__)
         return ""
 
 
-def save_sent_web_images(message: Message, images: list[WebImageResult], vision_summary: str = "") -> None:
-    for image in images:
-        save_external_image_memory(
-            message,
-            data=image.data,
-            mime_type=image.mime_type,
-            source_url=image.source_url or image.final_url,
-            source_title=image.source_title,
-            vision_summary=vision_summary or image.vision_summary,
-        )
+def save_sent_web_images(
+    message: Message,
+    deliveries: Sequence[DeliveredWebImage],
+    outbound_provenance: OutboundProvenance,
+    *,
+    intended_count: int,
+) -> list[int]:
+    item_ids: list[int] = []
+    part_count = max(1, int(intended_count))
+    for ordinal, delivery in enumerate(deliveries):
+        image = delivery.image
+        try:
+            item_id = save_external_image_memory(
+                message,
+                delivered=delivery.telegram_message,
+                data=image.data,
+                mime_type=image.mime_type,
+                source_url=image.source_url or image.final_url,
+                source_title=image.source_title,
+                outbound_provenance=outbound_provenance,
+                output_ordinal=ordinal,
+                output_part_count=part_count,
+                vision_summary=image.vision_summary,
+            )
+        except Exception as exc:
+            LOGGER.error("Delivered Telegram image could not be persisted error=%s", type(exc).__name__)
+            system_event(
+                level="error",
+                component="telegram_delivery",
+                event_type="post_delivery_persistence_failed",
+                telegram_message=message,
+                message=type(exc).__name__,
+                details={
+                    "part_index": ordinal,
+                    "part_count": part_count,
+                    "run_id": outbound_provenance.run_id,
+                },
+            )
+            continue
+        if item_id is not None:
+            item_ids.append(item_id)
+    return item_ids
 
 
-async def maybe_send_internet_image(message: Message, prompt: str) -> bool:
+async def maybe_send_internet_image(
+    message: Message,
+    prompt: str,
+    *,
+    outbound_provenance: OutboundProvenance | None = None,
+) -> bool:
     if not CONFIG.web_image_search_enabled or not is_internet_image_request(prompt, referenced_context_available(message)):
         return False
 
@@ -6941,17 +7321,41 @@ async def maybe_send_internet_image(message: Message, prompt: str) -> bool:
     await presence.start()
     try:
         candidates = await asyncio.to_thread(search_image_candidates, query, search_count)
-    except Exception:
-        LOGGER.exception("Image search failed")
+        append_tool_provenance(
+            outbound_provenance,
+            "search_images",
+            {"query": query},
+            f"candidate count {len(candidates)}",
+            status="ok",
+        )
+    except Exception as exc:
+        LOGGER.warning("Image search failed category=search_failed")
+        append_tool_provenance(
+            outbound_provenance,
+            "search_images",
+            {"query": query},
+            str(exc),
+            status="search_failed",
+        )
         system_event(
             level="error",
             component="image_search",
             event_type="search_failed",
             telegram_message=message,
             message="image search failed",
-            details={"query_preview": query, "target_count": target_count},
+            details={
+                "run_id": outbound_provenance.run_id if outbound_provenance is not None else "",
+                "query_chars": len(query),
+                "target_count": target_count,
+            },
         )
-        await send_reply(message, "Не зміг знайти безпечне зображення за цим запитом.")
+        await send_reply(
+            message,
+            "Не зміг знайти безпечне зображення за цим запитом.",
+            memory_label="Aigan",
+            route="internet_image_send",
+            outbound_provenance=outbound_provenance,
+        )
         return True
     finally:
         await presence.stop()
@@ -6960,44 +7364,88 @@ async def maybe_send_internet_image(message: Message, prompt: str) -> bool:
         event_type="search_success",
         telegram_message=message,
         message="image candidates",
-        details={"query_preview": query, "candidate_count": len(candidates), "target_count": target_count},
+        details={
+            "run_id": outbound_provenance.run_id if outbound_provenance is not None else "",
+            "query_chars": len(query),
+            "candidate_count": len(candidates),
+            "target_count": target_count,
+        },
     )
 
     if target_count == 1:
         for candidate in candidates:
-            image = await load_web_image_result(candidate)
+            image = await load_web_image_result(candidate, outbound_provenance)
             if image is None:
                 continue
             await send_activity_action(message.get_bot(), message.chat_id, ChatAction.UPLOAD_PHOTO, message=message)
-            sent_images = await send_web_image_results(message, [image])
-            if not sent_images:
+            delivery_result = await send_web_image_results(
+                message,
+                [image],
+                delivery_run_id=outbound_provenance.run_id if outbound_provenance is not None else "",
+            )
+            if delivery_result.ambiguous and not delivery_result.deliveries:
+                return True
+            if not delivery_result.deliveries:
                 continue
-            summary = await maybe_analyze_found_images(message, prompt, sent_images)
-            save_sent_web_images(message, sent_images, summary)
+            item_ids = save_sent_web_images(
+                message,
+                delivery_result.deliveries,
+                outbound_provenance or provenance_for_message(message, "internet_image_send"),
+                intended_count=delivery_result.intended_count,
+            )
+            summary = await maybe_analyze_found_images(message, prompt, delivery_result.deliveries)
+            if summary and MEMORY is not None:
+                for item_id in item_ids:
+                    MEMORY.update_vision_summary(item_id, summary)
             return True
     else:
         images: list[WebImageResult] = []
         for candidate in candidates:
-            image = await load_web_image_result(candidate)
+            image = await load_web_image_result(candidate, outbound_provenance)
             if image is None:
                 continue
             images.append(image)
             if len(images) >= target_count:
                 break
         await send_activity_action(message.get_bot(), message.chat_id, ChatAction.UPLOAD_PHOTO, message=message)
-        sent_images = await send_web_image_results(message, images)
-        if sent_images:
-            summary = await maybe_analyze_found_images(message, prompt, sent_images)
-            save_sent_web_images(message, sent_images, summary)
+        delivery_result = await send_web_image_results(
+            message,
+            images,
+            delivery_run_id=outbound_provenance.run_id if outbound_provenance is not None else "",
+        )
+        if delivery_result.deliveries:
+            item_ids = save_sent_web_images(
+                message,
+                delivery_result.deliveries,
+                outbound_provenance or provenance_for_message(message, "internet_image_send"),
+                intended_count=delivery_result.intended_count,
+            )
+            summary = await maybe_analyze_found_images(message, prompt, delivery_result.deliveries)
+            if summary and MEMORY is not None:
+                for item_id in item_ids:
+                    MEMORY.update_vision_summary(item_id, summary)
+            return True
+        if delivery_result.ambiguous:
             return True
 
-    await send_reply(message, "Не знайшов валідне безпечне зображення, яке можна надіслати в чат.")
+    await send_reply(
+        message,
+        "Не знайшов валідне безпечне зображення, яке можна надіслати в чат.",
+        memory_label="Aigan",
+        route="internet_image_send",
+        outbound_provenance=outbound_provenance,
+    )
     system_event(
         level="warning",
         component="image_search",
         event_type="no_valid_image",
         telegram_message=message,
-        details={"query_preview": query, "candidate_count": len(candidates), "target_count": target_count},
+        details={
+            "run_id": outbound_provenance.run_id if outbound_provenance is not None else "",
+            "query_chars": len(query),
+            "candidate_count": len(candidates),
+            "target_count": target_count,
+        },
     )
     return True
 
@@ -7139,33 +7587,232 @@ def split_text_chunks(
     return chunks
 
 
-async def send_formatted_text(send_func: Any, text: str, **kwargs: Any) -> None:
+async def send_formatted_text(send_func: Any, text: str, **kwargs: Any) -> Any:
     html_text = render_telegram_html(text)
     try:
-        await send_func(text=html_text, parse_mode=ParseMode.HTML, **kwargs)
+        return await send_func(text=html_text, parse_mode=ParseMode.HTML, **kwargs)
     except BadRequest as exc:
         LOGGER.warning("Telegram HTML formatting rejected; retrying as plain text: %s", exc)
         system_event(
             level="warning",
             component="telegram_delivery",
             event_type="html_fallback",
-            message=str(exc),
+            message="bad_request",
             details={"text_chars": len(text)},
         )
-        await send_func(text=render_plain_fallback(text), **kwargs)
+        return await send_func(text=render_plain_fallback(text), **kwargs)
 
 
-async def send_text_chunks(send_func: Any, text: str, **kwargs: Any) -> None:
-    for chunk in split_text_chunks(text):
-        await send_formatted_text(send_func, chunk, **kwargs)
+def delivered_message_id(message: Any) -> int | None:
+    value = getattr(message, "message_id", None)
+    return int(value) if isinstance(value, int) and not isinstance(value, bool) and value > 0 else None
 
 
-async def send_chat_text(bot: Any, chat_id: int, text: str) -> None:
-    await send_text_chunks(bot.send_message, text, chat_id=chat_id)
+def persist_delivered_bot_output(
+    delivered: Any,
+    chunk: str,
+    part_index: int,
+    part_count: int,
+    *,
+    provenance: OutboundProvenance,
+    label: str,
+    chat_type: str,
+) -> int:
+    if MEMORY is None:
+        raise RuntimeError("persistent memory is disabled")
+    message_id = delivered_message_id(delivered)
+    if message_id is None:
+        raise ValueError("Telegram delivery did not return a real message_id")
+    delivered_chat = getattr(delivered, "chat", None)
+    delivered_chat_type = str(getattr(delivered_chat, "type", "") or chat_type or "bot")
+    delivered_at = getattr(delivered, "date", None) or datetime.now(timezone.utc)
+    item_id = MEMORY.save_message(
+        chat_id=provenance.chat_id,
+        message_id=message_id,
+        chat_type=delivered_chat_type,
+        created_at=delivered_at,
+        sender_label=label,
+        is_bot=True,
+        text=chunk,
+        content_kind="text",
+        reply_to_message_id=provenance.trigger_message_id,
+    )
+    try:
+        MEMORY.record_provenance_output(
+            run_id=provenance.run_id,
+            chat_id=provenance.chat_id,
+            trigger_message_id=provenance.trigger_message_id,
+            input_memory_id=provenance.input_memory_id,
+            route=provenance.route,
+            started_at=provenance.started_at,
+            output_memory_id=item_id,
+            output_ordinal=part_index,
+            output_part_count=part_count,
+            tools=renumber_tool_provenance(provenance.tools),
+            subject_kind=provenance.subject_kind,
+            subject_id=provenance.subject_id,
+            subject_key=provenance.subject_key,
+        )
+    finally:
+        if REACTION_MEMORY is not None:
+            REACTION_MEMORY.link_pending_targets(MEMORY, provenance.chat_id)
+    return item_id
 
 
-async def send_reply(message: Message, text: str) -> None:
-    await send_text_chunks(message.reply_text, text)
+async def send_text_chunks(
+    send_func: Any,
+    text: str,
+    *,
+    on_delivered_chunk: Callable[[Any, str, int, int], None] | None = None,
+    delivery_run_id: str = "",
+    **kwargs: Any,
+) -> TextDeliveryResult:
+    chunks = split_text_chunks(text)
+    intended_count = len(chunks)
+    message_ids: list[int] = []
+    delivered_chunks: list[str] = []
+    delivered_count = 0
+    persistence_failed = False
+    for part_index, chunk in enumerate(chunks):
+        try:
+            delivered = await send_formatted_text(send_func, chunk, **kwargs)
+        except Exception as exc:
+            if delivered_count == 0:
+                if isinstance(exc, NetworkError):
+                    details: dict[str, Any] = {"delivered_parts": 0, "intended_parts": intended_count}
+                    if delivery_run_id:
+                        details["run_id"] = delivery_run_id
+                    LOGGER.warning("Telegram text delivery outcome is unknown error=%s", type(exc).__name__)
+                    system_event(
+                        level="warning",
+                        component="telegram_delivery",
+                        event_type="text_delivery_outcome_unknown",
+                        message=type(exc).__name__,
+                        details=details,
+                    )
+                    return TextDeliveryResult(
+                        (),
+                        False,
+                        intended_count,
+                        (),
+                        ambiguous=True,
+                    )
+                raise
+            LOGGER.error("Telegram text delivery stopped after a partial send error=%s", type(exc).__name__)
+            details: dict[str, Any] = {"delivered_parts": delivered_count, "intended_parts": intended_count}
+            if delivery_run_id:
+                details["run_id"] = delivery_run_id
+            system_event(
+                level="error",
+                component="telegram_delivery",
+                event_type="partial_delivery",
+                message=type(exc).__name__,
+                details=details,
+            )
+            return TextDeliveryResult(
+                tuple(message_ids),
+                False,
+                intended_count,
+                tuple(delivered_chunks),
+                persistence_failed,
+                ambiguous=isinstance(exc, NetworkError),
+            )
+        delivered_count += 1
+        delivered_chunks.append(chunk)
+        message_id = delivered_message_id(delivered)
+        if message_id is not None:
+            message_ids.append(message_id)
+        if on_delivered_chunk is not None:
+            try:
+                on_delivered_chunk(delivered, chunk, part_index, intended_count)
+            except Exception as exc:
+                persistence_failed = True
+                LOGGER.error("Delivered Telegram text could not be persisted error=%s", type(exc).__name__)
+                details = {"part_index": part_index, "part_count": intended_count}
+                if delivery_run_id:
+                    details["run_id"] = delivery_run_id
+                system_event(
+                    level="error",
+                    component="telegram_delivery",
+                    event_type="post_delivery_persistence_failed",
+                    message=type(exc).__name__,
+                    details=details,
+                )
+    return TextDeliveryResult(
+        tuple(message_ids),
+        True,
+        intended_count,
+        tuple(delivered_chunks),
+        persistence_failed,
+    )
+
+
+async def send_chat_text(
+    bot: Any,
+    chat_id: int,
+    text: str,
+    *,
+    memory_label: str | None = None,
+    route: str = "outbound_text",
+    trigger_message_id: int | None = None,
+    chat_type: str = "",
+    outbound_provenance: OutboundProvenance | None = None,
+) -> TextDeliveryResult:
+    provenance = outbound_provenance
+    if memory_label is not None and provenance is None:
+        provenance = new_outbound_provenance(
+            chat_id=chat_id,
+            route=route,
+            trigger_message_id=trigger_message_id,
+        )
+    callback = None
+    if memory_label is not None and provenance is not None and MEMORY is not None:
+        callback = lambda delivered, chunk, index, count: persist_delivered_bot_output(
+            delivered,
+            chunk,
+            index,
+            count,
+            provenance=provenance,
+            label=memory_label,
+            chat_type=chat_type,
+        )
+    return await send_text_chunks(
+        bot.send_message,
+        text,
+        on_delivered_chunk=callback,
+        delivery_run_id=provenance.run_id if provenance is not None else "",
+        chat_id=chat_id,
+    )
+
+
+async def send_reply(
+    message: Message,
+    text: str,
+    *,
+    memory_label: str | None = None,
+    route: str = "outbound_reply",
+    outbound_provenance: OutboundProvenance | None = None,
+) -> TextDeliveryResult:
+    provenance = outbound_provenance
+    if memory_label is not None and provenance is None:
+        provenance = provenance_for_message(message, route)
+    callback = None
+    if memory_label is not None and provenance is not None and MEMORY is not None:
+        callback = lambda delivered, chunk, index, count: persist_delivered_bot_output(
+            delivered,
+            chunk,
+            index,
+            count,
+            provenance=provenance,
+            label=memory_label,
+            chat_type=str(getattr(message.chat, "type", "") or ""),
+        )
+    return await send_text_chunks(
+        message.reply_text,
+        text,
+        on_delivered_chunk=callback,
+        delivery_run_id=provenance.run_id if provenance is not None else "",
+    )
 
 
 def parse_changelog_entries(text: str) -> list[str]:
@@ -8094,11 +8741,13 @@ async def proactive_now_command(update: Update, context: ContextTypes.DEFAULT_TY
         return
 
     prompt = build_manual_proactive_prompt(message.chat_id)
+    outbound_provenance = provenance_for_message(message, "manual_proactive")
     try:
         response = await run_proactive_model(
             prompt,
             chat_id=message.chat_id,
             event_message="manual",
+            outbound_provenance=outbound_provenance,
         )
     except Exception:
         LOGGER.exception("Manual proactive test failed")
@@ -8109,9 +8758,15 @@ async def proactive_now_command(update: Update, context: ContextTypes.DEFAULT_TY
         await message.reply_text("SKIP")
         return
 
-    passive_contexts[message.chat_id].append(f"Aigan (manual proactive): {clip_text(response, 700)}")
-    remember_bot_message(message.chat_id, response, label="Aigan (manual proactive)")
-    await send_reply(message, response)
+    delivery = await send_reply(
+        message,
+        response,
+        memory_label="Aigan (manual proactive)",
+        route="manual_proactive",
+        outbound_provenance=outbound_provenance,
+    )
+    if delivered := delivered_text(delivery):
+        passive_contexts[message.chat_id].append(f"Aigan (manual proactive): {clip_text(delivered, 700)}")
 
 
 def reminder_due_display(reminder: Reminder) -> str:
@@ -8965,10 +9620,7 @@ async def handle_prompt(
     privacy_response = prompt_privacy_response(prompt)
     if privacy_response:
         histories[message.chat_id].append(f"{user_label(message)}: {prompt[:500]}")
-        histories[message.chat_id].append(f"Aigan: {privacy_response[:500]}")
         remember_observed_message(message, label=f"{user_label(message)} (privacy-boundary request)")
-        passive_contexts[message.chat_id].append(f"Aigan: {clip_text(privacy_response, 700)}")
-        remember_bot_message(message.chat_id, privacy_response)
         system_event(
             component="routing",
             event_type="prompt_privacy_guard",
@@ -8977,15 +9629,20 @@ async def handle_prompt(
             message="prompt_privacy",
             details={"prompt_chars": len(prompt), "identity": bool(PUBLIC_IDENTITY_RE.search(prompt or ""))},
         )
-        await send_reply(message, privacy_response)
+        delivery = await send_reply(
+            message,
+            privacy_response,
+            memory_label="Aigan",
+            route="prompt_privacy",
+        )
+        if delivered := delivered_text(delivery):
+            histories[message.chat_id].append(f"Aigan: {delivered[:500]}")
+            passive_contexts[message.chat_id].append(f"Aigan: {clip_text(delivered, 700)}")
         return
 
     reaction_explanation = reaction_decision_explanation_for_message(message, prompt)
     if reaction_explanation is not None:
         histories[message.chat_id].append(f"{user_label(message)}: {prompt[:500]}")
-        histories[message.chat_id].append(f"Aigan: {reaction_explanation[:500]}")
-        passive_contexts[message.chat_id].append(f"Aigan: {clip_text(reaction_explanation, 700)}")
-        remember_bot_message(message.chat_id, reaction_explanation)
         system_event(
             component="outbound_reactions",
             event_type="outbound_reaction_explained",
@@ -8993,7 +9650,15 @@ async def handle_prompt(
             message="outbound_reaction_explained",
             details={"has_reply_target": getattr(message, "reply_to_message", None) is not None},
         )
-        await send_reply(message, reaction_explanation)
+        delivery = await send_reply(
+            message,
+            reaction_explanation,
+            memory_label="Aigan",
+            route="reaction_explanation",
+        )
+        if delivered := delivered_text(delivery):
+            histories[message.chat_id].append(f"Aigan: {delivered[:500]}")
+            passive_contexts[message.chat_id].append(f"Aigan: {clip_text(delivered, 700)}")
         return
 
     has_current_payload = has_current_context_payload(message)
@@ -9066,6 +9731,7 @@ async def handle_prompt_generation(
     await send_activity_action(context.bot, message.chat_id, ChatAction.TYPING, message=message)
     route, recall_intent = await classify_request_with_intent(message, prompt)
     LOGGER.info("Prompt route=%s chat_id=%s", route, message.chat_id)
+    outbound_provenance = provenance_for_message(message, route)
 
     def emit_prompt_route_decision(tool_route_decision: ToolRouteDecision) -> None:
         system_event(
@@ -9090,7 +9756,11 @@ async def handle_prompt_generation(
             },
         )
 
-    if route == "internet_image_send" and await maybe_send_internet_image(message, prompt):
+    if route == "internet_image_send" and await maybe_send_internet_image(
+        message,
+        prompt,
+        outbound_provenance=outbound_provenance,
+    ):
         emit_prompt_route_decision(no_tool_route("skipped_internet_image_send"))
         record_chat_answer(message, prompt, route)
         return
@@ -9101,7 +9771,10 @@ async def handle_prompt_generation(
         await presence.start()
         try:
             agent_input = build_translation_agent_input(message, prompt)
-            response = await asyncio.wait_for(run_agent(agent_input), timeout=120)
+            response = await asyncio.wait_for(
+                run_agent_for_outbound(outbound_provenance, agent_input),
+                timeout=120,
+            )
         except Exception:
             LOGGER.exception("Translation route failed")
             await message.reply_text("Не зміг перекласти. Деталі будуть у логах контейнера.")
@@ -9109,12 +9782,18 @@ async def handle_prompt_generation(
         finally:
             await presence.stop()
 
-        histories[message.chat_id].append(f"Aigan: {response[:500]}")
         remember_observed_message(message, label=f"{user_label(message)} (translation request)")
-        passive_contexts[message.chat_id].append(f"Aigan: {clip_text(response, 700)}")
-        remember_bot_message(message.chat_id, response)
-        await send_reply(message, response)
-        record_chat_answer(message, prompt, route)
+        delivery = await send_reply(
+            message,
+            response,
+            memory_label="Aigan",
+            route=route,
+            outbound_provenance=outbound_provenance,
+        )
+        if delivered := delivered_text(delivery):
+            histories[message.chat_id].append(f"Aigan: {delivered[:500]}")
+            passive_contexts[message.chat_id].append(f"Aigan: {clip_text(delivered, 700)}")
+            record_chat_answer(message, prompt, route)
         return
 
     tool_route_decision = await route_tool_capabilities_for_message(message, prompt)
@@ -9126,7 +9805,12 @@ async def handle_prompt_generation(
         if has_reference:
             user_id = message.from_user.id if message.from_user else "unknown"
             LOGGER.info("Reference context attached chat_id=%s user_id=%s", message.chat_id, user_id)
-        web_context = await maybe_prefetch_web_context(message, prompt, route)
+        web_context = await maybe_prefetch_web_context(
+            message,
+            prompt,
+            route,
+            outbound_provenance=outbound_provenance,
+        )
         reminder_context = reminder_tool_context_for_message(message, prompt, tool_route_decision)
         recalled_memory_context = None
         semantic_memory_context = None
@@ -9187,14 +9871,15 @@ async def handle_prompt_generation(
             or guard_reminder_claims
             or guard_specific_reminder_claims
         ):
-            agent_coro = run_agent(
+            agent_coro = run_agent_for_outbound(
+                outbound_provenance,
                 agent_input,
                 reminder_tool_context=reminder_context,
                 guard_reminder_claims=guard_reminder_claims,
                 guard_specific_reminder_claims=guard_specific_reminder_claims,
             )
         else:
-            agent_coro = run_agent(agent_input)
+            agent_coro = run_agent_for_outbound(outbound_provenance, agent_input)
         response = await asyncio.wait_for(agent_coro, timeout=120)
     except Exception:
         LOGGER.exception("Agent run failed")
@@ -9203,12 +9888,18 @@ async def handle_prompt_generation(
     finally:
         await presence.stop()
 
-    histories[message.chat_id].append(f"Aigan: {response[:500]}")
     remember_observed_message(message, label=f"{user_label(message)} (current request)")
-    passive_contexts[message.chat_id].append(f"Aigan: {clip_text(response, 700)}")
-    remember_bot_message(message.chat_id, response)
-    await send_reply(message, response)
-    record_chat_answer(message, prompt, route)
+    delivery = await send_reply(
+        message,
+        response,
+        memory_label="Aigan",
+        route=route,
+        outbound_provenance=outbound_provenance,
+    )
+    if delivered := delivered_text(delivery):
+        histories[message.chat_id].append(f"Aigan: {delivered[:500]}")
+        passive_contexts[message.chat_id].append(f"Aigan: {clip_text(delivered, 700)}")
+        record_chat_answer(message, prompt, route)
 
 
 def coalesced_payload_context(messages: Sequence[Message]) -> str:
@@ -9313,6 +10004,7 @@ async def handle_image_prompt_generation(
 
     mark_cooldown(message)
     remember_observed_message(message, label=f"{user_label(message)} (image request)")
+    outbound_provenance = provenance_for_message(message, "vision")
     presence = activity_presence_for_message(message, action=ChatAction.TYPING)
     await presence.start()
 
@@ -9371,7 +10063,17 @@ Image parts in this Telegram turn: {len(image_data_urls)}
 
 Explain the image(s) according to the current request. Ukrainian by default; English only if explicitly requested. Never Russian.
 """
-        response = await asyncio.wait_for(run_vision(vision_prompt, image_data_urls), timeout=120)
+        response = await asyncio.wait_for(
+            run_vision(vision_prompt, image_data_urls, run_id=outbound_provenance.run_id),
+            timeout=120,
+        )
+        append_tool_provenance(
+            outbound_provenance,
+            "vision_analysis",
+            {},
+            response,
+            status="ok",
+        )
     except Exception:
         LOGGER.exception("Image analysis failed")
         await message.reply_text("Не зміг проаналізувати зображення. Деталі будуть у логах контейнера.")
@@ -9380,8 +10082,6 @@ Explain the image(s) according to the current request. Ukrainian by default; Eng
         await presence.stop()
 
     histories[message.chat_id].append(f"{user_label(message)}: {prompt[:500]}")
-    histories[message.chat_id].append(f"Aigan: {response[:500]}")
-    passive_contexts[message.chat_id].append(f"Aigan: {clip_text(response, 700)}")
     if MEMORY is not None:
         for part in successful_image_messages:
             item = MEMORY.message_by_message_id(message.chat_id, getattr(part, "message_id", None))
@@ -9391,9 +10091,17 @@ Explain the image(s) according to the current request. Ukrainian by default; Eng
             )
             if item_id is not None:
                 MEMORY.update_vision_summary(item_id, response)
-    remember_bot_message(message.chat_id, response)
-    await send_reply(message, response)
-    record_chat_answer(message, dedupe_prompt, "vision")
+    delivery = await send_reply(
+        message,
+        response,
+        memory_label="Aigan",
+        route="vision",
+        outbound_provenance=outbound_provenance,
+    )
+    if delivered := delivered_text(delivery):
+        histories[message.chat_id].append(f"Aigan: {delivered[:500]}")
+        passive_contexts[message.chat_id].append(f"Aigan: {clip_text(delivered, 700)}")
+        record_chat_answer(message, dedupe_prompt, "vision")
 
 
 def auto_react_due(message: Message) -> bool:
@@ -9440,8 +10148,12 @@ Candidate message:
 Decide whether a response is genuinely useful. If not useful, reply exactly: SKIP
 If useful, write one concise professional response. Use Ukrainian by default, English only when clearly requested, and never Russian. Use dry irony only if it helps.
 """
+    outbound_provenance = provenance_for_message(message, "auto_response")
     try:
-        response = await asyncio.wait_for(run_agent(prompt), timeout=120)
+        response = await asyncio.wait_for(
+            run_agent_for_outbound(outbound_provenance, prompt),
+            timeout=120,
+        )
     except Exception:
         LOGGER.exception("Auto reaction failed")
         return
@@ -9450,9 +10162,18 @@ If useful, write one concise professional response. Use Ukrainian by default, En
         LOGGER.info("Auto reaction skipped chat_id=%s", message.chat_id)
         return
 
-    passive_contexts[message.chat_id].append(f"Aigan (auto): {clip_text(response, 700)}")
-    remember_bot_message(message.chat_id, response, label="Aigan (auto)")
-    await send_chat_text(context.bot, message.chat_id, response)
+    delivery = await send_chat_text(
+        context.bot,
+        message.chat_id,
+        response,
+        memory_label="Aigan (auto)",
+        route="auto_response",
+        trigger_message_id=getattr(message, "message_id", None),
+        chat_type=str(getattr(message.chat, "type", "") or ""),
+        outbound_provenance=outbound_provenance,
+    )
+    if delivered := delivered_text(delivery):
+        passive_contexts[message.chat_id].append(f"Aigan (auto): {clip_text(delivered, 700)}")
 
 
 def proactive_chat_idle_seconds(chat_id: int) -> int | None:
@@ -9860,8 +10581,14 @@ async def run_proactive_model(
     chat_id: int,
     event_message: str = "",
     user_id: int | None = None,
+    outbound_provenance: OutboundProvenance | None = None,
 ) -> str | None:
-    response = await asyncio.wait_for(run_agent(prompt), timeout=120)
+    model_call = (
+        run_agent_for_outbound(outbound_provenance, prompt)
+        if outbound_provenance is not None
+        else run_agent(prompt)
+    )
+    response = await asyncio.wait_for(model_call, timeout=120)
     if response.strip().upper() == "SKIP":
         return None
 
@@ -9888,7 +10615,12 @@ Rejection reason: {violation}
 
 Rewrite once about a non-meta chat topic. No availability notice, no capability list, no self-description, no internal setup, and no contact request. If you cannot do that tastefully, reply exactly: SKIP
 """
-    retry = await asyncio.wait_for(run_agent(retry_prompt), timeout=120)
+    retry_call = (
+        run_agent_for_outbound(outbound_provenance, retry_prompt)
+        if outbound_provenance is not None
+        else run_agent(retry_prompt)
+    )
+    retry = await asyncio.wait_for(retry_call, timeout=120)
     if retry.strip().upper() == "SKIP":
         return None
 
@@ -9913,8 +10645,14 @@ async def run_reminder_model(
     chat_id: int,
     event_message: str = "",
     user_id: int | None = None,
+    outbound_provenance: OutboundProvenance | None = None,
 ) -> tuple[str | None, str]:
-    response = await asyncio.wait_for(run_agent(prompt), timeout=120)
+    model_call = (
+        run_agent_for_outbound(outbound_provenance, prompt)
+        if outbound_provenance is not None
+        else run_agent(prompt)
+    )
+    response = await asyncio.wait_for(model_call, timeout=120)
     if response.strip().upper() == "SKIP":
         return None, "model_skip"
 
@@ -9941,7 +10679,12 @@ Rejection reason: {violation}
 
 Rewrite once as the reminder itself. No availability notice, no capability list, no self-description, no internal setup, and no contact request. If the reminder is unsafe or impossible to make useful, reply exactly: SKIP
 """
-    retry = await asyncio.wait_for(run_agent(retry_prompt), timeout=120)
+    retry_call = (
+        run_agent_for_outbound(outbound_provenance, retry_prompt)
+        if outbound_provenance is not None
+        else run_agent(retry_prompt)
+    )
+    retry = await asyncio.wait_for(retry_call, timeout=120)
     if retry.strip().upper() == "SKIP":
         return None, "model_skip"
 
@@ -10055,12 +10798,14 @@ async def run_proactive_once(application: Application) -> bool:
     else:
         prompt = build_idle_proactive_prompt(chat_id, idle_seconds, direction)
 
+    outbound_provenance = new_outbound_provenance(chat_id=chat_id, route="proactive")
     try:
         response = await run_proactive_model(
             prompt,
             chat_id=chat_id,
             user_id=candidate.user_id if candidate else None,
             event_message=candidate.key if candidate else direction,
+            outbound_provenance=outbound_provenance,
         )
         if response is None:
             event_type = "proactive_personal_model_skip" if candidate is not None else "proactive_idle_model_skip"
@@ -10087,12 +10832,20 @@ async def run_proactive_once(application: Application) -> bool:
             )
             return False
 
-        passive_contexts[chat_id].append(f"{label}: {clip_text(response, 700)}")
-        remember_bot_message(chat_id, response, label=label)
-        await send_chat_text(application.bot, chat_id, response)
+        delivery = await send_chat_text(
+            application.bot,
+            chat_id,
+            response,
+            memory_label=label,
+            route="proactive",
+            outbound_provenance=outbound_provenance,
+        )
+        delivered = delivered_text(delivery)
+        if delivered:
+            passive_contexts[chat_id].append(f"{label}: {clip_text(delivered, 700)}")
         last_proactive_sent_chat[chat_id] = time.monotonic()
         if SOCIAL_MEMORY is not None:
-            SOCIAL_MEMORY.save_seed(chat_id, direction=direction, topic=response, text=response)
+            SOCIAL_MEMORY.save_seed(chat_id, direction=direction, topic=delivered, text=delivered)
         event_type = "proactive_personal_sent" if candidate is not None else "proactive_idle_sent"
         if candidate is not None:
             last_proactive_personal_ping[f"{chat_id}:{candidate.key}"] = time.monotonic()
@@ -10181,6 +10934,63 @@ def needs_context_text(response: str) -> str | None:
     return question or "Мені бракує контексту для цього нагадування. Уточниш, як краще сформулювати?"
 
 
+def reminder_delivery_subject_key(claim: ClaimedReminderFire) -> str:
+    material = "\x00".join(
+        (
+            "reminder-delivery-v2",
+            str(claim.fire.id),
+            claim.fire.idempotency_key,
+            str(claim.fire.delivery_revision),
+        )
+    )
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()[:24]
+
+
+def reminder_delivery_receipt(claim: ClaimedReminderFire, subject_key: str) -> DeliveryReceipt | None:
+    if MEMORY is None:
+        return None
+    attempted_kind = str(claim.fire.delivery_kind or "")
+    subject_kinds = (
+        (attempted_kind,)
+        if attempted_kind in {"reminder_delivery", "reminder_clarification"}
+        else ("reminder_delivery", "reminder_clarification")
+    )
+    for subject_kind in subject_kinds:
+        receipt = MEMORY.delivery_receipt_for_subject(subject_kind, claim.fire.id, subject_key)
+        if receipt is not None:
+            return receipt
+    return None
+
+
+def finalize_claimed_reminder(
+    fire_id: int,
+    *,
+    expected_claimed_at: str,
+    subject_kind: str,
+    sent_message_id: int | None = None,
+) -> None:
+    if REMINDERS is None:
+        raise RuntimeError("reminder store is disabled")
+    if subject_kind == "reminder_delivery":
+        REMINDERS.mark_sent(
+            fire_id,
+            sent_message_id=sent_message_id,
+            expected_claimed_at=expected_claimed_at,
+        )
+        expected_status = "sent"
+    elif subject_kind == "reminder_clarification":
+        REMINDERS.mark_needs_context(
+            fire_id,
+            expected_claimed_at=expected_claimed_at,
+        )
+        expected_status = "needs_context"
+    else:
+        raise ValueError("unsupported reminder delivery subject")
+    fire = REMINDERS.fire_by_id(fire_id)
+    if fire is None or fire.status != expected_status:
+        raise RuntimeError("reminder delivery finalization did not commit")
+
+
 async def run_reminder_scheduler_once(application: Application) -> int:
     if REMINDERS is None or not CONFIG.reminders_enabled:
         return 0
@@ -10191,6 +11001,32 @@ async def run_reminder_scheduler_once(application: Application) -> int:
             event_type="reminder_context_expired",
             details={"count": expired},
         )
+    for attempt in REMINDERS.delivery_attempts(limit=CONFIG.reminder_max_due_per_tick * 4):
+        receipt = reminder_delivery_receipt(attempt, reminder_delivery_subject_key(attempt))
+        if receipt is None:
+            continue
+        try:
+            finalize_claimed_reminder(
+                attempt.fire.id,
+                expected_claimed_at=attempt.fire.claimed_at,
+                subject_kind=receipt.subject_kind,
+                sent_message_id=receipt.message_id,
+            )
+        except Exception as exc:
+            LOGGER.warning(
+                "Reminder delivery reconciliation is still pending reminder_id=%s error=%s",
+                attempt.reminder.id,
+                type(exc).__name__,
+            )
+        else:
+            system_event_for_chat(
+                component="reminders",
+                event_type="reminder_delivery_reconciled",
+                chat_id=attempt.reminder.chat_id,
+                user_id=attempt.reminder.created_by_user_id,
+                message=str(attempt.reminder.id),
+                details={"subject_kind": receipt.subject_kind},
+            )
     claims = REMINDERS.claim_due_fires(
         limit=CONFIG.reminder_max_due_per_tick,
         misfire_grace_seconds=CONFIG.reminder_misfire_grace_seconds,
@@ -10199,13 +11035,58 @@ async def run_reminder_scheduler_once(application: Application) -> int:
     for claim in claims:
         reminder = claim.reminder
         claim_token = claim.fire.claimed_at
+        subject_key = reminder_delivery_subject_key(claim)
+        receipt = reminder_delivery_receipt(claim, subject_key)
+        if receipt is not None:
+            try:
+                finalize_claimed_reminder(
+                    claim.fire.id,
+                    expected_claimed_at=claim_token,
+                    subject_kind=receipt.subject_kind,
+                    sent_message_id=receipt.message_id,
+                )
+            except Exception as exc:
+                LOGGER.warning(
+                    "Reminder delivery reconciliation is still pending reminder_id=%s error=%s",
+                    reminder.id,
+                    type(exc).__name__,
+                )
+                system_event_for_chat(
+                    level="error",
+                    component="reminders",
+                    event_type="reminder_delivery_finalization_pending",
+                    chat_id=reminder.chat_id,
+                    user_id=reminder.created_by_user_id,
+                    message=str(reminder.id),
+                    details={"subject_kind": receipt.subject_kind},
+                )
+            else:
+                system_event_for_chat(
+                    component="reminders",
+                    event_type="reminder_delivery_reconciled",
+                    chat_id=reminder.chat_id,
+                    user_id=reminder.created_by_user_id,
+                    message=str(reminder.id),
+                    details={"subject_kind": receipt.subject_kind},
+                )
+            continue
+
         prompt = build_scheduled_reminder_prompt(claim)
+        outbound_provenance = new_outbound_provenance(
+            chat_id=reminder.chat_id,
+            route="reminder",
+            trigger_message_id=reminder.created_from_message_id,
+            subject_id=claim.fire.id,
+            subject_key=subject_key,
+        )
+        delivery_confirmed = False
         try:
             response, failure_category = await run_reminder_model(
                 prompt,
                 chat_id=reminder.chat_id,
                 event_message=f"reminder:{reminder.id}",
                 user_id=reminder.created_by_user_id,
+                outbound_provenance=outbound_provenance,
             )
             if response is None:
                 if failure_category in {"model_skip", "style_rejected"}:
@@ -10244,13 +11125,83 @@ async def run_reminder_scheduler_once(application: Application) -> int:
                 if refreshed_token is None:
                     continue
                 claim_token = refreshed_token
-                await send_chat_text(application.bot, reminder.chat_id, question)
-                passive_contexts[reminder.chat_id].append(f"Aigan (reminder clarification): {clip_text(question, 700)}")
-                remember_bot_message(reminder.chat_id, question, label="Aigan (reminder clarification)")
-                REMINDERS.mark_needs_context(
-                    claim.fire.id,
-                    expected_claimed_at=claim_token,
+                outbound_provenance.route = "reminder_clarification"
+                outbound_provenance.subject_kind = "reminder_clarification"
+                try:
+                    delivery_attempted = REMINDERS.mark_delivery_attempted(
+                        claim.fire.id,
+                        expected_claimed_at=claim_token,
+                        delivery_kind="reminder_clarification",
+                    )
+                except Exception as exc:
+                    LOGGER.warning(
+                        "Reminder clarification pre-send marker failed reminder_id=%s error=%s",
+                        reminder.id,
+                        type(exc).__name__,
+                    )
+                    continue
+                if not delivery_attempted:
+                    continue
+                delivery = await send_chat_text(
+                    application.bot,
+                    reminder.chat_id,
+                    question,
+                    memory_label="Aigan (reminder clarification)",
+                    route="reminder_clarification",
+                    outbound_provenance=outbound_provenance,
                 )
+                if delivery.ambiguous and not delivery.delivered_chunks:
+                    try:
+                        REMINDERS.mark_delivery_unknown(
+                            claim.fire.id,
+                            expected_claimed_at=claim_token,
+                        )
+                    except Exception as exc:
+                        LOGGER.warning(
+                            "Reminder clarification outcome remains unknown reminder_id=%s error=%s",
+                            reminder.id,
+                            type(exc).__name__,
+                        )
+                    system_event_for_chat(
+                        level="warning",
+                        component="reminders",
+                        event_type="reminder_delivery_outcome_unknown",
+                        chat_id=reminder.chat_id,
+                        user_id=reminder.created_by_user_id,
+                        message=str(reminder.id),
+                        details={"subject_kind": "reminder_clarification"},
+                    )
+                    continue
+                delivery_confirmed = bool(delivery.delivered_chunks)
+                if not delivery_confirmed:
+                    raise RuntimeError("Telegram reminder clarification returned no delivered chunks")
+                delivered = delivered_text(delivery)
+                try:
+                    finalize_claimed_reminder(
+                        claim.fire.id,
+                        expected_claimed_at=claim_token,
+                        subject_kind="reminder_clarification",
+                        sent_message_id=delivery.message_ids[0] if delivery.message_ids else None,
+                    )
+                except Exception as exc:
+                    LOGGER.warning(
+                        "Reminder clarification finalization pending reminder_id=%s error=%s",
+                        reminder.id,
+                        type(exc).__name__,
+                    )
+                    system_event_for_chat(
+                        level="error",
+                        component="reminders",
+                        event_type="reminder_delivery_finalization_pending",
+                        chat_id=reminder.chat_id,
+                        user_id=reminder.created_by_user_id,
+                        message=str(reminder.id),
+                        details={"subject_kind": "reminder_clarification"},
+                    )
+                if delivered:
+                    passive_contexts[reminder.chat_id].append(
+                        f"Aigan (reminder clarification): {clip_text(delivered, 700)}"
+                    )
                 system_event_for_chat(
                     component="reminders",
                     event_type="reminder_needs_context",
@@ -10265,30 +11216,114 @@ async def run_reminder_scheduler_once(application: Application) -> int:
             if refreshed_token is None:
                 continue
             claim_token = refreshed_token
-            await send_chat_text(application.bot, reminder.chat_id, response)
-            passive_contexts[reminder.chat_id].append(f"Aigan (reminder): {clip_text(response, 700)}")
-            remember_bot_message(reminder.chat_id, response, label="Aigan (reminder)")
-            REMINDERS.mark_sent(claim.fire.id, expected_claimed_at=claim_token)
+            outbound_provenance.route = "reminder"
+            outbound_provenance.subject_kind = "reminder_delivery"
+            try:
+                delivery_attempted = REMINDERS.mark_delivery_attempted(
+                    claim.fire.id,
+                    expected_claimed_at=claim_token,
+                    delivery_kind="reminder_delivery",
+                )
+            except Exception as exc:
+                LOGGER.warning(
+                    "Reminder pre-send marker failed reminder_id=%s error=%s",
+                    reminder.id,
+                    type(exc).__name__,
+                )
+                continue
+            if not delivery_attempted:
+                continue
+            delivery = await send_chat_text(
+                application.bot,
+                reminder.chat_id,
+                response,
+                memory_label="Aigan (reminder)",
+                route="reminder",
+                outbound_provenance=outbound_provenance,
+            )
+            if delivery.ambiguous and not delivery.delivered_chunks:
+                try:
+                    REMINDERS.mark_delivery_unknown(
+                        claim.fire.id,
+                        expected_claimed_at=claim_token,
+                    )
+                except Exception as exc:
+                    LOGGER.warning(
+                        "Reminder delivery outcome remains unknown reminder_id=%s error=%s",
+                        reminder.id,
+                        type(exc).__name__,
+                    )
+                system_event_for_chat(
+                    level="warning",
+                    component="reminders",
+                    event_type="reminder_delivery_outcome_unknown",
+                    chat_id=reminder.chat_id,
+                    user_id=reminder.created_by_user_id,
+                    message=str(reminder.id),
+                    details={"subject_kind": "reminder_delivery"},
+                )
+                continue
+            delivery_confirmed = bool(delivery.delivered_chunks)
+            if not delivery_confirmed:
+                raise RuntimeError("Telegram reminder returned no delivered chunks")
+            delivered = delivered_text(delivery)
+            try:
+                finalize_claimed_reminder(
+                    claim.fire.id,
+                    sent_message_id=delivery.message_ids[0] if delivery.message_ids else None,
+                    expected_claimed_at=claim_token,
+                    subject_kind="reminder_delivery",
+                )
+            except Exception as exc:
+                LOGGER.warning(
+                    "Reminder delivery finalization pending reminder_id=%s error=%s",
+                    reminder.id,
+                    type(exc).__name__,
+                )
+                system_event_for_chat(
+                    level="error",
+                    component="reminders",
+                    event_type="reminder_delivery_finalization_pending",
+                    chat_id=reminder.chat_id,
+                    user_id=reminder.created_by_user_id,
+                    message=str(reminder.id),
+                    details={"subject_kind": "reminder_delivery"},
+                )
+            if delivered:
+                passive_contexts[reminder.chat_id].append(f"Aigan (reminder): {clip_text(delivered, 700)}")
             system_event_for_chat(
                 component="reminders",
                 event_type="reminder_sent",
                 chat_id=reminder.chat_id,
                 user_id=reminder.created_by_user_id,
                 message=str(reminder.id),
-                details={"response_chars": len(response), "kind": reminder.kind, "recurrence": reminder.recurrence},
+                details={"response_chars": len(delivered), "kind": reminder.kind, "recurrence": reminder.recurrence},
             )
             sent_or_asked += 1
-        except Exception:
-            LOGGER.exception("Reminder wake-up failed reminder_id=%s", reminder.id)
-            REMINDERS.mark_failed(
-                claim.fire.id,
-                category="send_or_model_failed",
-                expected_claimed_at=claim_token,
-            )
+        except Exception as exc:
+            if delivery_confirmed:
+                LOGGER.warning(
+                    "Reminder post-delivery work failed without retry reminder_id=%s error=%s",
+                    reminder.id,
+                    type(exc).__name__,
+                )
+                event_type = "reminder_delivery_finalization_pending"
+            else:
+                LOGGER.warning(
+                    "Reminder wake-up failed reminder_id=%s error=%s",
+                    reminder.id,
+                    type(exc).__name__,
+                )
+                REMINDERS.mark_failed(
+                    claim.fire.id,
+                    category="send_or_model_failed",
+                    expected_claimed_at=claim_token,
+                )
+                event_type = "reminder_failed"
             system_event_for_chat(
                 level="error",
                 component="reminders",
-                event_type="reminder_failed",
+                event_type=event_type,
                 chat_id=reminder.chat_id,
                 user_id=reminder.created_by_user_id,
                 message=str(reminder.id),

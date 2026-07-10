@@ -1,5 +1,13 @@
 # Aigan Changelog
 
+## 2026-07-09 - Persistent outbound identity and provenance
+
+- Persist Telegram bot text chunks and web images only after successful delivery, using the real returned message ids and ordered per-run chunk mappings.
+- Reconstruct reply chains through complete chunk groups after restart and repair pending reaction targets as soon as an outbound message is stored.
+- Add privacy-bounded route/tool provenance with keyed allowlisted source fingerprints, low-cardinality result digests, and sensitive Agents SDK tracing disabled.
+- Isolate post-delivery SQLite/provenance failures from Telegram retries so an already delivered reply is never duplicated.
+- Add durable pre-send reminder attempt markers and terminal unknown-outcome handling so timeouts, crashes, or simultaneous persistence/finalization failures cannot requeue a possibly delivered reminder.
+
 ## 2026-05-25 - Living reminders
 
 - Added durable SQLite living reminders with idempotent due-fire claiming, misfire handling, and yearly birthday recurrence.

@@ -186,6 +186,7 @@ Aigan stores bounded chat memory in SQLite so it can use recent context after re
 ```env
 MEMORY_ENABLED=true
 MEMORY_DB_PATH=/app/data/aigan.sqlite3
+PROVENANCE_HASH_SALT=
 MEMORY_CONTEXT_MESSAGES=10
 MEMORY_FOLLOWUP_CONTEXT_MESSAGES=40
 MEMORY_THREAD_CONTEXT_DEPTH=6
@@ -216,6 +217,12 @@ SOCIAL_PROFILE_RETENTION_DAYS=180
 ```
 
 `MEMORY_CONTEXT_MESSAGES` controls how many recent delivered messages are added to normal model requests. For explicit short follow-ups such as `@bot скільки?`, `що?`, or `how many?`, Aigan also injects up to `MEMORY_FOLLOWUP_CONTEXT_MESSAGES` recent messages plus reply-chain parents up to `MEMORY_THREAD_CONTEXT_DEPTH`. If the referent is still unclear, it should ask one concise clarification instead of guessing. This expanded retrieval only runs after an explicit bot invocation, private DM, reply-to-bot, or pending consume; ordinary group chatter stays passive memory only.
+
+Bot output enters memory only after Telegram confirms delivery with a real message id. Every delivered text chunk or web image keeps that id, its triggering input when one exists, its ordered delivery group, and an opaque run id, so replies and reactions still resolve after a restart. A post-delivery SQLite failure is diagnostic only and must never cause the already delivered Telegram output to be sent again.
+
+Scheduled reminders durably mark a delivery attempt before calling Telegram. A transport timeout or a crash after that marker is not retried automatically because Telegram may already have accepted the message; health diagnostics expose unresolved `delivery_attempted` fires for operator review instead of risking a duplicate reminder.
+
+Run provenance stores only route names, tool kinds, low-cardinality result status/digests, and keyed fingerprints derived from allowlisted source fields. It never stores raw prompts, tool arguments, search queries, URLs, transcripts, pages, or model output in provenance or Agents SDK traces. Set a private `PROVENANCE_HASH_SALT` to keep fingerprints stable across Telegram token rotation; never commit its real value.
 
 `MEMORY_RETENTION_DAYS` deletes older rows and cached media. `MEMORY_IMAGE_SUMMARY_LIMIT` limits how many recent unsummarized images can be lazily sent to vision for one answer. `WEB_SEARCH_TIMEOUT_SECONDS` controls DDGS web/image search network timeout, while `MCP_TOOL_TIMEOUT_SECONDS` controls the Agents SDK MCP session timeout for web and YouTube tools. For explicit URL checks, Aigan should fetch the current URL first, use search as secondary evidence, and report timeout/fetch/search failures as incomplete validation instead of guessing.
 

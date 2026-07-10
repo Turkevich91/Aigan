@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 import sqlite3
 import struct
@@ -50,6 +51,40 @@ class SemanticMemoryResult:
     search_text: str
     score: float
     source: str
+
+
+@dataclass(frozen=True)
+class ProvenanceToolRecord:
+    ordinal: int
+    tool_kind: str
+    source_fingerprint: str
+    result_status: str
+    result_digest: str
+
+
+@dataclass(frozen=True)
+class RunProvenance:
+    run_id: str
+    route: str
+    status: str
+    trigger_message_id: int | None
+    input_memory_id: int | None
+    subject_kind: str
+    subject_id: int | None
+    subject_key: str
+    started_at: str
+    completed_at: str
+    tools: tuple[ProvenanceToolRecord, ...]
+
+
+@dataclass(frozen=True)
+class DeliveryReceipt:
+    run_id: str
+    subject_kind: str
+    subject_id: int
+    subject_key: str
+    message_id: int
+    status: str
 
 
 class MemoryStore:
@@ -117,9 +152,53 @@ class MemoryStore:
                 ON message_embeddings(chat_id, model, dimensions);
             CREATE VIRTUAL TABLE IF NOT EXISTS message_fts
                 USING fts5(search_text, tokenize = 'unicode61');
+            CREATE TABLE IF NOT EXISTS provenance_runs (
+                run_id TEXT PRIMARY KEY,
+                chat_id INTEGER NOT NULL,
+                trigger_message_id INTEGER,
+                input_memory_id INTEGER REFERENCES messages(id) ON DELETE SET NULL,
+                route TEXT NOT NULL DEFAULT '',
+                subject_kind TEXT NOT NULL DEFAULT '',
+                subject_id INTEGER,
+                subject_key TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'partial_delivery',
+                started_at TEXT NOT NULL,
+                completed_at TEXT NOT NULL DEFAULT ''
+            );
+            CREATE INDEX IF NOT EXISTS idx_provenance_runs_chat_trigger
+                ON provenance_runs(chat_id, trigger_message_id);
+            CREATE TABLE IF NOT EXISTS provenance_tools (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id TEXT NOT NULL REFERENCES provenance_runs(run_id) ON DELETE CASCADE,
+                ordinal INTEGER NOT NULL,
+                tool_kind TEXT NOT NULL,
+                source_fingerprint TEXT NOT NULL DEFAULT '',
+                result_status TEXT NOT NULL,
+                result_digest TEXT NOT NULL DEFAULT '{}',
+                input_memory_id INTEGER REFERENCES messages(id) ON DELETE SET NULL,
+                output_memory_id INTEGER REFERENCES messages(id) ON DELETE SET NULL,
+                UNIQUE(run_id, ordinal)
+            );
+            CREATE TABLE IF NOT EXISTS provenance_outputs (
+                run_id TEXT NOT NULL REFERENCES provenance_runs(run_id) ON DELETE CASCADE,
+                memory_id INTEGER NOT NULL UNIQUE REFERENCES messages(id) ON DELETE CASCADE,
+                ordinal INTEGER NOT NULL,
+                part_count INTEGER NOT NULL DEFAULT 1,
+                PRIMARY KEY(run_id, memory_id),
+                UNIQUE(run_id, ordinal)
+            );
             """
         )
         self._ensure_column("messages", "source_text", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column("provenance_runs", "subject_kind", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column("provenance_runs", "subject_id", "INTEGER")
+        self._ensure_column("provenance_runs", "subject_key", "TEXT NOT NULL DEFAULT ''")
+        self._conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_provenance_runs_subject
+                ON provenance_runs(subject_kind, subject_id, subject_key)
+            """
+        )
         self._conn.commit()
 
     def _ensure_column(self, table: str, column: str, definition: str) -> None:
@@ -456,25 +535,384 @@ class MemoryStore:
             ).fetchone()
         return self._row_to_item(row) if row is not None else None
 
+    def record_provenance_output(
+        self,
+        *,
+        run_id: str,
+        chat_id: int,
+        trigger_message_id: int | None,
+        input_memory_id: int | None,
+        route: str,
+        started_at: datetime | str,
+        output_memory_id: int,
+        output_ordinal: int,
+        output_part_count: int,
+        tools: tuple[object, ...] | list[object] = (),
+        subject_kind: str = "",
+        subject_id: int | None = None,
+        subject_key: str = "",
+    ) -> None:
+        if not re.fullmatch(r"[0-9a-f]{32}", run_id or ""):
+            raise ValueError("run_id must be 32 lowercase hex characters")
+        route_value = re.sub(r"[^a-zA-Z0-9_-]", "", route or "")[:64]
+        subject_kind_value = re.sub(r"[^a-zA-Z0-9_-]", "", subject_kind or "")[:64]
+        subject_key_value = re.sub(r"[^0-9a-f]", "", subject_key or "")[:64]
+        started = self._format_datetime(started_at)
+        completed = self._format_datetime(None)
+        part_count = max(1, int(output_part_count))
+        ordinal = max(0, int(output_ordinal))
+        if ordinal >= part_count:
+            raise ValueError("provenance output ordinal must be smaller than part_count")
+        chat_value = int(chat_id)
+        trigger_value = int(trigger_message_id) if trigger_message_id is not None else None
+        input_value = int(input_memory_id) if input_memory_id is not None else None
+        subject_id_value = int(subject_id) if subject_id is not None else None
+        with self._lock:
+            try:
+                self._conn.execute("BEGIN")
+                output_chat = self._conn.execute(
+                    "SELECT chat_id, is_bot FROM messages WHERE id = ?",
+                    (int(output_memory_id),),
+                ).fetchone()
+                if output_chat is None or int(output_chat["chat_id"]) != chat_value:
+                    raise ValueError("provenance output chat mismatch")
+                if not bool(output_chat["is_bot"]):
+                    raise ValueError("provenance output must be bot-authored")
+                if input_value is not None:
+                    input_chat = self._conn.execute(
+                        "SELECT chat_id FROM messages WHERE id = ?",
+                        (input_value,),
+                    ).fetchone()
+                    if input_chat is None or int(input_chat["chat_id"]) != chat_value:
+                        raise ValueError("provenance input chat mismatch")
+                existing_run = self._conn.execute(
+                    "SELECT * FROM provenance_runs WHERE run_id = ?",
+                    (run_id,),
+                ).fetchone()
+                expected_run_metadata = (
+                    chat_value,
+                    trigger_value,
+                    input_value,
+                    route_value,
+                    subject_kind_value,
+                    subject_id_value,
+                    subject_key_value,
+                    started,
+                )
+                if existing_run is None:
+                    self._conn.execute(
+                        """
+                        INSERT INTO provenance_runs (
+                            run_id, chat_id, trigger_message_id, input_memory_id,
+                            route, subject_kind, subject_id, subject_key,
+                            status, started_at, completed_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'partial_delivery', ?, ?)
+                        """,
+                        (run_id, *expected_run_metadata, completed),
+                    )
+                else:
+                    actual_run_metadata = (
+                        int(existing_run["chat_id"]),
+                        existing_run["trigger_message_id"],
+                        existing_run["input_memory_id"],
+                        str(existing_run["route"]),
+                        str(existing_run["subject_kind"]),
+                        existing_run["subject_id"],
+                        str(existing_run["subject_key"]),
+                        str(existing_run["started_at"]),
+                    )
+                    if actual_run_metadata != expected_run_metadata:
+                        raise ValueError("provenance run metadata mismatch")
+                for tool in tools:
+                    tool_ordinal = max(0, int(getattr(tool, "ordinal", 0)))
+                    tool_kind = re.sub(r"[^a-zA-Z0-9_-]", "", str(getattr(tool, "tool_kind", "unknown")))[:64]
+                    source_fingerprint = re.sub(
+                        r"[^0-9a-f]",
+                        "",
+                        str(getattr(tool, "source_fingerprint", "")),
+                    )[:64]
+                    result_status = re.sub(
+                        r"[^a-z0-9_-]",
+                        "",
+                        str(getattr(tool, "result_status", "unknown")).casefold(),
+                    )[:48]
+                    result_digest = self._safe_provenance_result_digest(
+                        getattr(tool, "result_digest", "{}"),
+                        result_status or "unknown",
+                    )
+                    expected_tool_metadata = (
+                        tool_kind or "unknown",
+                        source_fingerprint,
+                        result_status or "unknown",
+                        result_digest,
+                        input_value,
+                    )
+                    existing_tool = self._conn.execute(
+                        """
+                        SELECT tool_kind, source_fingerprint, result_status, result_digest, input_memory_id
+                        FROM provenance_tools
+                        WHERE run_id = ? AND ordinal = ?
+                        """,
+                        (run_id, tool_ordinal),
+                    ).fetchone()
+                    if existing_tool is None:
+                        self._conn.execute(
+                            """
+                            INSERT INTO provenance_tools (
+                                run_id, ordinal, tool_kind, source_fingerprint,
+                                result_status, result_digest, input_memory_id, output_memory_id
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                            """,
+                            (run_id, tool_ordinal, *expected_tool_metadata, int(output_memory_id)),
+                        )
+                    else:
+                        actual_tool_metadata = tuple(existing_tool)
+                        if actual_tool_metadata != expected_tool_metadata:
+                            raise ValueError("provenance tool metadata mismatch")
+
+                output_id = int(output_memory_id)
+                existing_slot = self._conn.execute(
+                    """
+                    SELECT memory_id, part_count
+                    FROM provenance_outputs
+                    WHERE run_id = ? AND ordinal = ?
+                    """,
+                    (run_id, ordinal),
+                ).fetchone()
+                existing_output = self._conn.execute(
+                    """
+                    SELECT run_id, ordinal, part_count
+                    FROM provenance_outputs
+                    WHERE memory_id = ?
+                    """,
+                    (output_id,),
+                ).fetchone()
+                expected_slot = (output_id, part_count)
+                if existing_slot is not None and tuple(existing_slot) != expected_slot:
+                    raise ValueError("provenance output slot conflict")
+                if existing_output is not None and tuple(existing_output) != (run_id, ordinal, part_count):
+                    raise ValueError("provenance output mapping conflict")
+                existing_part_count = self._conn.execute(
+                    "SELECT MIN(part_count), MAX(part_count) FROM provenance_outputs WHERE run_id = ?",
+                    (run_id,),
+                ).fetchone()
+                if (
+                    existing_part_count is not None
+                    and existing_part_count[0] is not None
+                    and (int(existing_part_count[0]) != part_count or int(existing_part_count[1]) != part_count)
+                ):
+                    raise ValueError("provenance output part_count mismatch")
+                if existing_slot is None and existing_output is None:
+                    self._conn.execute(
+                        """
+                        INSERT INTO provenance_outputs (run_id, memory_id, ordinal, part_count)
+                        VALUES (?, ?, ?, ?)
+                        """,
+                        (run_id, output_id, ordinal, part_count),
+                    )
+                self._conn.execute(
+                    """
+                    UPDATE provenance_tools
+                    SET output_memory_id = COALESCE(output_memory_id, ?)
+                    WHERE run_id = ?
+                    """,
+                    (output_memory_id, run_id),
+                )
+                delivery = self._conn.execute(
+                    """
+                    SELECT COUNT(*) AS delivered_count,
+                           MIN(ordinal) AS min_ordinal,
+                           MAX(ordinal) AS max_ordinal,
+                           MIN(part_count) AS min_part_count,
+                           MAX(part_count) AS max_part_count
+                    FROM provenance_outputs
+                    WHERE run_id = ?
+                    """,
+                    (run_id,),
+                ).fetchone()
+                delivered_count = int(delivery["delivered_count"] or 0)
+                intended_count = max(1, int(delivery["max_part_count"] or part_count))
+                complete = (
+                    int(delivery["min_part_count"] or intended_count) == intended_count
+                    and delivered_count == intended_count
+                    and int(delivery["min_ordinal"] if delivery["min_ordinal"] is not None else -1) == 0
+                    and int(delivery["max_ordinal"] if delivery["max_ordinal"] is not None else -1)
+                    == intended_count - 1
+                )
+                status = "delivered" if complete else "partial_delivery"
+                self._conn.execute(
+                    "UPDATE provenance_runs SET status = ?, completed_at = ? WHERE run_id = ?",
+                    (status, completed, run_id),
+                )
+                self._conn.commit()
+            except Exception:
+                self._conn.rollback()
+                raise
+
+    @staticmethod
+    def _safe_provenance_result_digest(value: object, status: str) -> str:
+        try:
+            parsed = json.loads(str(value))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            parsed = {}
+        safe: dict[str, object] = {"status": status}
+        if isinstance(parsed, dict):
+            chars = parsed.get("chars")
+            if chars in {"empty", "small", "medium", "large"}:
+                safe["chars"] = chars
+            source = parsed.get("source")
+            if source in {"captions", "audio", "empty", "other"}:
+                safe["source"] = source
+            if isinstance(parsed.get("timestamps"), bool):
+                safe["timestamps"] = parsed["timestamps"]
+        return json.dumps(safe, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+
+    def provenance_for_output(self, output_memory_id: int | None) -> RunProvenance | None:
+        if output_memory_id is None:
+            return None
+        with self._lock:
+            run = self._conn.execute(
+                """
+                SELECT r.*
+                FROM provenance_runs AS r
+                JOIN provenance_outputs AS o ON o.run_id = r.run_id
+                JOIN messages AS m ON m.id = o.memory_id AND m.chat_id = r.chat_id
+                WHERE o.memory_id = ?
+                LIMIT 1
+                """,
+                (int(output_memory_id),),
+            ).fetchone()
+            if run is None:
+                return None
+            tool_rows = self._conn.execute(
+                """
+                SELECT ordinal, tool_kind, source_fingerprint, result_status, result_digest
+                FROM provenance_tools
+                WHERE run_id = ?
+                ORDER BY ordinal, id
+                """,
+                (run["run_id"],),
+            ).fetchall()
+        return RunProvenance(
+            run_id=str(run["run_id"]),
+            route=str(run["route"]),
+            status=str(run["status"]),
+            trigger_message_id=run["trigger_message_id"],
+            input_memory_id=run["input_memory_id"],
+            subject_kind=str(run["subject_kind"]),
+            subject_id=run["subject_id"],
+            subject_key=str(run["subject_key"]),
+            started_at=str(run["started_at"]),
+            completed_at=str(run["completed_at"]),
+            tools=tuple(
+                ProvenanceToolRecord(
+                    ordinal=int(row["ordinal"]),
+                    tool_kind=str(row["tool_kind"]),
+                    source_fingerprint=str(row["source_fingerprint"]),
+                    result_status=str(row["result_status"]),
+                    result_digest=str(row["result_digest"]),
+                )
+                for row in tool_rows
+            ),
+        )
+
+    def delivery_receipt_for_subject(
+        self,
+        subject_kind: str,
+        subject_id: int,
+        subject_key: str,
+    ) -> DeliveryReceipt | None:
+        kind = re.sub(r"[^a-zA-Z0-9_-]", "", subject_kind or "")[:64]
+        key = re.sub(r"[^0-9a-f]", "", subject_key or "")[:64]
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT r.run_id, r.subject_kind, r.subject_id, r.subject_key,
+                       r.status, m.message_id
+                FROM provenance_runs AS r
+                JOIN provenance_outputs AS o ON o.run_id = r.run_id
+                JOIN messages AS m ON m.id = o.memory_id AND m.chat_id = r.chat_id
+                WHERE r.subject_kind = ? AND r.subject_id = ? AND r.subject_key = ?
+                ORDER BY r.completed_at DESC, o.ordinal, m.id
+                LIMIT 1
+                """,
+                (kind, int(subject_id), key),
+            ).fetchone()
+        if row is None or row["message_id"] is None:
+            return None
+        return DeliveryReceipt(
+            run_id=str(row["run_id"]),
+            subject_kind=str(row["subject_kind"]),
+            subject_id=int(row["subject_id"]),
+            subject_key=str(row["subject_key"]),
+            message_id=int(row["message_id"]),
+            status=str(row["status"]),
+        )
+
+    def delivery_siblings(self, output_memory_id: int | None) -> list[MemoryItem]:
+        if output_memory_id is None:
+            return []
+        with self._lock:
+            run = self._conn.execute(
+                """
+                SELECT o.run_id, r.chat_id
+                FROM provenance_outputs AS o
+                JOIN provenance_runs AS r ON r.run_id = o.run_id
+                JOIN messages AS m ON m.id = o.memory_id AND m.chat_id = r.chat_id
+                WHERE o.memory_id = ?
+                LIMIT 1
+                """,
+                (int(output_memory_id),),
+            ).fetchone()
+            if run is None:
+                return []
+            rows = self._conn.execute(
+                """
+                SELECT m.*
+                FROM provenance_outputs AS o
+                JOIN messages AS m ON m.id = o.memory_id
+                WHERE o.run_id = ? AND m.chat_id = ?
+                ORDER BY o.ordinal, m.id
+                """,
+                (run["run_id"], run["chat_id"]),
+            ).fetchall()
+        return [self._row_to_item(row) for row in rows]
+
+    def safe_provenance_summary(self, output_memory_id: int | None) -> str:
+        provenance = self.provenance_for_output(output_memory_id)
+        if provenance is None:
+            return ""
+        parts = [f"route={provenance.route or 'unknown'}", f"delivery={provenance.status}"]
+        if provenance.tools:
+            tools = ",".join(f"{tool.tool_kind}:{tool.result_status}" for tool in provenance.tools[:8])
+            parts.append(f"tools={tools}")
+        return "; ".join(parts)
+
     def reply_chain(self, chat_id: int, message_id: int | None, depth: int = 6) -> list[MemoryItem]:
         depth = max(0, int(depth))
         if message_id is None or depth == 0:
             return []
 
-        chain: list[MemoryItem] = []
+        groups: list[list[MemoryItem]] = []
         seen: set[int] = set()
         current_id: int | None = message_id
         for _ in range(depth):
             item = self.message_by_message_id(chat_id, current_id)
             if item is None or item.id in seen:
                 break
-            chain.append(item)
-            seen.add(item.id)
-            current_id = item.reply_to_message_id
+            provenance = self.provenance_for_output(item.id)
+            siblings = self.delivery_siblings(item.id) if provenance is not None else []
+            group = siblings or [item]
+            unseen_group = [member for member in group if member.id not in seen]
+            if not unseen_group:
+                break
+            groups.append(unseen_group)
+            seen.update(member.id for member in unseen_group)
+            current_id = provenance.trigger_message_id if provenance is not None else item.reply_to_message_id
             if current_id is None:
                 break
 
-        return list(reversed(chain))
+        return [item for group in reversed(groups) for item in group]
 
     def user_messages(
         self,
@@ -971,15 +1409,31 @@ class MemoryStore:
         cutoff = datetime.now(timezone.utc) - timedelta(days=self.retention_days)
         cutoff_text = self._format_datetime(cutoff)
         with self._lock:
-            deleted_ids = [
-                int(row["id"])
-                for row in self._conn.execute("SELECT id FROM messages WHERE created_at < ?", (cutoff_text,)).fetchall()
-            ]
             rows = self._conn.execute(
-                "SELECT local_media_path FROM messages WHERE created_at < ? AND local_media_path != ''",
-                (cutoff_text,),
+                """
+                SELECT DISTINCT m.id, m.local_media_path
+                FROM messages AS m
+                LEFT JOIN provenance_outputs AS own_output ON own_output.memory_id = m.id
+                WHERE m.created_at < ?
+                   OR own_output.run_id IN (
+                       SELECT old_output.run_id
+                       FROM provenance_outputs AS old_output
+                       JOIN messages AS old_message ON old_message.id = old_output.memory_id
+                       WHERE old_message.created_at < ?
+                   )
+                """,
+                (cutoff_text, cutoff_text),
             ).fetchall()
-            cursor = self._conn.execute("DELETE FROM messages WHERE created_at < ?", (cutoff_text,))
+            deleted_ids = [int(row["id"]) for row in rows]
+            deleted_count = 0
+            for start in range(0, len(deleted_ids), 500):
+                batch = deleted_ids[start : start + 500]
+                placeholders = ",".join("?" for _ in batch)
+                cursor = self._conn.execute(f"DELETE FROM messages WHERE id IN ({placeholders})", batch)
+                deleted_count += int(cursor.rowcount)
+            self._conn.execute(
+                "DELETE FROM provenance_runs WHERE run_id NOT IN (SELECT run_id FROM provenance_outputs)"
+            )
             for item_id in deleted_ids:
                 self._conn.execute("DELETE FROM message_fts WHERE rowid = ?", (item_id,))
             self._conn.commit()
@@ -987,14 +1441,15 @@ class MemoryStore:
         for row in rows:
             path = Path(row["local_media_path"])
             try:
-                if path.is_file():
+                if row["local_media_path"] and path.is_file():
                     path.unlink()
             except OSError:
                 pass
-        return int(cursor.rowcount)
+        return deleted_count
 
     def clear_all(self) -> None:
         with self._lock:
+            self._conn.execute("DELETE FROM provenance_runs")
             self._conn.execute("DELETE FROM message_embeddings")
             self._conn.execute("DELETE FROM message_fts")
             self._conn.execute("DELETE FROM messages")
