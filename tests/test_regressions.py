@@ -198,8 +198,16 @@ class FakeMessage:
         self.document = None
         self.reply_to_message = None
         self.external_reply = None
+        self.forward_origin = None
+        self.forward_from = None
+        self.forward_from_chat = None
+        self.forward_sender_name = None
+        self.forward_date = None
+        self.is_automatic_forward = False
         self.quote = None
         self.entities = None
+        self.media_group_id = None
+        self.message_thread_id = None
         self.reply_calls = []
         self.photo_calls = []
         self.photo_failures = 0
@@ -228,6 +236,23 @@ class FakeMessage:
 
     def get_bot(self):
         return self.bot
+
+
+class FakeApplication:
+    def __init__(self) -> None:
+        self.tasks: list[asyncio.Task] = []
+
+    def create_task(self, coro, *args, **kwargs):
+        task = asyncio.create_task(coro)
+        self.tasks.append(task)
+        return task
+
+    async def drain(self) -> None:
+        observed = 0
+        while observed < len(self.tasks):
+            batch = self.tasks[observed:]
+            observed = len(self.tasks)
+            await asyncio.gather(*batch, return_exceptions=True)
 
 
 class FakeTelegramFile:
@@ -732,6 +757,294 @@ class PendingFlowTests(unittest.TestCase):
         self.assertFalse(consumed)
         self.assertIn("звичайне повідомлення", main.format_passive_context(message.chat_id))
         self.assertTrue(any(event.event_type == "ordinary_auto_react_suppressed" for event in main.SYSTEM_LOG.latest_events(10)))
+
+
+class TelegramTurnCoalescingTests(unittest.TestCase):
+    def setUp(self) -> None:
+        main.pending_requests.clear()
+        main.passive_contexts.clear()
+        main.histories.clear()
+        main.last_user_call.clear()
+        main.last_chat_call.clear()
+        main.chat_generation_locks.clear()
+        main.recent_chat_answers.clear()
+
+    @staticmethod
+    def prompt_context(application: FakeApplication):
+        return SimpleNamespace(
+            bot=SimpleNamespace(
+                id=123456,
+                username="thrd_ua_bot",
+                send_chat_action=AsyncMock(),
+            ),
+            application=application,
+        )
+
+    @staticmethod
+    async def reply_from_prompt(message, context, prompt, *args, **kwargs) -> None:
+        await message.reply_text(f"agent:{prompt}")
+
+    @staticmethod
+    async def reply_from_image(message, prompt, *args, **kwargs) -> None:
+        await message.reply_text(f"vision:{prompt}")
+
+    @staticmethod
+    def ingress_patches(prompt_dispatch, image_dispatch, persistence=None):
+        return (
+            patch.object(
+                main,
+                "remember_message_persistently",
+                new=persistence if persistence is not None else AsyncMock(),
+            ),
+            patch.object(main, "remember_self_complaint_signal", return_value=None),
+            patch.object(main, "handle_prompt", new=prompt_dispatch),
+            patch.object(main, "handle_image_prompt", new=image_dispatch),
+        )
+
+    @staticmethod
+    async def deliver_parts(messages, context) -> None:
+        release_debounce = asyncio.Event()
+
+        async def controlled_sleep(_delay: float) -> None:
+            await release_debounce.wait()
+
+        with patch.object(main.asyncio, "sleep", side_effect=controlled_sleep):
+            for message in messages:
+                await main.text_message(SimpleNamespace(effective_message=message), context)
+            release_debounce.set()
+            await context.application.drain()
+
+    def test_same_second_private_text_then_photo_runs_vision_once_with_prompt(self) -> None:
+        timestamp = datetime(2026, 7, 1, 12, 0, tzinfo=timezone.utc)
+        prompt = "Assess the device shown in the next photo."
+        text_part = FakeMessage(
+            prompt,
+            chat_type=ChatType.PRIVATE,
+            chat_id=407892151,
+            message_id=12001,
+        )
+        photo_part = FakeMessage(
+            "",
+            chat_type=ChatType.PRIVATE,
+            chat_id=407892151,
+            message_id=12002,
+        )
+        text_part.date = timestamp
+        photo_part.date = timestamp
+        photo_part.photo = [FakePhoto(file_id="same-turn-photo", unique_id="same-turn-photo-unique")]
+        application = FakeApplication()
+        context = self.prompt_context(application)
+        prompt_dispatch = AsyncMock(side_effect=self.reply_from_prompt)
+        image_dispatch = AsyncMock(side_effect=self.reply_from_image)
+        patches = self.ingress_patches(prompt_dispatch, image_dispatch)
+
+        with patches[0], patches[1], patches[2], patches[3]:
+            asyncio.run(self.deliver_parts((text_part, photo_part), context))
+
+        prompt_dispatch.assert_not_awaited()
+        image_dispatch.assert_awaited_once()
+        self.assertIs(photo_part, image_dispatch.await_args.args[0])
+        self.assertEqual(prompt, image_dispatch.await_args.args[1])
+        self.assertEqual(1, len(text_part.reply_calls) + len(photo_part.reply_calls))
+
+    def test_same_second_private_text_then_forward_runs_agent_once_with_prompt(self) -> None:
+        timestamp = datetime(2026, 7, 1, 12, 1, tzinfo=timezone.utc)
+        prompt = "Check whether the following source claim is credible."
+        text_part = FakeMessage(
+            prompt,
+            chat_type=ChatType.PRIVATE,
+            chat_id=407892151,
+            message_id=12011,
+        )
+        forward_part = FakeMessage(
+            "Sanitized forwarded source claim.",
+            chat_type=ChatType.PRIVATE,
+            chat_id=407892151,
+            message_id=12012,
+        )
+        text_part.date = timestamp
+        forward_part.date = timestamp
+        forward_part.forward_date = timestamp - timedelta(hours=1)
+        forward_part.forward_origin = SimpleNamespace(type="channel")
+        application = FakeApplication()
+        context = self.prompt_context(application)
+        prompt_dispatch = AsyncMock(side_effect=self.reply_from_prompt)
+        image_dispatch = AsyncMock(side_effect=self.reply_from_image)
+        patches = self.ingress_patches(prompt_dispatch, image_dispatch)
+
+        with patches[0], patches[1], patches[2], patches[3]:
+            asyncio.run(self.deliver_parts((text_part, forward_part), context))
+
+        image_dispatch.assert_not_awaited()
+        prompt_dispatch.assert_awaited_once()
+        self.assertIs(forward_part, prompt_dispatch.await_args.args[0])
+        self.assertEqual(prompt, prompt_dispatch.await_args.args[2])
+        self.assertEqual(1, len(text_part.reply_calls) + len(forward_part.reply_calls))
+
+    def test_resolved_pending_is_removed_before_dispatch_and_cannot_capture_unrelated_message(self) -> None:
+        request = FakeMessage("поясни", message_id=12021)
+        unrelated = FakeMessage("нова незалежна тема", message_id=12022)
+        token = main.store_pending_request(request, "поясни", "context")
+        self.assertIsNotNone(token)
+        context = self.prompt_context(FakeApplication())
+        original_started = asyncio.Event()
+        release_original = asyncio.Event()
+        calls = []
+
+        async def handle_prompt(message, _context, prompt, *args, **kwargs) -> None:
+            calls.append((message, prompt))
+            if message is request:
+                original_started.set()
+                await release_original.wait()
+
+        async def scenario() -> bool:
+            resolution = asyncio.create_task(
+                main.resolve_pending_after_debounce(request, context, "поясни", token)
+            )
+            await original_started.wait()
+            consumed = await main.handle_pending_or_observe(unrelated, context)
+            release_original.set()
+            await resolution
+            return consumed
+
+        with patch.object(main.asyncio, "sleep", new=AsyncMock()):
+            with patch.object(main, "handle_prompt", new=AsyncMock(side_effect=handle_prompt)):
+                with patch.object(main, "maybe_auto_react", new=AsyncMock()):
+                    consumed = asyncio.run(scenario())
+
+        self.assertFalse(consumed)
+        self.assertEqual([(request, "поясни")], calls)
+        self.assertFalse(main.has_pending_request(request))
+
+    def test_two_independent_texts_in_same_second_are_not_merged(self) -> None:
+        timestamp = datetime(2026, 7, 1, 12, 2, tzinfo=timezone.utc)
+        first = FakeMessage(
+            "First independent question about architecture.",
+            chat_type=ChatType.PRIVATE,
+            chat_id=407892151,
+            message_id=12031,
+        )
+        second = FakeMessage(
+            "Second independent question about testing.",
+            chat_type=ChatType.PRIVATE,
+            chat_id=407892151,
+            message_id=12032,
+        )
+        first.date = timestamp
+        second.date = timestamp
+        application = FakeApplication()
+        context = self.prompt_context(application)
+        prompt_dispatch = AsyncMock(side_effect=self.reply_from_prompt)
+        image_dispatch = AsyncMock(side_effect=self.reply_from_image)
+        patches = self.ingress_patches(prompt_dispatch, image_dispatch)
+
+        with patches[0], patches[1], patches[2], patches[3]:
+            asyncio.run(self.deliver_parts((first, second), context))
+
+        self.assertEqual(2, prompt_dispatch.await_count)
+        image_dispatch.assert_not_awaited()
+        self.assertEqual(
+            [first.text, second.text],
+            [call.args[2] for call in prompt_dispatch.await_args_list],
+        )
+        self.assertEqual(2, len(first.reply_calls) + len(second.reply_calls))
+
+    def test_photo_persistence_race_does_not_flush_text_as_a_separate_turn(self) -> None:
+        timestamp = datetime(2026, 7, 1, 12, 3, tzinfo=timezone.utc)
+        prompt = "Compare the object in the incoming photo with this description."
+        text_part = FakeMessage(
+            prompt,
+            chat_type=ChatType.PRIVATE,
+            chat_id=407892151,
+            message_id=12041,
+        )
+        photo_part = FakeMessage(
+            "",
+            chat_type=ChatType.PRIVATE,
+            chat_id=407892151,
+            message_id=12042,
+        )
+        text_part.date = timestamp
+        photo_part.date = timestamp
+        photo_part.photo = [FakePhoto(file_id="slow-photo", unique_id="slow-photo-unique")]
+        application = FakeApplication()
+        context = self.prompt_context(application)
+        prompt_dispatch = AsyncMock(side_effect=self.reply_from_prompt)
+        image_dispatch = AsyncMock(side_effect=self.reply_from_image)
+        real_sleep = asyncio.sleep
+
+        async def scenario():
+            photo_persistence_started = asyncio.Event()
+            release_photo_persistence = asyncio.Event()
+            release_debounce = asyncio.Event()
+
+            async def persist(message) -> None:
+                if message is photo_part:
+                    photo_persistence_started.set()
+                    await release_photo_persistence.wait()
+
+            async def controlled_sleep(_delay: float) -> None:
+                await release_debounce.wait()
+
+            persistence = AsyncMock(side_effect=persist)
+            patches = self.ingress_patches(prompt_dispatch, image_dispatch, persistence)
+            with patches[0], patches[1], patches[2], patches[3]:
+                with patch.object(main.asyncio, "sleep", side_effect=controlled_sleep):
+                    await main.text_message(SimpleNamespace(effective_message=text_part), context)
+                    photo_delivery = asyncio.create_task(
+                        main.text_message(SimpleNamespace(effective_message=photo_part), context)
+                    )
+                    await photo_persistence_started.wait()
+                    release_debounce.set()
+                    for _ in range(5):
+                        await real_sleep(0)
+                    release_photo_persistence.set()
+                    await photo_delivery
+                    await application.drain()
+            return persistence
+
+        persistence = asyncio.run(scenario())
+
+        self.assertEqual(2, persistence.await_count)
+        prompt_dispatch.assert_not_awaited()
+        image_dispatch.assert_awaited_once()
+        self.assertIs(photo_part, image_dispatch.await_args.args[0])
+        self.assertEqual(prompt, image_dispatch.await_args.args[1])
+        self.assertEqual(1, len(text_part.reply_calls) + len(photo_part.reply_calls))
+
+    def test_same_second_text_and_photo_with_different_reply_targets_are_not_merged(self) -> None:
+        timestamp = datetime(2026, 7, 1, 12, 4, tzinfo=timezone.utc)
+        text_part = FakeMessage(
+            "Explain the first referenced message.",
+            chat_type=ChatType.PRIVATE,
+            chat_id=407892151,
+            message_id=12051,
+        )
+        photo_part = FakeMessage(
+            "",
+            chat_type=ChatType.PRIVATE,
+            chat_id=407892151,
+            message_id=12052,
+        )
+        text_part.date = timestamp
+        photo_part.date = timestamp
+        text_part.reply_to_message = FakeMessage("first reference", message_id=12101)
+        photo_part.reply_to_message = FakeMessage("second reference", message_id=12102)
+        photo_part.photo = [FakePhoto(file_id="other-photo", unique_id="other-photo-unique")]
+        application = FakeApplication()
+        context = self.prompt_context(application)
+        prompt_dispatch = AsyncMock(side_effect=self.reply_from_prompt)
+        image_dispatch = AsyncMock(side_effect=self.reply_from_image)
+        patches = self.ingress_patches(prompt_dispatch, image_dispatch)
+
+        with patches[0], patches[1], patches[2], patches[3]:
+            asyncio.run(self.deliver_parts((text_part, photo_part), context))
+
+        prompt_dispatch.assert_awaited_once()
+        image_dispatch.assert_awaited_once()
+        self.assertIs(text_part, prompt_dispatch.await_args.args[0])
+        self.assertIs(photo_part, image_dispatch.await_args.args[0])
+        self.assertEqual(2, len(text_part.reply_calls) + len(photo_part.reply_calls))
 
 
 class WebSafetyTests(unittest.TestCase):
