@@ -4919,7 +4919,7 @@ async def run_model_policy_router(
         endpoint="responses",
         run_id=run_id,
         route_bucket=route_bucket,
-        task_class_bucket="router",
+        task_class_bucket="model_policy_router",
     )
     try:
         async with asyncio.timeout(CONFIG.model_router_timeout_seconds):

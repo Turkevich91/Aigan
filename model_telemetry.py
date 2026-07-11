@@ -691,7 +691,8 @@ class ModelTelemetryStore:
                         END,
                         task_class_bucket = CASE
                             WHEN model_telemetry_runs.task_class_bucket IN (
-                                '', 'other', 'embedding_index', 'embedding_query', 'router'
+                                '', 'other', 'embedding_index', 'embedding_query',
+                                'router', 'model_policy_router'
                             )
                             THEN excluded.task_class_bucket
                             ELSE model_telemetry_runs.task_class_bucket

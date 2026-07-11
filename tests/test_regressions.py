@@ -617,7 +617,7 @@ class ModelPolicyRoutingIntegrationTests(unittest.TestCase):
         stage = store.latest_stages(1)[0]
         self.assertEqual("1" * 32, stage.run_id)
         self.assertEqual("model_policy_router", stage.stage_kind)
-        self.assertEqual("router", stage.task_class_bucket)
+        self.assertEqual("model_policy_router", stage.task_class_bucket)
         self.assertEqual("gpt-5.4-nano", stage.actual_model)
         self.assertEqual("none", stage.actual_reasoning_effort)
 
