@@ -74,8 +74,8 @@ output schema v3        09838f4ccca1bf831c9ea7491e45a9d37a0a54b57b707904811d25c8
 deterministic baseline  433994c6d44a8abcab7756f79794a0d8987ae874c8e5c5ceae94832eec55d80e
 pricing snapshot        a8aebcd56703bf09c7f84cacf543d20c4bd3b7d532d6010e7db0ef9e9682a61c
 run matrix              203ad336482d56dd3f1fe1995c24f8b089734dd85fc75da325a8aff330518673
-evaluation bundle       9ada8c74f0e8aac1eafb3f0ac8b3fb10320253a7d83161c9ce5667a82a57aa7d
-whole manifest          22fbf6ed6348d5e2d2999839c806ef2a19b78e10522b08bd4bf03431ee577c0e
+evaluation bundle       e9f869057119320e0f1d1adc97c4a20f7bff556c5cbaab8fced57659c7502be2
+whole manifest          7821d39391e664a70f1f50d4b30c3fd64ed5f74c137be46d8c14f7852ec94272
 ```
 
 The manifest lists all 48 screen case IDs. That subset is exactly 12 cases per
@@ -97,6 +97,8 @@ ceiling. Sol remains the final-answer model and is only a same-usage cost
 counterfactual. The frozen standard-processing rates are Luna $1/$0.10/$6,
 Terra $2.50/$0.25/$15, and Sol $5/$0.50/$30 per million input/cached-input/output
 tokens. Cache writes are captured and priced at 1.25 times ordinary input.
+The evaluator tolerates both plural and singular input-detail field names and
+still requires complete cached/cache-write metadata.
 See the official [Luna](https://developers.openai.com/api/docs/models/gpt-5.6-luna),
 [Terra](https://developers.openai.com/api/docs/models/gpt-5.6-terra), and
 [Sol](https://developers.openai.com/api/docs/models/gpt-5.6-sol) pages.
@@ -148,6 +150,8 @@ Holdout additionally requires the exact manifest and attestation hashes and the
 selected model/effort/actual-model snapshot. Every artifact is rechecked before
 an API client is created. Immediately before the first request, the runner
 atomically creates a private external receipt with exclusive-create semantics.
+On POSIX, both the receipt file and its parent directory are fsynced before any
+provider request; a sync failure aborts the run and leaves the claim consumed.
 An existing receipt, concurrent claim, crash, timeout, or provider failure
 cannot be overridden and consumes v2 holdout. The aggregate result is written
 to a different external file. Neither file belongs in Git, GitHub, or runtime

@@ -98,7 +98,10 @@ def _field(value: Any, name: str) -> Any:
 
 def response_usage_v2(response: Any) -> tuple[int, int | None, int | None, int]:
     usage = _field(response, "usage")
-    details = _field(usage, "input_tokens_details")
+    details = _field(usage, "input_tokens_details") or _field(
+        usage,
+        "input_token_details",
+    )
     try:
         input_tokens = int(_field(usage, "input_tokens") or 0)
         output_tokens = int(_field(usage, "output_tokens") or 0)
@@ -136,6 +139,17 @@ def _validate_external_input_file(path: Path, field: str) -> None:
         raise ValueError(f"evaluation:{field}:external_file_required")
 
 
+def _fsync_parent_directory(path: Path) -> None:
+    if os.name != "posix":
+        return
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    descriptor = os.open(path.parent, flags)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
 def _write_exclusive_private_json(path: Path, payload: Mapping[str, Any]) -> None:
     encoded = (
         json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
@@ -148,6 +162,7 @@ def _write_exclusive_private_json(path: Path, payload: Mapping[str, Any]) -> Non
         handle.write(encoded)
         handle.flush()
         os.fsync(handle.fileno())
+    _fsync_parent_directory(path)
 
 
 def reserve_holdout_once(

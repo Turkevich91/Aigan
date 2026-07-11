@@ -17,6 +17,7 @@ import memory_extraction as v1
 from memory_extraction_v2 import (
     API_ARMS,
     BASELINE_MODEL,
+    EVALUATOR_VERSION,
     EXPECTED_CASES_PER_SPLIT,
     FROZEN_DETERMINISTIC_BASELINE_SHA256,
     FROZEN_DEVELOPMENT_CASE_SHA256,
@@ -167,6 +168,7 @@ class MemoryExtractionV2FixtureTests(unittest.TestCase):
         self.assertEqual(FROZEN_PROMPT_SHA256, manifest["prompt"]["sha256"])
         self.assertEqual(FROZEN_OUTPUT_SCHEMA_SHA256, manifest["output_schema"]["sha256"])
         self.assertEqual(FROZEN_EVALUATION_BUNDLE_SHA256, manifest["evaluation_bundle"]["sha256"])
+        self.assertEqual(EVALUATOR_VERSION, manifest["evaluation_bundle"]["version"])
         self.assertEqual(
             FROZEN_DETERMINISTIC_BASELINE_SHA256,
             manifest["deterministic_baseline"]["sha256"],
@@ -221,6 +223,47 @@ class MemoryExtractionV2ContractTests(unittest.TestCase):
         serialized = json.dumps(schema, sort_keys=True)
         for unsupported in ('"if"', '"then"', '"else"', '"allOf"', '"not"'):
             self.assertNotIn(unsupported, serialized)
+
+    def test_response_usage_accepts_plural_and_singular_input_details(self) -> None:
+        for detail_field in ("input_tokens_details", "input_token_details"):
+            with self.subTest(detail_field=detail_field):
+                response = {
+                    "usage": {
+                        "input_tokens": 100,
+                        "output_tokens": 20,
+                        detail_field: {
+                            "cached_tokens": 30,
+                            "cache_write_tokens": 10,
+                        },
+                    }
+                }
+                self.assertEqual((100, 30, 10, 20), eval_v2.response_usage_v2(response))
+
+    def test_parent_directory_fsync_is_fail_closed_on_posix(self) -> None:
+        path = Path("external") / "receipt.json"
+        with (
+            patch.object(eval_v2.os, "name", "posix"),
+            patch.object(eval_v2.os, "open", return_value=17) as open_directory,
+            patch.object(eval_v2.os, "fsync") as fsync,
+            patch.object(eval_v2.os, "close") as close,
+        ):
+            eval_v2._fsync_parent_directory(path)
+        open_directory.assert_called_once_with(
+            path.parent,
+            eval_v2.os.O_RDONLY | getattr(eval_v2.os, "O_DIRECTORY", 0),
+        )
+        fsync.assert_called_once_with(17)
+        close.assert_called_once_with(17)
+
+        with (
+            patch.object(eval_v2.os, "name", "posix"),
+            patch.object(eval_v2.os, "open", return_value=23),
+            patch.object(eval_v2.os, "fsync", side_effect=OSError("sync failed")),
+            patch.object(eval_v2.os, "close") as close_after_failure,
+            self.assertRaises(OSError),
+        ):
+            eval_v2._fsync_parent_directory(path)
+        close_after_failure.assert_called_once_with(23)
 
     def test_validator_rejects_ambiguous_or_empty_branches(self) -> None:
         case = self.development[0]
