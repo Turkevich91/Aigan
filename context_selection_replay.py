@@ -11,6 +11,7 @@ from pathlib import Path
 import re
 import secrets
 import sqlite3
+import stat
 from typing import Any, Iterable, Mapping
 
 
@@ -777,9 +778,9 @@ def collect_review_packets(
 def _assert_private_permissions(path: Path, *, directory: bool) -> None:
     if os.name == "nt":
         raise ContextSelectionReplayError("private replay writing requires POSIX owner-only permissions")
-    mode = path.stat().st_mode & 0o777
-    expected = 0o700 if directory else 0o600
-    if mode != expected:
+    mode = stat.S_IMODE(path.stat().st_mode)
+    safe = mode == 0o700 if directory else mode in {0o400, 0o600}
+    if not safe:
         raise ContextSelectionReplayError("unsafe private artifact permissions")
 
 

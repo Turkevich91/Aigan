@@ -15,6 +15,7 @@ from context_selection_replay import (
     REVIEW_MANIFEST_FILENAME,
     REVIEW_POOL_FILENAME,
     _MESSAGE_REPLAY_COLUMNS,
+    _assert_private_permissions,
     _write_exclusive,
     build_private_review_pool,
     collect_review_packets,
@@ -647,6 +648,32 @@ class ContextSelectionReplayTests(unittest.TestCase):
         exact = next(packet for packet in packets if packet["correlation_kind"] == "exact_provenance")
         reply = next(packet for packet in packets if packet["correlation_kind"] == "outbound_reply_link")
         self.assertEqual(exact["cluster_key"], reply["cluster_key"])
+
+    @unittest.skipIf(os.name == "nt", "private replay writer requires POSIX owner-only modes")
+    def test_private_file_permissions_allow_owner_read_only_but_no_shared_bits(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            artifact = Path(directory) / "private-artifact"
+            artifact.write_bytes(b"private")
+
+            os.chmod(artifact, 0o400)
+            _assert_private_permissions(artifact, directory=False)
+
+            os.chmod(artifact, 0o600)
+            _assert_private_permissions(artifact, directory=False)
+
+            for unsafe_mode in (0o000, 0o200, 0o500, 0o640, 0o700):
+                with self.subTest(mode=oct(unsafe_mode)):
+                    os.chmod(artifact, unsafe_mode)
+                    with self.assertRaises(ContextSelectionReplayError):
+                        _assert_private_permissions(artifact, directory=False)
+
+            private_directory = Path(directory) / "private-directory"
+            private_directory.mkdir(mode=0o700)
+            os.chmod(private_directory, 0o700)
+            _assert_private_permissions(private_directory, directory=True)
+            os.chmod(private_directory, 0o500)
+            with self.assertRaises(ContextSelectionReplayError):
+                _assert_private_permissions(private_directory, directory=True)
 
     @unittest.skipIf(os.name == "nt", "private replay writer requires POSIX owner-only modes")
     def test_private_writer_is_exclusive_and_manifest_is_aggregate_only(self) -> None:
