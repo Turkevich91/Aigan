@@ -13,9 +13,19 @@ was not structurally exclusive, evidence whitespace was not always preserved,
 and a correction could be linked to the wrong prior row.
 
 The first v2 development screen matrix ran on source commit
-`d3863098c01cd53909c21c1b524ab3e6df469837` on 2026-07-11. All three arms
+`d3863098c01cd53909c21c1b524ab3e6df469837` on 2026-07-11. All three v6 arms
 completed without provider failures but failed the strict schema/safety gate.
-No locked-development or holdout call followed; the v2 holdout remains closed.
+No v6 locked-development or holdout call followed.
+
+A prompt-only v7 iteration then ran once on exact evaluated source commit
+`d8ba57d9383315b910f4755f95a03540d571d49c`. Luna/low and Terra/low passed
+the 48-case screen; Luna/none failed and was excluded without retry. Both
+admitted 160-case, three-repeat locked-development arms returned `NO_GO`.
+Matrix attestation
+`5545f60d4f700c85654ad2f7fa0c8a8f8134234ee60b28c03860b5bf0981974b`
+selected no model. No holdout call followed; runtime remains unauthorized.
+Later documentation-only commits do not change the frozen evaluation artifacts
+or the exact measured source named above.
 
 The preregistered v5 prompt was superseded before any call by v6, which names
 every strict-schema `candidate_type` with its exact enum token. The v6 screen
@@ -116,8 +126,27 @@ V7 therefore makes the already-frozen representation explicit: a source-only
 `YYYY-MM-DD` is encoded as `YYYY-MM-DDT00:00:00Z` for canonical transport and
 does not claim that the source supplied a time. A later runtime design must
 retain date precision or otherwise avoid treating this transport encoding as
-an asserted midnight event. The complete three-arm screen matrix must be rerun
-against v7; prior reports cannot admit a v7 locked-development run.
+an asserted midnight event. The complete three-arm matrix was rerun against
+v7; prior v6 reports were not used for admission.
+
+### V7 completed development result
+
+| Arm | Screen | Locked development | Locked precision | Locked recall | Locked exact set | Locked candidate stability | Estimated locked cost |
+|---|---|---|---:|---:|---:|---:|---:|
+| Luna / none | 47/48, fail | not admitted | n/a | n/a | n/a | n/a | n/a |
+| Luna / low | 48/48, pass | `NO_GO` | 1.0000 | 0.8382 | 0.8625 | 0.8813 | $0.612741 |
+| Terra / low | 48/48, pass | `NO_GO` | 1.0000 | 0.8603 | 0.8813 | 0.9188 | $1.322455 |
+
+Both locked arms failed strict validity, hard-safety, recall-Wilson, exact-set,
+and repeat-stability gates. Conservative under-extraction dominated: first-
+repeat `fact_claim` recall was 0.45 for Luna and 0.625 for Terra. The aggregate
+selection verdict is `NO_GO` with `selected=null`; holdout remains closed.
+
+Before a new preregistered prompt/model experiment, the evaluator needs
+privacy-safe cohort counts for the public-synthetic fixture. Its latency metric
+also needs separate semaphore-queue and provider-duration fields, and semantic
+validation failures should not share a provider-failure label. These diagnostic
+follow-ups do not change this frozen result.
 
 ## Fixed model matrix
 
