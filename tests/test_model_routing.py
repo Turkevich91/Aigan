@@ -55,6 +55,10 @@ class ModelRoutingPolicyTests(unittest.TestCase):
             ModelTierAliases("gpt-5.4-nano", "gpt-5.6-terra", "gpt-5.5").validate(
                 primary_model="gpt-5.6-sol"
             )
+        with self.assertRaisesRegex(ValueError, "valid configured model id"):
+            ModelTierAliases("GPT-5.4-NANO", "gpt-5.6-terra", "gpt-5.6-sol").validate(
+                primary_model="gpt-5.6-sol"
+            )
 
     def test_schema_contains_no_tool_authority_or_free_rationale(self) -> None:
         schema = model_routing_schema()

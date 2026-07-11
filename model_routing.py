@@ -124,7 +124,7 @@ class ModelTierAliases:
 
     def validate(self, *, primary_model: str) -> "ModelTierAliases":
         values = (self.economy, self.balanced, self.premium)
-        if any(not MODEL_RE.fullmatch(str(value or "").strip().casefold()) for value in values):
+        if any(not MODEL_RE.fullmatch(str(value or "").strip()) for value in values):
             raise ValueError("Every model tier alias must be a valid configured model id")
         if self.premium.strip().casefold() != primary_model.strip().casefold():
             raise ValueError("The premium model tier must equal OPENAI_MODEL in off/shadow mode")
