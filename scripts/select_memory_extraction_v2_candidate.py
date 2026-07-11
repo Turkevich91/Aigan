@@ -46,8 +46,13 @@ def main() -> int:
             parser.error("report inputs must be existing external absolute files")
         try:
             reports.append(json.loads(resolved.read_text(encoding="utf-8")))
-        except (OSError, json.JSONDecodeError) as exc:
-            parser.error(f"cannot read aggregate report: {path.name}: {exc}")
+        except OSError as exc:
+            detail = exc.strerror or exc.__class__.__name__
+            parser.error(f"cannot read aggregate report: {detail}")
+        except UnicodeError:
+            parser.error("cannot decode aggregate report")
+        except json.JSONDecodeError:
+            parser.error("invalid aggregate report JSON")
     try:
         source_commit = current_clean_source_commit(ROOT)
         attestation = build_selection_attestation(
@@ -60,13 +65,24 @@ def main() -> int:
         json.dumps(attestation, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
     ).encode("utf-8")
     try:
-        descriptor = os.open(output, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        descriptor = os.open(
+            output,
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+        )
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(encoded)
+            handle.flush()
+            os.fsync(handle.fileno())
     except FileExistsError:
         parser.error("attestation output already exists")
-    with os.fdopen(descriptor, "wb") as handle:
-        handle.write(encoded)
-        handle.flush()
-        os.fsync(handle.fileno())
+    except OSError as exc:
+        detail = exc.strerror or exc.__class__.__name__
+        parser.error(f"cannot create attestation output: {detail}")
     print(selection_attestation_sha256(attestation))
     return 0
 

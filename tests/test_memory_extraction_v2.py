@@ -64,6 +64,7 @@ from memory_extraction_selection_v2 import (
     selection_attestation_sha256,
     validate_selection_attestation,
 )
+import scripts.select_memory_extraction_v2_candidate as select_v2
 import scripts.eval_memory_extraction_v2 as eval_v2
 from scripts.eval_memory_extraction_v2 import (
     CallResult,
@@ -861,6 +862,169 @@ class MemoryExtractionV2ContractTests(unittest.TestCase):
             eval_v2.main()
         self.assertIn("unrecognized arguments: --holdout-receipt", errors.getvalue())
         run_api.assert_not_called()
+
+    def test_eval_cli_read_failures_are_clean_and_pre_provider(self) -> None:
+        api_argv = ["eval_memory_extraction_v2.py", "--mode", "api", "--limit", "48"]
+        scenarios = (
+            ("fixture_sha256", PermissionError(13, "Permission denied")),
+            ("load_system_prompt", UnicodeDecodeError("utf-8", b"x", 0, 1, "bad")),
+        )
+        for target, failure in scenarios:
+            with self.subTest(target=target):
+                errors = io.StringIO()
+                with (
+                    patch.object(eval_v2, target, side_effect=failure),
+                    patch.object(eval_v2, "run_api") as run_api,
+                    patch.object(eval_v2, "current_clean_source_commit", return_value="a" * 40),
+                    patch.dict(os.environ, {"OPENAI_API_KEY": "test"}),
+                    patch.object(sys, "argv", api_argv),
+                    contextlib.redirect_stderr(errors),
+                    self.assertRaises(SystemExit),
+                ):
+                    eval_v2.main()
+                self.assertNotIn("Traceback", errors.getvalue())
+                self.assertIn("evaluation inputs", errors.getvalue())
+                run_api.assert_not_called()
+
+    def test_eval_cli_invalid_fixture_is_clean_and_pre_provider(self) -> None:
+        errors = io.StringIO()
+        private_marker = "private-user-fixture-id"
+        with (
+            patch.object(eval_v2, "load_fixture", side_effect=ValueError(private_marker)),
+            patch.object(eval_v2, "run_api") as run_api,
+            patch.object(eval_v2, "current_clean_source_commit", return_value="a" * 40),
+            patch.dict(os.environ, {"OPENAI_API_KEY": "test"}),
+            patch.object(
+                sys,
+                "argv",
+                ["eval_memory_extraction_v2.py", "--mode", "api", "--limit", "48"],
+            ),
+            contextlib.redirect_stderr(errors),
+            self.assertRaises(SystemExit),
+        ):
+            eval_v2.main()
+        self.assertNotIn("Traceback", errors.getvalue())
+        self.assertIn("invalid evaluation fixture", errors.getvalue())
+        self.assertNotIn(private_marker, errors.getvalue())
+        run_api.assert_not_called()
+
+    def test_undecodable_holdout_attestation_is_pre_provider_cli_error(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            attestation_path = root / "attestation.json"
+            attestation_path.write_bytes(b"\xff")
+            result_path = root / "holdout-result.json"
+            argv = [
+                "eval_memory_extraction_v2.py",
+                "--fixture",
+                str(HOLDOUT_FIXTURE),
+                "--mode",
+                "api",
+                "--model",
+                "gpt-5.6-luna",
+                "--reasoning-effort",
+                "low",
+                "--repeats",
+                "3",
+                "--require-gates",
+                "--acknowledge-holdout-manifest-sha256",
+                FROZEN_MANIFEST_SHA256,
+                "--development-attestation",
+                str(attestation_path),
+                "--acknowledge-development-attestation-sha256",
+                "0" * 64,
+                "--holdout-result",
+                str(result_path),
+            ]
+            errors = io.StringIO()
+            with (
+                patch.object(eval_v2, "current_clean_source_commit", return_value="a" * 40),
+                patch.object(eval_v2, "run_api") as run_api,
+                patch.dict(os.environ, {"OPENAI_API_KEY": "test"}),
+                patch.object(sys, "argv", argv),
+                contextlib.redirect_stderr(errors),
+                self.assertRaises(SystemExit),
+            ):
+                eval_v2.main()
+            self.assertNotIn("Traceback", errors.getvalue())
+            self.assertIn("selection:attestation_read", errors.getvalue())
+            run_api.assert_not_called()
+
+    def test_selection_cli_output_oserror_is_clean(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            report_path = root / "report.json"
+            report_path.write_text("{}\n", encoding="utf-8")
+            output_path = root / "attestation.json"
+            errors = io.StringIO()
+            argv = [
+                "select_memory_extraction_v2_candidate.py",
+                str(report_path),
+                "--output",
+                str(output_path),
+            ]
+            with (
+                patch.object(
+                    select_v2,
+                    "current_clean_source_commit",
+                    return_value="a" * 40,
+                ),
+                patch.object(
+                    select_v2,
+                    "build_selection_attestation",
+                    return_value={"schema_version": "test"},
+                ),
+                patch.object(
+                    select_v2.os,
+                    "open",
+                    side_effect=PermissionError(13, "Permission denied"),
+                ),
+                patch.object(sys, "argv", argv),
+                contextlib.redirect_stderr(errors),
+                self.assertRaises(SystemExit),
+            ):
+                select_v2.main()
+            self.assertNotIn("Traceback", errors.getvalue())
+            self.assertIn(
+                "cannot create attestation output: Permission denied",
+                errors.getvalue(),
+            )
+
+    def test_selection_cli_undecodable_report_is_clean(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            report_path = root / "report.json"
+            report_path.write_bytes(b"\xff")
+            output_path = root / "attestation.json"
+            errors = io.StringIO()
+            argv = [
+                "select_memory_extraction_v2_candidate.py",
+                str(report_path),
+                "--output",
+                str(output_path),
+            ]
+            with (
+                patch.object(sys, "argv", argv),
+                contextlib.redirect_stderr(errors),
+                self.assertRaises(SystemExit),
+            ):
+                select_v2.main()
+            self.assertNotIn("Traceback", errors.getvalue())
+            self.assertIn("cannot decode aggregate report", errors.getvalue())
+
+    def test_holdout_artifact_oserror_becomes_bounded_value_error(self) -> None:
+        with (
+            patch.object(
+                eval_v2.os,
+                "open",
+                side_effect=PermissionError(13, "Permission denied"),
+            ),
+            self.assertRaisesRegex(ValueError, "holdout:artifact_write_failed"),
+        ):
+            eval_v2._write_exclusive_private_json(
+                Path("external") / "claim.json",
+                {"status": "claimed_before_api"},
+            )
 
     def test_api_preflight_failure_never_calls_provider(self) -> None:
         argv = [

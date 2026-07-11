@@ -200,6 +200,8 @@ def _ensure_private_claim_directory(path: Path) -> None:
         os.mkdir(path, 0o700)
     except FileExistsError:
         pass
+    except OSError as exc:
+        raise ValueError("holdout:claim_directory_invalid") from exc
     try:
         metadata = path.lstat()
     except OSError as exc:
@@ -235,11 +237,16 @@ def _write_exclusive_private_json(path: Path, payload: Mapping[str, Any]) -> Non
         )
     except FileExistsError as exc:
         raise ValueError("holdout:exclusive_artifact_exists") from exc
-    with os.fdopen(descriptor, "wb") as handle:
-        handle.write(encoded)
-        handle.flush()
-        os.fsync(handle.fileno())
-    _fsync_parent_directory(path)
+    except OSError as exc:
+        raise ValueError("holdout:artifact_write_failed") from exc
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(encoded)
+            handle.flush()
+            os.fsync(handle.fileno())
+        _fsync_parent_directory(path)
+    except OSError as exc:
+        raise ValueError("holdout:artifact_write_failed") from exc
 
 
 def reserve_holdout_once(
@@ -681,8 +688,14 @@ def main() -> int:
     if args.limit < 0:
         parser.error("--limit cannot be negative")
 
-    frozen_fixture_hash = fixture_sha256(args.fixture)
-    system_prompt, prompt_hash = load_system_prompt()
+    try:
+        frozen_fixture_hash = fixture_sha256(args.fixture)
+        system_prompt, prompt_hash = load_system_prompt()
+    except OSError as exc:
+        detail = exc.strerror or exc.__class__.__name__
+        parser.error(f"cannot read evaluation inputs: {detail}")
+    except UnicodeError as exc:
+        parser.error(f"cannot decode evaluation inputs: {exc.__class__.__name__}")
     source_commit = ""
     if args.mode == "api":
         try:
@@ -696,10 +709,16 @@ def main() -> int:
         source_commit,
         parser,
     )
-    cases = load_fixture(args.fixture)
+    try:
+        cases = load_fixture(args.fixture)
+    except OSError as exc:
+        detail = exc.strerror or exc.__class__.__name__
+        parser.error(f"cannot read evaluation fixture: {detail}")
+    except (UnicodeError, ValueError):
+        parser.error("invalid evaluation fixture")
     splits = {str(case["split"]) for case in cases}
     if len(splits) != 1:
-        raise RuntimeError("fixture must contain exactly one split")
+        parser.error("fixture must contain exactly one split")
     split = next(iter(splits))
     _validate_run_contract(args, split, frozen_fixture_hash, parser)
     if args.mode == "api":

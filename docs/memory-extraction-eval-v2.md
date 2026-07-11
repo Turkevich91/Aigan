@@ -40,6 +40,10 @@ markers, symlinked state, non-owner state, and group/other-accessible state fail
 before any provider call.
 No model or holdout call was made under evaluator v6, and v5 reports cannot
 satisfy its new bundle/manifest hashes.
+Evaluator fixture/prompt and selector report/output filesystem or decoding
+failures terminate as bounded CLI errors rather than tracebacks. Claim-write
+failures remain pre-provider and fail closed; result-write failures are bounded
+after provider completion while the one-time claim remains consumed.
 
 The preregistered v5 prompt was superseded before any call by v6, which names
 every strict-schema `candidate_type` with its exact enum token. The v6 screen
@@ -115,8 +119,8 @@ deterministic baseline  433994c6d44a8abcab7756f79794a0d8987ae874c8e5c5ceae94832e
 pricing snapshot        a8aebcd56703bf09c7f84cacf543d20c4bd3b7d532d6010e7db0ef9e9682a61c
 holdout claim key       303d4e260a78f292b90d72d9d04ff96e9b4f45f632347ee964e5e211f9fbd3cc
 run matrix              24e010736117fa269ae32b563f6c15c3927bb59a64f6556ecfa26b2c605e7f1a
-evaluation bundle       f2faf805fe59a4aab42dd23861b516cda1cdacf0a1f1dab71488f0e4a15834ff
-whole manifest          0b17e81a2360cefcd8ffe1086d7d11ea8dab481fdab8993e2ea9bc7c05b7737c
+evaluation bundle       e898026e064f6b893e211da3e0dad8d6fbb959b6ab3cb0c5e2dd84632e7bd2fc
+whole manifest          885e0968b5b9d7eea7d721ba3b45437c561ec7e6dade44d240baa2fa9b4e4a94
 
 historical measured evaluator v5 snapshot
 run matrix              203ad336482d56dd3f1fe1995c24f8b089734dd85fc75da325a8aff330518673

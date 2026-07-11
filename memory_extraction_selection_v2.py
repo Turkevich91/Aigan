@@ -275,7 +275,7 @@ def selection_attestation_sha256(attestation: Mapping[str, Any]) -> str:
 def load_selection_attestation(path: Path | str) -> tuple[dict[str, Any], str]:
     try:
         payload = json.loads(Path(path).read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         raise ValueError("selection:attestation_read") from exc
     validated = validate_selection_attestation(payload)
     return validated, selection_attestation_sha256(validated)
