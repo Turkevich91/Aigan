@@ -601,7 +601,7 @@ def validate_media_input(item: HeavyMediaInput, settings: HeavyModelSettings) ->
     raw_url = item.url.strip()
     if not raw_url:
         return "invalid_request", 0
-    if raw_url.startswith("data:"):
+    if raw_url[:5].casefold() == "data:":
         header, separator, encoded = raw_url.partition(",")
         if (
             not separator
@@ -637,7 +637,10 @@ def validate_media_input(item: HeavyMediaInput, settings: HeavyModelSettings) ->
 def media_content_item(item: HeavyMediaInput) -> dict[str, Any]:
     modality = item.modality.strip().lower()
     field_name = f"{modality}_url"
-    return {"type": field_name, field_name: {"url": item.url.strip()}}
+    media_url = item.url.strip()
+    if media_url[:5].casefold() == "data:":
+        media_url = "data:" + media_url[5:]
+    return {"type": field_name, field_name: {"url": media_url}}
 
 
 def response_text(response: Any) -> str:

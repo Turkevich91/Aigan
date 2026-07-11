@@ -128,7 +128,7 @@ class HeavyModelBackendTests(unittest.IsolatedAsyncioTestCase):
             prompt="private prompt",
             task_class="video_context",
             media=(
-                HeavyMediaInput("image", data_url("image/jpeg", b"image")),
+                HeavyMediaInput("image", data_url("image/jpeg", b"image").replace("data:", "DATA:", 1)),
                 HeavyMediaInput("video", data_url("video/mp4", b"video")),
             ),
             max_output_tokens=80,
@@ -148,6 +148,7 @@ class HeavyModelBackendTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(0.1, call["temperature"])
         content = call["messages"][0]["content"]
         self.assertEqual(["text", "image_url", "video_url"], [item["type"] for item in content])
+        self.assertTrue(content[1]["image_url"]["url"].startswith("data:image/jpeg;base64,"))
         self.assertEqual({"enable_thinking": False}, call["extra_body"]["chat_template_kwargs"])
         public = result.public_dict()
         self.assertNotIn("text", public)
