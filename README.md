@@ -414,8 +414,8 @@ passed the screen but neither passed locked-development recall, exact-set,
 strict-validity, and stability gates, so the selection attestation chose no
 model. Post-result evaluator v6 removes the caller-selectable claim path and
 binds the claim to frozen holdout content in private persistent POSIX-user
-state; CI and detected common container markers fail closed. V6 made no model calls and
-does not relabel the v5 result. Development tests still treat holdout as opaque
+state; CI and detected common container markers fail closed. Evaluator v6 made
+no model calls and does not relabel the v5 result. Development tests still treat holdout as opaque
 bytes, and no v2 holdout result exists. Runtime memory and retrieval remain
 unchanged.
 See [`docs/memory-extraction-eval-v2.md`](docs/memory-extraction-eval-v2.md).

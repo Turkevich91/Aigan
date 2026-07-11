@@ -13,9 +13,9 @@ was not structurally exclusive, evidence whitespace was not always preserved,
 and a correction could be linked to the wrong prior row.
 
 The first v2 development screen matrix ran on source commit
-`d3863098c01cd53909c21c1b524ab3e6df469837` on 2026-07-11. All three v6 arms
-completed without provider failures but failed the strict schema/safety gate.
-No v6 locked-development or holdout call followed.
+`d3863098c01cd53909c21c1b524ab3e6df469837` on 2026-07-11. All three prompt-v6
+arms completed without provider failures but failed the strict schema/safety
+gate. No prompt-v6 locked-development or holdout call followed.
 
 A prompt-only v7 iteration then ran once on exact evaluated source commit
 `d8ba57d9383315b910f4755f95a03540d571d49c`. Luna/low and Terra/low passed
@@ -45,12 +45,13 @@ failures terminate as bounded CLI errors rather than tracebacks. Claim-write
 failures remain pre-provider and fail closed; result-write failures are bounded
 after provider completion while the one-time claim remains consumed.
 
-The preregistered v5 prompt was superseded before any call by v6, which names
-every strict-schema `candidate_type` with its exact enum token. The v6 screen
-then exposed two missing transport instructions: canonical date-only expiry
-encoding and unambiguous backward-only correction links. Prompt v7 restores
+The preregistered prompt v5 was superseded before any call by prompt v6, which
+names every strict-schema `candidate_type` with its exact enum token. The
+prompt-v6 screen then exposed two missing transport instructions: canonical
+date-only expiry encoding and unambiguous backward-only correction links.
+Prompt v7 restores
 those rules without changing fixtures, labels, schema, validator, run matrix,
-or holdout. Byte-identical v5 and v6 remain inactive audit artifacts at
+or holdout. Byte-identical prompts v5 and v6 remain inactive audit artifacts at
 SHA-256 `51ed7624b663001de77a0e219bde71e229d19b8cf953a479e5ebd07840e2af59`
 and `f063b311df0ba62abd610ac58b62410db25fb1a6d1b3c423a800e9ae13d3aa63`.
 The current evaluator v6 runner and manifest still reference prompt v7
@@ -133,7 +134,7 @@ language, 34 candidate-bearing and 14 expected-negative cases, with every
 candidate/rejection class, 20 exact-whitespace cases, and 6 multi-prior
 corrections.
 
-### V6 screen result and v7 rationale
+### Prompt-v6 screen result and prompt-v7 rationale
 
 | Arm | Strict valid | Overall F1 | Hard violations | Estimated cost | p95 latency |
 |---|---:|---:|---:|---:|---:|
@@ -154,7 +155,7 @@ V7 therefore makes the already-frozen representation explicit: a source-only
 does not claim that the source supplied a time. A later runtime design must
 retain date precision or otherwise avoid treating this transport encoding as
 an asserted midnight event. The complete three-arm matrix was rerun against
-v7; prior v6 reports were not used for admission.
+prompt v7; prior prompt-v6 reports were not used for admission.
 
 ### V7 completed development result
 
