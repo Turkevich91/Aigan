@@ -1,0 +1,126 @@
+{
+  "development": {
+    "case_count": 160,
+    "case_set_sha256": "e00f9fccb134017c94a196121b1101eb70f5d7241a97dc0ce10a0c2c0af548b8",
+    "file": "tests/fixtures/memory_extraction_v2_development.jsonl",
+    "file_sha256": "e00f9fccb134017c94a196121b1101eb70f5d7241a97dc0ce10a0c2c0af548b8"
+  },
+  "deterministic_baseline": {
+    "sha256": "433994c6d44a8abcab7756f79794a0d8987ae874c8e5c5ceae94832eec55d80e",
+    "version": "deterministic-baseline-v2"
+  },
+  "evaluation_bundle": {
+    "sha256": "17b0aa0950f2d3d1ac7c2cb3db40fdfbeec7b2ea937a163d4b856b2e76580ce3",
+    "version": "memory_extraction_eval_v6"
+  },
+  "fixture_schema_version": "memory_extraction_fixture_v2",
+  "holdout": {
+    "case_count": 160,
+    "case_set_sha256": "d9cc736f10e9a1196a500032532cc0cc76dadbf37dc2715199446a6e91cbc609",
+    "claim": {
+      "caller_selectable_path": false,
+      "ephemeral_environment_allowed": false,
+      "key_sha256": "303d4e260a78f292b90d72d9d04ff96e9b4f45f632347ee964e5e211f9fbd3cc",
+      "namespace": "memory_extraction_v2_holdout",
+      "scope": "frozen_holdout_content_per_effective_posix_user"
+    },
+    "file": "tests/fixtures/memory_extraction_v2_holdout.jsonl",
+    "file_sha256": "d9cc736f10e9a1196a500032532cc0cc76dadbf37dc2715199446a6e91cbc609",
+    "one_time": true
+  },
+  "manifest_version": "memory_extraction_manifest_v3",
+  "output_schema": {
+    "sha256": "09838f4ccca1bf831c9ea7491e45a9d37a0a54b57b707904811d25c811f12cef",
+    "version": "memory_extraction_output_v3"
+  },
+  "pricing_snapshot": {
+    "sha256": "a8aebcd56703bf09c7f84cacf543d20c4bd3b7d532d6010e7db0ef9e9682a61c",
+    "snapshot": {
+      "models": {
+        "gpt-5.6-luna": {
+          "cache_write_rate_nano_usd": 1250,
+          "cached_input_rate_nano_usd": 100,
+          "input_rate_nano_usd": 1000,
+          "output_rate_nano_usd": 6000
+        },
+        "gpt-5.6-sol": {
+          "cache_write_rate_nano_usd": 6250,
+          "cached_input_rate_nano_usd": 500,
+          "input_rate_nano_usd": 5000,
+          "output_rate_nano_usd": 30000
+        },
+        "gpt-5.6-terra": {
+          "cache_write_rate_nano_usd": 3125,
+          "cached_input_rate_nano_usd": 250,
+          "input_rate_nano_usd": 2500,
+          "output_rate_nano_usd": 15000
+        }
+      },
+      "version": "openai-standard-2026-07-09"
+    }
+  },
+  "prompt": {
+    "file": "prompts/memory_extraction_eval_v7.md",
+    "sha256": "22768ec62a69c0596af97e14a42960886d180bb06896d8402b197352c8d282c4",
+    "version": "memory_extraction_prompt_v7"
+  },
+  "run_matrix": {
+    "api_arms": [
+      ["gpt-5.6-luna", "none"],
+      ["gpt-5.6-luna", "low"],
+      ["gpt-5.6-terra", "low"]
+    ],
+    "screen_case_ids": [
+      "v2_development_uk_fact_claim_00_001",
+      "v2_development_uk_fact_claim_01_002",
+      "v2_development_uk_preference_00_005",
+      "v2_development_uk_decision_00_009",
+      "v2_development_uk_relationship_00_013",
+      "v2_development_uk_correction_00_017",
+      "v2_development_uk_correction_01_018",
+      "v2_development_uk_uncertainty_00_023",
+      "v2_development_uk_validity_expiry_00_026",
+      "v2_development_uk_opinion_00_029",
+      "v2_development_uk_joke_00_031",
+      "v2_development_uk_question_00_032",
+      "v2_development_ru_fact_claim_00_041",
+      "v2_development_ru_preference_00_045",
+      "v2_development_ru_preference_01_046",
+      "v2_development_ru_decision_00_049",
+      "v2_development_ru_relationship_00_053",
+      "v2_development_ru_correction_00_057",
+      "v2_development_ru_correction_01_058",
+      "v2_development_ru_uncertainty_00_063",
+      "v2_development_ru_validity_expiry_00_066",
+      "v2_development_ru_hypothetical_00_073",
+      "v2_development_ru_transient_00_074",
+      "v2_development_ru_forwarded_00_075",
+      "v2_development_en_fact_claim_00_081",
+      "v2_development_en_preference_00_085",
+      "v2_development_en_decision_00_089",
+      "v2_development_en_decision_01_090",
+      "v2_development_en_relationship_00_093",
+      "v2_development_en_correction_00_097",
+      "v2_development_en_uncertainty_00_103",
+      "v2_development_en_validity_expiry_00_106",
+      "v2_development_en_prior_bot_00_116",
+      "v2_development_en_cross_scope_00_118",
+      "v2_development_en_unsupported_tool_00_117",
+      "v2_development_en_not_durable_00_119",
+      "v2_development_mixed_fact_claim_00_121",
+      "v2_development_mixed_preference_00_125",
+      "v2_development_mixed_decision_00_129",
+      "v2_development_mixed_relationship_00_133",
+      "v2_development_mixed_relationship_01_134",
+      "v2_development_mixed_correction_00_137",
+      "v2_development_mixed_uncertainty_00_143",
+      "v2_development_mixed_validity_expiry_00_146",
+      "v2_development_mixed_unclassified_00_160",
+      "v2_development_mixed_opinion_00_149",
+      "v2_development_mixed_joke_00_151",
+      "v2_development_mixed_question_00_152"
+    ],
+    "screen_case_set_sha256": "938c07629cc3242e0b80e3339f30d4baaff549f7730dd1860a8e89b3e4cf6d18",
+    "sha256": "24e010736117fa269ae32b563f6c15c3927bb59a64f6556ecfa26b2c605e7f1a"
+  }
+}

@@ -404,6 +404,23 @@ of 360 repeated outputs failed the strict conditional schema invariant. No
 runtime memory worker or live shadow is authorized.
 See [`docs/memory-extraction-eval.md`](docs/memory-extraction-eval.md).
 
+V2 is a separate offline experiment with an exclusive nested output union,
+strict raw-evidence validation, text/identity-disjoint 160-case development and
+holdout fixtures, and a balanced frozen 48-case screen. It requires matrix-wide
+least-cost selection, a clean source commit, full preflight, and an atomic
+canonical one-time claim before holdout can run. The completed v7 development
+matrix, measured under evaluator v5, returned `NO_GO`: Luna/low and Terra/low
+passed the screen but neither passed locked-development recall, exact-set,
+strict-validity, and stability gates, so the selection attestation chose no
+model. Post-result evaluator v6 removes the caller-selectable claim path and
+binds the claim to frozen holdout content in private persistent POSIX-user
+state; CI and detected common container markers fail closed. Evaluator v6 made
+no model calls and does not relabel the evaluator-v5 result. Development tests
+still treat holdout as opaque bytes, and no v2 holdout result exists. Runtime
+memory and retrieval remain
+unchanged.
+See [`docs/memory-extraction-eval-v2.md`](docs/memory-extraction-eval-v2.md).
+
 
 The first live-runtime slice covers main Agents SDK model turns, direct router/plain/vision Responses calls, embeddings, and optional YouTube MCP audio transcription. Offline Telegram import/backfill is not covered. Coverage is call-site based, so a missing row is not proof that an uninstrumented path made no provider request.
 
