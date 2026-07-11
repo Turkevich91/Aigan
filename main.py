@@ -1335,6 +1335,13 @@ PROFILE_RECENT_TAIL = 15
 MIN_PROFILE_MESSAGES = 10
 SELF_TARGET_ALIASES = {"", "мій", "моя", "мої", "я", "me", "my", "self"}
 URL_TOKEN_RE = re.compile(r"https?://\S+|www\.\S+", re.IGNORECASE)
+MODEL_POLICY_BARE_DOMAIN_RE = re.compile(
+    r"(?<![A-Za-z0-9_@])"
+    r"(?:[A-Za-z0-9._%+-]+@)?"
+    r"(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+"
+    r"[A-Za-z]{2,63}(?::\d{1,5})?(?:/[^\s]*)?",
+    re.IGNORECASE,
+)
 MENTION_TOKEN_RE = re.compile(r"@[A-Za-z0-9_]{1,64}")
 SLASH_COMMAND_TOKEN_RE = re.compile(r"/(?:[A-Za-z0-9_]+|[^\W\d_]+)(?:@[A-Za-z0-9_]+)?", re.UNICODE)
 STAT_OUTPUT_LINE_RE = re.compile(r"^\s*\d+[.)]\s+\S+\s+-\s+\d+\s*$")
@@ -4870,16 +4877,22 @@ def build_model_policy_router_metadata(
         prompt,
         tool_route_decision,
     )
+    raw_prompt = prompt or ""
+    redacted_prompt = URL_TOKEN_RE.sub("[url]", raw_prompt)
+    redacted_prompt = MODEL_POLICY_BARE_DOMAIN_RE.sub("[url]", redacted_prompt)
+    contains_url = has_url(raw_prompt) or bool(
+        MODEL_POLICY_BARE_DOMAIN_RE.search(raw_prompt)
+    )
     short_followup = is_short_followup_prompt(prompt)
     return {
-        "trusted_text": clip_text(URL_TOKEN_RE.sub("[url]", prompt or ""), 1200),
+        "trusted_text": clip_text(redacted_prompt, 1200),
         "request_route": normalize_route_bucket(route, "other"),
         "chat_type": str(getattr(message.chat, "type", "") or ""),
         "has_reply": reply is not None,
         "reply_to_bot": reply_to_bot,
         "has_reference": has_reference,
         "has_attachment": has_supported_image(message) or has_supported_visual_media(message),
-        "has_url": has_url(prompt or ""),
+        "has_url": contains_url,
         "short_followup": short_followup,
         "short_unanchored_followup": short_followup and not (reply is not None or has_reference),
         "mutation_capability": mutation_capability,

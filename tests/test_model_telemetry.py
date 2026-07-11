@@ -624,6 +624,17 @@ class ModelTelemetryStoreTests(unittest.TestCase):
 
         row = self.store.latest_routing_decisions(1)[0]
         summary = self.store.aggregate_since(3600)["routing"]
+        query_plan = " ".join(
+            str(item[3])
+            for item in self.store._conn.execute(
+                """
+                EXPLAIN QUERY PLAN
+                SELECT * FROM model_routing_decisions
+                ORDER BY created_at DESC, decision_id DESC
+                LIMIT 1
+                """
+            ).fetchall()
+        )
 
         self.assertTrue(recorded)
         self.assertEqual("simple_utility", row.task_class)
@@ -635,6 +646,7 @@ class ModelTelemetryStoreTests(unittest.TestCase):
         self.assertEqual(1, summary["decision_count"])
         self.assertEqual({"economy": 1}, summary["selected_tier_counts"])
         self.assertEqual(1, summary["canary_eligible_count"])
+        self.assertIn("idx_model_routing_decision_created", query_plan)
         self.store._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
         persisted = self.db_path.read_bytes()
         wal_path = Path(f"{self.db_path}-wal")

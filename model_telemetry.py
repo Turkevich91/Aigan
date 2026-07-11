@@ -1092,7 +1092,7 @@ class ModelTelemetryStore:
             rows = self._conn.execute(
                 """
                 SELECT * FROM model_routing_decisions
-                ORDER BY datetime(created_at) DESC, decision_id DESC
+                ORDER BY created_at DESC, decision_id DESC
                 LIMIT ?
                 """,
                 (max(1, min(int(limit), 500)),),

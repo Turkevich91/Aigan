@@ -862,6 +862,17 @@ class ModelPolicyRoutingIntegrationTests(unittest.TestCase):
         self.assertTrue(read_only_metadata["mutation_capability"])
         self.assertFalse(read_only_metadata["mutation_requested"])
 
+        bare_domain = "Summarize private.example/secret without opening it"
+        bare_metadata = main.build_model_policy_router_metadata(
+            FakeMessage(bare_domain, chat_type=ChatType.PRIVATE),
+            bare_domain,
+            route="normal",
+            tool_route_decision=None,
+        )
+        self.assertTrue(bare_metadata["has_url"])
+        self.assertIn("[url]", bare_metadata["trusted_text"])
+        self.assertNotIn("private.example", bare_metadata["trusted_text"])
+
     def test_non_thread_replies_are_single_turn_and_threads_are_sticky(self) -> None:
         parent = FakeMessage("parent", message_id=601)
         first_reply = FakeMessage("first", message_id=602)
