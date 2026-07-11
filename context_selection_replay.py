@@ -796,8 +796,17 @@ def _write_exclusive(path: Path, payload: bytes) -> None:
         os.fsync(descriptor)
     finally:
         os.close(descriptor)
-    _assert_private_permissions(temporary, directory=False)
-    os.replace(temporary, path)
+    try:
+        _assert_private_permissions(temporary, directory=False)
+        try:
+            os.link(temporary, path)
+        except FileExistsError as exc:
+            raise ContextSelectionReplayError("private output already exists") from exc
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
     _assert_private_permissions(path, directory=False)
 
 
@@ -820,7 +829,7 @@ def build_private_review_pool(
     manifest_path = private_root / REVIEW_MANIFEST_FILENAME
     if output_path.exists() or manifest_path.exists():
         raise ContextSelectionReplayError("private review pool already exists")
-    uri = f"file:{database_path.resolve().as_posix()}?mode=ro"
+    uri = f"{database_path.resolve().as_uri()}?mode=ro"
     connection = sqlite3.connect(uri, uri=True)
     try:
         connection.execute("BEGIN")

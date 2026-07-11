@@ -14,6 +14,7 @@ from context_selection_replay import (
     ContextSelectionReplayError,
     REVIEW_MANIFEST_FILENAME,
     REVIEW_POOL_FILENAME,
+    _write_exclusive,
     build_private_review_pool,
     collect_review_packets,
 )
@@ -469,6 +470,42 @@ class ContextSelectionReplayTests(unittest.TestCase):
                     recent_limit=20,
                     reply_depth=8,
                 )
+
+    @unittest.skipIf(os.name == "nt", "private replay writer requires POSIX owner-only modes")
+    def test_read_only_database_uri_encodes_reserved_path_characters(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            special = Path(directory) / "uri ? fragment #"
+            special.mkdir()
+            database = special / "replay.sqlite3"
+            private_root = special / "private"
+            _create_database(database)
+            manifest = build_private_review_pool(
+                database_path=database,
+                private_root=private_root,
+                lookback_days=30,
+                recent_limit=20,
+                reply_depth=8,
+            )
+        self.assertEqual(3, manifest["packet_count"])
+
+    @unittest.skipIf(os.name == "nt", "private replay writer requires POSIX owner-only modes")
+    def test_exclusive_publish_never_replaces_racing_destination(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            destination = root / "private-output.json"
+            real_link = os.link
+
+            def racing_link(source: str | bytes | os.PathLike[str], target: str | bytes | os.PathLike[str]) -> None:
+                Path(target).write_bytes(b"winner")
+                os.chmod(target, 0o600)
+                real_link(source, target)
+
+            with patch("context_selection_replay.os.link", side_effect=racing_link):
+                with self.assertRaises(ContextSelectionReplayError):
+                    _write_exclusive(destination, b"loser")
+
+            self.assertEqual(b"winner", destination.read_bytes())
+            self.assertEqual([], list(root.glob(".*.tmp-*")))
 
     @unittest.skipUnless(os.name == "nt", "Windows-specific fail-closed contract")
     def test_private_writer_fails_closed_on_windows(self) -> None:

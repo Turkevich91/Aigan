@@ -212,8 +212,11 @@ fields for raw Telegram/chat/user/message IDs, usernames, source URLs, local
 paths, file IDs, and run IDs. Its output directory is outside the repository or
 in the already ignored runtime-data tree, and is owner-only; the JSONL,
 manifest, and HMAC key are owner-only files. Existing outputs are never
-overwritten implicitly. The CLI uses an owner data directory automatically when
-the runtime-data tree is not writable by the operator account.
+overwritten implicitly: a completed temporary file is published with an atomic
+no-replace link, so a concurrent writer wins or fails rather than being
+replaced. The SQLite read-only URI is percent-encoded for reserved path
+characters. The CLI uses an owner data directory automatically when the
+runtime-data tree is not writable by the operator account.
 
 ## Fixture contract
 
