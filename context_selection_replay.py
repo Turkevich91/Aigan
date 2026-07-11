@@ -13,11 +13,11 @@ import sqlite3
 from typing import Any, Iterable, Mapping
 
 
-REVIEW_PACKET_SCHEMA_VERSION = "context-selection-review-packet-v2"
-REVIEW_MANIFEST_SCHEMA_VERSION = "context-selection-review-manifest-v2"
+REVIEW_PACKET_SCHEMA_VERSION = "context-selection-review-packet-v3"
+REVIEW_MANIFEST_SCHEMA_VERSION = "context-selection-review-manifest-v3"
 PRIVATE_ROOT_RELATIVE = Path("data/research/context-selection-v1")
-REVIEW_POOL_FILENAME = "review-pool-v2.jsonl"
-REVIEW_MANIFEST_FILENAME = "review-pool-v2-manifest.json"
+REVIEW_POOL_FILENAME = "review-pool-v3.jsonl"
+REVIEW_MANIFEST_FILENAME = "review-pool-v3-manifest.json"
 KEY_FILENAME = "replay-key.bin"
 WORD_RE = re.compile(r"\w+", flags=re.UNICODE)
 LEADING_INVOCATION_RE = re.compile(r"^\s*(?:/[A-Za-z0-9_@-]+|@[A-Za-z0-9_]+)\s*", flags=re.UNICODE)
