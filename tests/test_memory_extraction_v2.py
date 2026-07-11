@@ -32,6 +32,7 @@ from memory_extraction_v2 import (
     FROZEN_RUN_MATRIX_SHA256,
     FROZEN_SCREEN_CASE_SHA256,
     PRICING_SNAPSHOT,
+    PROMPT_VERSION,
     aggregate_report_has_private_fields,
     canonical_to_v2,
     deterministic_extract,
@@ -71,7 +72,8 @@ ROOT = Path(__file__).resolve().parents[1]
 DEV_FIXTURE = ROOT / "tests" / "fixtures" / "memory_extraction_v2_development.jsonl"
 HOLDOUT_FIXTURE = ROOT / "tests" / "fixtures" / "memory_extraction_v2_holdout.jsonl"
 MANIFEST = ROOT / "tests" / "fixtures" / "memory_extraction_v2_manifest.json"
-PROMPT = ROOT / "prompts" / "memory_extraction_eval_v5.md"
+PROMPT = ROOT / "prompts" / "memory_extraction_eval_v6.md"
+SUPERSEDED_PROMPT_V5 = ROOT / "prompts" / "memory_extraction_eval_v5.md"
 
 
 class MemoryExtractionV2FixtureTests(unittest.TestCase):
@@ -104,6 +106,13 @@ class MemoryExtractionV2FixtureTests(unittest.TestCase):
         self.assertEqual(v1.FROZEN_PROMPT_SHA256, v1.fixture_sha256(v1_prompt))
         self.assertEqual(v1.FROZEN_OUTPUT_SCHEMA_SHA256, v1.output_schema_sha256())
         self.assertEqual(v1.FROZEN_EVALUATION_BUNDLE_SHA256, v1.evaluation_bundle_sha256())
+
+    def test_superseded_v5_prompt_remains_immutable_and_inactive(self) -> None:
+        self.assertEqual(
+            "51ed7624b663001de77a0e219bde71e229d19b8cf953a479e5ebd07840e2af59",
+            fixture_sha256(SUPERSEDED_PROMPT_V5),
+        )
+        self.assertNotEqual(SUPERSEDED_PROMPT_V5, PROMPT)
 
     def test_distribution_matches_preregistration(self) -> None:
         expected_reasons = set(v1.NO_CANDIDATE_REASONS) - {"none"}
@@ -166,6 +175,11 @@ class MemoryExtractionV2FixtureTests(unittest.TestCase):
             manifest["holdout"]["case_set_sha256"],
         )
         self.assertEqual(FROZEN_PROMPT_SHA256, manifest["prompt"]["sha256"])
+        self.assertEqual(PROMPT_VERSION, manifest["prompt"]["version"])
+        self.assertEqual(
+            "prompts/memory_extraction_eval_v6.md",
+            manifest["prompt"]["file"],
+        )
         self.assertEqual(FROZEN_OUTPUT_SCHEMA_SHA256, manifest["output_schema"]["sha256"])
         self.assertEqual(FROZEN_EVALUATION_BUNDLE_SHA256, manifest["evaluation_bundle"]["sha256"])
         self.assertEqual(EVALUATOR_VERSION, manifest["evaluation_bundle"]["version"])
@@ -238,6 +252,14 @@ class MemoryExtractionV2ContractTests(unittest.TestCase):
                     }
                 }
                 self.assertEqual((100, 30, 10, 20), eval_v2.response_usage_v2(response))
+
+    def test_prompt_uses_exact_candidate_type_enum_tokens(self) -> None:
+        prompt = PROMPT.read_text(encoding="utf-8")
+        for candidate_type in v1.CANDIDATE_TYPES:
+            with self.subTest(candidate_type=candidate_type):
+                self.assertIn(f"`{candidate_type}`", prompt)
+        self.assertNotIn("fact claim", prompt)
+        self.assertNotIn("validity/expiry candidates", prompt)
 
     def test_parent_directory_fsync_is_fail_closed_on_posix(self) -> None:
         path = Path("external") / "receipt.json"

@@ -71,7 +71,7 @@ from scripts.eval_memory_extraction import (
 )
 
 
-PROMPT_PATH = ROOT / "prompts" / "memory_extraction_eval_v5.md"
+PROMPT_PATH = ROOT / "prompts" / "memory_extraction_eval_v6.md"
 DEFAULT_FIXTURE = ROOT / "tests" / "fixtures" / "memory_extraction_v2_development.jsonl"
 HOLDOUT_RECEIPT_VERSION = "memory_extraction_holdout_receipt_v1"
 HOLDOUT_RESULT_VERSION = "memory_extraction_holdout_result_v1"

@@ -13,6 +13,11 @@ was not structurally exclusive, evidence whitespace was not always preserved,
 and a correction could be linked to the wrong prior row.
 
 No v2 model call has been made yet. The v2 holdout is closed.
+The preregistered v5 prompt was superseded before any call by v6, which names
+every strict-schema `candidate_type` with its exact enum token.
+The byte-identical v5 file remains only as a preregistration audit artifact at
+SHA-256 `51ed7624b663001de77a0e219bde71e229d19b8cf953a479e5ebd07840e2af59`;
+the runner and manifest reference v6 exclusively.
 
 ## Ownership boundary
 
@@ -69,13 +74,13 @@ Frozen SHA-256 values:
 development file/cases  e00f9fccb134017c94a196121b1101eb70f5d7241a97dc0ce10a0c2c0af548b8
 holdout file/cases      d9cc736f10e9a1196a500032532cc0cc76dadbf37dc2715199446a6e91cbc609
 screen cases            938c07629cc3242e0b80e3339f30d4baaff549f7730dd1860a8e89b3e4cf6d18
-prompt v5               51ed7624b663001de77a0e219bde71e229d19b8cf953a479e5ebd07840e2af59
+prompt v6               f063b311df0ba62abd610ac58b62410db25fb1a6d1b3c423a800e9ae13d3aa63
 output schema v3        09838f4ccca1bf831c9ea7491e45a9d37a0a54b57b707904811d25c811f12cef
 deterministic baseline  433994c6d44a8abcab7756f79794a0d8987ae874c8e5c5ceae94832eec55d80e
 pricing snapshot        a8aebcd56703bf09c7f84cacf543d20c4bd3b7d532d6010e7db0ef9e9682a61c
 run matrix              203ad336482d56dd3f1fe1995c24f8b089734dd85fc75da325a8aff330518673
-evaluation bundle       e9f869057119320e0f1d1adc97c4a20f7bff556c5cbaab8fced57659c7502be2
-whole manifest          7821d39391e664a70f1f50d4b30c3fd64ed5f74c137be46d8c14f7852ec94272
+evaluation bundle       7df9e75b867719d2a01ad38db311a3d9e48bf588eef9a5f24e8a32377843ac46
+whole manifest          07540b48b33f42d9f89782885545690de4ddca5c1ed090363002e945589b22d5
 ```
 
 The manifest lists all 48 screen case IDs. That subset is exactly 12 cases per
