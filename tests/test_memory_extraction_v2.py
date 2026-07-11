@@ -886,6 +886,36 @@ class MemoryExtractionV2ContractTests(unittest.TestCase):
                 self.assertIn("evaluation inputs", errors.getvalue())
                 run_api.assert_not_called()
 
+    def test_api_preflight_artifact_read_failures_are_clean(self) -> None:
+        scenarios = (
+            ("manifest_sha256", PermissionError(13, "Permission denied")),
+            (
+                "evaluation_bundle_sha256",
+                UnicodeDecodeError("utf-8", b"x", 0, 1, "bad"),
+            ),
+        )
+        argv = ["eval_memory_extraction_v2.py", "--mode", "api", "--limit", "48"]
+        for target, failure in scenarios:
+            with self.subTest(target=target):
+                errors = io.StringIO()
+                with (
+                    patch.object(eval_v2, target, side_effect=failure),
+                    patch.object(eval_v2, "run_api") as run_api,
+                    patch.object(
+                        eval_v2,
+                        "current_clean_source_commit",
+                        return_value="a" * 40,
+                    ),
+                    patch.dict(os.environ, {"OPENAI_API_KEY": "test"}),
+                    patch.object(sys, "argv", argv),
+                    contextlib.redirect_stderr(errors),
+                    self.assertRaises(SystemExit),
+                ):
+                    eval_v2.main()
+                self.assertNotIn("Traceback", errors.getvalue())
+                self.assertIn("frozen evaluation artifacts", errors.getvalue())
+                run_api.assert_not_called()
+
     def test_eval_cli_invalid_fixture_is_clean_and_pre_provider(self) -> None:
         errors = io.StringIO()
         private_marker = "private-user-fixture-id"

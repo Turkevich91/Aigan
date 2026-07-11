@@ -540,18 +540,28 @@ def _preflight_fixture_access(
         return None, None
     if not os.getenv("OPENAI_API_KEY", "").strip():
         parser.error("OPENAI_API_KEY is required for --mode api")
-    artifact_checks = {
-        "manifest": manifest_sha256() == FROZEN_MANIFEST_SHA256,
-        "prompt": prompt_hash == FROZEN_PROMPT_SHA256,
-        "schema": output_schema_sha256() == FROZEN_OUTPUT_SCHEMA_SHA256,
-        "baseline": deterministic_baseline_sha256()
-        == FROZEN_DETERMINISTIC_BASELINE_SHA256,
-        "pricing": pricing_snapshot_sha256() == FROZEN_PRICING_SNAPSHOT_SHA256,
-        "bundle": evaluation_bundle_sha256() == FROZEN_EVALUATION_BUNDLE_SHA256,
-        "run_matrix": run_matrix_sha256() == FROZEN_RUN_MATRIX_SHA256,
-        "fixture": fixture_hash
-        in {FROZEN_DEVELOPMENT_FILE_SHA256, FROZEN_HOLDOUT_FILE_SHA256},
-    }
+    try:
+        artifact_checks = {
+            "manifest": manifest_sha256() == FROZEN_MANIFEST_SHA256,
+            "prompt": prompt_hash == FROZEN_PROMPT_SHA256,
+            "schema": output_schema_sha256() == FROZEN_OUTPUT_SCHEMA_SHA256,
+            "baseline": deterministic_baseline_sha256()
+            == FROZEN_DETERMINISTIC_BASELINE_SHA256,
+            "pricing": pricing_snapshot_sha256()
+            == FROZEN_PRICING_SNAPSHOT_SHA256,
+            "bundle": evaluation_bundle_sha256()
+            == FROZEN_EVALUATION_BUNDLE_SHA256,
+            "run_matrix": run_matrix_sha256() == FROZEN_RUN_MATRIX_SHA256,
+            "fixture": fixture_hash
+            in {FROZEN_DEVELOPMENT_FILE_SHA256, FROZEN_HOLDOUT_FILE_SHA256},
+        }
+    except OSError as exc:
+        detail = exc.strerror or exc.__class__.__name__
+        parser.error(f"cannot read frozen evaluation artifacts: {detail}")
+    except UnicodeError as exc:
+        parser.error(
+            f"cannot decode frozen evaluation artifacts: {exc.__class__.__name__}"
+        )
     failed = [name for name, passed in artifact_checks.items() if not passed]
     if failed:
         parser.error("frozen artifact preflight failed: " + ",".join(failed))

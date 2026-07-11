@@ -10,7 +10,7 @@
     "version": "deterministic-baseline-v2"
   },
   "evaluation_bundle": {
-    "sha256": "e898026e064f6b893e211da3e0dad8d6fbb959b6ab3cb0c5e2dd84632e7bd2fc",
+    "sha256": "17b0aa0950f2d3d1ac7c2cb3db40fdfbeec7b2ea937a163d4b856b2e76580ce3",
     "version": "memory_extraction_eval_v6"
   },
   "fixture_schema_version": "memory_extraction_fixture_v2",

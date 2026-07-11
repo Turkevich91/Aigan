@@ -121,8 +121,8 @@ deterministic baseline  433994c6d44a8abcab7756f79794a0d8987ae874c8e5c5ceae94832e
 pricing snapshot        a8aebcd56703bf09c7f84cacf543d20c4bd3b7d532d6010e7db0ef9e9682a61c
 holdout claim key       303d4e260a78f292b90d72d9d04ff96e9b4f45f632347ee964e5e211f9fbd3cc
 run matrix              24e010736117fa269ae32b563f6c15c3927bb59a64f6556ecfa26b2c605e7f1a
-evaluation bundle       e898026e064f6b893e211da3e0dad8d6fbb959b6ab3cb0c5e2dd84632e7bd2fc
-whole manifest          885e0968b5b9d7eea7d721ba3b45437c561ec7e6dade44d240baa2fa9b4e4a94
+evaluation bundle       17b0aa0950f2d3d1ac7c2cb3db40fdfbeec7b2ea937a163d4b856b2e76580ce3
+whole manifest          a901ba7866e767c1b3fcc8491d22affe58584546bb8a4ba6a572b17fb86cde46
 
 historical measured evaluator v5 snapshot
 run matrix              203ad336482d56dd3f1fe1995c24f8b089734dd85fc75da325a8aff330518673
