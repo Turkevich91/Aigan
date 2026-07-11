@@ -1,5 +1,13 @@
 # Aigan Changelog
 
+## 2026-07-11 - Frozen bounded-memory extraction evaluation
+
+- Added separate 120-case development and 120-case holdout public-synthetic multilingual extraction blocks with explicit source, speaker, scope, correction/conflict, uncertainty, validity, forwarded, prior-bot, and tool-anchor labels.
+- Added a strict candidate-only schema, fail-closed provenance validator, deterministic high-precision baseline, repeated stability measurement, frozen prompt/schema/evaluator hashes, Wilson-bound gates, and an aggregate-only API evaluator.
+- Kept evaluator pricing on the existing shared runtime snapshot so this offline slice does not change live telemetry or authorize additional runtime models.
+- Recorded the one locked Luna-low holdout as `NO_GO`: quality was perfect on 120 unique cases, but two of 360 repeat outputs failed the strict conditional schema-validity gate; no runtime worker or live shadow is authorized.
+- Kept runtime memory, SQLite schema, vector/FTS retrieval, Telegram behavior, and the Sol-low answer path unchanged; a separate runtime-shadow PR remains gated on model results.
+
 ## 2026-07-10 - Privacy-bounded at-most-once self-reporting
 
 - Added a durable SQLite report-claim ledger so concurrent threshold crossings, restarts, timeouts, and local finalization failures cannot automatically duplicate a GitHub issue.
