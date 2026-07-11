@@ -416,6 +416,61 @@ class AgentsSdkCompatibilityTests(unittest.TestCase):
 
         self.assertTrue(model.called)
 
+    def test_primary_model_defaults_to_sol_with_low_reasoning(self) -> None:
+        environment = dict(os.environ)
+        environment.pop("OPENAI_MODEL", None)
+        environment.pop("MODEL_REASONING_EFFORT", None)
+
+        with patch.dict(os.environ, environment, clear=True):
+            config = main.Config.from_env()
+
+        self.assertEqual("gpt-5.6-sol", config.openai_model)
+        self.assertEqual("low", config.model_reasoning_effort)
+
+    def test_main_agent_receives_configured_sol_reasoning_and_verbosity(self) -> None:
+        original = main.CONFIG
+        main.CONFIG = replace(
+            original,
+            openai_model="gpt-5.6-sol",
+            model_reasoning_effort="low",
+            model_verbosity="medium",
+            max_output_tokens=321,
+        )
+        try:
+            agent = main.make_agent([])
+        finally:
+            main.CONFIG = original
+
+        self.assertEqual("gpt-5.6-sol", agent.model)
+        self.assertEqual(321, agent.model_settings.max_tokens)
+        self.assertEqual("medium", agent.model_settings.verbosity)
+        self.assertEqual("low", agent.model_settings.reasoning.effort)
+
+    def test_plain_model_receives_global_reasoning_and_verbosity(self) -> None:
+        original = main.CONFIG
+        main.CONFIG = replace(
+            original,
+            openai_model="gpt-5.6-sol",
+            model_reasoning_effort="low",
+            model_verbosity="medium",
+            max_output_tokens=321,
+        )
+        try:
+            with patch.object(main, "OpenAI") as client_class:
+                client_class.return_value.responses.create.return_value = SimpleNamespace(
+                    output_text="  AIGAN_SOL_LOW_OK  "
+                )
+                result = main.run_plain_model_sync("synthetic smoke")
+                request = client_class.return_value.responses.create.call_args.kwargs
+        finally:
+            main.CONFIG = original
+
+        self.assertEqual("AIGAN_SOL_LOW_OK", result)
+        self.assertEqual("gpt-5.6-sol", request["model"])
+        self.assertEqual({"effort": "low"}, request["reasoning"])
+        self.assertEqual({"verbosity": "medium"}, request["text"])
+        self.assertEqual(321, request["max_output_tokens"])
+
 
 class PendingFlowTests(unittest.TestCase):
     def setUp(self) -> None:
