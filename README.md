@@ -346,6 +346,50 @@ MODEL_TELEMETRY_RETENTION_DAYS=30
 MODEL_ROUTING_POLICY_VERSION=primary_sol_low_v1
 ```
 
+Model-responsibility routing is off by default. The first experiment supports
+only `off` and `shadow`: a bounded classifier runs in the background for
+explicit text requests, while every visible answer and every Agents SDK turn
+still uses the configured primary model and effort.
+
+```env
+MODEL_ROUTING_MODE=off
+MODEL_ROUTER_MODEL=gpt-5.4-nano
+MODEL_ROUTER_REASONING_EFFORT=none
+MODEL_ROUTER_MAX_OUTPUT_TOKENS=240
+MODEL_ROUTER_CONFIDENCE_THRESHOLD=0.75
+MODEL_ROUTER_TIMEOUT_SECONDS=8
+MODEL_ROUTER_SCHEMA_VERSION=model_policy_v1
+MODEL_ROUTER_PROMPT_VERSION=model_policy_prompt_v1
+MODEL_TIER_ECONOMY_MODEL=gpt-5.4-nano
+MODEL_TIER_BALANCED_MODEL=gpt-5.6-terra
+MODEL_TIER_PREMIUM_MODEL=gpt-5.6-sol
+```
+
+To enable shadow collection, also set
+`MODEL_ROUTING_POLICY_VERSION=shadow_tier_router_v1`. Shadow mode requires the
+payload-free model telemetry store. The premium alias must equal
+`OPENAI_MODEL`; this prevents a configuration label from drifting away from
+the actual Sol answer path.
+
+The classifier receives only the trusted current request plus bounded flags;
+URLs in that request are replaced by a `[url]` marker before the provider call.
+It does not receive assembled memory, tool output, identities, or the full
+Agents prompt. Its structured recommendation cannot authorize tools and is
+never passed into `RunConfig.model`. A deterministic safety floor upgrades
+memory, current, risky, ambiguous, creative, complex, mutation-requesting, and
+unanchored-follow-up work to premium. Any timeout, invalid output, unavailable
+model, or low-confidence result also records a premium fallback without
+blocking the Sol answer.
+
+The additive routing ledger stores only enums, configured model aliases,
+confidence, an opaque keyed episode handle, and outcome metadata. It never
+stores request text or model output. `/health` reports shadow decision counts,
+tier distribution, fallback count, and the narrow exact-utility population
+that could qualify for a future canary. A live canary requires a separate
+reviewed change with a tier-aware provider seam and frozen quality/cost evals.
+The architecture, frozen-v1 result, and current active-routing `NO-GO` are
+recorded in [`docs/model-routing-shadow.md`](docs/model-routing-shadow.md).
+
 The first live-runtime slice covers main Agents SDK model turns, direct router/plain/vision Responses calls, embeddings, and optional YouTube MCP audio transcription. Offline Telegram import/backfill is not covered. Coverage is call-site based, so a missing row is not proof that an uninstrumented path made no provider request.
 
 Each stage keeps opaque run/stage identifiers and bounded operational fields: route/task buckets, intended model, provider-returned actual model when available, requested/actual reasoning effort when exposed, endpoint, status/failure category, fallback/application-retry count, latency, token usage, price-snapshot version, and estimated cost. It never stores prompts, model output, tool arguments, search queries, URLs, transcripts, user text or identities, secrets, or private paths.

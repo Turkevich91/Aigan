@@ -6,6 +6,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from model_pricing import TokenUsage, estimate_token_cost
+from model_routing import normalize_model_routing_decision, opaque_episode_key
 from model_telemetry import (
     ModelTelemetryStore,
     extract_usage_metrics,
@@ -200,6 +201,7 @@ class ModelTelemetryStoreTests(unittest.TestCase):
         self.assertEqual("preserve-me", value)
         self.assertIn("model_telemetry_runs", tables)
         self.assertIn("model_telemetry_stages", tables)
+        self.assertIn("model_routing_decisions", tables)
 
     def test_ordered_migration_upgrades_v1_to_current_schema(self) -> None:
         self.store.close()
@@ -220,6 +222,12 @@ class ModelTelemetryStoreTests(unittest.TestCase):
                 "PRAGMA table_info(model_telemetry_stages)"
             )
         }
+        routing_columns = {
+            str(row[1])
+            for row in self.store._conn.execute(
+                "PRAGMA table_info(model_routing_decisions)"
+            )
+        }
         version = self.store._conn.execute(
             "SELECT value FROM model_telemetry_meta WHERE key = 'schema_version'"
         ).fetchone()[0]
@@ -227,7 +235,38 @@ class ModelTelemetryStoreTests(unittest.TestCase):
         self.assertIn("actual_reasoning_effort", columns)
         self.assertIn("route_bucket", columns)
         self.assertIn("task_class_bucket", columns)
-        self.assertEqual("3", version)
+        self.assertIn("router_prompt_version", routing_columns)
+        self.assertEqual("5", version)
+
+    def test_v3_migration_adds_routing_ledger_without_touching_stage_rows(self) -> None:
+        handle = self.store.begin_stage(
+            run_id="4" * 32,
+            route_bucket="normal",
+            task_class_bucket="agent",
+            stage_kind="final_answer",
+            intended_model="gpt-5.6-sol",
+            endpoint="agents",
+        )
+        self.store.finish_stage(handle, status="succeeded", usage=response_usage())
+        self.store.close()
+        connection = sqlite3.connect(self.db_path)
+        connection.execute("DROP TABLE model_routing_decisions")
+        connection.execute(
+            "UPDATE model_telemetry_meta SET value = '3' WHERE key = 'schema_version'"
+        )
+        connection.commit()
+        connection.close()
+
+        self.store = ModelTelemetryStore(self.db_path)
+
+        self.assertEqual(1, len(self.store.latest_stages(10)))
+        self.assertEqual([], self.store.latest_routing_decisions(10))
+        self.assertEqual(
+            "5",
+            self.store._conn.execute(
+                "SELECT value FROM model_telemetry_meta WHERE key = 'schema_version'"
+            ).fetchone()[0],
+        )
 
     def test_newer_schema_version_is_rejected_without_being_downgraded(self) -> None:
         self.store.close()
@@ -528,6 +567,142 @@ class ModelTelemetryStoreTests(unittest.TestCase):
         ).fetchone()[0]
         self.assertEqual("agent", run_task)
 
+    def test_shadow_routing_decision_is_payload_free_and_aggregated(self) -> None:
+        run_id = "5" * 32
+        stage = self.store.begin_stage(
+            run_id=run_id,
+            route_bucket="normal",
+            task_class_bucket="model_policy_router",
+            policy_version="shadow_tier_router_v1",
+            stage_kind="model_policy_router",
+            intended_model="gpt-5.4-nano",
+            reasoning_effort="none",
+            endpoint="responses",
+        )
+        self.store.finish_stage(
+            stage,
+            status="succeeded",
+            usage=response_usage(input_tokens=20, output_tokens=5),
+            actual_model="gpt-5.4-nano",
+            actual_model_source="provider_response",
+            actual_reasoning_effort="none",
+        )
+        decision = normalize_model_routing_decision(
+            {
+                "task_class": "simple_utility",
+                "complexity": "low",
+                "freshness": "not_required",
+                "risk": "low",
+                "ambiguity": "low",
+                "selected_tier": "economy",
+                "reasoning_effort": "none",
+                "confidence": 0.96,
+                "reason_codes": ["bounded_extraction"],
+                "fallback_chain": ["economy", "balanced", "premium"],
+            },
+            confidence_threshold=0.75,
+            route_bucket="normal",
+        )
+        marker = "private-routing-payload-marker"
+        recorded = self.store.record_routing_decision(
+            run_id=run_id,
+            route_bucket="normal",
+            policy_version="shadow_tier_router_v1",
+            router_schema_version="model_policy_v1",
+            router_prompt_version="model_policy_prompt_v1",
+            mode="shadow",
+            decision=decision,
+            selected_model="gpt-5.4-nano",
+            applied_tier="premium",
+            applied_model="gpt-5.6-sol",
+            applied_reasoning_effort="low",
+            assignment_key=opaque_episode_key("private-test-secret", marker),
+            assignment_scope="single_turn",
+            canary_eligible=True,
+            eligibility_reason="eligible_exact_utility",
+        )
+
+        row = self.store.latest_routing_decisions(1)[0]
+        summary = self.store.aggregate_since(3600)["routing"]
+        query_plan = " ".join(
+            str(item[3])
+            for item in self.store._conn.execute(
+                """
+                EXPLAIN QUERY PLAN
+                SELECT * FROM model_routing_decisions
+                ORDER BY created_at DESC, decision_id DESC
+                LIMIT 1
+                """
+            ).fetchall()
+        )
+
+        self.assertTrue(recorded)
+        self.assertEqual("simple_utility", row.task_class)
+        self.assertEqual("model_policy_prompt_v1", row.router_prompt_version)
+        self.assertEqual("economy", row.selected_tier)
+        self.assertEqual("premium", row.applied_tier)
+        self.assertEqual("gpt-5.6-sol", row.applied_model)
+        self.assertTrue(row.canary_eligible)
+        self.assertEqual(1, summary["decision_count"])
+        self.assertEqual({"economy": 1}, summary["selected_tier_counts"])
+        self.assertEqual(1, summary["canary_eligible_count"])
+        self.assertIn("idx_model_routing_decision_created", query_plan)
+        self.store._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        persisted = self.db_path.read_bytes()
+        wal_path = Path(f"{self.db_path}-wal")
+        if wal_path.exists():
+            persisted += wal_path.read_bytes()
+        self.assertNotIn(marker.encode(), persisted)
+
+    def test_routing_decision_is_at_most_once_per_run(self) -> None:
+        run_id = "b" * 32
+        stage = self.store.begin_stage(
+            run_id=run_id,
+            route_bucket="normal",
+            task_class_bucket="model_policy_router",
+            policy_version="shadow_tier_router_v1",
+            stage_kind="model_policy_router",
+            intended_model="gpt-5.4-nano",
+            endpoint="responses",
+        )
+        self.store.finish_stage(stage, status="succeeded", usage=response_usage())
+        decision = normalize_model_routing_decision(
+            {
+                "task_class": "simple_utility",
+                "complexity": "low",
+                "freshness": "not_required",
+                "risk": "low",
+                "ambiguity": "low",
+                "selected_tier": "economy",
+                "reasoning_effort": "none",
+                "confidence": 0.99,
+                "reason_codes": ["low_complexity"],
+                "fallback_chain": ["economy", "balanced", "premium"],
+            },
+            confidence_threshold=0.75,
+        )
+        values = dict(
+            run_id=run_id,
+            route_bucket="normal",
+            policy_version="shadow_tier_router_v1",
+            router_schema_version="model_policy_v1",
+            router_prompt_version="model_policy_prompt_v1",
+            mode="shadow",
+            decision=decision,
+            selected_model="gpt-5.4-nano",
+            applied_tier="premium",
+            applied_model="gpt-5.6-sol",
+            applied_reasoning_effort="low",
+            assignment_key=opaque_episode_key("secret", "episode"),
+            assignment_scope="single_turn",
+            canary_eligible=True,
+            eligibility_reason="eligible_exact_utility",
+        )
+
+        self.assertTrue(self.store.record_routing_decision(**values))
+        self.assertFalse(self.store.record_routing_decision(**values))
+        self.assertEqual(1, len(self.store.latest_routing_decisions(10)))
+
     def test_recovery_marks_pending_stage_abandoned(self) -> None:
         self.store.begin_stage(
             run_id="f" * 32,
@@ -667,9 +842,13 @@ class ModelTelemetryStoreTests(unittest.TestCase):
         self.assertEqual(1, self.store.write_failure_count)
 
     def test_schema_contains_no_payload_or_identity_columns(self) -> None:
-        columns = {
+        stage_columns = {
             str(row[1])
             for row in self.store._conn.execute("PRAGMA table_info(model_telemetry_stages)")
+        }
+        routing_columns = {
+            str(row[1])
+            for row in self.store._conn.execute("PRAGMA table_info(model_routing_decisions)")
         }
         forbidden = {
             "prompt",
@@ -683,7 +862,8 @@ class ModelTelemetryStoreTests(unittest.TestCase):
             "exception_text",
         }
 
-        self.assertTrue(forbidden.isdisjoint(columns))
+        self.assertTrue(forbidden.isdisjoint(stage_columns))
+        self.assertTrue(forbidden.isdisjoint(routing_columns))
         self.assertEqual("ok", self.store._conn.execute("PRAGMA integrity_check").fetchone()[0])
         self.assertEqual([], self.store._conn.execute("PRAGMA foreign_key_check").fetchall())
 

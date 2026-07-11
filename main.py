@@ -49,7 +49,19 @@ from media_acquisition import (
     YtDlpMediaAcquisitionAdapter,
 )
 from media_frames import FfmpegMediaFrameAdapter, MediaFrameAdapter, MediaFrameLimits, NullMediaFrameAdapter
-from model_pricing import PRICE_SNAPSHOT_VERSION
+from model_pricing import PRICE_SNAPSHOT_VERSION, token_price_for_model
+from model_routing import (
+    MODEL_POLICY_ROUTER_SYSTEM_PROMPT,
+    ModelPolicyRouter,
+    ModelRoutingDecision,
+    ModelTierAliases,
+    failed_model_routing_decision,
+    model_routing_schema,
+    normalize_model_routing_decision,
+    normalize_routing_mode,
+    opaque_episode_key,
+    shadow_canary_eligibility,
+)
 from model_telemetry import (
     ModelTelemetryStore,
     StageHandle,
@@ -176,6 +188,17 @@ class Config:
     model_telemetry_enabled: bool
     model_telemetry_retention_days: int
     model_routing_policy_version: str
+    model_routing_mode: str
+    model_router_model: str
+    model_router_reasoning_effort: str
+    model_router_max_output_tokens: int
+    model_router_confidence_threshold: float
+    model_router_timeout_seconds: float
+    model_router_schema_version: str
+    model_router_prompt_version: str
+    model_tier_economy_model: str
+    model_tier_balanced_model: str
+    model_tier_premium_model: str
     telegram_text_chunk_chars: int
     max_reply_chunks: int
     telegram_activity_presence_enabled: bool
@@ -317,25 +340,115 @@ class Config:
         if not api_key or api_key.startswith("put_"):
             raise RuntimeError("Set OPENAI_API_KEY in .env")
         proactive_chat_id = os.getenv("PROACTIVE_CHAT_ID", "").strip()
+        openai_model = os.getenv("OPENAI_MODEL", "gpt-5.6-sol").strip()
+        telemetry_enabled = _env_bool("MODEL_TELEMETRY_ENABLED", True)
         routing_policy_version = normalize_policy_version(
             os.getenv("MODEL_ROUTING_POLICY_VERSION", "primary_sol_low_v1"),
             "",
         )
         if not routing_policy_version:
             raise RuntimeError("Set MODEL_ROUTING_POLICY_VERSION to a supported policy")
+        try:
+            routing_mode = normalize_routing_mode(os.getenv("MODEL_ROUTING_MODE", "off"))
+        except ValueError as exc:
+            raise RuntimeError(str(exc)) from exc
+        model_router_model = os.getenv("MODEL_ROUTER_MODEL", "gpt-5.4-nano").strip()
+        model_router_reasoning_effort = os.getenv(
+            "MODEL_ROUTER_REASONING_EFFORT", "none"
+        ).strip().casefold()
+        if model_router_reasoning_effort not in {"none", "low", "medium", "high"}:
+            raise RuntimeError(
+                "MODEL_ROUTER_REASONING_EFFORT must be one of: none, low, medium, high"
+            )
+        model_router_schema_version = os.getenv(
+            "MODEL_ROUTER_SCHEMA_VERSION", "model_policy_v1"
+        ).strip().casefold()
+        if not re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,63}", model_router_schema_version):
+            raise RuntimeError("MODEL_ROUTER_SCHEMA_VERSION must be a safe version label")
+        model_router_prompt_version = os.getenv(
+            "MODEL_ROUTER_PROMPT_VERSION", "model_policy_prompt_v1"
+        ).strip().casefold()
+        if not re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,63}", model_router_prompt_version):
+            raise RuntimeError("MODEL_ROUTER_PROMPT_VERSION must be a safe version label")
+        tier_aliases = ModelTierAliases(
+            economy=os.getenv("MODEL_TIER_ECONOMY_MODEL", "gpt-5.4-nano").strip(),
+            balanced=os.getenv("MODEL_TIER_BALANCED_MODEL", "gpt-5.6-terra").strip(),
+            premium=os.getenv("MODEL_TIER_PREMIUM_MODEL", openai_model).strip(),
+        )
+        try:
+            tier_aliases.validate(primary_model=openai_model)
+        except ValueError as exc:
+            raise RuntimeError(str(exc)) from exc
+        if routing_mode == "shadow":
+            if model_router_schema_version != "model_policy_v1":
+                raise RuntimeError(
+                    "MODEL_ROUTING_MODE=shadow requires MODEL_ROUTER_SCHEMA_VERSION=model_policy_v1"
+                )
+            if model_router_prompt_version != "model_policy_prompt_v1":
+                raise RuntimeError(
+                    "MODEL_ROUTING_MODE=shadow requires MODEL_ROUTER_PROMPT_VERSION=model_policy_prompt_v1"
+                )
+            if not telemetry_enabled:
+                raise RuntimeError("MODEL_ROUTING_MODE=shadow requires MODEL_TELEMETRY_ENABLED=true")
+            if routing_policy_version != "shadow_tier_router_v1":
+                raise RuntimeError(
+                    "MODEL_ROUTING_MODE=shadow requires MODEL_ROUTING_POLICY_VERSION=shadow_tier_router_v1"
+                )
+            if not model_router_model:
+                raise RuntimeError("MODEL_ROUTING_MODE=shadow requires MODEL_ROUTER_MODEL")
+            priced_models = {
+                "MODEL_ROUTER_MODEL": model_router_model,
+                "MODEL_TIER_ECONOMY_MODEL": tier_aliases.economy,
+                "MODEL_TIER_BALANCED_MODEL": tier_aliases.balanced,
+                "MODEL_TIER_PREMIUM_MODEL": tier_aliases.premium,
+            }
+            unpriced = [
+                name
+                for name, model in priced_models.items()
+                if token_price_for_model(model) is None
+            ]
+            if unpriced:
+                raise RuntimeError(
+                    "Shadow model routing requires price-snapshot entries for: "
+                    + ", ".join(sorted(unpriced))
+                )
 
         return cls(
             telegram_token=token,
             openai_api_key=api_key,
             bot_username=os.getenv("BOT_USERNAME", "").strip().lstrip("@") or None,
-            openai_model=os.getenv("OPENAI_MODEL", "gpt-5.6-sol").strip(),
+            openai_model=openai_model,
             model_reasoning_effort=os.getenv("MODEL_REASONING_EFFORT", "low").strip(),
             model_verbosity=os.getenv("MODEL_VERBOSITY", "low").strip(),
             max_output_tokens=int(os.getenv("MAX_OUTPUT_TOKENS", "900")),
             agents_tracing_mode=normalize_tracing_mode(os.getenv("AGENTS_TRACING_MODE", "disabled")),
-            model_telemetry_enabled=_env_bool("MODEL_TELEMETRY_ENABLED", True),
+            model_telemetry_enabled=telemetry_enabled,
             model_telemetry_retention_days=max(1, int(os.getenv("MODEL_TELEMETRY_RETENTION_DAYS", "30"))),
             model_routing_policy_version=routing_policy_version,
+            model_routing_mode=routing_mode,
+            model_router_model=model_router_model,
+            model_router_reasoning_effort=model_router_reasoning_effort,
+            model_router_max_output_tokens=max(
+                80,
+                min(600, int(os.getenv("MODEL_ROUTER_MAX_OUTPUT_TOKENS", "240"))),
+            ),
+            model_router_confidence_threshold=_env_float(
+                "MODEL_ROUTER_CONFIDENCE_THRESHOLD",
+                0.75,
+                minimum=0.0,
+                maximum=1.0,
+            ),
+            model_router_timeout_seconds=_env_float(
+                "MODEL_ROUTER_TIMEOUT_SECONDS",
+                8.0,
+                minimum=1.0,
+                maximum=30.0,
+            ),
+            model_router_schema_version=model_router_schema_version,
+            model_router_prompt_version=model_router_prompt_version,
+            model_tier_economy_model=tier_aliases.economy,
+            model_tier_balanced_model=tier_aliases.balanced,
+            model_tier_premium_model=tier_aliases.premium,
             bot_trigger=os.getenv("BOT_TRIGGER", "!m").strip(),
             bot_timezone=os.getenv("BOT_TIMEZONE", "America/New_York").strip() or "America/New_York",
             prompt_privacy_guard_enabled=_env_bool("PROMPT_PRIVACY_GUARD_ENABLED", True),
@@ -1222,6 +1335,13 @@ PROFILE_RECENT_TAIL = 15
 MIN_PROFILE_MESSAGES = 10
 SELF_TARGET_ALIASES = {"", "мій", "моя", "мої", "я", "me", "my", "self"}
 URL_TOKEN_RE = re.compile(r"https?://\S+|www\.\S+", re.IGNORECASE)
+MODEL_POLICY_BARE_DOMAIN_RE = re.compile(
+    r"(?<![A-Za-z0-9_@])"
+    r"(?:[A-Za-z0-9._%+-]+@)?"
+    r"(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+"
+    r"[A-Za-z]{2,63}(?::\d{1,5})?(?:/[^\s]*)?",
+    re.IGNORECASE,
+)
 MENTION_TOKEN_RE = re.compile(r"@[A-Za-z0-9_]{1,64}")
 SLASH_COMMAND_TOKEN_RE = re.compile(r"/(?:[A-Za-z0-9_]+|[^\W\d_]+)(?:@[A-Za-z0-9_]+)?", re.UNICODE)
 STAT_OUTPUT_LINE_RE = re.compile(r"^\s*\d+[.)]\s+\S+\s+-\s+\d+\s*$")
@@ -4694,6 +4814,330 @@ async def classify_request_with_intent(message: Message, prompt: str) -> tuple[s
     return "normal", recall_intent
 
 
+def configured_model_tier_aliases() -> ModelTierAliases:
+    return ModelTierAliases(
+        economy=CONFIG.model_tier_economy_model,
+        balanced=CONFIG.model_tier_balanced_model,
+        premium=CONFIG.model_tier_premium_model,
+    )
+
+
+def model_policy_mutation_requested(
+    message: Message,
+    prompt: str,
+    tool_route_decision: ToolRouteDecision | None,
+) -> bool:
+    if (
+        tool_route_decision is not None
+        and tool_route_decision.intent in REMINDER_MUTATION_INTENTS
+    ):
+        return True
+    if deterministic_reminder_intent(prompt) in REMINDER_MUTATION_INTENTS:
+        return True
+    text = (prompt or "").strip()
+    return bool(
+        text
+        and REMINDER_CONTEXTUAL_MUTATION_FOLLOWUP_RE.search(text)
+        and recent_reminder_mutation_context(
+            int(getattr(message, "chat_id", 0) or 0),
+            message_user_id(message),
+        )
+    )
+
+
+def model_policy_reference_available(message: Message) -> bool:
+    quote = getattr(message, "quote", None)
+    return bool(
+        getattr(quote, "text", None)
+        or getattr(message, "reply_to_message", None) is not None
+        or getattr(message, "external_reply", None) is not None
+    )
+
+
+def build_model_policy_router_metadata(
+    message: Message,
+    prompt: str,
+    *,
+    route: str,
+    tool_route_decision: ToolRouteDecision | None,
+) -> dict[str, Any]:
+    reply = getattr(message, "reply_to_message", None)
+    reply_to_bot = bool(
+        reply is not None
+        and getattr(reply, "from_user", None) is not None
+        and getattr(reply.from_user, "id", None) == BOT_ID
+    )
+    has_reference = model_policy_reference_available(message)
+    mutation_capability = bool(
+        tool_route_decision is not None
+        and tool_route_decision.allowed_toolsets
+    )
+    mutation_requested = model_policy_mutation_requested(
+        message,
+        prompt,
+        tool_route_decision,
+    )
+    raw_prompt = prompt or ""
+    redacted_prompt = URL_TOKEN_RE.sub("[url]", raw_prompt)
+    redacted_prompt = MODEL_POLICY_BARE_DOMAIN_RE.sub("[url]", redacted_prompt)
+    contains_url = has_url(raw_prompt) or bool(
+        MODEL_POLICY_BARE_DOMAIN_RE.search(raw_prompt)
+    )
+    short_followup = is_short_followup_prompt(prompt)
+    return {
+        "trusted_text": clip_text(redacted_prompt, 1200),
+        "request_route": normalize_route_bucket(route, "other"),
+        "chat_type": str(getattr(message.chat, "type", "") or ""),
+        "has_reply": reply is not None,
+        "reply_to_bot": reply_to_bot,
+        "has_reference": has_reference,
+        "has_attachment": has_supported_image(message) or has_supported_visual_media(message),
+        "has_url": contains_url,
+        "short_followup": short_followup,
+        "short_unanchored_followup": short_followup and not (reply is not None or has_reference),
+        "mutation_capability": mutation_capability,
+        "mutation_requested": mutation_requested,
+        "tool_intent": (
+            tool_route_decision.intent
+            if tool_route_decision is not None
+            else "none"
+        ),
+    }
+
+
+def model_routing_episode_identity(message: Message) -> tuple[str, str]:
+    thread_id = message_thread_id(message)
+    if thread_id is not None:
+        scope = "thread"
+        anchor: object = thread_id
+    else:
+        scope = "single_turn"
+        anchor = getattr(message, "message_id", 0)
+    return (
+        opaque_episode_key(
+            provenance_hash_secret(),
+            "model-routing-v1",
+            getattr(message, "chat_id", 0),
+            scope,
+            anchor,
+        ),
+        scope,
+    )
+
+
+async def run_model_policy_router(
+    metadata: dict[str, Any],
+    *,
+    run_id: str,
+    route_bucket: str,
+) -> str:
+    stage = begin_model_stage(
+        stage_kind="model_policy_router",
+        intended_model=CONFIG.model_router_model,
+        reasoning_effort=CONFIG.model_router_reasoning_effort,
+        endpoint="responses",
+        run_id=run_id,
+        route_bucket=route_bucket,
+        task_class_bucket="model_policy_router",
+    )
+    try:
+        async with asyncio.timeout(CONFIG.model_router_timeout_seconds):
+            async with AsyncOpenAI(
+                api_key=CONFIG.openai_api_key,
+                timeout=CONFIG.model_router_timeout_seconds,
+                max_retries=0,
+            ) as client:
+                response = await client.responses.create(
+                    model=CONFIG.model_router_model,
+                    input=[
+                        {
+                            "role": "system",
+                            "content": [
+                                {
+                                    "type": "input_text",
+                                    "text": MODEL_POLICY_ROUTER_SYSTEM_PROMPT,
+                                }
+                            ],
+                        },
+                        {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "input_text",
+                                    "text": json.dumps(
+                                        metadata,
+                                        ensure_ascii=False,
+                                        sort_keys=True,
+                                    ),
+                                }
+                            ],
+                        },
+                    ],
+                    reasoning={"effort": CONFIG.model_router_reasoning_effort},
+                    max_output_tokens=CONFIG.model_router_max_output_tokens,
+                    text={
+                        "format": {
+                            "type": "json_schema",
+                            "name": CONFIG.model_router_schema_version,
+                            "strict": True,
+                            "schema": model_routing_schema(),
+                        }
+                    },
+                )
+    except asyncio.CancelledError as exc:
+        finish_model_stage(stage, status="cancelled", failure_class=exc)
+        raise
+    except Exception as exc:
+        finish_model_stage(stage, status="failed", failure_class=exc)
+        raise
+    status, failure_class = response_telemetry_status(response)
+    actual_model, actual_model_source = response_actual_model(response)
+    finish_model_stage(
+        stage,
+        status=status,
+        usage=response_usage(response),
+        actual_model=actual_model,
+        actual_model_source=actual_model_source,
+        actual_reasoning_effort=response_actual_reasoning_effort(response),
+        failure_class=failure_class,
+    )
+    if status != "succeeded":
+        raise RuntimeError("model_policy_router_provider_failure")
+    return response.output_text.strip()
+
+
+async def evaluate_model_policy_shadow(
+    metadata: dict[str, Any],
+    *,
+    run_id: str,
+    route_bucket: str,
+    assignment_key: str,
+    assignment_scope: str,
+) -> ModelRoutingDecision:
+    route_bucket = normalize_route_bucket(route_bucket, "other")
+    try:
+        raw = await run_model_policy_router(
+            metadata,
+            run_id=run_id,
+            route_bucket=route_bucket,
+        )
+        decision = ModelPolicyRouter(
+            confidence_threshold=CONFIG.model_router_confidence_threshold
+        ).decide(
+            json.loads(raw),
+            route_bucket=route_bucket,
+            mutation_requested=bool(metadata.get("mutation_requested")),
+            short_unanchored_followup=bool(metadata.get("short_unanchored_followup")),
+            source_context=bool(metadata.get("has_reference")),
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        LOGGER.warning("Model policy router failed error=%s", type(exc).__name__)
+        decision = failed_model_routing_decision()
+
+    canary_eligible, eligibility_reason = shadow_canary_eligibility(
+        decision,
+        route_bucket=route_bucket,
+        has_url=bool(metadata.get("has_url")),
+        has_attachment=bool(metadata.get("has_attachment")),
+        has_reference=bool(metadata.get("has_reference")),
+        mutation_capability=bool(metadata.get("mutation_capability")),
+        short_followup=bool(metadata.get("short_followup")),
+        mutation_requested=bool(metadata.get("mutation_requested")),
+    )
+    selected_model = configured_model_tier_aliases().model_for(decision.selected_tier)
+    recorded = False
+    if MODEL_TELEMETRY is not None:
+        recorded = MODEL_TELEMETRY.record_routing_decision(
+            run_id=run_id,
+            route_bucket=route_bucket,
+            policy_version=CONFIG.model_routing_policy_version,
+            router_schema_version=CONFIG.model_router_schema_version,
+            router_prompt_version=CONFIG.model_router_prompt_version,
+            mode="shadow",
+            decision=decision,
+            selected_model=selected_model,
+            applied_tier="premium",
+            applied_model=CONFIG.openai_model,
+            applied_reasoning_effort=CONFIG.model_reasoning_effort,
+            assignment_key=assignment_key,
+            assignment_scope=assignment_scope,
+            canary_eligible=canary_eligible,
+            eligibility_reason=eligibility_reason,
+        )
+    system_event(
+        level="info" if recorded else "warning",
+        component="model_policy_router",
+        event_type="shadow_decision" if recorded else "shadow_decision_unrecorded",
+        route=route_bucket,
+        message=decision.task_class,
+        details={
+            "mode": "shadow",
+            "schema_version": CONFIG.model_router_schema_version,
+            "prompt_version": CONFIG.model_router_prompt_version,
+            "task_class": decision.task_class,
+            "selected_tier": decision.selected_tier,
+            "applied_tier": "premium",
+            "outcome": decision.outcome,
+            "fallback_reason": decision.fallback_reason,
+            "canary_eligible": canary_eligible,
+            "eligibility_reason": eligibility_reason,
+        },
+    )
+    return decision
+
+
+def schedule_model_policy_shadow(
+    message: Message,
+    context: ContextTypes.DEFAULT_TYPE,
+    prompt: str,
+    *,
+    route: str,
+    outbound_provenance: OutboundProvenance,
+    tool_route_decision: ToolRouteDecision | None,
+) -> bool:
+    if CONFIG.model_routing_mode != "shadow":
+        return False
+    coroutine: Any = None
+    try:
+        metadata = build_model_policy_router_metadata(
+            message,
+            prompt,
+            route=route,
+            tool_route_decision=tool_route_decision,
+        )
+        assignment_key, assignment_scope = model_routing_episode_identity(message)
+        coroutine = evaluate_model_policy_shadow(
+            metadata,
+            run_id=outbound_provenance.run_id,
+            route_bucket=route,
+            assignment_key=assignment_key,
+            assignment_scope=assignment_scope,
+        )
+        schedule_background_task(context, coroutine)
+        return True
+    except Exception as exc:
+        if coroutine is not None and hasattr(coroutine, "close"):
+            try:
+                coroutine.close()
+            except Exception:
+                pass
+        LOGGER.warning(
+            "Model policy shadow scheduling failed error=%s",
+            type(exc).__name__,
+        )
+        system_event(
+            level="warning",
+            component="model_policy_router",
+            event_type="shadow_schedule_failed",
+            route=normalize_route_bucket(route, "other"),
+            message="scheduling_failed",
+            details={"failure_class": type(exc).__name__[:80]},
+        )
+        return False
+
+
 def is_image_request(prompt: str) -> bool:
     lowered = prompt.lower()
     keywords = (
@@ -6767,6 +7211,23 @@ def model_telemetry_health_text(lookback_seconds: int | None = None) -> str:
         f"{safe_detail_code(str(key))}={int(value)}"
         for key, value in sorted(status_counts.items())
     ) or "none"
+    routing_summary = summary.get("routing") if isinstance(summary, dict) else {}
+    if not isinstance(routing_summary, dict):
+        routing_summary = {}
+    routing_tiers = routing_summary.get("selected_tier_counts")
+    if not isinstance(routing_tiers, dict):
+        routing_tiers = {}
+    routing_outcomes = routing_summary.get("outcome_counts")
+    if not isinstance(routing_outcomes, dict):
+        routing_outcomes = {}
+    routing_tier_text = ", ".join(
+        f"{safe_detail_code(str(key))}={int(value)}"
+        for key, value in sorted(routing_tiers.items())
+    ) or "none"
+    routing_outcome_text = ", ".join(
+        f"{safe_detail_code(str(key))}={int(value)}"
+        for key, value in sorted(routing_outcomes.items())
+    ) or "none"
     cost_nano_usd = int(summary.get("known_cost_nano_usd", 0) or 0)
     stage_count = int(summary.get("stage_count", 0) or 0)
     cost_incomplete = int(summary.get("cost_incomplete_count", 0) or 0)
@@ -6785,6 +7246,12 @@ def model_telemetry_health_text(lookback_seconds: int | None = None) -> str:
             f"- tracing_mode: {CONFIG.agents_tracing_mode}",
             f"- trace_exporter: {agents_trace_exporter_status()}",
             f"- policy_version: {safe_detail_code(CONFIG.model_routing_policy_version)}",
+            f"- routing_mode: {safe_detail_code(CONFIG.model_routing_mode)}",
+            f"- routing_decisions: {int(routing_summary.get('decision_count', 0) or 0)} "
+            f"(tiers={routing_tier_text}; outcomes={routing_outcome_text})",
+            f"- routing_fallbacks: {int(routing_summary.get('fallback_count', 0) or 0)}",
+            f"- routing_canary_eligible: {int(routing_summary.get('canary_eligible_count', 0) or 0)}",
+            f"- routing_last_decision_at: {routing_summary.get('last_decision_at') or 'never'}",
             f"- price_snapshot: {PRICE_SNAPSHOT_VERSION}",
             f"- retention_days: {CONFIG.model_telemetry_retention_days}",
             f"- stages: {stage_count} ({status_text})",
@@ -7076,6 +7543,48 @@ def configured_capability_rows() -> list[CapabilityRow]:
                 "max_due_per_tick": CONFIG.reminder_max_due_per_tick,
                 **reminder_details,
             },
+        )
+    )
+    model_policy_router_enabled = CONFIG.model_routing_mode == "shadow"
+    model_policy_router_configured = bool(
+        model_policy_router_enabled
+        and CONFIG.model_router_model
+        and CONFIG.model_tier_economy_model
+        and CONFIG.model_tier_balanced_model
+        and CONFIG.model_tier_premium_model == CONFIG.openai_model
+        and MODEL_TELEMETRY is not None
+    )
+    rows.append(
+        CapabilityRow(
+            name="model_policy_router",
+            family="routing",
+            enabled=model_policy_router_enabled,
+            configured=model_policy_router_configured,
+            available=False,
+            status=(
+                "configured_unverified"
+                if model_policy_router_configured
+                else ("unconfigured" if model_policy_router_enabled else "disabled")
+            ),
+            adapter="OpenAI Responses",
+            mode=CONFIG.model_routing_mode,
+            backend=CONFIG.model_router_model,
+            details={
+                "schema_version": CONFIG.model_router_schema_version,
+                "prompt_version": CONFIG.model_router_prompt_version,
+                "policy_version": CONFIG.model_routing_policy_version,
+                "confidence_threshold": CONFIG.model_router_confidence_threshold,
+                "timeout_seconds": CONFIG.model_router_timeout_seconds,
+                "economy_model": CONFIG.model_tier_economy_model,
+                "balanced_model": CONFIG.model_tier_balanced_model,
+                "premium_model": CONFIG.model_tier_premium_model,
+                "answer_path_unchanged": True,
+            },
+            next_action=(
+                "check model routing configuration"
+                if model_policy_router_enabled and not model_policy_router_configured
+                else ""
+            ),
         )
     )
     tool_router_model_configured = bool(CONFIG.tool_router_model)
@@ -10520,6 +11029,14 @@ async def _handle_prompt_generation(
 
     if route == "translate_reference":
         emit_prompt_route_decision(no_tool_route("skipped_translate_reference"))
+        schedule_model_policy_shadow(
+            message,
+            context,
+            prompt,
+            route=route,
+            outbound_provenance=outbound_provenance,
+            tool_route_decision=None,
+        )
         presence = activity_presence_for_message(message, bot=context.bot, action=activity_action_for_route(route))
         await presence.start()
         try:
@@ -10550,6 +11067,14 @@ async def _handle_prompt_generation(
         return
 
     tool_route_decision = await route_tool_capabilities_for_message(message, prompt)
+    schedule_model_policy_shadow(
+        message,
+        context,
+        prompt,
+        route=route,
+        outbound_provenance=outbound_provenance,
+        tool_route_decision=tool_route_decision,
+    )
     emit_prompt_route_decision(tool_route_decision)
     presence = activity_presence_for_message(message, bot=context.bot, action=activity_action_for_route(route))
     await presence.start()
