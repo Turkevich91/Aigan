@@ -31,15 +31,16 @@ and run matrix
 `203ad336482d56dd3f1fe1995c24f8b089734dd85fc75da325a8aff330518673`.
 Later commits do not change or relabel that frozen result.
 
-Post-result review found that v5 let the operator choose the receipt path, so
-a different filename could bypass the one-time holdout claim. Evaluator v6 is
-a prospective safety-only contract: the claim path is no longer a CLI input,
+Post-result review found that evaluator v5 let the operator choose the receipt
+path, so a different filename could bypass the one-time holdout claim.
+Evaluator v6 is a prospective safety-only contract: the claim path is no longer
+a CLI input,
 its key depends only on frozen holdout content, and it lives in private durable
 state for the effective POSIX user. CI, detected common ephemeral-container
 markers, symlinked state, non-owner state, and group/other-accessible state fail
 before any provider call.
-No model or holdout call was made under evaluator v6, and v5 reports cannot
-satisfy its new bundle/manifest hashes.
+No model or holdout call was made under evaluator v6, and evaluator-v5 reports
+cannot satisfy its new bundle/manifest hashes.
 Evaluator fixture/prompt and selector report/output filesystem or decoding
 failures terminate as bounded CLI errors rather than tracebacks. Claim-write
 failures remain pre-provider and fail closed; result-write failures are bounded
