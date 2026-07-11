@@ -25,8 +25,12 @@ def _private_root(repo_root: Path) -> Path:
         private_root.relative_to(data_root)
     except ValueError as exc:
         raise ContextSelectionReplayError("private root escaped ignored data directory") from exc
-    data_writable = private_root.exists() and os.access(private_root, os.W_OK)
-    data_writable = data_writable or (not private_root.exists() and os.access(data_root, os.W_OK))
+    if private_root.exists():
+        data_writable = private_root.is_dir() and os.access(private_root, os.W_OK)
+    elif data_root.exists():
+        data_writable = data_root.is_dir() and os.access(data_root, os.W_OK)
+    else:
+        data_writable = os.access(data_root.parent, os.W_OK)
     if data_writable:
         git = shutil.which("git")
         if git is not None:
@@ -58,6 +62,11 @@ def _private_root(repo_root: Path) -> Path:
     raise ContextSelectionReplayError("private fallback cannot be inside the repository")
 
 
+def _fail(message: str) -> int:
+    print(f"context-selection replay build failed: {message}", file=sys.stderr)
+    return 2
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Build the local-only #119 human-review pool from retained runtime evidence."
@@ -87,13 +96,11 @@ def main() -> int:
             historical_output_window_seconds=args.historical_output_window_seconds,
         )
     except ContextSelectionReplayError as exc:
-        print(f"context-selection replay build failed: {exc}", file=sys.stderr)
-        return 2
+        return _fail(str(exc))
     # This is the final private-data boundary: row corruption and schema drift
     # must fail type-only instead of escaping through a traceback with payloads.
     except Exception as exc:
-        print(f"context-selection replay build failed: {type(exc).__name__}", file=sys.stderr)
-        return 2
+        return _fail(type(exc).__name__)
     print(json.dumps(manifest, ensure_ascii=False, sort_keys=True))
     return 0
 

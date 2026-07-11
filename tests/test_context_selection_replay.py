@@ -323,6 +323,20 @@ class ContextSelectionReplayTests(unittest.TestCase):
         )
         self.assertNotIn(private_sentinel, stderr.getvalue())
 
+    def test_private_root_uses_ignored_repo_data_when_data_is_absent(self) -> None:
+        from scripts import build_context_selection_replay as command
+
+        with tempfile.TemporaryDirectory() as directory:
+            repo_root = Path(directory)
+            (repo_root / ".gitignore").write_text("data/\n", encoding="utf-8")
+            with patch.object(command.shutil, "which", return_value=None):
+                private_root = command._private_root(repo_root)
+            self.assertEqual(
+                (repo_root / "data/research/context-selection-v1").resolve(),
+                private_root,
+            )
+            self.assertFalse((repo_root / "data").exists())
+
     def test_cli_bounds_corrupt_row_failures_without_payload(self) -> None:
         from scripts import build_context_selection_replay as command
 
