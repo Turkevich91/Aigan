@@ -1053,7 +1053,7 @@ def paired_top1_comparison(
         by_class_family[eligibility_class][family].append(delta)
     point_delta = (
         statistics.fmean(
-            statistics.fmean(delta for family_values in families.values() for delta in family_values)
+            statistics.fmean(statistics.fmean(values) for values in families.values())
             for families in by_class_family.values()
         )
         if by_class_family
@@ -1070,10 +1070,11 @@ def paired_top1_comparison(
             sample_delta = 0.0
             for eligibility_class, families in sorted(by_class_family.items()):
                 family_names = sorted(families)
-                sampled_values: list[int] = []
-                for _family_index in range(len(family_names)):
-                    sampled_values.extend(families[rng.choice(family_names)])
-                sample_delta += class_weight * statistics.fmean(sampled_values)
+                sampled_family_means = [
+                    statistics.fmean(families[rng.choice(family_names)])
+                    for _family_index in range(len(family_names))
+                ]
+                sample_delta += class_weight * statistics.fmean(sampled_family_means)
             bootstrap.append(sample_delta)
 
     family_deltas = [
@@ -1085,7 +1086,7 @@ def paired_top1_comparison(
     right_family_only = sum(delta > 0 for delta in family_deltas)
     return {
         "eligible_cases": len(rows),
-        "estimand": "macro_equal_class",
+        "estimand": "macro_equal_class_equal_family",
         "family_counts_by_class": {
             eligibility_class: len(families)
             for eligibility_class, families in sorted(by_class_family.items())

@@ -17,6 +17,9 @@ from context_selection_eval import (
     candidate_snapshot_sha256,
     evaluate_context_selection_fixture,
     load_context_selection_fixture,
+    paired_top1_comparison,
+    score_case,
+    select_b0,
     select_b1,
     select_c1,
 )
@@ -130,6 +133,47 @@ class ContextSelectionContractTests(unittest.TestCase):
         first = evaluate_context_selection_fixture(FIXTURE, bootstrap_samples=250)
         second = evaluate_context_selection_fixture(FIXTURE, bootstrap_samples=250)
         self.assertEqual(first["comparisons"], second["comparisons"])
+
+    def test_point_estimate_weights_families_equally_when_sizes_differ(self) -> None:
+        case = load_context_selection_fixture(FIXTURE)[0]
+        template = score_case(case, select_b0(case.deployed))
+        rows = [
+            ("large-1", "large-family", False, True),
+            ("large-2", "large-family", False, True),
+            ("large-3", "large-family", False, True),
+            ("large-4", "large-family", False, True),
+            ("small-1", "small-family", True, False),
+        ]
+        left = [
+            replace(
+                template,
+                case_id=case_id,
+                case_family=family,
+                eligibility_class="explicit_reply",
+                top1_eligible=True,
+                top1_correct=left_correct,
+            )
+            for case_id, family, left_correct, _right_correct in rows
+        ]
+        right = [
+            replace(
+                template,
+                case_id=case_id,
+                case_family=family,
+                eligibility_class="explicit_reply",
+                top1_eligible=True,
+                top1_correct=right_correct,
+            )
+            for case_id, family, _left_correct, right_correct in rows
+        ]
+        comparison = paired_top1_comparison(
+            left,
+            right,
+            bootstrap_samples=0,
+            seed=119,
+        )
+        self.assertEqual("macro_equal_class_equal_family", comparison["estimand"])
+        self.assertEqual(0.0, comparison["delta_right_minus_left"])
 
     def test_future_source_is_rejected_without_echoing_payload(self) -> None:
         case = build_cases()[0]

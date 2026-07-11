@@ -243,11 +243,12 @@ The current source-selection stage records raw counts for:
 - selected-source count, context characters, compile time, explicit drop
   reasons, and amortized C1 construction use.
 
-Top-1 comparisons are paired. The primary interval is a deterministic,
-equal-class estimand with a stratified cluster bootstrap over replay
-window/case family. A family-level exact sign test is secondary evidence. Raw
-counts are retained alongside rates; the bundle does not report an
-independence-assuming per-message interval.
+Top-1 comparisons are paired. The primary estimand gives every class equal
+weight and every family equal weight within its class, so repeated cases in a
+large family cannot dominate the point estimate. The deterministic cluster
+bootstrap resamples those same family means within class. A family-level exact
+sign test is secondary evidence. Raw counts are retained alongside rates; the
+bundle does not report an independence-assuming per-message interval.
 
 The minimum useful effect remains ten percentage points for C1 over both B0 and
 B1. This bundle records comparisons but does not implement that decision gate.
