@@ -1,14 +1,94 @@
 import os
 import re
+import sys
 import tempfile
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
+if __package__ in {None, ""}:
+    # MCPServerStdio executes this file directly, so expose the project modules.
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
 from mcp.server.fastmcp import FastMCP
+from model_telemetry import ModelTelemetryStore, StageHandle
 from youtube_transcript_api import YouTubeTranscriptApi
 
 
 mcp = FastMCP("aigan-youtube-transcript")
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().casefold() in {"1", "true", "yes", "on"}
+
+
+def _build_model_telemetry_store() -> ModelTelemetryStore | None:
+    if not _env_bool("MODEL_TELEMETRY_ENABLED", False):
+        return None
+    db_path = os.getenv("MODEL_TELEMETRY_DB_PATH", "").strip() or os.getenv(
+        "MEMORY_DB_PATH", ""
+    ).strip()
+    if not db_path:
+        return None
+    try:
+        retention_days = max(
+            1,
+            int(os.getenv("MODEL_TELEMETRY_RETENTION_DAYS", "30").strip()),
+        )
+        return ModelTelemetryStore(Path(db_path), retention_days=retention_days)
+    except Exception:
+        # Telemetry is deliberately best-effort and must never disable the tool.
+        return None
+
+
+MODEL_TELEMETRY = _build_model_telemetry_store()
+
+
+def _begin_transcription_stage(model: str) -> StageHandle | None:
+    store = MODEL_TELEMETRY
+    if store is None:
+        return None
+    try:
+        return store.begin_stage(
+            run_id=os.getenv("AIGAN_MODEL_RUN_ID", ""),
+            route_bucket=os.getenv("AIGAN_MODEL_ROUTE_BUCKET", "tool"),
+            task_class_bucket="youtube_transcript",
+            policy_version=os.getenv("MODEL_ROUTING_POLICY_VERSION", ""),
+            stage_kind="transcription",
+            intended_model=model,
+            endpoint="audio_transcriptions",
+        )
+    except Exception:
+        return None
+
+
+def _finish_transcription_stage(
+    handle: StageHandle | None,
+    *,
+    status: str,
+    usage: object | None = None,
+    failure_class: type[BaseException] | None = None,
+) -> None:
+    store = MODEL_TELEMETRY
+    if store is None or handle is None:
+        return
+    try:
+        store.finish_stage(
+            handle,
+            status=status,
+            usage=usage,
+            # The transcription response does not report an effective model.
+            actual_model="",
+            actual_model_source="not_reported",
+            failure_class=failure_class,
+            fallback_reason="captions_unavailable",
+            retry_count=0,
+        )
+    except Exception:
+        # A telemetry sink failure must not change the transcription result.
+        return
 
 
 def _video_id(value: str) -> str:
@@ -98,8 +178,22 @@ def _transcribe_audio_fallback(video_url: str, max_chars: int) -> str:
             return "Audio download finished, but no audio file was found."
 
         client = OpenAI()
-        with audio_files[0].open("rb") as audio_file:
-            result = client.audio.transcriptions.create(model=model, file=audio_file)
+        stage = _begin_transcription_stage(model)
+        try:
+            with audio_files[0].open("rb") as audio_file:
+                result = client.audio.transcriptions.create(model=model, file=audio_file)
+        except Exception as exc:
+            _finish_transcription_stage(
+                stage,
+                status="failed",
+                failure_class=type(exc),
+            )
+            raise
+        _finish_transcription_stage(
+            stage,
+            status="succeeded",
+            usage=getattr(result, "usage", None),
+        )
         text = getattr(result, "text", str(result))
         return text[:max_chars]
 

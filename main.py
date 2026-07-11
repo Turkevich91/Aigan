@@ -23,7 +23,15 @@ from pathlib import Path
 from typing import AbstractSet, Any, Callable, Sequence, cast
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from agents import Agent, ModelSettings, RunConfig, RunHooks, Runner, function_tool
+from agents import (
+    Agent,
+    ModelSettings,
+    RunConfig,
+    RunHooks,
+    Runner,
+    function_tool,
+    set_tracing_disabled,
+)
 from agents.mcp import MCPServerStdio
 from openai import OpenAI
 from telegram import Bot, InputMediaPhoto, Message, MessageEntity, Update
@@ -40,6 +48,16 @@ from media_acquisition import (
     YtDlpMediaAcquisitionAdapter,
 )
 from media_frames import FfmpegMediaFrameAdapter, MediaFrameAdapter, MediaFrameLimits, NullMediaFrameAdapter
+from model_pricing import PRICE_SNAPSHOT_VERSION
+from model_telemetry import (
+    ModelTelemetryStore,
+    StageHandle,
+    normalize_policy_version,
+    normalize_route_bucket,
+    normalize_run_id,
+    normalize_task_class_bucket,
+    normalize_tracing_mode,
+)
 from outbound_reactions import NullReactionAdapter, OutboundReactionAdapter, OutboundReactionConfig, ReactionAdapter
 from provenance import ToolProvenance, extract_tool_provenance, make_tool_provenance, renumber_tool_provenance
 from reaction_memory import ReactionAsset, ReactionMemoryStore, ReactionPreference, ReactionSpec
@@ -153,6 +171,10 @@ class Config:
     model_reasoning_effort: str
     model_verbosity: str
     max_output_tokens: int
+    agents_tracing_mode: str
+    model_telemetry_enabled: bool
+    model_telemetry_retention_days: int
+    model_routing_policy_version: str
     telegram_text_chunk_chars: int
     max_reply_chunks: int
     telegram_activity_presence_enabled: bool
@@ -294,6 +316,12 @@ class Config:
         if not api_key or api_key.startswith("put_"):
             raise RuntimeError("Set OPENAI_API_KEY in .env")
         proactive_chat_id = os.getenv("PROACTIVE_CHAT_ID", "").strip()
+        routing_policy_version = normalize_policy_version(
+            os.getenv("MODEL_ROUTING_POLICY_VERSION", "primary_sol_low_v1"),
+            "",
+        )
+        if not routing_policy_version:
+            raise RuntimeError("Set MODEL_ROUTING_POLICY_VERSION to a supported policy")
 
         return cls(
             telegram_token=token,
@@ -303,6 +331,10 @@ class Config:
             model_reasoning_effort=os.getenv("MODEL_REASONING_EFFORT", "low").strip(),
             model_verbosity=os.getenv("MODEL_VERBOSITY", "low").strip(),
             max_output_tokens=int(os.getenv("MAX_OUTPUT_TOKENS", "900")),
+            agents_tracing_mode=normalize_tracing_mode(os.getenv("AGENTS_TRACING_MODE", "disabled")),
+            model_telemetry_enabled=_env_bool("MODEL_TELEMETRY_ENABLED", True),
+            model_telemetry_retention_days=max(1, int(os.getenv("MODEL_TELEMETRY_RETENTION_DAYS", "30"))),
+            model_routing_policy_version=routing_policy_version,
             bot_trigger=os.getenv("BOT_TRIGGER", "!m").strip(),
             bot_timezone=os.getenv("BOT_TIMEZONE", "America/New_York").strip() or "America/New_York",
             prompt_privacy_guard_enabled=_env_bool("PROMPT_PRIVACY_GUARD_ENABLED", True),
@@ -464,7 +496,17 @@ class Config:
         )
 
 
+def apply_agents_tracing_policy(mode: str) -> str:
+    resolved = normalize_tracing_mode(mode)
+    # The SDK also reads OPENAI_AGENTS_DISABLE_TRACING globally. A manual
+    # override makes this project setting authoritative instead of letting a
+    # stale legacy environment variable silently win over per-run RunConfig.
+    set_tracing_disabled(resolved == "disabled")
+    return resolved
+
+
 CONFIG = Config.from_env()
+apply_agents_tracing_policy(CONFIG.agents_tracing_mode)
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
@@ -528,6 +570,18 @@ REMINDERS = ReminderStore(CONFIG.memory_db_path) if CONFIG.reminders_enabled els
 SYSTEM_LOG = (
     SystemLogStore(CONFIG.memory_db_path, CONFIG.system_log_retention_days) if CONFIG.system_log_enabled else None
 )
+MODEL_TELEMETRY: ModelTelemetryStore | None = None
+if CONFIG.model_telemetry_enabled:
+    try:
+        MODEL_TELEMETRY = ModelTelemetryStore(
+            CONFIG.memory_db_path,
+            CONFIG.model_telemetry_retention_days,
+        )
+    except Exception as exc:
+        LOGGER.warning(
+            "Model telemetry initialization failed; continuing without it error=%s",
+            type(exc).__name__,
+        )
 SOCIAL_MEMORY = (
     SocialMemoryStore(CONFIG.memory_db_path, CONFIG.social_profile_retention_days)
     if CONFIG.memory_enabled and CONFIG.social_memory_enabled
@@ -568,10 +622,181 @@ def delivered_text(result: TextDeliveryResult) -> str:
     return "\n".join(result.delivered_chunks).strip()
 
 
+ACTIVE_MODEL_RUN_ID: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "active_model_run_id",
+    default="",
+)
+ACTIVE_MODEL_ROUTE_BUCKET: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "active_model_route_bucket",
+    default="pre_route",
+)
+ACTIVE_MODEL_TASK_CLASS_BUCKET: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "active_model_task_class_bucket",
+    default="",
+)
 ACTIVE_OUTBOUND_PROVENANCE: contextvars.ContextVar[OutboundProvenance | None] = contextvars.ContextVar(
     "active_outbound_provenance",
     default=None,
 )
+
+
+def current_model_run_id(explicit_run_id: str = "") -> str:
+    if explicit_run_id.strip():
+        return normalize_run_id(explicit_run_id)
+    active_run_id = ACTIVE_MODEL_RUN_ID.get().strip()
+    if active_run_id:
+        return normalize_run_id(active_run_id)
+    provenance = ACTIVE_OUTBOUND_PROVENANCE.get()
+    if provenance is not None and provenance.run_id:
+        return normalize_run_id(provenance.run_id)
+    return secrets.token_hex(16)
+
+
+def current_model_route_bucket(explicit_route: str = "") -> str:
+    if explicit_route.strip():
+        return normalize_route_bucket(explicit_route, "other")
+    provenance = ACTIVE_OUTBOUND_PROVENANCE.get()
+    if provenance is not None and provenance.route:
+        return normalize_route_bucket(provenance.route, "other")
+    return normalize_route_bucket(ACTIVE_MODEL_ROUTE_BUCKET.get(), "pre_route")
+
+
+def begin_model_stage(
+    *,
+    stage_kind: str,
+    intended_model: str,
+    reasoning_effort: str = "",
+    endpoint: str,
+    run_id: str = "",
+    route_bucket: str = "",
+    task_class_bucket: str = "",
+) -> StageHandle | None:
+    if MODEL_TELEMETRY is None:
+        return None
+    try:
+        return MODEL_TELEMETRY.begin_stage(
+            run_id=current_model_run_id(run_id),
+            route_bucket=current_model_route_bucket(route_bucket),
+            task_class_bucket=normalize_task_class_bucket(
+                task_class_bucket or ACTIVE_MODEL_TASK_CLASS_BUCKET.get() or stage_kind,
+                "other",
+            ),
+            policy_version=CONFIG.model_routing_policy_version,
+            stage_kind=stage_kind,
+            intended_model=intended_model,
+            reasoning_effort=reasoning_effort,
+            endpoint=endpoint,
+        )
+    except Exception as exc:
+        LOGGER.debug("Model telemetry begin failed error=%s", type(exc).__name__)
+        return None
+
+
+def finish_model_stage(
+    handle: StageHandle | None,
+    *,
+    status: str,
+    usage: Any = None,
+    stage_kind: str | None = None,
+    actual_model: str = "",
+    actual_model_source: str = "not_reported",
+    actual_reasoning_effort: str = "",
+    failure_class: str | type[BaseException] | BaseException | None = None,
+    retry_count: int | None = 0,
+) -> bool:
+    if MODEL_TELEMETRY is None or handle is None:
+        return False
+    try:
+        values: dict[str, Any] = {
+            "status": status,
+            "usage": usage,
+            "actual_model": actual_model,
+            "actual_model_source": actual_model_source,
+            "actual_reasoning_effort": actual_reasoning_effort,
+            "failure_class": failure_class,
+            "retry_count": retry_count,
+        }
+        if stage_kind:
+            values["stage_kind"] = stage_kind
+        return MODEL_TELEMETRY.finish_stage(handle, **values)
+    except Exception as exc:
+        LOGGER.debug("Model telemetry finish failed error=%s", type(exc).__name__)
+        return False
+
+
+def response_actual_model(response: Any) -> tuple[str, str]:
+    try:
+        actual_model = str(getattr(response, "model", "") or "").strip()
+    except Exception:
+        actual_model = ""
+    return actual_model, "provider_response" if actual_model else "not_reported"
+
+
+def response_actual_reasoning_effort(response: Any) -> str:
+    try:
+        reasoning = getattr(response, "reasoning", None)
+        return str(
+            getattr(reasoning, "effort", "")
+            or getattr(response, "reasoning_effort", "")
+            or ""
+        ).strip()
+    except Exception:
+        return ""
+
+
+def response_usage(response: Any) -> Any:
+    try:
+        return getattr(response, "usage", None)
+    except Exception:
+        return None
+
+
+def response_telemetry_status(response: Any) -> tuple[str, str]:
+    try:
+        provider_status = str(getattr(response, "status", "") or "").strip().casefold()
+    except Exception:
+        provider_status = ""
+    if provider_status in {"cancelled", "canceled"}:
+        return "cancelled", "provider_cancelled"
+    if provider_status in {"failed", "incomplete", "queued", "in_progress"}:
+        return "failed", f"provider_{provider_status}"
+    if provider_status in {"", "completed"}:
+        return "succeeded", ""
+    return "failed", "provider_unknown_status"
+
+
+def response_requests_tools(response: Any) -> bool:
+    try:
+        for item in getattr(response, "output", None) or ():
+            item_type = str(getattr(item, "type", "") or "").strip().casefold()
+            if item_type.endswith("_call") or "tool_call" in item_type:
+                return True
+    except Exception:
+        return False
+    return False
+
+
+def build_agents_run_config(*, run_id: str = "", route_bucket: str = "") -> RunConfig:
+    mode = normalize_tracing_mode(CONFIG.agents_tracing_mode)
+    resolved_run_id = current_model_run_id(run_id)
+    resolved_route = current_model_route_bucket(route_bucket)
+    return RunConfig(
+        tracing_disabled=mode == "disabled",
+        trace_include_sensitive_data=mode == "sensitive",
+        workflow_name="Aigan Telegram",
+        group_id=resolved_run_id,
+        trace_metadata={
+            "route_bucket": resolved_route,
+            "policy_version": normalize_policy_version(
+                CONFIG.model_routing_policy_version,
+                "other",
+            ),
+        },
+    )
+
+
+def agents_trace_exporter_status() -> str:
+    return "disabled" if CONFIG.agents_tracing_mode == "disabled" else "configured_unverified"
 
 
 def provenance_hash_secret() -> str:
@@ -596,7 +821,7 @@ def new_outbound_provenance(
         item = MEMORY.message_by_message_id(chat_id, trigger_message_id)
         input_memory_id = item.id if item is not None else None
     return OutboundProvenance(
-        run_id=secrets.token_hex(16),
+        run_id=current_model_run_id(),
         chat_id=int(chat_id),
         trigger_message_id=trigger_message_id,
         input_memory_id=input_memory_id,
@@ -1653,46 +1878,67 @@ def tool_router_schema() -> dict[str, Any]:
 
 
 def run_tool_router_model_sync(metadata: dict[str, Any]) -> str:
+    stage = begin_model_stage(
+        stage_kind="router",
+        intended_model=CONFIG.tool_router_model,
+        endpoint="responses",
+        task_class_bucket="router",
+    )
     client = OpenAI()
-    response = client.responses.create(
-        model=CONFIG.tool_router_model,
-        input=[
-            {
-                "role": "system",
-                "content": [
-                    {
-                        "type": "input_text",
-                        "text": (
-                            "Classify whether this trusted Telegram request needs Aigan reminder CRUD tools. "
-                            "This is a domain gate, not an exact action gate: if the user is managing reminders "
-                            "in any way, allow the reminder_crud toolset. Return none only when the request is not "
-                            "about managing reminder records. Passive facts and ordinary date mentions are none. "
-                            "Ukrainian cues: 'нагадування' and 'ремайндери' mean reminders; "
-                            "'які в мене є нагадування', 'покажи мої ремайндери', or requests to read/list "
-                            "reminder records are intent=list; 'перенеси нагадування #5' is intent=update; "
-                            "'скасуй нагадування #5' is intent=cancel; 'нагадай мені завтра...' is intent=create. "
-                            "When the reminder domain is clear but the exact action is ambiguous or multi-step, use intent=manage. "
-                            "For follow-ups like 'поверни назад те, що ти чіпав' in reminder context, choose update. "
-                            "If a prompt asks to use a tool to read existing reminder records, choose list even "
-                            "when it contains the phrase 'нагадати мені які'."
-                        ),
-                    }
-                ],
+    try:
+        response = client.responses.create(
+            model=CONFIG.tool_router_model,
+            input=[
+                {
+                    "role": "system",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": (
+                                "Classify whether this trusted Telegram request needs Aigan reminder CRUD tools. "
+                                "This is a domain gate, not an exact action gate: if the user is managing reminders "
+                                "in any way, allow the reminder_crud toolset. Return none only when the request is not "
+                                "about managing reminder records. Passive facts and ordinary date mentions are none. "
+                                "Ukrainian cues: 'нагадування' and 'ремайндери' mean reminders; "
+                                "'які в мене є нагадування', 'покажи мої ремайндери', or requests to read/list "
+                                "reminder records are intent=list; 'перенеси нагадування #5' is intent=update; "
+                                "'скасуй нагадування #5' is intent=cancel; 'нагадай мені завтра...' is intent=create. "
+                                "When the reminder domain is clear but the exact action is ambiguous or multi-step, use intent=manage. "
+                                "For follow-ups like 'поверни назад те, що ти чіпав' in reminder context, choose update. "
+                                "If a prompt asks to use a tool to read existing reminder records, choose list even "
+                                "when it contains the phrase 'нагадати мені які'."
+                            ),
+                        }
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": json.dumps(metadata, ensure_ascii=False, sort_keys=True)}],
+                },
+            ],
+            max_output_tokens=CONFIG.tool_router_max_output_tokens,
+            text={
+                "format": {
+                    "type": "json_schema",
+                    "name": "tool_route_decision",
+                    "strict": True,
+                    "schema": tool_router_schema(),
+                }
             },
-            {
-                "role": "user",
-                "content": [{"type": "input_text", "text": json.dumps(metadata, ensure_ascii=False, sort_keys=True)}],
-            },
-        ],
-        max_output_tokens=CONFIG.tool_router_max_output_tokens,
-        text={
-            "format": {
-                "type": "json_schema",
-                "name": "tool_route_decision",
-                "strict": True,
-                "schema": tool_router_schema(),
-            }
-        },
+        )
+    except Exception as exc:
+        finish_model_stage(stage, status="failed", failure_class=exc)
+        raise
+    status, failure_class = response_telemetry_status(response)
+    actual_model, actual_model_source = response_actual_model(response)
+    finish_model_stage(
+        stage,
+        status=status,
+        usage=response_usage(response),
+        actual_model=actual_model,
+        actual_model_source=actual_model_source,
+        actual_reasoning_effort=response_actual_reasoning_effort(response),
+        failure_class=failure_class,
     )
     return response.output_text.strip()
 
@@ -2700,8 +2946,36 @@ def emit_llm_end_event(agent_name: str, run_id: str = "") -> None:
 
 
 class AiganRunHooks(RunHooks[Any]):
-    def __init__(self, run_id: str = "") -> None:
+    def __init__(
+        self,
+        run_id: str = "",
+        *,
+        route_bucket: str = "",
+        intended_model: str = "",
+        reasoning_effort: str = "",
+    ) -> None:
         self.run_id = run_id
+        self.route_bucket = route_bucket
+        self.intended_model = intended_model or CONFIG.openai_model
+        self.reasoning_effort = reasoning_effort or CONFIG.model_reasoning_effort
+        self._pending_stage: StageHandle | None = None
+
+    def finalize_pending(
+        self,
+        status: str,
+        failure_class: str | type[BaseException] | BaseException | None,
+    ) -> None:
+        if self._pending_stage is None:
+            return
+        pending = self._pending_stage
+        self._pending_stage = None
+        finish_model_stage(
+            pending,
+            status=status,
+            stage_kind="agent_turn",
+            failure_class=failure_class,
+            retry_count=0,
+        )
 
     async def on_agent_start(self, context: Any, agent: Agent) -> None:
         emit_agent_start_event(agent.name, self.run_id)
@@ -2716,9 +2990,31 @@ class AiganRunHooks(RunHooks[Any]):
             has_system_prompt=bool(system_prompt),
             run_id=self.run_id,
         )
+        self.finalize_pending("failed", "overlapping_llm_turn")
+        self._pending_stage = begin_model_stage(
+            run_id=self.run_id,
+            route_bucket=self.route_bucket,
+            task_class_bucket="agent",
+            stage_kind="agent_turn",
+            intended_model=self.intended_model,
+            reasoning_effort=self.reasoning_effort,
+            endpoint="agents",
+        )
 
     async def on_llm_end(self, context: Any, agent: Agent, response: Any) -> None:
         emit_llm_end_event(agent.name, self.run_id)
+        pending = self._pending_stage
+        self._pending_stage = None
+        finish_model_stage(
+            pending,
+            status="succeeded",
+            usage=response_usage(response),
+            stage_kind="agent_tool_turn" if response_requests_tools(response) else "final_answer",
+            actual_model="",
+            actual_model_source="unavailable_sdk",
+            actual_reasoning_effort="",
+            retry_count=0,
+        )
 
     async def on_tool_start(self, context: Any, agent: Agent, tool: Any) -> None:
         details = {"run_id": self.run_id} if self.run_id else None
@@ -3369,7 +3665,14 @@ base_emoji={asset.base_emoji or '(none)'}
 set_name={asset.set_name or '(none)'}
 """
     try:
-        output = await asyncio.wait_for(run_vision(prompt, [data_url]), timeout=120)
+        output = await asyncio.wait_for(
+            run_vision(
+                prompt,
+                [data_url],
+                route_bucket="background",
+            ),
+            timeout=120,
+        )
     except Exception:
         LOGGER.exception("Reaction asset vision analysis failed reaction_key=%s", spec.reaction_key)
         return
@@ -5126,6 +5429,41 @@ Task:
 """
 
 
+def youtube_mcp_environment(*, run_id: str, route_bucket: str) -> dict[str, str]:
+    child_env = {
+        key: value
+        for key in (
+            "YOUTUBE_AUDIO_FALLBACK",
+            "YOUTUBE_TRANSCRIPTION_MODEL",
+            "YOUTUBE_MAX_DURATION_SECONDS",
+        )
+        if (value := os.getenv(key, "").strip())
+    }
+    audio_fallback_enabled = child_env.get("YOUTUBE_AUDIO_FALLBACK", "").casefold() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    if not audio_fallback_enabled:
+        return child_env
+    child_env["OPENAI_API_KEY"] = CONFIG.openai_api_key
+    if CONFIG.model_telemetry_enabled:
+        child_env.update(
+            {
+                "MEMORY_DB_PATH": CONFIG.memory_db_path,
+                "MODEL_TELEMETRY_ENABLED": "true",
+                "MODEL_TELEMETRY_RETENTION_DAYS": str(
+                    CONFIG.model_telemetry_retention_days
+                ),
+                "MODEL_ROUTING_POLICY_VERSION": CONFIG.model_routing_policy_version,
+                "AIGAN_MODEL_RUN_ID": current_model_run_id(run_id),
+                "AIGAN_MODEL_ROUTE_BUCKET": current_model_route_bucket(route_bucket),
+            }
+        )
+    return child_env
+
+
 async def run_agent(
     prompt: str,
     reminder_tool_context: ReminderToolContext | None = None,
@@ -5135,6 +5473,8 @@ async def run_agent(
     outbound_provenance: OutboundProvenance | None = None,
 ) -> str:
     active_provenance = outbound_provenance or ACTIVE_OUTBOUND_PROVENANCE.get()
+    model_run_id = current_model_run_id(active_provenance.run_id if active_provenance is not None else "")
+    model_route = current_model_route_bucket(active_provenance.route if active_provenance is not None else "")
     started = time.monotonic()
     system_event(
         component="agent",
@@ -5154,6 +5494,7 @@ async def run_agent(
         params={
             "command": sys.executable,
             "args": [str(APP_DIR / "mcp_servers" / "youtube_transcript.py")],
+            "env": youtube_mcp_environment(run_id=model_run_id, route_bucket=model_route),
         },
         cache_tools_list=True,
         client_session_timeout_seconds=CONFIG.mcp_tool_timeout_seconds,
@@ -5171,6 +5512,12 @@ async def run_agent(
         )
         else None
     )
+    run_hooks = AiganRunHooks(
+        model_run_id,
+        route_bucket=model_route,
+        intended_model=CONFIG.openai_model,
+        reasoning_effort=CONFIG.model_reasoning_effort,
+    )
     try:
         async with web_server as web, youtube_server as youtube:
             agent = make_agent([web, youtube])
@@ -5179,10 +5526,21 @@ async def run_agent(
                     agent,
                     with_current_time_metadata(prompt),
                     max_turns=6,
-                    hooks=AiganRunHooks(active_provenance.run_id if active_provenance is not None else ""),
-                    run_config=RunConfig(tracing_disabled=True),
+                    hooks=run_hooks,
+                    run_config=build_agents_run_config(run_id=model_run_id, route_bucket=model_route),
                 )
+            except asyncio.CancelledError as exc:
+                run_hooks.finalize_pending("cancelled", exc)
+                system_event(
+                    level="warning",
+                    component="agent",
+                    event_type="run_cancelled",
+                    duration_ms=int((time.monotonic() - started) * 1000),
+                    message=type(exc).__name__,
+                )
+                raise
             except Exception as exc:
+                run_hooks.finalize_pending("failed", exc)
                 system_event(
                     level="error",
                     component="agent",
@@ -5191,6 +5549,8 @@ async def run_agent(
                     message=type(exc).__name__,
                 )
                 raise
+            finally:
+                run_hooks.finalize_pending("failed", "run_ended_with_pending_turn")
         output = str(result.final_output).strip()
         if active_provenance is not None:
             sdk_observations = extract_tool_provenance(
@@ -5259,23 +5619,82 @@ def build_plain_model_request_settings() -> dict[str, Any]:
     return settings
 
 
-def run_plain_model_sync(prompt: str) -> str:
+def run_plain_model_sync(
+    prompt: str,
+    *,
+    route_bucket: str = "",
+    task_class_bucket: str = "",
+) -> str:
+    stage = begin_model_stage(
+        stage_kind="plain",
+        intended_model=CONFIG.openai_model,
+        reasoning_effort=CONFIG.model_reasoning_effort,
+        endpoint="responses",
+        route_bucket=route_bucket,
+        task_class_bucket=task_class_bucket,
+    )
     client = OpenAI()
-    response = client.responses.create(
-        model=CONFIG.openai_model,
-        input=[
-            {
-                "role": "user",
-                "content": [{"type": "input_text", "text": with_current_time_metadata(prompt)}],
-            }
-        ],
-        **build_plain_model_request_settings(),
+    try:
+        response = client.responses.create(
+            model=CONFIG.openai_model,
+            input=[
+                {
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": with_current_time_metadata(prompt)}],
+                }
+            ],
+            **build_plain_model_request_settings(),
+        )
+    except Exception as exc:
+        finish_model_stage(stage, status="failed", failure_class=exc)
+        raise
+    status, failure_class = response_telemetry_status(response)
+    actual_model, actual_model_source = response_actual_model(response)
+    finish_model_stage(
+        stage,
+        status=status,
+        usage=response_usage(response),
+        actual_model=actual_model,
+        actual_model_source=actual_model_source,
+        actual_reasoning_effort=response_actual_reasoning_effort(response),
+        failure_class=failure_class,
     )
     return response.output_text.strip()
 
 
-async def run_plain_model(prompt: str) -> str:
-    return await asyncio.to_thread(run_plain_model_sync, prompt)
+async def run_plain_model(
+    prompt: str,
+    *,
+    route_bucket: str = "",
+    task_class_bucket: str = "",
+) -> str:
+    return await asyncio.to_thread(
+        run_plain_model_sync,
+        prompt,
+        route_bucket=route_bucket,
+        task_class_bucket=task_class_bucket,
+    )
+
+
+async def run_plain_model_for_route(
+    prompt: str,
+    *,
+    route_bucket: str,
+    task_class_bucket: str,
+) -> str:
+    route_token = ACTIVE_MODEL_ROUTE_BUCKET.set(
+        normalize_route_bucket(route_bucket, "other")
+    )
+    task_token = ACTIVE_MODEL_TASK_CLASS_BUCKET.set(
+        normalize_task_class_bucket(task_class_bucket, "other")
+    )
+    try:
+        # Keep the underlying call signature stable for tests and alternate
+        # adapters while ContextVars carry bounded telemetry-only labels.
+        return await run_plain_model(prompt)
+    finally:
+        ACTIVE_MODEL_TASK_CLASS_BUCKET.reset(task_token)
+        ACTIVE_MODEL_ROUTE_BUCKET.reset(route_token)
 
 
 async def extract_image_data_urls(message: Message) -> list[str]:
@@ -5295,7 +5714,14 @@ async def extract_image_data_urls(message: Message) -> list[str]:
     return [data_url_from_bytes(data, mime_type)]
 
 
-def run_vision_sync(prompt: str, image_data_urls: list[str]) -> str:
+def run_vision_sync(
+    prompt: str,
+    image_data_urls: list[str],
+    *,
+    run_id: str = "",
+    route_bucket: str = "",
+    task_class_bucket: str = "vision",
+) -> str:
     content: list[dict[str, Any]] = [
         {
             "type": "input_text",
@@ -5315,11 +5741,34 @@ Request and Telegram context:
     for data_url in image_data_urls:
         content.append({"type": "input_image", "image_url": data_url})
 
+    stage = begin_model_stage(
+        stage_kind="vision",
+        intended_model=CONFIG.vision_model,
+        endpoint="responses",
+        run_id=run_id,
+        route_bucket=route_bucket,
+        task_class_bucket=task_class_bucket,
+    )
     client = OpenAI()
-    response = client.responses.create(
-        model=CONFIG.vision_model,
-        input=[{"role": "user", "content": content}],
-        max_output_tokens=CONFIG.max_output_tokens,
+    try:
+        response = client.responses.create(
+            model=CONFIG.vision_model,
+            input=[{"role": "user", "content": content}],
+            max_output_tokens=CONFIG.max_output_tokens,
+        )
+    except Exception as exc:
+        finish_model_stage(stage, status="failed", failure_class=exc)
+        raise
+    status, failure_class = response_telemetry_status(response)
+    actual_model, actual_model_source = response_actual_model(response)
+    finish_model_stage(
+        stage,
+        status=status,
+        usage=response_usage(response),
+        actual_model=actual_model,
+        actual_model_source=actual_model_source,
+        actual_reasoning_effort=response_actual_reasoning_effort(response),
+        failure_class=failure_class,
     )
     return response.output_text.strip()
 
@@ -5327,10 +5776,29 @@ Request and Telegram context:
 VISION_AGENT_NAME = "Aigan Vision"
 
 
-async def run_vision(prompt: str, image_data_urls: list[str], *, run_id: str = "") -> str:
+async def run_vision(
+    prompt: str,
+    image_data_urls: list[str],
+    *,
+    run_id: str = "",
+    route_bucket: str = "",
+    task_class_bucket: str = "vision",
+) -> str:
     emit_agent_start_event(VISION_AGENT_NAME, run_id)
     emit_llm_start_event(VISION_AGENT_NAME, input_item_count=1, has_system_prompt=True, run_id=run_id)
-    output = await asyncio.to_thread(run_vision_sync, prompt, image_data_urls)
+    run_token = ACTIVE_MODEL_RUN_ID.set(run_id) if run_id else None
+    try:
+        output = await asyncio.to_thread(
+            run_vision_sync,
+            prompt,
+            image_data_urls,
+            run_id=run_id,
+            route_bucket=route_bucket,
+            task_class_bucket=task_class_bucket,
+        )
+    finally:
+        if run_token is not None:
+            ACTIVE_MODEL_RUN_ID.reset(run_token)
     emit_llm_end_event(VISION_AGENT_NAME, run_id)
     emit_agent_end_event(VISION_AGENT_NAME, run_id)
     return output
@@ -5370,7 +5838,14 @@ Stored message context:
 {format_memory_items([item])}
 """
         try:
-            summary = await asyncio.wait_for(run_vision(prompt, [data_url]), timeout=120)
+            summary = await asyncio.wait_for(
+                run_vision(
+                    prompt,
+                    [data_url],
+                    route_bucket="memory_index",
+                ),
+                timeout=120,
+            )
         except Exception:
             LOGGER.exception("Lazy memory image summary failed item_id=%s", item.id)
             continue
@@ -5453,11 +5928,22 @@ def normalize_embedding(vector: list[float]) -> list[float]:
     return [float(value / norm) for value in vector]
 
 
-def create_embeddings_sync(texts: list[str]) -> list[list[float]]:
+def create_embeddings_sync(
+    texts: list[str],
+    stage_kind: str = "embedding_query",
+    *,
+    route_bucket: str = "",
+    task_class_bucket: str = "",
+) -> list[list[float]]:
     if not texts:
         return []
-    if CONFIG.openai_api_key == "sk-test":
-        raise RuntimeError("test OpenAI API key cannot create embeddings")
+    stage = begin_model_stage(
+        stage_kind=stage_kind,
+        intended_model=CONFIG.memory_embedding_model,
+        endpoint="embeddings",
+        route_bucket=route_bucket,
+        task_class_bucket=task_class_bucket or stage_kind,
+    )
     kwargs: dict[str, Any] = {
         "model": CONFIG.memory_embedding_model,
         "input": texts,
@@ -5465,15 +5951,41 @@ def create_embeddings_sync(texts: list[str]) -> list[list[float]]:
     }
     if CONFIG.memory_embedding_dimensions > 0:
         kwargs["dimensions"] = CONFIG.memory_embedding_dimensions
-    response = OpenAI().embeddings.create(**kwargs)
+    try:
+        if CONFIG.openai_api_key == "sk-test":
+            raise RuntimeError("test OpenAI API key cannot create embeddings")
+        response = OpenAI().embeddings.create(**kwargs)
+    except Exception as exc:
+        finish_model_stage(stage, status="failed", failure_class=exc)
+        raise
+    actual_model, actual_model_source = response_actual_model(response)
+    finish_model_stage(
+        stage,
+        status="succeeded",
+        usage=response_usage(response),
+        actual_model=actual_model,
+        actual_model_source=actual_model_source,
+    )
     return [normalize_embedding(list(item.embedding)) for item in response.data]
 
 
-async def create_embeddings(texts: list[str]) -> list[list[float]]:
+async def create_embeddings(
+    texts: list[str],
+    *,
+    stage_kind: str = "embedding_query",
+    route_bucket: str = "",
+    task_class_bucket: str = "",
+) -> list[list[float]]:
     clipped = [clip_text(text, 4000) for text in texts if text.strip()]
     if not clipped:
         return []
-    return await asyncio.to_thread(create_embeddings_sync, clipped)
+    return await asyncio.to_thread(
+        create_embeddings_sync,
+        clipped,
+        stage_kind,
+        route_bucket=route_bucket,
+        task_class_bucket=task_class_bucket,
+    )
 
 
 async def process_embedding_candidates(candidates: list[EmbeddingCandidate], source: str) -> int:
@@ -5484,7 +5996,12 @@ async def process_embedding_candidates(candidates: list[EmbeddingCandidate], sou
 
     started = time.monotonic()
     try:
-        vectors = await create_embeddings([candidate.search_text for candidate in candidates])
+        vectors = await create_embeddings(
+            [candidate.search_text for candidate in candidates],
+            stage_kind="embedding_index",
+            route_bucket="memory_index",
+            task_class_bucket="embedding_index",
+        )
     except Exception as exc:
         last_embedding_error = f"{type(exc).__name__}: {exc}"
         LOGGER.exception("Memory embedding batch failed source=%s count=%s", source, len(candidates))
@@ -5918,7 +6435,11 @@ async def semantic_memory_search_outcome(
                 lookback_days=CONFIG.memory_semantic_lookback_days,
             )
             if embedding_indexed > 0:
-                vectors = await create_embeddings([query])
+                vectors = await create_embeddings(
+                    [query],
+                    route_bucket=route,
+                    task_class_bucket="embedding_query",
+                )
             else:
                 vectors = []
             if vectors:
@@ -6127,6 +6648,70 @@ def memory_vector_health_text() -> str:
             f"- backlog: {backlog}",
             f"- last_embedded_at: {last_embedding_at or 'never'}",
             f"- last_error: {error}",
+        ]
+    )
+
+
+def model_telemetry_health_text(lookback_seconds: int | None = None) -> str:
+    if MODEL_TELEMETRY is None:
+        return (
+            "Model telemetry: unavailable."
+            if CONFIG.model_telemetry_enabled
+            else "Model telemetry: disabled."
+        )
+    try:
+        summary = MODEL_TELEMETRY.aggregate_since(
+            lookback_seconds or CONFIG.health_report_lookback_seconds
+        )
+    except Exception as exc:
+        LOGGER.debug(
+            "Model telemetry health aggregation failed error=%s",
+            type(exc).__name__,
+        )
+        return "Model telemetry: unavailable (aggregation failed)."
+    token_totals = summary.get("token_totals") if isinstance(summary, dict) else {}
+    if not isinstance(token_totals, dict):
+        token_totals = {}
+    status_counts = summary.get("status_counts") if isinstance(summary, dict) else {}
+    if not isinstance(status_counts, dict):
+        status_counts = {}
+    status_text = ", ".join(
+        f"{safe_detail_code(str(key))}={int(value)}"
+        for key, value in sorted(status_counts.items())
+    ) or "none"
+    cost_nano_usd = int(summary.get("known_cost_nano_usd", 0) or 0)
+    stage_count = int(summary.get("stage_count", 0) or 0)
+    cost_incomplete = int(summary.get("cost_incomplete_count", 0) or 0)
+    if stage_count == 0:
+        cost_text = "- estimated_cost_usd: unavailable (no terminal stages)"
+    elif bool(summary.get("cost_complete")):
+        cost_text = f"- estimated_cost_usd: {cost_nano_usd / 1_000_000_000:.6f} (complete)"
+    else:
+        cost_text = (
+            f"- known_estimated_cost_usd: {cost_nano_usd / 1_000_000_000:.6f} "
+            f"(partial; incomplete_stages={cost_incomplete})"
+        )
+    return "\n".join(
+        [
+            "Model telemetry:",
+            f"- tracing_mode: {CONFIG.agents_tracing_mode}",
+            f"- trace_exporter: {agents_trace_exporter_status()}",
+            f"- policy_version: {safe_detail_code(CONFIG.model_routing_policy_version)}",
+            f"- price_snapshot: {PRICE_SNAPSHOT_VERSION}",
+            f"- retention_days: {CONFIG.model_telemetry_retention_days}",
+            f"- stages: {stage_count} ({status_text})",
+            f"- pending: {int(summary.get('pending_count', 0) or 0)} "
+            f"(stale={int(summary.get('stale_pending_count', 0) or 0)})",
+            f"- requests: {int(token_totals.get('requests', 0) or 0)}",
+            f"- tokens: input={int(token_totals.get('input_tokens', 0) or 0)}, "
+            f"cached={int(token_totals.get('cached_input_tokens', 0) or 0)}, "
+            f"output={int(token_totals.get('output_tokens', 0) or 0)}, "
+            f"reasoning={int(token_totals.get('reasoning_tokens', 0) or 0)}",
+            cost_text,
+            f"- usage_missing: {int(summary.get('usage_missing_count', 0) or 0)}",
+            f"- unpriced: {int(summary.get('unpriced_count', 0) or 0)}",
+            f"- write_failures: {int(summary.get('write_failure_count', 0) or 0)}",
+            f"- last_completed_at: {summary.get('last_completed_at') or 'never'}",
         ]
     )
 
@@ -6358,6 +6943,32 @@ def memory_capability_rows() -> list[CapabilityRow]:
 
 def configured_capability_rows() -> list[CapabilityRow]:
     rows = memory_capability_rows()
+    model_telemetry_available = MODEL_TELEMETRY is not None
+    rows.append(
+        CapabilityRow(
+            name="model_telemetry",
+            family="observability",
+            enabled=model_telemetry_available,
+            configured=CONFIG.model_telemetry_enabled,
+            available=model_telemetry_available,
+            status="ok" if model_telemetry_available else (
+                "unavailable" if CONFIG.model_telemetry_enabled else "disabled"
+            ),
+            adapter="ModelTelemetryStore" if model_telemetry_available else "null",
+            mode=CONFIG.agents_tracing_mode,
+            details={
+                "trace_exporter": agents_trace_exporter_status(),
+                "retention_days": CONFIG.model_telemetry_retention_days,
+                "policy_version": normalize_policy_version(
+                    CONFIG.model_routing_policy_version,
+                    "other",
+                ),
+                "price_snapshot": PRICE_SNAPSHOT_VERSION,
+                "write_failures": MODEL_TELEMETRY.write_failure_count if MODEL_TELEMETRY is not None else 0,
+            },
+            next_action="check telemetry initialization" if CONFIG.model_telemetry_enabled and not model_telemetry_available else "",
+        )
+    )
     reminder_details = REMINDERS.health_summary() if REMINDERS is not None else {}
     reminders_available = REMINDERS is not None
     rows.append(
@@ -7249,6 +7860,7 @@ Analyze the found web image or images according to the request. Reply in Ukraini
                 vision_prompt,
                 [data_url_from_bytes(image.data, image.mime_type) for image in images],
                 run_id=outbound_provenance.run_id,
+                route_bucket=outbound_provenance.route,
             ),
             timeout=120,
         )
@@ -8432,7 +9044,14 @@ async def handle_character_command(message: Message, context: ContextTypes.DEFAU
     await maybe_send_chat_action(context, message.chat_id, ChatAction.TYPING)
     prompt = build_character_profile_prompt(selection, social_observations_for_profile(message, selection))
     try:
-        response = await asyncio.wait_for(run_plain_model(prompt), timeout=120)
+        response = await asyncio.wait_for(
+            run_plain_model_for_route(
+                prompt,
+                route_bucket="character",
+                task_class_bucket="character",
+            ),
+            timeout=120,
+        )
     except Exception:
         LOGGER.exception("Character profile command failed")
         await message.reply_text("Не зміг зібрати портрет. Деталі будуть у логах контейнера.")
@@ -8996,6 +9615,8 @@ async def health_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         + "\n\n"
         + memory_vector_health_text()
         + "\n\n"
+        + model_telemetry_health_text(CONFIG.health_report_lookback_seconds)
+        + "\n\n"
         + tool_runtime_health_text()
         + "\n\n"
         + reaction_health_diagnostics_text(CONFIG.health_report_lookback_seconds),
@@ -9052,7 +9673,14 @@ Sanitized input:
 {SELF_ANALYSIS.selfcheck_context(CONFIG.health_report_lookback_seconds)}
 """
     try:
-        response = await asyncio.wait_for(run_plain_model(prompt), timeout=60)
+        response = await asyncio.wait_for(
+            run_plain_model_for_route(
+                prompt,
+                route_bucket="selfcheck",
+                task_class_bucket="selfcheck",
+            ),
+            timeout=60,
+        )
     except Exception:
         LOGGER.exception("Selfcheck failed")
         system_event(level="error", component="self_analysis", event_type="selfcheck_failed", telegram_message=message)
@@ -9731,6 +10359,28 @@ async def handle_prompt_generation(
     allow_pending_wait: bool,
     skip_cooldown: bool = False,
 ) -> None:
+    run_token = ACTIVE_MODEL_RUN_ID.set(ACTIVE_MODEL_RUN_ID.get() or secrets.token_hex(16))
+    route_token = ACTIVE_MODEL_ROUTE_BUCKET.set("pre_route")
+    try:
+        await _handle_prompt_generation(
+            message,
+            context,
+            prompt,
+            allow_pending_wait,
+            skip_cooldown,
+        )
+    finally:
+        ACTIVE_MODEL_ROUTE_BUCKET.reset(route_token)
+        ACTIVE_MODEL_RUN_ID.reset(run_token)
+
+
+async def _handle_prompt_generation(
+    message: Message,
+    context: ContextTypes.DEFAULT_TYPE,
+    prompt: str,
+    allow_pending_wait: bool,
+    skip_cooldown: bool = False,
+) -> None:
     if await maybe_resolve_reminder_context_response(message, context, prompt):
         return
 
@@ -9744,6 +10394,7 @@ async def handle_prompt_generation(
 
     await send_activity_action(context.bot, message.chat_id, ChatAction.TYPING, message=message)
     route, recall_intent = await classify_request_with_intent(message, prompt)
+    ACTIVE_MODEL_ROUTE_BUCKET.set(normalize_route_bucket(route, "other"))
     LOGGER.info("Prompt route=%s chat_id=%s", route, message.chat_id)
     outbound_provenance = provenance_for_message(message, route)
 
@@ -10078,7 +10729,12 @@ Image parts in this Telegram turn: {len(image_data_urls)}
 Explain the image(s) according to the current request. Ukrainian by default; English only if explicitly requested. Never Russian.
 """
         response = await asyncio.wait_for(
-            run_vision(vision_prompt, image_data_urls, run_id=outbound_provenance.run_id),
+            run_vision(
+                vision_prompt,
+                image_data_urls,
+                run_id=outbound_provenance.run_id,
+                route_bucket=outbound_provenance.route,
+            ),
             timeout=120,
         )
         append_tool_provenance(
@@ -11395,6 +12051,8 @@ async def health_report_loop(application: Application) -> None:
 async def post_init(application: Application) -> None:
     global BOT_ID, BOT_USERNAME, embedding_queue
 
+    apply_agents_tracing_policy(CONFIG.agents_tracing_mode)
+
     me = await application.bot.get_me()
     BOT_ID = me.id
     if me.username:
@@ -11447,6 +12105,48 @@ async def post_init(application: Application) -> None:
             message="system logs enabled",
             details={"cleanup_deleted": deleted, "github_reporting_configured": GITHUB_REPORTER.is_configured},
         )
+    if MODEL_TELEMETRY is not None:
+        try:
+            # Docker Compose runs one Aigan container and stops the old process
+            # before this startup hook. Any pre-existing pending stage therefore
+            # belongs to an interrupted process, while the store default remains
+            # conservative for multi-process callers such as MCP tests.
+            recovered = MODEL_TELEMETRY.recover_abandoned(stale_after_seconds=0)
+            deleted = MODEL_TELEMETRY.cleanup()
+        except Exception as exc:
+            LOGGER.warning(
+                "Model telemetry startup maintenance failed error=%s",
+                type(exc).__name__,
+            )
+            system_event(
+                level="error",
+                component="model_telemetry",
+                event_type="startup_maintenance_failed",
+                message="model_telemetry_startup_maintenance_failed",
+            )
+        else:
+            LOGGER.info(
+                "Model telemetry enabled retention_days=%s recovered_abandoned=%s cleanup_deleted=%s tracing_mode=%s trace_exporter=%s price_snapshot=%s",
+                CONFIG.model_telemetry_retention_days,
+                recovered,
+                deleted,
+                CONFIG.agents_tracing_mode,
+                agents_trace_exporter_status(),
+                PRICE_SNAPSHOT_VERSION,
+            )
+            system_event(
+                component="model_telemetry",
+                event_type="startup_maintenance_complete",
+                message="model telemetry ready",
+                details={
+                    "recovered_abandoned": recovered,
+                    "cleanup_deleted": deleted,
+                    "retention_days": CONFIG.model_telemetry_retention_days,
+                    "tracing_mode": CONFIG.agents_tracing_mode,
+                    "trace_exporter": agents_trace_exporter_status(),
+                    "price_snapshot": PRICE_SNAPSHOT_VERSION,
+                },
+            )
     if REACTION_MEMORY is not None:
         LOGGER.info(
             "Reaction memory enabled db=%s asset_analysis=%s min_uses_for_vision=%s prompt_version=%s",

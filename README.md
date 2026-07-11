@@ -16,6 +16,7 @@ Default main-chat model: `gpt-5.6-sol` with `low` reasoning effort. Vision and t
 - User profile and stats commands based on messages the bot has actually seen.
 - Social taste memory for sanitized group/user interests and reactions, used by proactive thought seeds.
 - Sanitized system health logs, admin self-check commands, and optional GitHub self-reporting.
+- Payload-free per-stage model telemetry for routing, usage, latency, and estimated-cost experiments.
 - Placeholder `.env` ready for secrets.
 
 ## Setup
@@ -222,7 +223,7 @@ Bot output enters memory only after Telegram confirms delivery with a real messa
 
 Scheduled reminders durably mark a delivery attempt before calling Telegram. A transport timeout or a crash after that marker is not retried automatically because Telegram may already have accepted the message; health diagnostics expose unresolved `delivery_attempted` fires for operator review instead of risking a duplicate reminder.
 
-Run provenance stores only route names, tool kinds, low-cardinality result status/digests, and keyed fingerprints derived from allowlisted source fields. It never stores raw prompts, tool arguments, search queries, URLs, transcripts, pages, or model output in provenance or Agents SDK traces. Set a private `PROVENANCE_HASH_SALT` to keep fingerprints stable across Telegram token rotation; never commit its real value.
+Run provenance stores only route names, tool kinds, low-cardinality result status/digests, and keyed fingerprints derived from allowlisted source fields. It never stores raw prompts, tool arguments, search queries, URLs, transcripts, pages, or model output. Set a private `PROVENANCE_HASH_SALT` to keep fingerprints stable across Telegram token rotation; never commit its real value. Agents SDK hosted tracing has a separate operator-controlled policy described under system health.
 
 `MEMORY_RETENTION_DAYS` deletes older rows and cached media. `MEMORY_IMAGE_SUMMARY_LIMIT` limits how many recent unsummarized images can be lazily sent to vision for one answer. `WEB_SEARCH_TIMEOUT_SECONDS` controls DDGS web/image search network timeout, while `MCP_TOOL_TIMEOUT_SECONDS` controls the Agents SDK MCP session timeout for web and YouTube tools. For explicit URL checks, Aigan should fetch the current URL first, use search as secondary evidence, and report timeout/fetch/search failures as incomplete validation instead of guessing.
 
@@ -334,6 +335,38 @@ TELEGRAM_STREAMING_DRAFT_DELAY_SECONDS=2.5
 ## System Health And Self-Analysis
 
 Aigan keeps a separate sanitized operational journal in SQLite. These records are not normal chat memory and are not used by `/stat`, `/character`, or ordinary answers.
+
+### Model Telemetry And Hosted Tracing
+
+Per-stage model telemetry is a separate local SQLite ledger for routing and cost experiments:
+
+```env
+MODEL_TELEMETRY_ENABLED=true
+MODEL_TELEMETRY_RETENTION_DAYS=30
+MODEL_ROUTING_POLICY_VERSION=primary_sol_low_v1
+```
+
+The first live-runtime slice covers main Agents SDK model turns, direct router/plain/vision Responses calls, embeddings, and optional YouTube MCP audio transcription. Offline Telegram import/backfill is not covered. Coverage is call-site based, so a missing row is not proof that an uninstrumented path made no provider request.
+
+Each stage keeps opaque run/stage identifiers and bounded operational fields: route/task buckets, intended model, provider-returned actual model when available, requested/actual reasoning effort when exposed, endpoint, status/failure category, fallback/application-retry count, latency, token usage, price-snapshot version, and estimated cost. It never stores prompts, model output, tool arguments, search queries, URLs, transcripts, user text or identities, secrets, or private paths.
+
+Cost is an estimate from a versioned static price snapshot, not an OpenAI billing record. Unknown model prices or missing usage remain unavailable rather than becoming zero. Provider-internal retries are not visible. The Agents SDK response object does not expose the provider-returned actual model or effective reasoning effort, so those fields remain unavailable for Agents turns instead of being copied from the intended settings.
+
+`/health` reports the ledger enabled state, retention, routing-policy version, price-snapshot version, aggregate counters, and the configured tracing mode. The hosted exporter state is `disabled` when tracing is off and `configured_unverified` when tracing is enabled: local diagnostics cannot prove that OpenAI accepted or retained a hosted trace.
+
+Repository-default hosted tracing is off:
+
+```env
+AGENTS_TRACING_MODE=disabled
+```
+
+Supported modes:
+
+- `disabled`: do not configure hosted Agents SDK trace export.
+- `metadata_only`: enable hosted tracing with SDK sensitive-data inclusion disabled; Aigan supplies only sanitized low-cardinality trace metadata.
+- `sensitive`: enable SDK sensitive-data inclusion. This is an explicit private-operator choice because prompts, responses, or tool payloads may leave the deployment through hosted tracing. Never commit a live environment configured this way.
+
+The local model telemetry ledger remains payload-free in every tracing mode. `AGENTS_TRACING_MODE` changes hosted tracing only.
 
 Admin-only commands:
 
