@@ -72,7 +72,8 @@ ROOT = Path(__file__).resolve().parents[1]
 DEV_FIXTURE = ROOT / "tests" / "fixtures" / "memory_extraction_v2_development.jsonl"
 HOLDOUT_FIXTURE = ROOT / "tests" / "fixtures" / "memory_extraction_v2_holdout.jsonl"
 MANIFEST = ROOT / "tests" / "fixtures" / "memory_extraction_v2_manifest.json"
-PROMPT = ROOT / "prompts" / "memory_extraction_eval_v6.md"
+PROMPT = ROOT / "prompts" / "memory_extraction_eval_v7.md"
+SUPERSEDED_PROMPT_V6 = ROOT / "prompts" / "memory_extraction_eval_v6.md"
 SUPERSEDED_PROMPT_V5 = ROOT / "prompts" / "memory_extraction_eval_v5.md"
 
 
@@ -107,12 +108,43 @@ class MemoryExtractionV2FixtureTests(unittest.TestCase):
         self.assertEqual(v1.FROZEN_OUTPUT_SCHEMA_SHA256, v1.output_schema_sha256())
         self.assertEqual(v1.FROZEN_EVALUATION_BUNDLE_SHA256, v1.evaluation_bundle_sha256())
 
-    def test_superseded_v5_prompt_remains_immutable_and_inactive(self) -> None:
+    def test_superseded_prompts_remain_immutable_and_inactive(self) -> None:
         self.assertEqual(
             "51ed7624b663001de77a0e219bde71e229d19b8cf953a479e5ebd07840e2af59",
             fixture_sha256(SUPERSEDED_PROMPT_V5),
         )
+        self.assertEqual(
+            "f063b311df0ba62abd610ac58b62410db25fb1a6d1b3c423a800e9ae13d3aa63",
+            fixture_sha256(SUPERSEDED_PROMPT_V6),
+        )
         self.assertNotEqual(SUPERSEDED_PROMPT_V5, PROMPT)
+        self.assertNotEqual(SUPERSEDED_PROMPT_V6, PROMPT)
+
+    def test_prompt_v7_closes_canonical_date_and_correction_direction_gaps(self) -> None:
+        prompt = PROMPT.read_text(encoding="utf-8")
+        for clause in (
+            "YYYY-MM-DDT00:00:00Z",
+            "canonical transport",
+            "Every non-correction candidate must leave both link arrays empty.",
+            "Never link the replied-to older row forward to the correction.",
+        ):
+            with self.subTest(clause=clause):
+                self.assertIn(clause, prompt)
+
+    def test_development_validity_dates_use_canonical_transport_encoding(self) -> None:
+        cases = [
+            case
+            for case in self.development
+            if case["tags"][0] == "validity_expiry"
+        ]
+        self.assertEqual(12, len(cases))
+        for case in cases:
+            with self.subTest(case_id=case["id"]):
+                candidate = case["expected"]["candidates"][0]
+                valid_until = candidate["valid_until"]
+                self.assertEqual(20, len(valid_until))
+                self.assertTrue(valid_until.endswith("T00:00:00Z"))
+                self.assertIn(valid_until[:10], candidate["evidence_span"])
 
     def test_distribution_matches_preregistration(self) -> None:
         expected_reasons = set(v1.NO_CANDIDATE_REASONS) - {"none"}
@@ -177,7 +209,7 @@ class MemoryExtractionV2FixtureTests(unittest.TestCase):
         self.assertEqual(FROZEN_PROMPT_SHA256, manifest["prompt"]["sha256"])
         self.assertEqual(PROMPT_VERSION, manifest["prompt"]["version"])
         self.assertEqual(
-            "prompts/memory_extraction_eval_v6.md",
+            "prompts/memory_extraction_eval_v7.md",
             manifest["prompt"]["file"],
         )
         self.assertEqual(FROZEN_OUTPUT_SCHEMA_SHA256, manifest["output_schema"]["sha256"])
@@ -364,16 +396,29 @@ class MemoryExtractionV2ContractTests(unittest.TestCase):
                 failures[case["id"]] = errors
         self.assertEqual({}, failures)
 
-    def test_validator_rejects_values_that_v1_would_normalize(self) -> None:
+    def test_validator_requires_exact_canonical_valid_until(self) -> None:
         case = next(
             case
             for case in self.development
             if case["tags"][0] == "validity_expiry" and case["language"] == "en"
         )
-        prediction = deterministic_extract(case)
-        prediction["result"]["candidates"][0]["valid_until"] = "2032-04-11"
-        _normalized, errors = validate_prediction(case, prediction)
-        self.assertTrue(any("normalized_valid_until" in error for error in errors))
+        canonical_prediction = deterministic_extract(case)
+        _normalized, canonical_errors = validate_prediction(case, canonical_prediction)
+        self.assertEqual([], canonical_errors)
+        canonical = canonical_prediction["result"]["candidates"][0]["valid_until"]
+        date = canonical[:10]
+        for noncanonical in (
+            date,
+            f"{date}T00:00:00+00:00",
+            f"{date}T00:00:00.000Z",
+        ):
+            with self.subTest(valid_until=noncanonical):
+                prediction = copy.deepcopy(canonical_prediction)
+                prediction["result"]["candidates"][0]["valid_until"] = noncanonical
+                _normalized, errors = validate_prediction(case, prediction)
+                self.assertTrue(
+                    any("normalized_valid_until" in error for error in errors)
+                )
 
     def test_repeats_keep_model_input_identical(self) -> None:
         jobs = repeat_jobs([self.development[0]], 3)

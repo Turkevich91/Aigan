@@ -10,7 +10,7 @@
     "version": "deterministic-baseline-v2"
   },
   "evaluation_bundle": {
-    "sha256": "7df9e75b867719d2a01ad38db311a3d9e48bf588eef9a5f24e8a32377843ac46",
+    "sha256": "26f4457465cf533d4b402f8290269954198975dfd505ade15fc2dd1813931852",
     "version": "memory_extraction_eval_v5"
   },
   "fixture_schema_version": "memory_extraction_fixture_v2",
@@ -53,9 +53,9 @@
     }
   },
   "prompt": {
-    "file": "prompts/memory_extraction_eval_v6.md",
-    "sha256": "f063b311df0ba62abd610ac58b62410db25fb1a6d1b3c423a800e9ae13d3aa63",
-    "version": "memory_extraction_prompt_v6"
+    "file": "prompts/memory_extraction_eval_v7.md",
+    "sha256": "22768ec62a69c0596af97e14a42960886d180bb06896d8402b197352c8d282c4",
+    "version": "memory_extraction_prompt_v7"
   },
   "run_matrix": {
     "api_arms": [

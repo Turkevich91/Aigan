@@ -12,12 +12,20 @@ repeat outputs and exposed three contract gaps: candidate versus no-candidate
 was not structurally exclusive, evidence whitespace was not always preserved,
 and a correction could be linked to the wrong prior row.
 
-No v2 model call has been made yet. The v2 holdout is closed.
+The first v2 development screen matrix ran on source commit
+`d3863098c01cd53909c21c1b524ab3e6df469837` on 2026-07-11. All three arms
+completed without provider failures but failed the strict schema/safety gate.
+No locked-development or holdout call followed; the v2 holdout remains closed.
+
 The preregistered v5 prompt was superseded before any call by v6, which names
-every strict-schema `candidate_type` with its exact enum token.
-The byte-identical v5 file remains only as a preregistration audit artifact at
-SHA-256 `51ed7624b663001de77a0e219bde71e229d19b8cf953a479e5ebd07840e2af59`;
-the runner and manifest reference v6 exclusively.
+every strict-schema `candidate_type` with its exact enum token. The v6 screen
+then exposed two missing transport instructions: canonical date-only expiry
+encoding and unambiguous backward-only correction links. Prompt v7 restores
+those rules without changing fixtures, labels, schema, validator, run matrix,
+or holdout. Byte-identical v5 and v6 remain inactive audit artifacts at
+SHA-256 `51ed7624b663001de77a0e219bde71e229d19b8cf953a479e5ebd07840e2af59`
+and `f063b311df0ba62abd610ac58b62410db25fb1a6d1b3c423a800e9ae13d3aa63`.
+The runner and manifest reference v7 exclusively.
 
 ## Ownership boundary
 
@@ -74,19 +82,42 @@ Frozen SHA-256 values:
 development file/cases  e00f9fccb134017c94a196121b1101eb70f5d7241a97dc0ce10a0c2c0af548b8
 holdout file/cases      d9cc736f10e9a1196a500032532cc0cc76dadbf37dc2715199446a6e91cbc609
 screen cases            938c07629cc3242e0b80e3339f30d4baaff549f7730dd1860a8e89b3e4cf6d18
-prompt v6               f063b311df0ba62abd610ac58b62410db25fb1a6d1b3c423a800e9ae13d3aa63
+prompt v7               22768ec62a69c0596af97e14a42960886d180bb06896d8402b197352c8d282c4
 output schema v3        09838f4ccca1bf831c9ea7491e45a9d37a0a54b57b707904811d25c811f12cef
 deterministic baseline  433994c6d44a8abcab7756f79794a0d8987ae874c8e5c5ceae94832eec55d80e
 pricing snapshot        a8aebcd56703bf09c7f84cacf543d20c4bd3b7d532d6010e7db0ef9e9682a61c
 run matrix              203ad336482d56dd3f1fe1995c24f8b089734dd85fc75da325a8aff330518673
-evaluation bundle       7df9e75b867719d2a01ad38db311a3d9e48bf588eef9a5f24e8a32377843ac46
-whole manifest          07540b48b33f42d9f89782885545690de4ddca5c1ed090363002e945589b22d5
+evaluation bundle       26f4457465cf533d4b402f8290269954198975dfd505ade15fc2dd1813931852
+whole manifest          a9de1e0f74bfef5e43d9858c3e3c70b9bf3939342d571b8527abe6a462bfda90
 ```
 
 The manifest lists all 48 screen case IDs. That subset is exactly 12 cases per
 language, 34 candidate-bearing and 14 expected-negative cases, with every
 candidate/rejection class, 20 exact-whitespace cases, and 6 multi-prior
 corrections.
+
+### V6 screen result and v7 rationale
+
+| Arm | Strict valid | Overall F1 | Hard violations | Estimated cost | p95 latency |
+|---|---:|---:|---:|---:|---:|
+| Luna / none | 45/48 | 0.8889 | 3 | $0.080292 | 9,884 ms |
+| Luna / low | 44/48 | 0.8889 | 4 | $0.094266 | 11,970 ms |
+| Terra / low | 44/48 | 0.9041 | 4 | $0.203850 | 10,012 ms |
+
+All three had zero provider failures, zero expected-negative false positives,
+complete model/effort/usage evidence, and `runtime_authorized=false`. Each
+failed only `structured_valid_rate_100`,
+`all_repeat_structured_valid_rate_100`, and `hard_safety_violations_zero`.
+The two low-effort arms failed all four screen expiry cases solely because the
+model returned a parseable but noncanonical `valid_until`. Luna/none also
+produced correction-link direction errors.
+
+V7 therefore makes the already-frozen representation explicit: a source-only
+`YYYY-MM-DD` is encoded as `YYYY-MM-DDT00:00:00Z` for canonical transport and
+does not claim that the source supplied a time. A later runtime design must
+retain date precision or otherwise avoid treating this transport encoding as
+an asserted midnight event. The complete three-arm screen matrix must be rerun
+against v7; prior reports cannot admit a v7 locked-development run.
 
 ## Fixed model matrix
 
