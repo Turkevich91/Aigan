@@ -88,10 +88,17 @@ class ContextSelectionContractTests(unittest.TestCase):
         source_ids = {source.source_id for source in case.selection_input.sources}
         event_ids = {event.event_id for event in case.selection_input.events}
         self.assertTrue(result.selected_event_ids)
+        self.assertEqual(1, len(result.selected_event_ids))
         self.assertTrue(set(result.selected_source_ids).issubset(source_ids))
         self.assertFalse(set(result.selected_source_ids) & event_ids)
-        self.assertGreater(result.amortized_calls, 0)
-        self.assertGreater(result.amortized_input_tokens, 0)
+        self.assertEqual(
+            sum(event.amortized_calls for event in case.selection_input.events),
+            result.amortized_calls,
+        )
+        self.assertEqual(
+            sum(event.amortized_input_tokens for event in case.selection_input.events),
+            result.amortized_input_tokens,
+        )
 
     def test_aggregate_report_never_contains_case_payloads_or_ids(self) -> None:
         cases = load_context_selection_fixture(FIXTURE)
@@ -106,6 +113,10 @@ class ContextSelectionContractTests(unittest.TestCase):
         self.assertEqual("INCONCLUSIVE", report["research_decision"])
         self.assertFalse(report["runtime_authorized"])
         self.assertFalse(report["answer_evaluation_complete"])
+        provisional_cost = report["arms"]["C1"][
+            "candidate_snapshot_construction_not_deduplicated"
+        ]
+        self.assertFalse(provisional_cost["decision_usable"])
 
     def test_synthetic_contract_exercises_deployed_failures(self) -> None:
         report = evaluate_context_selection_fixture(FIXTURE, bootstrap_samples=100)

@@ -773,6 +773,9 @@ def select_b1(selection_input: SelectionInput, config: SelectorConfig) -> Select
     for source in rank_b1_sources(selection_input, config):
         state.add_source(source)
     action = "answer" if state.selected else "clarify"
+    # Persistent event construction happens before query-time selection. This
+    # provisional, explicitly non-deduplicated ledger therefore includes every
+    # candidate event in the frozen snapshot, not only the selected anchor.
     return SelectionResult(
         arm="B1",
         selected_source_ids=tuple(state.selected),
@@ -991,7 +994,7 @@ def aggregate_arm(scores: Sequence[CaseScore]) -> dict[str, Any]:
         "context_chars": _distribution([float(score.context_chars) for score in scores]),
         "navigation_chars": _distribution([float(score.navigation_chars) for score in scores]),
         "compile_ms": _distribution([score.compile_ms for score in scores]),
-        "declared_event_construction_not_deduplicated": {
+        "candidate_snapshot_construction_not_deduplicated": {
             "calls": sum(score.amortized_calls for score in scores),
             "input_tokens": sum(score.amortized_input_tokens for score in scores),
             "output_tokens": sum(score.amortized_output_tokens for score in scores),

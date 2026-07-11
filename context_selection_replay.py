@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from bisect import bisect_left, bisect_right
 from collections import Counter
 from datetime import datetime, timedelta, timezone
 import hashlib
@@ -100,80 +101,128 @@ def _summary_route_bucket(route: str) -> str:
     return route if route in SUMMARY_ROUTE_BUCKETS else "other"
 
 
-def _cluster_key(
-    connection: sqlite3.Connection,
-    key: bytes,
-    row: Mapping[str, Any],
-) -> str:
-    target_time = _parse_timestamp(row.get("created_at"))
-    if target_time is None or row.get("chat_id") is None or row.get("id") is None:
-        raise ContextSelectionReplayError("cluster key source is incomplete")
-    target_id = int(row["id"])
-    candidates: list[tuple[datetime, int]] = []
-    for message in _rows(
-        connection,
-        "SELECT id, created_at FROM messages WHERE chat_id = ?",
-        (int(row["chat_id"]),),
-    ):
-        created_at = _parse_timestamp(message["created_at"])
-        if created_at is None:
-            continue
-        message_id = int(message["id"])
-        if created_at < target_time or (created_at == target_time and message_id <= target_id):
-            candidates.append((created_at, message_id))
-    candidates.sort()
-    if not candidates or candidates[-1][1] != target_id:
-        raise ContextSelectionReplayError("cluster target is absent from replay history")
-    session_start = candidates[-1]
-    inactivity = timedelta(minutes=CLUSTER_INACTIVITY_MINUTES)
-    for previous in reversed(candidates[:-1]):
-        if session_start[0] - previous[0] > inactivity:
-            break
-        session_start = previous
-    material = f"{row['chat_id']}:{session_start[0].isoformat()}:{session_start[1]}"
-    return _opaque(key, "cluster", material)
-
-
 def _rows(connection: sqlite3.Connection, query: str, parameters: Iterable[Any] = ()) -> list[sqlite3.Row]:
     return list(connection.execute(query, tuple(parameters)).fetchall())
 
 
-def _preceding_messages(
-    connection: sqlite3.Connection,
-    *,
-    chat_id: int,
-    cutoff_time: datetime,
-    cutoff_id: int | None = None,
-    is_bot: bool | None = None,
-    user_id: int | None = None,
-    limit: int | None = None,
-) -> list[sqlite3.Row]:
-    query = "SELECT * FROM messages WHERE chat_id = ?"
-    parameters: list[Any] = [chat_id]
-    if is_bot is not None:
-        query += " AND is_bot = ?"
-        parameters.append(int(is_bot))
-    if user_id is not None:
-        query += " AND user_id = ?"
-        parameters.append(user_id)
-    candidates: list[tuple[datetime, int, sqlite3.Row]] = []
-    for row in _rows(connection, query, parameters):
-        created_at = _parse_timestamp(row["created_at"])
-        if created_at is None:
-            continue
-        row_id = int(row["id"])
-        before = created_at < cutoff_time
-        before = before or (created_at == cutoff_time and (cutoff_id is None or row_id < cutoff_id))
-        if before:
-            candidates.append((created_at, row_id, row))
-    candidates.sort(key=lambda item: (item[0], item[1]), reverse=True)
-    selected = candidates if limit is None else candidates[:limit]
-    return [row for _created_at, _row_id, row in selected]
+HistoryEntry = tuple[datetime, int, sqlite3.Row]
+
+
+class _MessageHistoryIndex:
+    """One parsed chronological index shared by every replay packet."""
+
+    def __init__(self, rows: Iterable[sqlite3.Row]) -> None:
+        by_chat: dict[int, list[HistoryEntry]] = {}
+        by_external_id: dict[tuple[int, int], list[HistoryEntry]] = {}
+        for row in rows:
+            created_at = _parse_timestamp(row["created_at"])
+            if created_at is None or row["chat_id"] is None:
+                continue
+            chat_id = int(row["chat_id"])
+            entry = (created_at, int(row["id"]), row)
+            by_chat.setdefault(chat_id, []).append(entry)
+            if row["message_id"] is not None:
+                key = (chat_id, int(row["message_id"]))
+                by_external_id.setdefault(key, []).append(entry)
+
+        self._by_chat = {
+            chat_id: tuple(sorted(entries, key=lambda item: (item[0], item[1])))
+            for chat_id, entries in by_chat.items()
+        }
+        self._chat_keys = {
+            chat_id: tuple((created_at, row_id) for created_at, row_id, _row in entries)
+            for chat_id, entries in self._by_chat.items()
+        }
+        self._by_external_id = {
+            key: tuple(sorted(entries, key=lambda item: (item[0], item[1])))
+            for key, entries in by_external_id.items()
+        }
+        self._external_keys = {
+            key: tuple((created_at, row_id) for created_at, row_id, _row in entries)
+            for key, entries in self._by_external_id.items()
+        }
+
+    @staticmethod
+    def _cutoff_position(
+        keys: tuple[tuple[datetime, int], ...],
+        *,
+        cutoff_time: datetime,
+        cutoff_id: int | None,
+    ) -> int:
+        if cutoff_id is None:
+            return bisect_right(keys, (cutoff_time, 2**63 - 1))
+        return bisect_left(keys, (cutoff_time, cutoff_id))
+
+    def preceding(
+        self,
+        *,
+        chat_id: int,
+        cutoff_time: datetime,
+        cutoff_id: int | None = None,
+        is_bot: bool | None = None,
+        user_id: int | None = None,
+        limit: int | None = None,
+    ) -> list[sqlite3.Row]:
+        entries = self._by_chat.get(chat_id, ())
+        keys = self._chat_keys.get(chat_id, ())
+        position = self._cutoff_position(keys, cutoff_time=cutoff_time, cutoff_id=cutoff_id)
+        selected: list[sqlite3.Row] = []
+        for index in range(position - 1, -1, -1):
+            row = entries[index][2]
+            if is_bot is not None and bool(row["is_bot"]) is not is_bot:
+                continue
+            if user_id is not None and row["user_id"] != user_id:
+                continue
+            selected.append(row)
+            if limit is not None and len(selected) >= limit:
+                break
+        return selected
+
+    def external_before(
+        self,
+        *,
+        chat_id: int,
+        message_id: int,
+        cutoff_time: datetime,
+        cutoff_id: int,
+        is_bot: bool | None = None,
+    ) -> sqlite3.Row | None:
+        key = (chat_id, message_id)
+        entries = self._by_external_id.get(key, ())
+        keys = self._external_keys.get(key, ())
+        position = self._cutoff_position(keys, cutoff_time=cutoff_time, cutoff_id=cutoff_id)
+        for index in range(position - 1, -1, -1):
+            row = entries[index][2]
+            if is_bot is None or bool(row["is_bot"]) is is_bot:
+                return row
+        return None
+
+    def cluster_key(self, key: bytes, row: Mapping[str, Any]) -> str:
+        target_time = _parse_timestamp(row.get("created_at"))
+        if target_time is None or row.get("chat_id") is None or row.get("id") is None:
+            raise ContextSelectionReplayError("cluster key source is incomplete")
+        chat_id = int(row["chat_id"])
+        target_id = int(row["id"])
+        entries = self._by_chat.get(chat_id, ())
+        keys = self._chat_keys.get(chat_id, ())
+        position = bisect_left(keys, (target_time, target_id))
+        if position >= len(keys) or keys[position] != (target_time, target_id):
+            raise ContextSelectionReplayError("cluster target is absent from replay history")
+        session_start = entries[position][:2]
+        inactivity = timedelta(minutes=CLUSTER_INACTIVITY_MINUTES)
+        for index in range(position - 1, -1, -1):
+            previous = entries[index][:2]
+            if session_start[0] - previous[0] > inactivity:
+                break
+            session_start = previous
+        material = f"{chat_id}:{session_start[0].isoformat()}:{session_start[1]}"
+        return _opaque(key, "cluster", material)
 
 
 def _target_candidates(
     connection: sqlite3.Connection,
     *,
+    history: _MessageHistoryIndex,
     lookback_days: int,
     approximate_window_seconds: int,
     historical_output_window_seconds: int,
@@ -245,8 +294,7 @@ def _target_candidates(
         event_time = _parse_timestamp(event["created_at"])
         if event_time is None or event_time < cutoff or event["chat_id"] is None:
             continue
-        possible = _preceding_messages(
-            connection,
+        possible = history.preceding(
             chat_id=int(event["chat_id"]),
             cutoff_time=event_time,
             is_bot=False,
@@ -312,15 +360,13 @@ def _target_candidates(
         correlation_kind = "outbound_reply_link"
         reply_target = output["reply_to_message_id"]
         if reply_target is not None:
-            replied = connection.execute(
-                """
-                SELECT * FROM messages
-                WHERE chat_id = ? AND message_id = ? AND is_bot = 0
-                ORDER BY id DESC
-                LIMIT 1
-                """,
-                (output["chat_id"], reply_target),
-            ).fetchone()
+            replied = history.external_before(
+                chat_id=int(output["chat_id"]),
+                message_id=int(reply_target),
+                cutoff_time=output_time,
+                cutoff_id=int(output["id"]),
+                is_bot=False,
+            )
             if replied is not None:
                 replied_time = _parse_timestamp(replied["created_at"])
                 if replied_time is not None and (
@@ -330,8 +376,7 @@ def _target_candidates(
                     selected = replied
                     selected_gap_ms = int((output_time - replied_time).total_seconds() * 1000)
 
-        possible = _preceding_messages(
-            connection,
+        possible = history.preceding(
             chat_id=int(output["chat_id"]),
             cutoff_time=output_time,
             cutoff_id=int(output["id"]),
@@ -352,16 +397,14 @@ def _target_candidates(
             )
             reply_target = message["reply_to_message_id"]
             if reply_target is not None:
-                replied = connection.execute(
-                    """
-                    SELECT is_bot FROM messages
-                    WHERE chat_id = ? AND message_id = ?
-                    ORDER BY id DESC
-                    LIMIT 1
-                    """,
-                    (message["chat_id"], reply_target),
-                ).fetchone()
-                likely_invocation = likely_invocation or bool(replied and replied["is_bot"])
+                replied = history.external_before(
+                    chat_id=int(message["chat_id"]),
+                    message_id=int(reply_target),
+                    cutoff_time=message_time,
+                    cutoff_id=int(message["id"]),
+                    is_bot=True,
+                )
+                likely_invocation = likely_invocation or replied is not None
             if likely_invocation:
                 selected = message
                 selected_gap_ms = gap_ms
@@ -417,35 +460,41 @@ def _target_candidates(
 
 
 def _reply_chain(
-    connection: sqlite3.Connection,
+    history: _MessageHistoryIndex,
     *,
     chat_id: int,
     reply_to_message_id: int | None,
+    target_time: datetime,
+    target_id: int,
     depth: int,
 ) -> list[dict[str, Any]]:
     chain: list[dict[str, Any]] = []
     current = reply_to_message_id
+    cutoff_time = target_time
+    cutoff_id = target_id
     seen: set[int] = set()
     while current is not None and len(chain) < depth and current not in seen:
         seen.add(current)
-        row = connection.execute(
-            """
-            SELECT * FROM messages
-            WHERE chat_id = ? AND message_id = ?
-            ORDER BY id DESC
-            LIMIT 1
-            """,
-            (chat_id, current),
-        ).fetchone()
+        row = history.external_before(
+            chat_id=chat_id,
+            message_id=int(current),
+            cutoff_time=cutoff_time,
+            cutoff_id=cutoff_id,
+        )
         if row is None:
             break
         chain.append(dict(row))
         current = row["reply_to_message_id"]
+        parsed = _parse_timestamp(row["created_at"])
+        if parsed is None:
+            break
+        cutoff_time = parsed
+        cutoff_id = int(row["id"])
     return chain
 
 
 def _candidate_sources(
-    connection: sqlite3.Connection,
+    history: _MessageHistoryIndex,
     target: Mapping[str, Any],
     *,
     recent_limit: int,
@@ -456,8 +505,7 @@ def _candidate_sources(
         raise ContextSelectionReplayError("target has invalid timestamp")
     recent = [
         dict(row)
-        for row in _preceding_messages(
-            connection,
+        for row in history.preceding(
             chat_id=int(target["chat_id"]),
             cutoff_time=target_time,
             cutoff_id=int(target["id"]),
@@ -465,9 +513,11 @@ def _candidate_sources(
         )
     ]
     chain = _reply_chain(
-        connection,
+        history,
         chat_id=int(target["chat_id"]),
         reply_to_message_id=target.get("reply_to_message_id"),
+        target_time=target_time,
+        target_id=int(target["id"]),
         depth=reply_depth,
     )
     history_rows = []
@@ -582,8 +632,10 @@ def collect_review_packets(
         raise ContextSelectionReplayError("invalid replay key")
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA query_only = ON")
+    history = _MessageHistoryIndex(_rows(connection, "SELECT * FROM messages"))
     targets, correlation_counts = _target_candidates(
         connection,
+        history=history,
         lookback_days=lookback_days,
         approximate_window_seconds=approximate_window_seconds,
         historical_output_window_seconds=historical_output_window_seconds,
@@ -596,7 +648,7 @@ def collect_review_packets(
     for target_item in targets:
         target = target_item["row"]
         candidates = _candidate_sources(
-            connection,
+            history,
             target,
             recent_limit=recent_limit,
             reply_depth=reply_depth,
@@ -622,7 +674,7 @@ def collect_review_packets(
                 "schema_version": REVIEW_PACKET_SCHEMA_VERSION,
                 "packet_key": _opaque(hmac_key, "packet", target_item["packet_material"]),
                 "case_key": _opaque(hmac_key, "case", int(target["id"])),
-                "cluster_key": _cluster_key(connection, hmac_key, target),
+                "cluster_key": history.cluster_key(hmac_key, target),
                 "cluster_method": "inactivity_session",
                 "cluster_inactivity_minutes": CLUSTER_INACTIVITY_MINUTES,
                 "run_key": _opaque(hmac_key, "run", run_id) if run_id is not None else None,

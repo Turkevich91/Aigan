@@ -193,6 +193,11 @@ model: development data must estimate dependence and choose a session or block
 bootstrap rule, and that rule plus the required independent-cluster count must
 be frozen before holdout analysis.
 
+Packet collection parses retained message timestamps once into a shared
+chronological index. Recent windows, reply lookup, and session clustering reuse
+that index, preserving mixed-offset timestamp ordering without rescanning a
+chat for every packet.
+
 When neither modern provenance nor a retained route event exists, a retained
 outbound reply edge is preferred and marked `outbound_reply_link`. A separate
 lower-confidence intake may correlate a historical bot output with a nearby
@@ -255,8 +260,10 @@ ten-point comparisons.
 The current compile durations are not comparable: B0 is a frozen live duration,
 while B1/C1 are local selector loops. Declared event construction values can be
 exercised by the contract but are not deduplicated across cases and have no
-frozen USD price snapshot. They appear under
-`declared_event_construction_not_deduplicated` with
+frozen USD price snapshot. Because persistent events are built before a query,
+the provisional total covers every candidate event in the frozen snapshot, not
+only the selected anchor. It appears under
+`candidate_snapshot_construction_not_deduplicated` with
 `decision_usable=false`. A final economic comparison requires unique
 construction keys, actual prompt/output token ledgers, a dated price snapshot,
 and end-to-end latency measured in the same environment.

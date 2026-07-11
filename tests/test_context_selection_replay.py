@@ -218,6 +218,31 @@ class ContextSelectionReplayTests(unittest.TestCase):
         self.assertEqual(2, len({packet["run_key"] for packet in exact}))
         self.assertEqual(1, summary["correlation_counts"]["repeated_exact_targets"])
 
+    def test_message_history_is_loaded_once_instead_of_per_packet(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "replay.sqlite3"
+            _create_database(database)
+            connection = sqlite3.connect(database)
+            statements: list[str] = []
+            connection.set_trace_callback(statements.append)
+            collect_review_packets(
+                connection,
+                hmac_key=b"k" * 32,
+                lookback_days=30,
+                recent_limit=20,
+                reply_depth=8,
+            )
+            connection.close()
+
+        normalized = [" ".join(statement.split()).casefold() for statement in statements]
+        self.assertEqual(1, normalized.count("select * from messages"))
+        self.assertFalse(
+            any(
+                "from messages where chat_id" in statement
+                for statement in normalized
+            )
+        )
+
     def test_manifest_route_counts_never_copy_untrusted_route_values(self) -> None:
         private_route = "PRIVATE_ROUTE_SENTINEL"
         with tempfile.TemporaryDirectory() as directory:
