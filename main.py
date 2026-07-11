@@ -4510,12 +4510,7 @@ def has_current_context_payload(message: Message) -> bool:
 
 
 def referenced_context_available(message: Message) -> bool:
-    quote = getattr(message, "quote", None)
-    return bool(
-        getattr(quote, "text", None)
-        or getattr(message, "reply_to_message", None) is not None
-        or getattr(message, "external_reply", None) is not None
-    )
+    return build_reference_context(message) != "(none)"
 
 
 def is_translate_request(prompt: str) -> bool:
@@ -4837,6 +4832,15 @@ def model_policy_mutation_requested(
     )
 
 
+def model_policy_reference_available(message: Message) -> bool:
+    quote = getattr(message, "quote", None)
+    return bool(
+        getattr(quote, "text", None)
+        or getattr(message, "reply_to_message", None) is not None
+        or getattr(message, "external_reply", None) is not None
+    )
+
+
 def build_model_policy_router_metadata(
     message: Message,
     prompt: str,
@@ -4850,7 +4854,7 @@ def build_model_policy_router_metadata(
         and getattr(reply, "from_user", None) is not None
         and getattr(reply.from_user, "id", None) == BOT_ID
     )
-    has_reference = referenced_context_available(message)
+    has_reference = model_policy_reference_available(message)
     mutation_capability = bool(
         tool_route_decision is not None
         and tool_route_decision.allowed_toolsets
@@ -5002,7 +5006,6 @@ async def evaluate_model_policy_shadow(
         ).decide(
             json.loads(raw),
             route_bucket=route_bucket,
-            mutation_capability=bool(metadata.get("mutation_capability")),
             mutation_requested=bool(metadata.get("mutation_requested")),
             short_unanchored_followup=bool(metadata.get("short_unanchored_followup")),
             source_context=bool(metadata.get("has_reference")),

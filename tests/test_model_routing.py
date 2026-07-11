@@ -104,7 +104,6 @@ class ModelRoutingPolicyTests(unittest.TestCase):
             ),
             ({}, {"route_bucket": "memory_recall"}, "premium"),
             ({}, {"route_bucket": "time_sensitive"}, "premium"),
-            ({}, {"mutation_capability": True}, "premium"),
             ({}, {"mutation_requested": True}, "premium"),
             ({}, {"short_unanchored_followup": True}, "premium"),
             ({}, {"source_context": True}, "balanced"),
@@ -128,7 +127,6 @@ class ModelRoutingPolicyTests(unittest.TestCase):
                     payload,
                     confidence_threshold=0.75,
                     route_bucket=str(policy_changes.get("route_bucket", "normal")),
-                    mutation_capability=bool(policy_changes.get("mutation_capability", False)),
                     mutation_requested=bool(policy_changes.get("mutation_requested", False)),
                     short_unanchored_followup=bool(
                         policy_changes.get("short_unanchored_followup", False)
@@ -212,6 +210,19 @@ class ModelRoutingPolicyTests(unittest.TestCase):
                 mutation_requested=True,
             ),
         )
+        self.assertEqual(
+            (False, "unsafe_context"),
+            shadow_canary_eligibility(
+                decision,
+                route_bucket="normal",
+                has_url=False,
+                has_attachment=False,
+                has_reference=False,
+                mutation_capability=True,
+                short_followup=False,
+                mutation_requested=False,
+            ),
+        )
 
     def test_episode_keys_are_stable_opaque_and_secret_bound(self) -> None:
         first = opaque_episode_key("private-a", "chat", 1, "thread", 2)
@@ -261,7 +272,7 @@ class ModelRoutingPolicyTests(unittest.TestCase):
                 payload,
                 confidence_threshold=0.75,
                 route_bucket=case["input"]["request_route"],
-                mutation_capability=bool(case["input"]["mutation_capability"]),
+                mutation_requested=bool(case["input"]["mutation_capability"]),
                 short_unanchored_followup=bool(case["input"]["short_unanchored_followup"]),
                 source_context=bool(case["input"].get("has_reference", False)),
             )

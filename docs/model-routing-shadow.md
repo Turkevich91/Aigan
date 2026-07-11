@@ -63,6 +63,12 @@ The sanitized fixture is
 evaluation runner emits aggregate metrics only and does not persist model
 outputs.
 
+For hash stability, the frozen-v1 field `mutation_capability=true` denotes
+synthetic cases that both request mutation and expose a mutating toolset. Live
+runtime metadata tracks `mutation_requested` and `mutation_capability`
+separately: only intent raises the tier, while either flag blocks future
+exact-utility canary eligibility.
+
 Fixture SHA-256:
 
 ```text

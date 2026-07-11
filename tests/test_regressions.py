@@ -821,6 +821,20 @@ class ModelPolicyRoutingIntegrationTests(unittest.TestCase):
         self.assertIn("[url]", metadata["trusted_text"])
         self.assertNotIn("private.example", metadata["trusted_text"])
 
+        read_only_metadata = main.build_model_policy_router_metadata(
+            FakeMessage("List my reminders", chat_type=ChatType.PRIVATE),
+            "List my reminders",
+            route="normal",
+            tool_route_decision=main.ToolRouteDecision(
+                domains=("reminders",),
+                intent="list",
+                confidence=0.9,
+                allowed_toolsets=("reminder_crud",),
+            ),
+        )
+        self.assertTrue(read_only_metadata["mutation_capability"])
+        self.assertFalse(read_only_metadata["mutation_requested"])
+
     def test_non_thread_replies_are_single_turn_and_threads_are_sticky(self) -> None:
         parent = FakeMessage("parent", message_id=601)
         first_reply = FakeMessage("first", message_id=602)

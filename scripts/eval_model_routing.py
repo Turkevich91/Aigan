@@ -78,6 +78,7 @@ def router_metadata(case: dict[str, Any]) -> dict[str, Any]:
         "short_followup": short_unanchored,
         "short_unanchored_followup": short_unanchored,
         "mutation_capability": bool(item.get("mutation_capability", False)),
+        "mutation_requested": bool(item.get("mutation_capability", False)),
         "tool_intent": "manage" if item.get("mutation_capability") else "none",
     }
 
@@ -158,7 +159,7 @@ def evaluate_case(
             payload,
             confidence_threshold=threshold,
             route_bucket=str(metadata["request_route"]),
-            mutation_capability=bool(metadata["mutation_capability"]),
+            mutation_requested=bool(metadata["mutation_requested"]),
             short_unanchored_followup=bool(metadata["short_unanchored_followup"]),
             source_context=bool(metadata["has_reference"]),
         )
