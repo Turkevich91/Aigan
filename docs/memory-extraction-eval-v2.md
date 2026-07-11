@@ -24,8 +24,22 @@ admitted 160-case, three-repeat locked-development arms returned `NO_GO`.
 Matrix attestation
 `5545f60d4f700c85654ad2f7fa0c8a8f8134234ee60b28c03860b5bf0981974b`
 selected no model. No holdout call followed; runtime remains unauthorized.
-Later documentation-only commits do not change the frozen evaluation artifacts
-or the exact measured source named above.
+That measurement belongs only to evaluator v5 bundle
+`26f4457465cf533d4b402f8290269954198975dfd505ade15fc2dd1813931852`,
+manifest `a9de1e0f74bfef5e43d9858c3e3c70b9bf3939342d571b8527abe6a462bfda90`,
+and run matrix
+`203ad336482d56dd3f1fe1995c24f8b089734dd85fc75da325a8aff330518673`.
+Later commits do not change or relabel that frozen result.
+
+Post-result review found that v5 let the operator choose the receipt path, so
+a different filename could bypass the one-time holdout claim. Evaluator v6 is
+a prospective safety-only contract: the claim path is no longer a CLI input,
+its key depends only on frozen holdout content, and it lives in private durable
+state for the effective POSIX user. CI, detected common ephemeral-container
+markers, symlinked state, non-owner state, and group/other-accessible state fail
+before any provider call.
+No model or holdout call was made under evaluator v6, and v5 reports cannot
+satisfy its new bundle/manifest hashes.
 
 The preregistered v5 prompt was superseded before any call by v6, which names
 every strict-schema `candidate_type` with its exact enum token. The v6 screen
@@ -35,7 +49,8 @@ those rules without changing fixtures, labels, schema, validator, run matrix,
 or holdout. Byte-identical v5 and v6 remain inactive audit artifacts at
 SHA-256 `51ed7624b663001de77a0e219bde71e229d19b8cf953a479e5ebd07840e2af59`
 and `f063b311df0ba62abd610ac58b62410db25fb1a6d1b3c423a800e9ae13d3aa63`.
-The runner and manifest reference v7 exclusively.
+The current evaluator v6 runner and manifest still reference prompt v7
+exclusively; evaluator and prompt version numbers are independent.
 
 ## Ownership boundary
 
@@ -89,6 +104,8 @@ an opaque frozen byte file and verify its hash without loading its labels.
 Frozen SHA-256 values:
 
 ```text
+current prospective evaluator v6 contract (no model calls)
+
 development file/cases  e00f9fccb134017c94a196121b1101eb70f5d7241a97dc0ce10a0c2c0af548b8
 holdout file/cases      d9cc736f10e9a1196a500032532cc0cc76dadbf37dc2715199446a6e91cbc609
 screen cases            938c07629cc3242e0b80e3339f30d4baaff549f7730dd1860a8e89b3e4cf6d18
@@ -96,6 +113,12 @@ prompt v7               22768ec62a69c0596af97e14a42960886d180bb06896d8402b197352
 output schema v3        09838f4ccca1bf831c9ea7491e45a9d37a0a54b57b707904811d25c811f12cef
 deterministic baseline  433994c6d44a8abcab7756f79794a0d8987ae874c8e5c5ceae94832eec55d80e
 pricing snapshot        a8aebcd56703bf09c7f84cacf543d20c4bd3b7d532d6010e7db0ef9e9682a61c
+holdout claim key       303d4e260a78f292b90d72d9d04ff96e9b4f45f632347ee964e5e211f9fbd3cc
+run matrix              24e010736117fa269ae32b563f6c15c3927bb59a64f6556ecfa26b2c605e7f1a
+evaluation bundle       f2faf805fe59a4aab42dd23861b516cda1cdacf0a1f1dab71488f0e4a15834ff
+whole manifest          0b17e81a2360cefcd8ffe1086d7d11ea8dab481fdab8993e2ea9bc7c05b7737c
+
+historical measured evaluator v5 snapshot
 run matrix              203ad336482d56dd3f1fe1995c24f8b089734dd85fc75da325a8aff330518673
 evaluation bundle       26f4457465cf533d4b402f8290269954198975dfd505ade15fc2dd1813931852
 whole manifest          a9de1e0f74bfef5e43d9858c3e3c70b9bf3939342d571b8527abe6a462bfda90
@@ -214,13 +237,34 @@ tie-breaker.
 Holdout additionally requires the exact manifest and attestation hashes and the
 selected model/effort/actual-model snapshot. Every artifact is rechecked before
 an API client is created. Immediately before the first request, the runner
-atomically creates a private external receipt with exclusive-create semantics.
-On POSIX, both the receipt file and its parent directory are fsynced before any
-provider request; a sync failure aborts the run and leaves the claim consumed.
-An existing receipt, concurrent claim, crash, timeout, or provider failure
-cannot be overridden and consumes v2 holdout. The aggregate result is written
-to a different external file. Neither file belongs in Git, GitHub, or runtime
-SQLite.
+atomically creates a private canonical claim with exclusive-create semantics.
+There is no claim-path option. The stable claim key contains the namespace plus
+the frozen holdout file and case-set hashes; it deliberately excludes manifest,
+evaluator, prompt, source commit, model, attestation, and result path. Contract
+changes therefore cannot silently reopen the same holdout content.
+
+The claim lives in an owner-only directory below the effective POSIX account's
+passwd home, independent of `HOME`, current directory, repository clone, and
+result filename. The runner rejects CI and common ephemeral-container markers;
+the supported execution surface is the authoritative persistent host account.
+The directory must be real, owned by that account, mode `0700`, and writable.
+The claim-directory link in the account home, the mode-`0600` claim file, and
+the claim directory are all fsynced before any
+provider request. A home-parent sync failure aborts before the claim and before
+provider access. Once the exclusive claim file exists, a later file or
+claim-directory sync failure aborts while leaving that claim consumed. An
+existing claim,
+including an empty or malformed file, concurrent claim, crash, timeout, provider
+failure, or result-write failure cannot be overridden. The aggregate result is
+written to a separate caller-selected external file, but changing that path
+does not change the claim.
+
+This protects against accidental repeat execution on one persistent host/user.
+It cannot defend against a privileged or intentionally malicious operator who
+deletes state, changes the runner, uses another account/host, or calls the API
+outside the evaluator. That stronger threat model needs an external blinded
+evaluation service. Claims and results never belong in Git, GitHub, runtime
+SQLite, or container layers.
 
 This document intentionally contains no runnable holdout command. Holdout is a
 separate operator gate after matrix selection and source freeze.

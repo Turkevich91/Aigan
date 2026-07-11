@@ -14,11 +14,15 @@ from pathlib import Path
 from unittest.mock import patch
 
 import memory_extraction as v1
+import memory_extraction_v2 as contract_v2
 from memory_extraction_v2 import (
     API_ARMS,
     BASELINE_MODEL,
     EVALUATOR_VERSION,
+    HOLDOUT_CLAIM_NAMESPACE,
+    MANIFEST_VERSION,
     EXPECTED_CASES_PER_SPLIT,
+    HOLDOUT_CLAIM_SCOPE,
     FROZEN_DETERMINISTIC_BASELINE_SHA256,
     FROZEN_DEVELOPMENT_CASE_SHA256,
     FROZEN_DEVELOPMENT_FILE_SHA256,
@@ -40,6 +44,7 @@ from memory_extraction_v2 import (
     evaluate_predictions,
     evaluation_bundle_sha256,
     fixture_case_set_sha256,
+    holdout_claim_key_sha256,
     fixture_sha256,
     load_fixture,
     manifest_sha256,
@@ -62,6 +67,7 @@ from memory_extraction_selection_v2 import (
 import scripts.eval_memory_extraction_v2 as eval_v2
 from scripts.eval_memory_extraction_v2 import (
     CallResult,
+    canonical_holdout_claim_path,
     first_repeat_predictions,
     reserve_holdout_once,
 )
@@ -200,12 +206,21 @@ class MemoryExtractionV2FixtureTests(unittest.TestCase):
 
     def test_manifest_matches_frozen_contract(self) -> None:
         manifest = json.loads(MANIFEST.read_text(encoding="utf-8"))
+        self.assertEqual(MANIFEST_VERSION, manifest["manifest_version"])
         self.assertEqual(FROZEN_DEVELOPMENT_FILE_SHA256, manifest["development"]["file_sha256"])
         self.assertEqual(FROZEN_HOLDOUT_FILE_SHA256, manifest["holdout"]["file_sha256"])
         self.assertEqual(
             FROZEN_HOLDOUT_CASE_SHA256,
             manifest["holdout"]["case_set_sha256"],
         )
+        self.assertEqual(
+            {
+                "caller_selectable_path": False,
+                "ephemeral_environment_allowed": False,
+                "key_sha256": holdout_claim_key_sha256(),
+                "namespace": HOLDOUT_CLAIM_NAMESPACE,
+                "scope": HOLDOUT_CLAIM_SCOPE,
+            }, manifest["holdout"]["claim"])
         self.assertEqual(FROZEN_PROMPT_SHA256, manifest["prompt"]["sha256"])
         self.assertEqual(PROMPT_VERSION, manifest["prompt"]["version"])
         self.assertEqual(
@@ -295,6 +310,12 @@ class MemoryExtractionV2ContractTests(unittest.TestCase):
 
     def test_parent_directory_fsync_is_fail_closed_on_posix(self) -> None:
         path = Path("external") / "receipt.json"
+        expected_flags = (
+            eval_v2.os.O_RDONLY
+            | getattr(eval_v2.os, "O_DIRECTORY", 0)
+            | getattr(eval_v2.os, "O_CLOEXEC", 0)
+            | getattr(eval_v2.os, "O_NOFOLLOW", 0)
+        )
         with (
             patch.object(eval_v2.os, "name", "posix"),
             patch.object(eval_v2.os, "open", return_value=17) as open_directory,
@@ -302,10 +323,7 @@ class MemoryExtractionV2ContractTests(unittest.TestCase):
             patch.object(eval_v2.os, "close") as close,
         ):
             eval_v2._fsync_parent_directory(path)
-        open_directory.assert_called_once_with(
-            path.parent,
-            eval_v2.os.O_RDONLY | getattr(eval_v2.os, "O_DIRECTORY", 0),
-        )
+        open_directory.assert_called_once_with(path.parent, expected_flags)
         fsync.assert_called_once_with(17)
         close.assert_called_once_with(17)
 
@@ -693,7 +711,7 @@ class MemoryExtractionV2ContractTests(unittest.TestCase):
         self.assertEqual("NO_GO", attestation["verdict"])
         self.assertIsNone(attestation["selected"])
 
-    def test_holdout_receipt_is_atomic_and_survives_first_claim(self) -> None:
+    def test_holdout_receipt_is_canonical_atomic_and_survives_first_claim(self) -> None:
         attestation = build_selection_attestation(
             self._passing_matrix_reports(),
             source_commit="a" * 40,
@@ -701,12 +719,12 @@ class MemoryExtractionV2ContractTests(unittest.TestCase):
         selected = attestation["selected"]
         attestation_hash = selection_attestation_sha256(attestation)
         with tempfile.TemporaryDirectory() as directory:
-            receipt_path = Path(directory) / "holdout-receipt.json"
+            receipt_path = Path(directory) / "canonical-holdout-receipt.json"
+            os.chmod(Path(directory), 0o700)
 
             def attempt() -> dict | None:
                 try:
                     return reserve_holdout_once(
-                        receipt_path,
                         attestation_sha256=attestation_hash,
                         selected=selected,
                         source_commit="a" * 40,
@@ -714,17 +732,135 @@ class MemoryExtractionV2ContractTests(unittest.TestCase):
                 except ValueError:
                     return None
 
-            with ThreadPoolExecutor(max_workers=2) as executor:
-                results = list(executor.map(lambda _index: attempt(), range(2)))
-            self.assertEqual(1, sum(result is not None for result in results))
-            self.assertTrue(receipt_path.exists())
-            with self.assertRaisesRegex(ValueError, "exclusive_artifact_exists"):
-                reserve_holdout_once(
-                    receipt_path,
-                    attestation_sha256=attestation_hash,
-                    selected=selected,
-                    source_commit="a" * 40,
-                )
+            with patch.object(
+                eval_v2,
+                "canonical_holdout_claim_path",
+                return_value=receipt_path,
+            ), patch.object(
+                eval_v2,
+                "_validate_durable_holdout_environment",
+                return_value=None,
+            ):
+                with ThreadPoolExecutor(max_workers=2) as executor:
+                    results = list(executor.map(lambda _index: attempt(), range(2)))
+                self.assertEqual(1, sum(result is not None for result in results))
+                self.assertTrue(receipt_path.exists())
+                self.assertEqual(0o600, receipt_path.stat().st_mode & 0o777)
+                with self.assertRaisesRegex(ValueError, "exclusive_artifact_exists"):
+                    reserve_holdout_once(
+                        attestation_sha256=attestation_hash,
+                        selected=selected,
+                        source_commit="a" * 40,
+                    )
+
+    @unittest.skipUnless(os.name == "posix", "canonical holdout is POSIX-only")
+    def test_canonical_holdout_claim_ignores_home_cwd_and_manifest(self) -> None:
+        original = canonical_holdout_claim_path()
+        with tempfile.TemporaryDirectory() as alternate_home:
+            with (
+                patch.dict(os.environ, {"HOME": alternate_home}),
+                patch.object(contract_v2, "FROZEN_MANIFEST_SHA256", "f" * 64),
+            ):
+                alternate = canonical_holdout_claim_path()
+            self.assertEqual(original, alternate)
+            self.assertEqual(
+                eval_v2.HOLDOUT_CLAIM_DIRECTORY_NAME,
+                original.parent.name,
+            )
+            self.assertEqual(f"{holdout_claim_key_sha256()}.json", original.name)
+            previous_cwd = Path.cwd()
+            try:
+                os.chdir(alternate_home)
+                self.assertEqual(original, canonical_holdout_claim_path())
+            finally:
+                os.chdir(previous_cwd)
+
+    @unittest.skipUnless(os.name == "posix", "canonical holdout is POSIX-only")
+    def test_private_claim_directory_is_durable_owner_only_and_not_a_symlink(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            private = root / "private"
+            with patch.object(eval_v2, "_fsync_parent_directory") as fsync_parent:
+                eval_v2._ensure_private_claim_directory(private)
+            fsync_parent.assert_called_once_with(private)
+            self.assertEqual(0o700, private.stat().st_mode & 0o777)
+
+            os.chmod(private, 0o750)
+            with self.assertRaisesRegex(ValueError, "claim_directory_not_private"):
+                eval_v2._ensure_private_claim_directory(private)
+
+            os.chmod(private, 0o700)
+            with patch.object(
+                eval_v2.os,
+                "geteuid",
+                return_value=private.stat().st_uid + 1,
+            ), self.assertRaisesRegex(ValueError, "claim_directory_wrong_owner"):
+                eval_v2._ensure_private_claim_directory(private)
+
+            private.rmdir()
+            target = root / "target"
+            target.mkdir(mode=0o700)
+            private.symlink_to(target, target_is_directory=True)
+            with self.assertRaisesRegex(ValueError, "claim_directory_invalid"):
+                eval_v2._ensure_private_claim_directory(private)
+
+    def test_holdout_claim_identity_constants_are_permanent(self) -> None:
+        self.assertEqual("memory_extraction_v2_holdout", HOLDOUT_CLAIM_NAMESPACE)
+        self.assertEqual(
+            "frozen_holdout_content_per_effective_posix_user",
+            HOLDOUT_CLAIM_SCOPE,
+        )
+        self.assertEqual(
+            ".aigan-memory-extraction-holdout-claims",
+            eval_v2.HOLDOUT_CLAIM_DIRECTORY_NAME,
+        )
+
+    @unittest.skipUnless(os.name == "posix", "canonical holdout is POSIX-only")
+    def test_claim_directory_parent_sync_failure_is_fail_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            private = Path(directory) / "private"
+            with (
+                patch.object(
+                    eval_v2,
+                    "_fsync_parent_directory",
+                    side_effect=OSError("sync failed"),
+                ),
+                self.assertRaisesRegex(ValueError, "claim_directory_sync_failed"),
+            ):
+                eval_v2._ensure_private_claim_directory(private)
+
+    @unittest.skipUnless(os.name == "posix", "canonical holdout is POSIX-only")
+    def test_claim_key_changes_only_with_frozen_holdout_content(self) -> None:
+        original = holdout_claim_key_sha256()
+        with patch.object(contract_v2, "FROZEN_MANIFEST_SHA256", "e" * 64):
+            self.assertEqual(original, holdout_claim_key_sha256())
+        with patch.object(contract_v2, "FROZEN_HOLDOUT_FILE_SHA256", "d" * 64):
+            self.assertNotEqual(original, holdout_claim_key_sha256())
+
+    @unittest.skipUnless(os.name == "posix", "canonical holdout is POSIX-only")
+    def test_ci_holdout_environment_fails_closed(self) -> None:
+        with (
+            patch.dict(os.environ, {"CI": "true"}),
+            self.assertRaisesRegex(ValueError, "ephemeral_ci_forbidden"),
+        ):
+            eval_v2._validate_durable_holdout_environment()
+
+    def test_holdout_receipt_path_is_not_caller_selectable(self) -> None:
+        argv = [
+            "eval_memory_extraction_v2.py",
+            "--holdout-receipt",
+            str(Path("alternate") / "receipt.json"),
+        ]
+        errors = io.StringIO()
+        with (
+            patch.object(eval_v2, "run_api") as run_api,
+            patch.object(sys, "argv", argv),
+            contextlib.redirect_stderr(errors),
+            self.assertRaises(SystemExit),
+        ):
+            eval_v2.main()
+        self.assertIn("unrecognized arguments: --holdout-receipt", errors.getvalue())
+        run_api.assert_not_called()
 
     def test_api_preflight_failure_never_calls_provider(self) -> None:
         argv = [

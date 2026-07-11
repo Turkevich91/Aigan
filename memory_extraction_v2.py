@@ -15,8 +15,10 @@ import memory_extraction as v1
 FIXTURE_SCHEMA_VERSION = "memory_extraction_fixture_v2"
 OUTPUT_SCHEMA_VERSION = "memory_extraction_output_v3"
 PROMPT_VERSION = "memory_extraction_prompt_v7"
-EVALUATOR_VERSION = "memory_extraction_eval_v5"
-MANIFEST_VERSION = "memory_extraction_manifest_v2"
+EVALUATOR_VERSION = "memory_extraction_eval_v6"
+MANIFEST_VERSION = "memory_extraction_manifest_v3"
+HOLDOUT_CLAIM_NAMESPACE = "memory_extraction_v2_holdout"
+HOLDOUT_CLAIM_SCOPE = "frozen_holdout_content_per_effective_posix_user"
 EXPECTED_CASES_PER_SPLIT = 160
 SCREEN_CASE_COUNT = 48
 
@@ -29,9 +31,9 @@ FROZEN_PROMPT_SHA256 = "22768ec62a69c0596af97e14a42960886d180bb06896d8402b197352
 FROZEN_OUTPUT_SCHEMA_SHA256 = "09838f4ccca1bf831c9ea7491e45a9d37a0a54b57b707904811d25c811f12cef"
 FROZEN_DETERMINISTIC_BASELINE_SHA256 = "433994c6d44a8abcab7756f79794a0d8987ae874c8e5c5ceae94832eec55d80e"
 FROZEN_PRICING_SNAPSHOT_SHA256 = "a8aebcd56703bf09c7f84cacf543d20c4bd3b7d532d6010e7db0ef9e9682a61c"
-FROZEN_EVALUATION_BUNDLE_SHA256 = "26f4457465cf533d4b402f8290269954198975dfd505ade15fc2dd1813931852"
-FROZEN_RUN_MATRIX_SHA256 = "203ad336482d56dd3f1fe1995c24f8b089734dd85fc75da325a8aff330518673"
-FROZEN_MANIFEST_SHA256 = "a9de1e0f74bfef5e43d9858c3e3c70b9bf3939342d571b8527abe6a462bfda90"
+FROZEN_EVALUATION_BUNDLE_SHA256 = "f2faf805fe59a4aab42dd23861b516cda1cdacf0a1f1dab71488f0e4a15834ff"
+FROZEN_RUN_MATRIX_SHA256 = "24e010736117fa269ae32b563f6c15c3927bb59a64f6556ecfa26b2c605e7f1a"
+FROZEN_MANIFEST_SHA256 = "0b17e81a2360cefcd8ffe1086d7d11ea8dab481fdab8993e2ea9bc7c05b7737c"
 
 PRICING_SNAPSHOT = {
     "version": "openai-standard-2026-07-09",
@@ -91,6 +93,10 @@ RUN_MATRIX = {
         "max_output_tokens": 1200,
         "store": False,
         "one_time": True,
+        "claim_namespace": HOLDOUT_CLAIM_NAMESPACE,
+        "claim_scope": HOLDOUT_CLAIM_SCOPE,
+        "caller_selectable_claim_path": False,
+        "ephemeral_environment_allowed": False,
     },
 }
 
@@ -98,6 +104,20 @@ RUN_MATRIX = {
 def run_matrix_sha256() -> str:
     encoded = json.dumps(
         RUN_MATRIX,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def holdout_claim_key_sha256() -> str:
+    encoded = json.dumps(
+        {
+            "namespace": HOLDOUT_CLAIM_NAMESPACE,
+            "holdout_file_sha256": FROZEN_HOLDOUT_FILE_SHA256,
+            "holdout_case_sha256": FROZEN_HOLDOUT_CASE_SHA256,
+        },
         ensure_ascii=False,
         sort_keys=True,
         separators=(",", ":"),

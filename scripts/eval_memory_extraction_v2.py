@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 import secrets
+import stat
 import subprocess
 import sys
 import time
@@ -25,6 +26,7 @@ from openai import AsyncOpenAI
 
 from memory_extraction_v2 import (
     API_ARMS,
+    HOLDOUT_CLAIM_NAMESPACE,
     BASELINE_MODEL,
     FROZEN_DETERMINISTIC_BASELINE_SHA256,
     FROZEN_DEVELOPMENT_CASE_SHA256,
@@ -45,6 +47,7 @@ from memory_extraction_v2 import (
     evaluate_predictions,
     evaluation_bundle_sha256,
     fixture_case_set_sha256,
+    holdout_claim_key_sha256,
     fixture_sha256,
     load_fixture,
     manifest_sha256,
@@ -73,8 +76,9 @@ from scripts.eval_memory_extraction import (
 
 PROMPT_PATH = ROOT / "prompts" / "memory_extraction_eval_v7.md"
 DEFAULT_FIXTURE = ROOT / "tests" / "fixtures" / "memory_extraction_v2_development.jsonl"
-HOLDOUT_RECEIPT_VERSION = "memory_extraction_holdout_receipt_v1"
-HOLDOUT_RESULT_VERSION = "memory_extraction_holdout_result_v1"
+HOLDOUT_RECEIPT_VERSION = "memory_extraction_holdout_receipt_v2"
+HOLDOUT_RESULT_VERSION = "memory_extraction_holdout_result_v2"
+HOLDOUT_CLAIM_DIRECTORY_NAME = ".aigan-memory-extraction-holdout-claims"
 
 
 @dataclass(frozen=True)
@@ -141,8 +145,13 @@ def _validate_external_input_file(path: Path, field: str) -> None:
 
 def _fsync_parent_directory(path: Path) -> None:
     if os.name != "posix":
-        return
-    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        raise ValueError("holdout:posix_durability_required")
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
     descriptor = os.open(path.parent, flags)
     try:
         os.fsync(descriptor)
@@ -150,12 +159,80 @@ def _fsync_parent_directory(path: Path) -> None:
         os.close(descriptor)
 
 
+def _effective_posix_home() -> Path:
+    if os.name != "posix":
+        raise ValueError("holdout:posix_host_required")
+    import pwd
+
+    home = Path(pwd.getpwuid(os.geteuid()).pw_dir)
+    if not home.is_absolute():
+        raise ValueError("holdout:effective_user_home_invalid")
+    try:
+        resolved = home.resolve(strict=True)
+    except OSError as exc:
+        raise ValueError("holdout:effective_user_home_invalid") from exc
+    if not resolved.is_dir():
+        raise ValueError("holdout:effective_user_home_invalid")
+    return resolved
+
+
+def _validate_durable_holdout_environment() -> None:
+    if os.name != "posix":
+        raise ValueError("holdout:posix_host_required")
+    if os.getenv("CI", "").strip():
+        raise ValueError("holdout:ephemeral_ci_forbidden")
+    if Path("/.dockerenv").exists() or Path("/run/.containerenv").exists():
+        raise ValueError("holdout:ephemeral_container_forbidden")
+
+
+def canonical_holdout_claim_path() -> Path:
+    return (
+        _effective_posix_home()
+        / HOLDOUT_CLAIM_DIRECTORY_NAME
+        / f"{holdout_claim_key_sha256()}.json"
+    )
+
+
+def _ensure_private_claim_directory(path: Path) -> None:
+    if os.name != "posix":
+        raise ValueError("holdout:posix_host_required")
+    try:
+        os.mkdir(path, 0o700)
+    except FileExistsError:
+        pass
+    try:
+        metadata = path.lstat()
+    except OSError as exc:
+        raise ValueError("holdout:claim_directory_invalid") from exc
+    mode = stat.S_IMODE(metadata.st_mode)
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+        raise ValueError("holdout:claim_directory_invalid")
+    if metadata.st_uid != os.geteuid():
+        raise ValueError("holdout:claim_directory_wrong_owner")
+    if mode & 0o077 or mode & 0o700 != 0o700:
+        raise ValueError("holdout:claim_directory_not_private")
+    if not os.access(path, os.W_OK | os.X_OK):
+        raise ValueError("holdout:claim_directory_not_writable")
+    try:
+        _fsync_parent_directory(path)
+    except (OSError, ValueError) as exc:
+        raise ValueError("holdout:claim_directory_sync_failed") from exc
+
+
 def _write_exclusive_private_json(path: Path, payload: Mapping[str, Any]) -> None:
     encoded = (
         json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
     ).encode("utf-8")
     try:
-        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        descriptor = os.open(
+            path,
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+        )
     except FileExistsError as exc:
         raise ValueError("holdout:exclusive_artifact_exists") from exc
     with os.fdopen(descriptor, "wb") as handle:
@@ -166,17 +243,22 @@ def _write_exclusive_private_json(path: Path, payload: Mapping[str, Any]) -> Non
 
 
 def reserve_holdout_once(
-    path: Path,
     *,
     attestation_sha256: str,
     selected: Mapping[str, Any],
     source_commit: str,
 ) -> dict[str, Any]:
+    _validate_durable_holdout_environment()
+    path = canonical_holdout_claim_path()
+    _ensure_private_claim_directory(path.parent)
+    claim_key = holdout_claim_key_sha256()
     receipt = {
         "schema_version": HOLDOUT_RECEIPT_VERSION,
         "status": "claimed_before_api",
         "run_id": secrets.token_hex(16),
         "claimed_at": datetime.now(timezone.utc).isoformat(),
+        "claim_namespace": HOLDOUT_CLAIM_NAMESPACE,
+        "claim_key_sha256": claim_key,
         "manifest_sha256": FROZEN_MANIFEST_SHA256,
         "attestation_sha256": attestation_sha256,
         "source_commit": source_commit,
@@ -211,6 +293,7 @@ def finalize_holdout_result(
     payload = {
         "schema_version": HOLDOUT_RESULT_VERSION,
         "receipt_run_id": receipt["run_id"],
+        "claim_key_sha256": receipt["claim_key_sha256"],
         "manifest_sha256": receipt["manifest_sha256"],
         "attestation_sha256": receipt["attestation_sha256"],
         "report_sha256": hashlib.sha256(canonical_report).hexdigest(),
@@ -514,12 +597,18 @@ def _preflight_fixture_access(
         args.reasoning_effort,
     ):
         parser.error("holdout arm does not match the selected development candidate")
-    if args.holdout_receipt is None or args.holdout_result is None:
-        parser.error("holdout requires external receipt and result paths")
-    if args.holdout_receipt.resolve() == args.holdout_result.resolve():
+    if args.holdout_result is None:
+        parser.error("holdout requires an external result path")
+    try:
+        _validate_durable_holdout_environment()
+        receipt_path = canonical_holdout_claim_path()
+        _ensure_private_claim_directory(receipt_path.parent)
+    except ValueError as exc:
+        parser.error(str(exc))
+    if receipt_path == args.holdout_result.resolve():
         parser.error("holdout receipt and result paths must differ")
     try:
-        _validate_external_artifact_path(args.holdout_receipt, "receipt")
+        _validate_external_artifact_path(receipt_path, "receipt")
         _validate_external_artifact_path(args.holdout_result, "result")
     except ValueError as exc:
         parser.error(str(exc))
@@ -584,7 +673,6 @@ def main() -> int:
     parser.add_argument("--acknowledge-screen-admission-sha256", default="")
     parser.add_argument("--development-attestation", type=Path)
     parser.add_argument("--acknowledge-development-attestation-sha256", default="")
-    parser.add_argument("--holdout-receipt", type=Path)
     parser.add_argument("--holdout-result", type=Path)
     parser.add_argument("--require-gates", action="store_true")
     args = parser.parse_args()
@@ -656,15 +744,18 @@ def main() -> int:
     else:
         if split == "holdout":
             assert attestation is not None and attestation_hash is not None
-            assert args.holdout_receipt is not None
             try:
                 if current_clean_source_commit(ROOT) != source_commit:
                     raise ValueError("holdout:source_changed_after_preflight")
                 assert args.holdout_result is not None
-                _validate_external_artifact_path(args.holdout_receipt, "receipt")
+                claim_path = canonical_holdout_claim_path()
+                _ensure_private_claim_directory(claim_path.parent)
+                _validate_external_artifact_path(
+                    claim_path,
+                    "receipt",
+                )
                 _validate_external_artifact_path(args.holdout_result, "result")
                 holdout_receipt = reserve_holdout_once(
-                    args.holdout_receipt,
                     attestation_sha256=attestation_hash,
                     selected=attestation["selected"],
                     source_commit=source_commit,

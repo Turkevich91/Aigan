@@ -4,8 +4,10 @@
 
 - Added a separate offline v2 schema with mutually exclusive candidate/no-candidate branches and strict rejection of model-owned values that require normalization.
 - Added text-, template-, and identity-disjoint 160-case development/holdout fixtures plus a frozen balanced 48-case multilingual screen; regular tests keep holdout labels closed.
-- Added cache-write-aware cost accounting, complete transitive artifact hashes, matrix-wide least-cost selection, clean-commit binding, pre-API validation, and an atomic external one-time holdout receipt.
-- Kept v1 immutable and permanently closed; recorded the v7 development matrix as `NO_GO` with no selected model and no v2 holdout request; left runtime memory, SQLite, vector/FTS retrieval, Telegram behavior, and the Sol answer path unchanged.
+- Added cache-write-aware cost accounting, complete transitive artifact hashes, matrix-wide least-cost selection, clean-commit binding, and pre-API validation.
+- Replaced the caller-selectable v5 holdout receipt with a v6 canonical content-keyed claim in private persistent POSIX-user state; CI, detected common container markers, unsafe directories, and repeated claims fail before provider access.
+- Kept the measured evaluator-v5/prompt-v7 development matrix as `NO_GO` with no selected model and no v2 holdout request; evaluator v6 made no model calls and does not reinterpret that result.
+- Left v1 immutable and permanently closed and left runtime memory, SQLite, vector/FTS retrieval, Telegram behavior, and the Sol answer path unchanged.
 
 ## 2026-07-11 - Frozen bounded-memory extraction evaluation
 
