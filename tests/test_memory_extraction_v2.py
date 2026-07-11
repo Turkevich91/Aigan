@@ -1163,8 +1163,18 @@ class MemoryExtractionV2ContractTests(unittest.TestCase):
         self.assertEqual("NO_GO", report["verdict"])
         self.assertFalse(aggregate_report_has_private_fields(report))
         bucket_keys = set(report["safety"]["error_buckets"])
-        self.assertNotIn("evidence_span", bucket_keys)
-        self.assertTrue(any(key.startswith("validation_") for key in bucket_keys))
+        self.assertEqual({"validation_provider_failure"}, bucket_keys)
+        self.assertTrue(all(key.startswith("validation_") for key in bucket_keys))
+        self.assertFalse(any("evidence_span" in key for key in bucket_keys))
+        serialized_buckets = json.dumps(
+            report["safety"]["error_buckets"],
+            sort_keys=True,
+        )
+        private_markers = {"wrong", positive["id"]}
+        private_markers.update(row["row_key"] for row in positive["inputs"])
+        for marker in private_markers:
+            with self.subTest(marker=marker):
+                self.assertNotIn(marker, serialized_buckets)
 
     def test_deterministic_baseline_never_authorizes(self) -> None:
         predictions = {case["id"]: deterministic_extract(case) for case in self.development}
