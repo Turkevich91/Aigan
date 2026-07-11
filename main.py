@@ -299,8 +299,8 @@ class Config:
             telegram_token=token,
             openai_api_key=api_key,
             bot_username=os.getenv("BOT_USERNAME", "").strip().lstrip("@") or None,
-            openai_model=os.getenv("OPENAI_MODEL", "gpt-5.4-mini").strip(),
-            model_reasoning_effort=os.getenv("MODEL_REASONING_EFFORT", "none").strip(),
+            openai_model=os.getenv("OPENAI_MODEL", "gpt-5.6-sol").strip(),
+            model_reasoning_effort=os.getenv("MODEL_REASONING_EFFORT", "low").strip(),
             model_verbosity=os.getenv("MODEL_VERBOSITY", "low").strip(),
             max_output_tokens=int(os.getenv("MAX_OUTPUT_TOKENS", "900")),
             bot_trigger=os.getenv("BOT_TRIGGER", "!m").strip(),
@@ -5249,6 +5249,16 @@ async def run_agent_for_outbound(
         ACTIVE_OUTBOUND_PROVENANCE.reset(token)
 
 
+def build_plain_model_request_settings() -> dict[str, Any]:
+    settings: dict[str, Any] = {
+        "max_output_tokens": CONFIG.max_output_tokens,
+        "text": {"verbosity": CONFIG.model_verbosity},
+    }
+    if CONFIG.model_reasoning_effort:
+        settings["reasoning"] = {"effort": CONFIG.model_reasoning_effort}
+    return settings
+
+
 def run_plain_model_sync(prompt: str) -> str:
     client = OpenAI()
     response = client.responses.create(
@@ -5259,7 +5269,7 @@ def run_plain_model_sync(prompt: str) -> str:
                 "content": [{"type": "input_text", "text": with_current_time_metadata(prompt)}],
             }
         ],
-        max_output_tokens=CONFIG.max_output_tokens,
+        **build_plain_model_request_settings(),
     )
     return response.output_text.strip()
 

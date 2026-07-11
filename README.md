@@ -2,7 +2,7 @@
 
 Telegram group assistant backed by OpenAI Agents SDK and local MCP tools.
 
-Default model: `gpt-5.4-mini`. The public model catalog currently lists `gpt-5.4-mini` and `gpt-5.4-nano`, not `GPT-5.4-micro`, so this project uses the mini model as the practical chat default.
+Default main-chat model: `gpt-5.6-sol` with `low` reasoning effort. Vision and tool routing remain independently configurable so lightweight work can continue using smaller models.
 
 ## What is included
 
