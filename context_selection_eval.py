@@ -212,10 +212,9 @@ class CaseScore:
 def _require_exact_keys(value: Mapping[str, Any], expected: set[str], location: str) -> None:
     actual = set(value)
     if actual != expected:
-        missing = sorted(expected - actual)
-        extra = sorted(actual - expected)
         raise ContextSelectionFixtureError(
-            f"{location}: invalid fields missing={missing} extra={extra}"
+            f"{location}: invalid fields "
+            f"missing_count={len(expected - actual)} extra_count={len(actual - expected)}"
         )
 
 

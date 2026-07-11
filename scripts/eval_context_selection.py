@@ -8,6 +8,7 @@ if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from context_selection_eval import (
+    ContextSelectionFixtureError,
     canonical_report_json,
     evaluate_context_selection_fixture,
 )
@@ -27,6 +28,9 @@ def main() -> int:
             args.fixture,
             bootstrap_samples=args.bootstrap_samples,
         )
+    except ContextSelectionFixtureError as exc:
+        print(f"context-selection evaluation failed: {exc}", file=sys.stderr)
+        return 2
     # This is the final private-data boundary: unexpected parser or report
     # failures must remain type-only instead of escaping through a traceback.
     except Exception as exc:

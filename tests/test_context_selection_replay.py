@@ -343,6 +343,25 @@ class ContextSelectionReplayTests(unittest.TestCase):
         )
         self.assertNotIn(private_sentinel, stderr.getvalue())
 
+    def test_cli_surfaces_bounded_replay_contract_diagnostic(self) -> None:
+        from scripts import build_context_selection_replay as command
+
+        stderr = StringIO()
+        with patch.object(command, "_private_root", return_value=Path("ignored")):
+            with patch.object(
+                command,
+                "build_private_review_pool",
+                side_effect=ContextSelectionReplayError("private output already exists"),
+            ):
+                with patch("sys.argv", ["build_context_selection_replay.py"]):
+                    with redirect_stderr(stderr):
+                        result = command.main()
+        self.assertEqual(2, result)
+        self.assertEqual(
+            "context-selection replay build failed: private output already exists\n",
+            stderr.getvalue(),
+        )
+
     def test_reply_chain_never_admits_a_future_duplicate(self) -> None:
         future_sentinel = "FUTURE_REPLY_SENTINEL"
         with tempfile.TemporaryDirectory() as directory:

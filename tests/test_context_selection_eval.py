@@ -199,6 +199,18 @@ class ContextSelectionContractTests(unittest.TestCase):
         self.assertIn("candidate snapshot hash mismatch", str(raised.exception))
         self.assertNotIn(private_sentinel, str(raised.exception))
 
+    def test_unknown_field_name_is_not_echoed_by_contract_error(self) -> None:
+        case = build_cases()[0]
+        private_field_name = "PRIVATE_FIELD_NAME_SENTINEL"
+        case[private_field_name] = "ignored"
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "unknown-field.jsonl"
+            path.write_text(json.dumps(case, ensure_ascii=False) + "\n", encoding="utf-8")
+            with self.assertRaises(ContextSelectionFixtureError) as raised:
+                load_context_selection_fixture(path)
+        self.assertIn("extra_count=1", str(raised.exception))
+        self.assertNotIn(private_field_name, str(raised.exception))
+
     def test_event_cannot_include_source_created_after_the_event(self) -> None:
         case = build_cases()[0]
         case["events"][0]["created_at"] = "2026-01-02T00:00:00Z"
@@ -278,6 +290,27 @@ class ContextSelectionContractTests(unittest.TestCase):
             stderr.getvalue(),
         )
         self.assertNotIn(private_sentinel, stderr.getvalue())
+
+    def test_cli_surfaces_bounded_fixture_contract_diagnostic(self) -> None:
+        from scripts import eval_context_selection as command
+
+        stderr = StringIO()
+        with patch.object(
+            command,
+            "evaluate_context_selection_fixture",
+            side_effect=ContextSelectionFixtureError("line 4: invalid timestamp"),
+        ):
+            with patch(
+                "sys.argv",
+                ["eval_context_selection.py", "--fixture", "ignored-private-fixture.jsonl"],
+            ):
+                with redirect_stderr(stderr):
+                    result = command.main()
+        self.assertEqual(2, result)
+        self.assertEqual(
+            "context-selection evaluation failed: line 4: invalid timestamp\n",
+            stderr.getvalue(),
+        )
 
 
 if __name__ == "__main__":

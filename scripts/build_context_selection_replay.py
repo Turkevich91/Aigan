@@ -86,6 +86,9 @@ def main() -> int:
             reply_depth=args.reply_depth,
             historical_output_window_seconds=args.historical_output_window_seconds,
         )
+    except ContextSelectionReplayError as exc:
+        print(f"context-selection replay build failed: {exc}", file=sys.stderr)
+        return 2
     # This is the final private-data boundary: row corruption and schema drift
     # must fail type-only instead of escaping through a traceback with payloads.
     except Exception as exc:

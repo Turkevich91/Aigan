@@ -228,7 +228,9 @@ Selectors receive `SelectionInput`; that type has no expected labels. The
 loader rejects unknown fields, unknown provenance links, duplicate IDs, future
 sources/events, malformed ranks, and overlapping relevant/forbidden labels.
 Validation failures identify only the line and contract class, never payload
-content.
+content. Unknown fields are reported by count rather than by their untrusted
+names. The CLIs show these bounded contract diagnostics, while unexpected
+exceptions remain type-only with no traceback.
 
 ## Metrics and uncertainty
 
