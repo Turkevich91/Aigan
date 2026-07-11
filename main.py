@@ -41,6 +41,12 @@ from telegram.error import BadRequest, NetworkError
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, MessageReactionHandler, filters
 
 from mcp_servers.web import fetch_binary_url, fetch_url, search_image_candidates, search_web
+from heavy_model_backend import (
+    HeavyModelAdapter,
+    HeavyModelSettings,
+    NullHeavyModelAdapter,
+    OpenAICompatibleHeavyModelAdapter,
+)
 from memory import DeliveryReceipt, EmbeddingCandidate, MemoryItem, MemoryStore, SemanticMemoryResult
 from media_acquisition import (
     MediaAcquisitionAdapter,
@@ -137,6 +143,19 @@ def _csv_strings(value: str) -> list[str]:
 
 def _csv_values(value: str) -> list[str]:
     return [item.strip() for item in value.split(",") if item.strip()]
+
+
+def _env_json_object(name: str) -> dict[str, Any]:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(f"{name} must be a valid JSON object") from exc
+    if not isinstance(parsed, dict):
+        raise RuntimeError(f"{name} must be a JSON object")
+    return parsed
 
 
 REACTION_EMOJI_ALIASES = {
@@ -298,6 +317,21 @@ class Config:
     media_acquisition_max_duration_seconds: int
     media_acquisition_max_download_bytes: int
     media_acquisition_socket_timeout_seconds: int
+    heavy_model_enabled: bool
+    heavy_model_base_url: str
+    heavy_model_api_key: str
+    heavy_model_model: str
+    heavy_model_api_flavor: str
+    heavy_model_capabilities: tuple[str, ...]
+    heavy_model_timeout_seconds: float
+    heavy_model_max_prompt_chars: int
+    heavy_model_max_inline_media_bytes: int
+    heavy_model_max_media_bytes: int
+    heavy_model_max_media_items: int
+    heavy_model_max_output_tokens: int
+    heavy_model_max_result_chars: int
+    heavy_model_max_concurrency: int
+    heavy_model_extra_body: dict[str, Any]
     system_log_enabled: bool
     system_log_retention_days: int
     health_report_enabled: bool
@@ -573,6 +607,30 @@ class Config:
             media_acquisition_max_duration_seconds=int(os.getenv("MEDIA_ACQUISITION_MAX_DURATION_SECONDS", "180")),
             media_acquisition_max_download_bytes=int(os.getenv("MEDIA_ACQUISITION_MAX_DOWNLOAD_BYTES", "50000000")),
             media_acquisition_socket_timeout_seconds=int(os.getenv("MEDIA_ACQUISITION_SOCKET_TIMEOUT_SECONDS", "12")),
+            heavy_model_enabled=_env_bool("HEAVY_MODEL_ENABLED", False),
+            heavy_model_base_url=os.getenv("HEAVY_MODEL_BASE_URL", "").strip(),
+            heavy_model_api_key=os.getenv("HEAVY_MODEL_API_KEY", "").strip(),
+            heavy_model_model=os.getenv("HEAVY_MODEL_MODEL", "").strip(),
+            heavy_model_api_flavor=os.getenv("HEAVY_MODEL_API_FLAVOR", "chat_completions").strip(),
+            heavy_model_capabilities=tuple(
+                _csv_strings(os.getenv("HEAVY_MODEL_CAPABILITIES", "text,image,video"))
+            ),
+            heavy_model_timeout_seconds=_env_float(
+                "HEAVY_MODEL_TIMEOUT_SECONDS",
+                180.0,
+                minimum=1.0,
+                maximum=900.0,
+            ),
+            heavy_model_max_prompt_chars=int(os.getenv("HEAVY_MODEL_MAX_PROMPT_CHARS", "30000")),
+            heavy_model_max_inline_media_bytes=int(
+                os.getenv("HEAVY_MODEL_MAX_INLINE_MEDIA_BYTES", "20000000")
+            ),
+            heavy_model_max_media_bytes=int(os.getenv("HEAVY_MODEL_MAX_MEDIA_BYTES", "50000000")),
+            heavy_model_max_media_items=int(os.getenv("HEAVY_MODEL_MAX_MEDIA_ITEMS", "8")),
+            heavy_model_max_output_tokens=int(os.getenv("HEAVY_MODEL_MAX_OUTPUT_TOKENS", "2000")),
+            heavy_model_max_result_chars=int(os.getenv("HEAVY_MODEL_MAX_RESULT_CHARS", "40000")),
+            heavy_model_max_concurrency=int(os.getenv("HEAVY_MODEL_MAX_CONCURRENCY", "1")),
+            heavy_model_extra_body=_env_json_object("HEAVY_MODEL_EXTRA_BODY_JSON"),
             system_log_enabled=_env_bool("SYSTEM_LOG_ENABLED", True),
             system_log_retention_days=int(os.getenv("SYSTEM_LOG_RETENTION_DAYS", "14")),
             health_report_enabled=_env_bool("HEALTH_REPORT_ENABLED", False),
@@ -1150,8 +1208,36 @@ def build_media_acquisition_adapter() -> MediaAcquisitionAdapter:
         return NullMediaAcquisitionAdapter()
 
 
+def build_heavy_model_adapter() -> HeavyModelAdapter:
+    if not CONFIG.heavy_model_enabled:
+        return NullHeavyModelAdapter()
+    try:
+        return OpenAICompatibleHeavyModelAdapter(
+            settings=HeavyModelSettings(
+                base_url=CONFIG.heavy_model_base_url,
+                model=CONFIG.heavy_model_model,
+                api_key=CONFIG.heavy_model_api_key,
+                api_flavor=CONFIG.heavy_model_api_flavor,
+                capabilities=CONFIG.heavy_model_capabilities,
+                timeout_seconds=CONFIG.heavy_model_timeout_seconds,
+                max_prompt_chars=CONFIG.heavy_model_max_prompt_chars,
+                max_inline_media_bytes=CONFIG.heavy_model_max_inline_media_bytes,
+                max_media_bytes=CONFIG.heavy_model_max_media_bytes,
+                max_media_items=CONFIG.heavy_model_max_media_items,
+                max_output_tokens=CONFIG.heavy_model_max_output_tokens,
+                max_result_chars=CONFIG.heavy_model_max_result_chars,
+                max_concurrency=CONFIG.heavy_model_max_concurrency,
+                extra_body=CONFIG.heavy_model_extra_body,
+            )
+        )
+    except Exception:
+        LOGGER.warning("Heavy-model connector configuration is invalid; using null adapter")
+        return NullHeavyModelAdapter(requested_enabled=True, failure_category="unconfigured")
+
+
 MEDIA_FRAME_ADAPTER: MediaFrameAdapter = build_media_frame_adapter()
 MEDIA_ACQUISITION_ADAPTER: MediaAcquisitionAdapter = build_media_acquisition_adapter()
+HEAVY_MODEL_ADAPTER: HeavyModelAdapter = build_heavy_model_adapter()
 TOOL_RUNTIME = ToolRuntime()
 
 
@@ -1204,6 +1290,23 @@ def runtime_media_acquisition_adapter() -> MediaAcquisitionAdapter:
 
 
 set_media_acquisition_adapter(MEDIA_ACQUISITION_ADAPTER)
+
+
+def set_heavy_model_adapter(adapter: HeavyModelAdapter) -> HeavyModelAdapter:
+    global HEAVY_MODEL_ADAPTER
+    HEAVY_MODEL_ADAPTER = adapter
+    TOOL_RUNTIME.register("heavy_model", adapter)
+    return adapter
+
+
+def runtime_heavy_model_adapter() -> HeavyModelAdapter:
+    adapter = TOOL_RUNTIME.get("heavy_model")
+    if adapter is None:
+        return set_heavy_model_adapter(HEAVY_MODEL_ADAPTER)
+    return cast(HeavyModelAdapter, adapter)
+
+
+set_heavy_model_adapter(HEAVY_MODEL_ADAPTER)
 GITHUB_REPORTER = GitHubReporter(
     enabled=CONFIG.github_reporting_enabled,
     token=CONFIG.github_token,

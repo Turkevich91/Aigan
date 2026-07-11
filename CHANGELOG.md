@@ -1,5 +1,12 @@
 # Aigan Changelog
 
+## 2026-07-11 - Provider-neutral heavy local inference connector
+
+- Added a disabled-by-default `heavy_model` adapter boundary with null and OpenAI-compatible Chat Completions backends for bounded text, image, and video inference.
+- Kept the configured endpoint, model id, credential, media URLs, prompts, and generated text out of health output and telemetry-safe result metadata.
+- Added fixed-model requests, strict data-URL parsing with actual decoded-byte limits, rejection of all remote media references pending a trusted staging layer, output limits, fail-fast concurrency control, safe error categories, cleanup, and a model-list probe that performs no inference.
+- Left Telegram media routing, durable background jobs, media persistence, memory integration, provider fallback, deployment, and model lifecycle control unchanged.
+
 ## 2026-07-11 - Preregistered bounded-memory extraction v2
 
 - Added a separate offline v2 schema with mutually exclusive candidate/no-candidate branches and strict rejection of model-owned values that require normalization.
