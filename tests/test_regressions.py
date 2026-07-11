@@ -131,6 +131,11 @@ from telegram.constants import ChatType, ParseMode
 from telegram.error import BadRequest, TimedOut
 
 import main
+from agents.items import ModelResponse
+from agents.models.interface import ModelTracing
+from agents.models.openai_responses import OpenAIResponsesModel
+from agents.usage import Usage
+from openai.types.responses import ResponseOutputMessage, ResponseOutputText
 from github_reporting import GitHubIssue, GitHubReporter, GitHubReportingError
 from outbound_reactions import EmotionPolicyDecision
 from provenance import extract_tool_provenance, make_tool_provenance
@@ -498,6 +503,7 @@ class ModelTelemetryIntegrationTests(unittest.TestCase):
                 )
                 self.assertEqual(tracing_disabled, config.tracing_disabled)
                 self.assertEqual(includes_sensitive, config.trace_include_sensitive_data)
+                self.assertIsInstance(config.model, main.TelemetryOpenAIResponsesModel)
                 self.assertEqual("a" * 32, config.group_id)
                 self.assertEqual(
                     {
@@ -694,6 +700,246 @@ class ModelTelemetryIntegrationTests(unittest.TestCase):
         self.assertTrue(all(record.actual_model == "" for record in records))
         self.assertTrue(all(record.actual_reasoning_effort == "" for record in records))
         self.assertTrue(all(record.actual_model_source == "unavailable_sdk" for record in records))
+
+    def test_agents_hook_does_not_misreport_nonterminal_response(self) -> None:
+        store = self.use_isolated_store()
+        hook = main.AiganRunHooks("e" * 32, route_bucket="normal")
+        agent = SimpleNamespace(name="Aigan")
+        raw_response = SimpleNamespace(
+            id="resp_telemetry_test",
+            status="incomplete",
+            model="gpt-5.6-sol",
+            reasoning=SimpleNamespace(effort="low"),
+            output=[],
+            usage=SimpleNamespace(
+                input_tokens=4,
+                output_tokens=1,
+                total_tokens=5,
+                input_tokens_details={
+                    "cached_tokens": 0,
+                    "cache_write_tokens": 0,
+                },
+                output_tokens_details={"reasoning_tokens": 0},
+            ),
+        )
+
+        async def fake_sdk_fetch(_model, *args, **kwargs):
+            return raw_response
+
+        async def exercise() -> None:
+            await hook.on_llm_start(None, agent, "system", ["one"])
+            model = main.TelemetryOpenAIResponsesModel(
+                "gpt-5.6-sol",
+                SimpleNamespace(),
+            )
+            with patch.object(
+                OpenAIResponsesModel,
+                "_fetch_response",
+                new=fake_sdk_fetch,
+            ):
+                response = await model.get_response(
+                    None,
+                    [],
+                    main.ModelSettings(),
+                    [],
+                    None,
+                    [],
+                    ModelTracing.DISABLED,
+                )
+            self.assertFalse(hasattr(response, "status"))
+            await hook.on_llm_end(None, agent, response)
+
+        asyncio.run(exercise())
+
+        record = store.latest_stages(1)[0]
+        self.assertEqual("failed", record.status)
+        self.assertEqual("provider_incomplete", record.failure_class)
+        self.assertEqual("final_answer", record.stage_kind)
+        self.assertEqual("gpt-5.6-sol", record.actual_model)
+        self.assertEqual("provider_response", record.actual_model_source)
+        self.assertEqual("low", record.actual_reasoning_effort)
+
+    def test_agents_provider_metadata_is_isolated_between_concurrent_calls(self) -> None:
+        model = main.TelemetryOpenAIResponsesModel(
+            "gpt-5.6-sol",
+            SimpleNamespace(),
+        )
+        responses = {
+            "slow": SimpleNamespace(
+                id="resp_slow",
+                status="completed",
+                model="gpt-5.6-sol",
+                reasoning=SimpleNamespace(effort="low"),
+                output=[],
+                usage=None,
+            ),
+            "fast": SimpleNamespace(
+                id="resp_fast",
+                status="incomplete",
+                model="gpt-5.6-luna",
+                reasoning=SimpleNamespace(effort="minimal"),
+                output=[],
+                usage=None,
+            ),
+            "clean": SimpleNamespace(
+                id="resp_clean",
+                output=[],
+                usage=None,
+            ),
+        }
+
+        async def fake_sdk_fetch(_model, _system, input_value, *args, **kwargs):
+            if input_value == "slow":
+                await asyncio.sleep(0.01)
+            return responses[input_value]
+
+        barrier = asyncio.Barrier(2)
+
+        async def fake_sdk_get_response(_model, *args, **kwargs):
+            raw_response = await _model._fetch_response(*args[:6], stream=False)
+            if args[1] != "clean":
+                await barrier.wait()
+            return ModelResponse(
+                output=raw_response.output,
+                usage=Usage(),
+                response_id=raw_response.id,
+            )
+
+        async def call(input_value: str):
+            return await model.get_response(
+                None,
+                input_value,
+                main.ModelSettings(),
+                [],
+                None,
+                [],
+                ModelTracing.DISABLED,
+            )
+
+        async def exercise():
+            with patch.object(
+                OpenAIResponsesModel,
+                "_fetch_response",
+                new=fake_sdk_fetch,
+            ), patch.object(
+                OpenAIResponsesModel,
+                "get_response",
+                new=fake_sdk_get_response,
+            ):
+                slow, fast = await asyncio.gather(call("slow"), call("fast"))
+                clean = await call("clean")
+            return slow, fast, clean
+
+        slow, fast, clean = asyncio.run(exercise())
+
+        self.assertEqual(
+            ("completed", "gpt-5.6-sol", "low"),
+            (
+                slow._aigan_provider_status,
+                slow._aigan_provider_model,
+                slow._aigan_provider_reasoning_effort,
+            ),
+        )
+        self.assertEqual(
+            ("incomplete", "gpt-5.6-luna", "minimal"),
+            (
+                fast._aigan_provider_status,
+                fast._aigan_provider_model,
+                fast._aigan_provider_reasoning_effort,
+            ),
+        )
+        self.assertEqual(
+            ("", "", ""),
+            (
+                clean._aigan_provider_status,
+                clean._aigan_provider_model,
+                clean._aigan_provider_reasoning_effort,
+            ),
+        )
+
+    def test_run_config_adapter_preserves_agent_request_settings(self) -> None:
+        captured: dict[str, object] = {}
+        raw_response = SimpleNamespace(
+            id="resp_runner_adapter",
+            status="completed",
+            model="gpt-5.6-sol",
+            reasoning=SimpleNamespace(effort="low"),
+            output=[
+                ResponseOutputMessage(
+                    id="msg_runner_adapter",
+                    content=[
+                        ResponseOutputText(
+                            annotations=[],
+                            text="ok",
+                            type="output_text",
+                            logprobs=[],
+                        )
+                    ],
+                    role="assistant",
+                    status="completed",
+                    type="message",
+                )
+            ],
+            usage=None,
+        )
+
+        class FakeResponses:
+            async def create(self, **kwargs):
+                captured.update(kwargs)
+                return raw_response
+
+        original_config = main.CONFIG
+        main.CONFIG = replace(
+            original_config,
+            openai_model="gpt-5.6-sol",
+            model_reasoning_effort="low",
+            model_verbosity="medium",
+            max_output_tokens=321,
+        )
+        model = main.configured_agents_model()
+        original_client = model._client
+        model._client = SimpleNamespace(responses=FakeResponses())
+        try:
+            result = asyncio.run(
+                main.Runner.run(
+                    main.make_agent([]),
+                    "adapter settings probe",
+                    max_turns=1,
+                    run_config=main.build_agents_run_config(
+                        run_id="7" * 32,
+                        route_bucket="selfcheck",
+                    ),
+                )
+            )
+        finally:
+            model._client = original_client
+            main.CONFIG = original_config
+
+        self.assertEqual("ok", str(result.final_output))
+        self.assertEqual("gpt-5.6-sol", captured["model"])
+        self.assertEqual(321, captured["max_output_tokens"])
+        self.assertEqual("auto", captured["truncation"])
+        self.assertEqual("medium", captured["text"]["verbosity"])
+        self.assertEqual("low", getattr(captured["reasoning"], "effort", None))
+
+    def test_configured_agents_client_close_is_best_effort_and_resets_cache(self) -> None:
+        original_client = main._AGENTS_OPENAI_CLIENT
+        original_model = main._AGENTS_RESPONSE_MODEL
+        try:
+            for failure in (None, RuntimeError("private close detail")):
+                with self.subTest(failure=type(failure).__name__ if failure else "none"):
+                    client = SimpleNamespace(close=AsyncMock(side_effect=failure))
+                    main._AGENTS_OPENAI_CLIENT = client
+                    main._AGENTS_RESPONSE_MODEL = object()
+
+                    asyncio.run(main.close_configured_agents_model())
+
+                    client.close.assert_awaited_once_with()
+                    self.assertIsNone(main._AGENTS_OPENAI_CLIENT)
+                    self.assertIsNone(main._AGENTS_RESPONSE_MODEL)
+        finally:
+            main._AGENTS_OPENAI_CLIENT = original_client
+            main._AGENTS_RESPONSE_MODEL = original_model
 
     def test_pending_agent_turn_is_terminalized_on_cancel(self) -> None:
         store = self.use_isolated_store()

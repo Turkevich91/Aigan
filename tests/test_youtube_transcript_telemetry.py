@@ -72,7 +72,7 @@ class YoutubeTranscriptTelemetryTests(unittest.TestCase):
             {
                 "AIGAN_MODEL_RUN_ID": "a" * 32,
                 "AIGAN_MODEL_ROUTE_BUCKET": "tool",
-                "MODEL_ROUTING_POLICY_VERSION": "telemetry_v1",
+                "MODEL_ROUTING_POLICY_VERSION": "primary_sol_low_v1",
                 "YOUTUBE_MAX_DURATION_SECONDS": "60",
                 "YOUTUBE_TRANSCRIPTION_MODEL": "gpt-4o-mini-transcribe",
             },
@@ -127,6 +127,13 @@ class YoutubeTranscriptTelemetryTests(unittest.TestCase):
                 self.assertEqual(120, stage.total_tokens)
                 self.assertIsNotNone(stage.estimated_cost_nano_usd)
                 self.assertNotIn("PRIVATE_VIDEO_MARKER", repr(stage))
+                self.assertEqual("tool", stage.route_bucket)
+                self.assertEqual("youtube_transcript", stage.task_class_bucket)
+                policy_version = store._conn.execute(
+                    "SELECT policy_version FROM model_telemetry_runs WHERE run_id = ?",
+                    ("a" * 32,),
+                ).fetchone()[0]
+                self.assertEqual("primary_sol_low_v1", policy_version)
             finally:
                 store.close()
 

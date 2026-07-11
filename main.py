@@ -33,7 +33,8 @@ from agents import (
     set_tracing_disabled,
 )
 from agents.mcp import MCPServerStdio
-from openai import OpenAI
+from agents.models.openai_responses import OpenAIResponsesModel
+from openai import AsyncOpenAI, OpenAI
 from telegram import Bot, InputMediaPhoto, Message, MessageEntity, Update
 from telegram.constants import ChatAction, ChatType, ParseMode
 from telegram.error import BadRequest, NetworkError
@@ -634,10 +635,82 @@ ACTIVE_MODEL_TASK_CLASS_BUCKET: contextvars.ContextVar[str] = contextvars.Contex
     "active_model_task_class_bucket",
     default="",
 )
+AGENTS_PROVIDER_RESPONSE_METADATA: contextvars.ContextVar[tuple[str, str, str]] = (
+    contextvars.ContextVar(
+        "agents_provider_response_metadata",
+        default=("", "", ""),
+    )
+)
 ACTIVE_OUTBOUND_PROVENANCE: contextvars.ContextVar[OutboundProvenance | None] = contextvars.ContextVar(
     "active_outbound_provenance",
     default=None,
 )
+
+
+class TelemetryOpenAIResponsesModel(OpenAIResponsesModel):
+    """Preserve bounded provider metadata for Aigan's non-streaming Runner path."""
+
+    async def get_response(self, *args: Any, **kwargs: Any) -> Any:
+        token = AGENTS_PROVIDER_RESPONSE_METADATA.set(("", "", ""))
+        try:
+            response = await super().get_response(*args, **kwargs)
+            provider_status, provider_model, provider_reasoning_effort = (
+                AGENTS_PROVIDER_RESPONSE_METADATA.get()
+            )
+            setattr(response, "_aigan_provider_status", provider_status)
+            setattr(response, "_aigan_provider_model", provider_model)
+            setattr(
+                response,
+                "_aigan_provider_reasoning_effort",
+                provider_reasoning_effort,
+            )
+            return response
+        finally:
+            AGENTS_PROVIDER_RESPONSE_METADATA.reset(token)
+
+    async def _fetch_response(self, *args: Any, **kwargs: Any) -> Any:
+        response = await super()._fetch_response(*args, **kwargs)
+        if not bool(kwargs.get("stream", False)):
+            try:
+                reasoning = getattr(response, "reasoning", None)
+                AGENTS_PROVIDER_RESPONSE_METADATA.set(
+                    (
+                        str(getattr(response, "status", "") or "").strip(),
+                        str(getattr(response, "model", "") or "").strip(),
+                        str(getattr(reasoning, "effort", "") or "").strip(),
+                    )
+                )
+            except Exception:
+                AGENTS_PROVIDER_RESPONSE_METADATA.set(("", "", ""))
+        return response
+
+
+_AGENTS_OPENAI_CLIENT: AsyncOpenAI | None = None
+_AGENTS_RESPONSE_MODEL: TelemetryOpenAIResponsesModel | None = None
+
+
+def configured_agents_model() -> TelemetryOpenAIResponsesModel:
+    global _AGENTS_OPENAI_CLIENT, _AGENTS_RESPONSE_MODEL
+    if _AGENTS_RESPONSE_MODEL is None:
+        _AGENTS_OPENAI_CLIENT = AsyncOpenAI(api_key=CONFIG.openai_api_key)
+        _AGENTS_RESPONSE_MODEL = TelemetryOpenAIResponsesModel(
+            CONFIG.openai_model,
+            _AGENTS_OPENAI_CLIENT,
+        )
+    return _AGENTS_RESPONSE_MODEL
+
+
+async def close_configured_agents_model() -> None:
+    global _AGENTS_OPENAI_CLIENT, _AGENTS_RESPONSE_MODEL
+    client = _AGENTS_OPENAI_CLIENT
+    _AGENTS_OPENAI_CLIENT = None
+    _AGENTS_RESPONSE_MODEL = None
+    if client is None:
+        return
+    try:
+        await client.close()
+    except Exception as exc:
+        LOGGER.debug("Agents OpenAI client close failed error=%s", type(exc).__name__)
 
 
 def current_model_run_id(explicit_run_id: str = "") -> str:
@@ -726,7 +799,11 @@ def finish_model_stage(
 
 def response_actual_model(response: Any) -> tuple[str, str]:
     try:
-        actual_model = str(getattr(response, "model", "") or "").strip()
+        actual_model = str(
+            getattr(response, "_aigan_provider_model", "")
+            or getattr(response, "model", "")
+            or ""
+        ).strip()
     except Exception:
         actual_model = ""
     return actual_model, "provider_response" if actual_model else "not_reported"
@@ -736,7 +813,8 @@ def response_actual_reasoning_effort(response: Any) -> str:
     try:
         reasoning = getattr(response, "reasoning", None)
         return str(
-            getattr(reasoning, "effort", "")
+            getattr(response, "_aigan_provider_reasoning_effort", "")
+            or getattr(reasoning, "effort", "")
             or getattr(response, "reasoning_effort", "")
             or ""
         ).strip()
@@ -753,7 +831,11 @@ def response_usage(response: Any) -> Any:
 
 def response_telemetry_status(response: Any) -> tuple[str, str]:
     try:
-        provider_status = str(getattr(response, "status", "") or "").strip().casefold()
+        provider_status = str(
+            getattr(response, "_aigan_provider_status", "")
+            or getattr(response, "status", "")
+            or ""
+        ).strip().casefold()
     except Exception:
         provider_status = ""
     if provider_status in {"cancelled", "canceled"}:
@@ -781,6 +863,7 @@ def build_agents_run_config(*, run_id: str = "", route_bucket: str = "") -> RunC
     resolved_run_id = current_model_run_id(run_id)
     resolved_route = current_model_route_bucket(route_bucket)
     return RunConfig(
+        model=configured_agents_model(),
         tracing_disabled=mode == "disabled",
         trace_include_sensitive_data=mode == "sensitive",
         workflow_name="Aigan Telegram",
@@ -3005,14 +3088,19 @@ class AiganRunHooks(RunHooks[Any]):
         emit_llm_end_event(agent.name, self.run_id)
         pending = self._pending_stage
         self._pending_stage = None
+        status, failure_class = response_telemetry_status(response)
+        actual_model, actual_model_source = response_actual_model(response)
+        if actual_model_source == "not_reported":
+            actual_model_source = "unavailable_sdk"
         finish_model_stage(
             pending,
-            status="succeeded",
+            status=status,
             usage=response_usage(response),
             stage_kind="agent_tool_turn" if response_requests_tools(response) else "final_answer",
-            actual_model="",
-            actual_model_source="unavailable_sdk",
-            actual_reasoning_effort="",
+            actual_model=actual_model,
+            actual_model_source=actual_model_source,
+            actual_reasoning_effort=response_actual_reasoning_effort(response),
+            failure_class=failure_class,
             retry_count=0,
         )
 
@@ -12195,6 +12283,7 @@ async def post_init(application: Application) -> None:
 
 
 async def post_shutdown(application: Application) -> None:
+    await close_configured_agents_model()
     await TOOL_RUNTIME.cleanup()
     tool_runtime_health = TOOL_RUNTIME.health_summary()
     LOGGER.info(
