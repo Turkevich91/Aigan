@@ -1,0 +1,25 @@
+{
+  "case_count": 60,
+  "case_family_count": 30,
+  "corpus_kind": "public_synthetic",
+  "effective_config_sha256": "5987b1d2f10bc3947a9e341ed0fd19152e0eb36b67bdd1bff4b113c72248b1d8",
+  "efficacy_evidence": false,
+  "eligibility_class_counts": {
+    "correction_stale_guardrail": 10,
+    "explicit_reply": 10,
+    "knowledge_update": 10,
+    "same_question_transform": 10,
+    "short_followup": 10,
+    "topic_shift_distractors": 10
+  },
+  "fixture_sha256": "91039f5b5d33b2fd4aa613b31fa8f41d31bbebeaaefc4adce4156c48477b5648",
+  "languages": {
+    "en": 12,
+    "mixed": 12,
+    "ru": 18,
+    "uk": 18
+  },
+  "schema_version": "context-selection-contract-manifest-v1",
+  "source_commit": "ad2c69079181311cb416d13f7445f05c393aa45f",
+  "split": "contract"
+}
