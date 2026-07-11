@@ -176,10 +176,10 @@ class SelectionResult:
     compile_ms: float
     recommended_action: str
     dropped_by_reason: Mapping[str, int]
-    amortized_calls: float = 0.0
-    amortized_input_tokens: float = 0.0
-    amortized_output_tokens: float = 0.0
-    amortized_latency_ms: float = 0.0
+    candidate_construction_calls: float = 0.0
+    candidate_construction_input_tokens: float = 0.0
+    candidate_construction_output_tokens: float = 0.0
+    candidate_construction_latency_ms: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -202,10 +202,10 @@ class CaseScore:
     context_chars: int
     navigation_chars: int
     compile_ms: float
-    amortized_calls: float
-    amortized_input_tokens: float
-    amortized_output_tokens: float
-    amortized_latency_ms: float
+    candidate_construction_calls: float
+    candidate_construction_input_tokens: float
+    candidate_construction_output_tokens: float
+    candidate_construction_latency_ms: float
     dropped_by_reason: Mapping[str, int]
 
 
@@ -861,10 +861,18 @@ def select_c1(selection_input: SelectionInput, config: SelectorConfig) -> Select
         compile_ms=(time.perf_counter() - started) * 1000,
         recommended_action=action,
         dropped_by_reason=dict(sorted(state.dropped.items())),
-        amortized_calls=sum(event.amortized_calls for event in selection_input.events),
-        amortized_input_tokens=sum(event.amortized_input_tokens for event in selection_input.events),
-        amortized_output_tokens=sum(event.amortized_output_tokens for event in selection_input.events),
-        amortized_latency_ms=sum(event.amortized_latency_ms for event in selection_input.events),
+        candidate_construction_calls=sum(
+            event.amortized_calls for event in selection_input.events
+        ),
+        candidate_construction_input_tokens=sum(
+            event.amortized_input_tokens for event in selection_input.events
+        ),
+        candidate_construction_output_tokens=sum(
+            event.amortized_output_tokens for event in selection_input.events
+        ),
+        candidate_construction_latency_ms=sum(
+            event.amortized_latency_ms for event in selection_input.events
+        ),
     )
 
 
@@ -909,10 +917,10 @@ def score_case(case: ContextCase, result: SelectionResult) -> CaseScore:
         context_chars=result.context_chars,
         navigation_chars=result.navigation_chars,
         compile_ms=result.compile_ms,
-        amortized_calls=result.amortized_calls,
-        amortized_input_tokens=result.amortized_input_tokens,
-        amortized_output_tokens=result.amortized_output_tokens,
-        amortized_latency_ms=result.amortized_latency_ms,
+        candidate_construction_calls=result.candidate_construction_calls,
+        candidate_construction_input_tokens=result.candidate_construction_input_tokens,
+        candidate_construction_output_tokens=result.candidate_construction_output_tokens,
+        candidate_construction_latency_ms=result.candidate_construction_latency_ms,
         dropped_by_reason=result.dropped_by_reason,
     )
 
@@ -995,10 +1003,16 @@ def aggregate_arm(scores: Sequence[CaseScore]) -> dict[str, Any]:
         "navigation_chars": _distribution([float(score.navigation_chars) for score in scores]),
         "compile_ms": _distribution([score.compile_ms for score in scores]),
         "candidate_snapshot_construction_not_deduplicated": {
-            "calls": sum(score.amortized_calls for score in scores),
-            "input_tokens": sum(score.amortized_input_tokens for score in scores),
-            "output_tokens": sum(score.amortized_output_tokens for score in scores),
-            "latency_ms": sum(score.amortized_latency_ms for score in scores),
+            "calls": sum(score.candidate_construction_calls for score in scores),
+            "input_tokens": sum(
+                score.candidate_construction_input_tokens for score in scores
+            ),
+            "output_tokens": sum(
+                score.candidate_construction_output_tokens for score in scores
+            ),
+            "latency_ms": sum(
+                score.candidate_construction_latency_ms for score in scores
+            ),
             "decision_usable": False,
         },
         "dropped_by_reason": dict(sorted(dropped.items())),

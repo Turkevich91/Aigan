@@ -349,25 +349,45 @@ class ContextSelectionReplayTests(unittest.TestCase):
             database = Path(directory) / "replay.sqlite3"
             _create_database(database)
             connection = sqlite3.connect(database)
-            connection.execute(
+            connection.executemany(
                 """
                 INSERT INTO messages (
                     id, chat_id, message_id, chat_type, created_at, sender_label,
                     user_id, is_bot, text, content_kind
-                ) VALUES (10, 101, 12, 'private', '2026-01-01T14:00:00+00:00',
-                          'future', 999, 0, ?, 'text')
+                ) VALUES (?, 101, ?, 'private', ?, ?, ?, 0, ?, 'text')
                 """,
-                (future_sentinel,),
+                [
+                    (
+                        10,
+                        12,
+                        "2026-01-01T14:00:00+00:00",
+                        "future",
+                        999,
+                        future_sentinel,
+                    ),
+                    (
+                        11,
+                        17,
+                        "2026-01-01T11:59:30+00:00",
+                        "distractor",
+                        998,
+                        "Recent distractor",
+                    ),
+                ],
             )
             connection.commit()
             packets, _summary = collect_review_packets(
                 connection,
                 hmac_key=b"k" * 32,
                 lookback_days=30,
-                recent_limit=10,
+                recent_limit=1,
                 reply_depth=8,
             )
             connection.close()
+        exact = next(packet for packet in packets if packet["correlation_kind"] == "exact_provenance")
+        source_texts = {source["text"] for source in exact["sources"]}
+        self.assertIn("Recent distractor", source_texts)
+        self.assertIn("Prior bot answer", source_texts)
         self.assertNotIn(future_sentinel, json.dumps(packets, ensure_ascii=False))
 
     def test_cluster_session_does_not_split_at_wall_clock_boundary(self) -> None:

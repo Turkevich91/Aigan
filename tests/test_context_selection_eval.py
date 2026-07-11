@@ -93,11 +93,11 @@ class ContextSelectionContractTests(unittest.TestCase):
         self.assertFalse(set(result.selected_source_ids) & event_ids)
         self.assertEqual(
             sum(event.amortized_calls for event in case.selection_input.events),
-            result.amortized_calls,
+            result.candidate_construction_calls,
         )
         self.assertEqual(
             sum(event.amortized_input_tokens for event in case.selection_input.events),
-            result.amortized_input_tokens,
+            result.candidate_construction_input_tokens,
         )
 
     def test_aggregate_report_never_contains_case_payloads_or_ids(self) -> None:
