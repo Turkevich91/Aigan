@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import copy
 import contextlib
 import io
@@ -337,6 +338,31 @@ class MemoryExtractionV2ContractTests(unittest.TestCase):
         ):
             eval_v2._fsync_parent_directory(path)
         close_after_failure.assert_called_once_with(23)
+
+    def test_evaluate_case_propagates_cooperative_cancellation(self) -> None:
+        class CancelledResponses:
+            async def create(self, **_request: object) -> object:
+                raise asyncio.CancelledError
+
+        class CancelledClient:
+            responses = CancelledResponses()
+
+        async def run() -> None:
+            await eval_v2.evaluate_case(
+                CancelledClient(),
+                asyncio.Semaphore(1),
+                self.development[0],
+                model="gpt-5.6-luna",
+                reasoning_effort="none",
+                max_output_tokens=1200,
+                timeout_seconds=45,
+                system_prompt="synthetic test prompt",
+            )
+
+        self.assertFalse(issubclass(asyncio.CancelledError, Exception))
+        self.assertTrue(issubclass(asyncio.CancelledError, BaseException))
+        with self.assertRaises(asyncio.CancelledError):
+            asyncio.run(run())
 
     def test_validator_rejects_ambiguous_or_empty_branches(self) -> None:
         case = self.development[0]
