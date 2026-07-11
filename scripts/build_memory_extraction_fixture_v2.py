@@ -624,7 +624,7 @@ def write_fixture(path: Path, cases: list[dict[str, Any]]) -> None:
         for case in cases
     )
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(payload, encoding="utf-8")
+    path.write_text(payload, encoding="utf-8", newline="\n")
 
 
 def main() -> int:

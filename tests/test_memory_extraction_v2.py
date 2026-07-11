@@ -353,6 +353,9 @@ class MemoryExtractionV2ContractTests(unittest.TestCase):
         effort: str = "none",
         repeat_count: int = 3,
         predictions: dict[str, dict] | None = None,
+        provider_actual_models: list[str] | None = None,
+        provider_actual_efforts: list[str] | None = None,
+        provider_metadata_missing: int = 0,
     ) -> dict:
         if predictions is None:
             predictions = {
@@ -382,9 +385,17 @@ class MemoryExtractionV2ContractTests(unittest.TestCase):
             sol_counterfactual_nano_usd=sol.nano_usd,
             provider_model_mismatches=0,
             provider_effort_mismatches=0,
-            provider_metadata_missing=0,
-            provider_actual_models=[model],
-            provider_actual_efforts=[effort],
+            provider_metadata_missing=provider_metadata_missing,
+            provider_actual_models=(
+                provider_actual_models
+                if provider_actual_models is not None
+                else [model]
+            ),
+            provider_actual_efforts=(
+                provider_actual_efforts
+                if provider_actual_efforts is not None
+                else [effort]
+            ),
             input_tokens=usage.input_tokens,
             cached_input_tokens=usage.cached_input_tokens,
             cache_write_tokens=usage.cache_write_tokens,
@@ -409,6 +420,41 @@ class MemoryExtractionV2ContractTests(unittest.TestCase):
             attested_actual_models=[model],
             source_commit="a" * 40,
         )
+
+    def test_per_call_provider_metadata_is_canonicalized_fail_closed(self) -> None:
+        screen = select_screen_cases(self.development)
+        repeated = self._api_like_report(
+            screen,
+            fixture_path=DEV_FIXTURE,
+            repeat_count=1,
+            provider_actual_models=["gpt-5.6-luna"] * len(screen),
+            provider_actual_efforts=["none"] * len(screen),
+        )
+        self.assertEqual(["gpt-5.6-luna"], repeated["provider"]["actual_models"])
+        self.assertEqual(["none"], repeated["provider"]["actual_efforts"])
+        self.assertEqual("PASS_FOR_LOCKED_DEVELOPMENT", repeated["verdict"])
+
+        mixed = self._api_like_report(
+            screen,
+            fixture_path=DEV_FIXTURE,
+            repeat_count=1,
+            provider_actual_models=["gpt-5.6-luna"] * (len(screen) - 1)
+            + ["gpt-5.6-luna-2026-07-10"],
+            provider_actual_efforts=["none"] * len(screen),
+        )
+        self.assertEqual("SCREEN_FAIL", mixed["verdict"])
+        self.assertFalse(mixed["gates"]["single_actual_model_snapshot"])
+
+        missing = self._api_like_report(
+            screen,
+            fixture_path=DEV_FIXTURE,
+            repeat_count=1,
+            provider_actual_models=["gpt-5.6-luna"] * (len(screen) - 1) + [""],
+            provider_actual_efforts=["none"] * (len(screen) - 1) + [""],
+            provider_metadata_missing=1,
+        )
+        self.assertEqual("SCREEN_FAIL", missing["verdict"])
+        self.assertFalse(missing["gates"]["provider_metadata_complete"])
 
     def test_perfect_development_report_can_only_authorize_holdout(self) -> None:
         report = self._api_like_report(self.development, fixture_path=DEV_FIXTURE)
