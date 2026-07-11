@@ -14,6 +14,7 @@ from context_selection_replay import (
     ContextSelectionReplayError,
     REVIEW_MANIFEST_FILENAME,
     REVIEW_POOL_FILENAME,
+    _MESSAGE_REPLAY_COLUMNS,
     _write_exclusive,
     build_private_review_pool,
     collect_review_packets,
@@ -236,7 +237,57 @@ class ContextSelectionReplayTests(unittest.TestCase):
             connection.close()
 
         normalized = [" ".join(statement.split()).casefold() for statement in statements]
-        self.assertEqual(1, normalized.count("select * from messages"))
+        self.assertEqual(
+            {
+                "id",
+                "chat_id",
+                "message_id",
+                "chat_type",
+                "created_at",
+                "sender_label",
+                "user_id",
+                "username",
+                "is_bot",
+                "text",
+                "content_kind",
+                "attachment_type",
+                "vision_summary",
+                "source_title",
+                "reply_to_message_id",
+                "forward_origin",
+                "source_text",
+            },
+            set(_MESSAGE_REPLAY_COLUMNS),
+        )
+        message_queries = [
+            statement
+            for statement in normalized
+            if " from messages" in statement or " join messages " in statement
+        ]
+        history_queries = [
+            statement
+            for statement in message_queries
+            if statement.endswith(" from messages")
+        ]
+        self.assertEqual(1, len(history_queries))
+        self.assertFalse(
+            any(
+                "select * from messages" in statement or "m.*" in statement
+                for statement in message_queries
+            )
+        )
+        for unused_column in (
+            "telegram_file_id",
+            "telegram_unique_id",
+            "local_media_path",
+            "mime_type",
+            "source_url",
+            "raw_note",
+        ):
+            self.assertFalse(
+                any(unused_column in statement for statement in message_queries),
+                unused_column,
+            )
         self.assertFalse(
             any(
                 "from messages where chat_id" in statement
@@ -323,19 +374,115 @@ class ContextSelectionReplayTests(unittest.TestCase):
         )
         self.assertNotIn(private_sentinel, stderr.getvalue())
 
-    def test_private_root_uses_ignored_repo_data_when_data_is_absent(self) -> None:
+    def test_private_root_uses_repo_data_after_git_ignore_verification(self) -> None:
         from scripts import build_context_selection_replay as command
 
         with tempfile.TemporaryDirectory() as directory:
             repo_root = Path(directory)
             (repo_root / ".gitignore").write_text("data/\n", encoding="utf-8")
-            with patch.object(command.shutil, "which", return_value=None):
-                private_root = command._private_root(repo_root)
+            completed = command.subprocess.CompletedProcess(args=["git"], returncode=0)
+            with patch.object(command.shutil, "which", return_value="git"):
+                with patch.object(command.subprocess, "run", return_value=completed) as run:
+                    private_root = command._private_root(repo_root)
             self.assertEqual(
                 (repo_root / "data/research/context-selection-v1").resolve(),
                 private_root,
             )
             self.assertFalse((repo_root / "data").exists())
+            run.assert_called_once()
+            self.assertEqual(repo_root.resolve(), run.call_args.kwargs["cwd"])
+            self.assertEqual(
+                [
+                    "git",
+                    "check-ignore",
+                    "--quiet",
+                    "--",
+                    "data/research/context-selection-v1",
+                ],
+                run.call_args.args[0],
+            )
+
+    def test_private_root_uses_external_fallback_without_git(self) -> None:
+        from scripts import build_context_selection_replay as command
+
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            repo_root = base / "repo"
+            repo_root.mkdir()
+            xdg_data_home = base / "xdg"
+            with patch.dict(os.environ, {"XDG_DATA_HOME": str(xdg_data_home)}):
+                with patch.object(command.shutil, "which", return_value=None):
+                    private_root = command._private_root(repo_root)
+            self.assertEqual(
+                (xdg_data_home / "aigan-context-selection-v1").resolve(),
+                private_root,
+            )
+            self.assertFalse((repo_root / "data").exists())
+
+    def test_private_root_rejects_fallback_inside_repository(self) -> None:
+        from scripts import build_context_selection_replay as command
+
+        with tempfile.TemporaryDirectory() as directory:
+            repo_root = Path(directory)
+            xdg_data_home = repo_root / "private-state"
+            with patch.dict(os.environ, {"XDG_DATA_HOME": str(xdg_data_home)}):
+                with patch.object(command.shutil, "which", return_value=None):
+                    with self.assertRaisesRegex(
+                        ContextSelectionReplayError,
+                        "^private fallback cannot be inside the repository$",
+                    ):
+                        command._private_root(repo_root)
+
+    def test_private_root_fails_when_git_cannot_verify_ignore(self) -> None:
+        from scripts import build_context_selection_replay as command
+
+        with tempfile.TemporaryDirectory() as directory:
+            repo_root = Path(directory)
+            completed = command.subprocess.CompletedProcess(args=["git"], returncode=1)
+            with patch.object(command.shutil, "which", return_value="git"):
+                with patch.object(command.subprocess, "run", return_value=completed):
+                    with self.assertRaisesRegex(
+                        ContextSelectionReplayError,
+                        "^private root is not ignored by Git$",
+                    ):
+                        command._private_root(repo_root)
+
+    def test_private_root_does_not_parse_negated_gitignore_without_git(self) -> None:
+        from scripts import build_context_selection_replay as command
+
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            repo_root = base / "repo"
+            repo_root.mkdir()
+            (repo_root / ".gitignore").write_text("data/\n!data/\n", encoding="utf-8")
+            xdg_data_home = base / "xdg"
+            with patch.dict(os.environ, {"XDG_DATA_HOME": str(xdg_data_home)}):
+                with patch.object(command.shutil, "which", return_value=None):
+                    private_root = command._private_root(repo_root)
+            self.assertEqual(
+                (xdg_data_home / "aigan-context-selection-v1").resolve(),
+                private_root,
+            )
+
+    @unittest.skipIf(os.name == "nt", "symlink creation is not reliably available")
+    def test_private_root_does_not_parse_symlinked_gitignore_without_git(self) -> None:
+        from scripts import build_context_selection_replay as command
+
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            repo_root = base / "repo"
+            repo_root.mkdir()
+            external_ignore = base / "external-ignore"
+            external_ignore.write_text("data/\n", encoding="utf-8")
+            (repo_root / ".gitignore").symlink_to(external_ignore)
+            xdg_data_home = base / "xdg"
+            with patch.dict(os.environ, {"XDG_DATA_HOME": str(xdg_data_home)}):
+                with patch.object(command.shutil, "which", return_value=None):
+                    private_root = command._private_root(repo_root)
+            self.assertEqual(
+                (xdg_data_home / "aigan-context-selection-v1").resolve(),
+                private_root,
+            )
 
     @unittest.skipIf(os.name == "nt", "symlink creation is not reliably available")
     def test_private_root_rejects_dangling_data_symlink(self) -> None:

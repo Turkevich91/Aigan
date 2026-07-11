@@ -55,15 +55,7 @@ def _private_root(repo_root: Path) -> Path:
             )
             if ignored.returncode != 0:
                 raise ContextSelectionReplayError("private root is not ignored by Git")
-        else:
-            ignore_lines = {
-                line.strip()
-                for line in (repo_root / ".gitignore").read_text(encoding="utf-8").splitlines()
-                if line.strip() and not line.lstrip().startswith("#")
-            }
-            if "data/" not in ignore_lines and "/data/" not in ignore_lines:
-                raise ContextSelectionReplayError("private root ignore contract is missing")
-        return private_root
+            return private_root
 
     data_home = Path(os.environ.get("XDG_DATA_HOME") or (Path.home() / ".local/share")).resolve()
     fallback = (data_home / "aigan-context-selection-v1").resolve()

@@ -23,6 +23,29 @@ KEY_FILENAME = "replay-key.bin"
 WORD_RE = re.compile(r"\w+", flags=re.UNICODE)
 LEADING_INVOCATION_RE = re.compile(r"^\s*(?:/[A-Za-z0-9_@-]+|@[A-Za-z0-9_]+)\s*", flags=re.UNICODE)
 CLUSTER_INACTIVITY_MINUTES = 30
+_MESSAGE_REPLAY_COLUMNS = (
+    "id",
+    "chat_id",
+    "message_id",
+    "chat_type",
+    "created_at",
+    "sender_label",
+    "user_id",
+    "username",
+    "is_bot",
+    "text",
+    "content_kind",
+    "attachment_type",
+    "vision_summary",
+    "source_title",
+    "reply_to_message_id",
+    "forward_origin",
+    "source_text",
+)
+_MESSAGE_REPLAY_COLUMNS_SQL = ", ".join(_MESSAGE_REPLAY_COLUMNS)
+_QUALIFIED_MESSAGE_REPLAY_COLUMNS_SQL = ", ".join(
+    f"m.{column}" for column in _MESSAGE_REPLAY_COLUMNS
+)
 SUMMARY_ROUTE_BUCKETS = frozenset(
     {
         "auto_response",
@@ -229,9 +252,9 @@ def _target_candidates(
 ) -> tuple[list[dict[str, Any]], dict[str, int]]:
     exact_rows = _rows(
         connection,
-        """
+        f"""
         SELECT p.run_id, p.input_memory_id, p.route, p.status,
-               p.started_at, p.completed_at, m.*
+               p.started_at, p.completed_at, {_QUALIFIED_MESSAGE_REPLAY_COLUMNS_SQL}
         FROM provenance_runs AS p
         JOIN messages AS m ON m.id = p.input_memory_id
         WHERE m.is_bot = 0
@@ -249,7 +272,8 @@ def _target_candidates(
     )
     all_historical_outputs = _rows(
         connection,
-        "SELECT * FROM messages WHERE is_bot = 1 ORDER BY created_at, id",
+        f"SELECT {_MESSAGE_REPLAY_COLUMNS_SQL} "
+        "FROM messages WHERE is_bot = 1 ORDER BY created_at, id",
     )
     reference_times = [
         parsed
@@ -632,7 +656,9 @@ def collect_review_packets(
         raise ContextSelectionReplayError("invalid replay key")
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA query_only = ON")
-    history = _MessageHistoryIndex(_rows(connection, "SELECT * FROM messages"))
+    history = _MessageHistoryIndex(
+        _rows(connection, f"SELECT {_MESSAGE_REPLAY_COLUMNS_SQL} FROM messages")
+    )
     targets, correlation_counts = _target_candidates(
         connection,
         history=history,
