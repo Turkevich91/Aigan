@@ -39,6 +39,7 @@ def fake_github_token() -> str:
 
 os.environ["TELEGRAM_BOT_TOKEN"] = "123456:test-token"
 os.environ["OPENAI_API_KEY"] = "sk-test"
+os.environ["AGENTS_TRACING_MODE"] = "disabled"
 os.environ["ALLOWED_CHAT_IDS"] = "-1001"
 os.environ["ADMIN_USER_IDS"] = "407892151"
 os.environ["AUTO_REACT_ENABLED"] = "false"
@@ -3234,7 +3235,15 @@ class TimeContextTests(unittest.TestCase):
         for kwargs in server_kwargs:
             self.assertEqual(42.0, kwargs["client_session_timeout_seconds"])
             self.assertIs(main.mcp_tool_failure_message, kwargs["failure_error_function"])
-        self.assertTrue(runner.await_args.kwargs["run_config"].tracing_disabled)
+        run_config = runner.await_args.kwargs["run_config"]
+        self.assertEqual(
+            original_config.agents_tracing_mode == "disabled",
+            run_config.tracing_disabled,
+        )
+        self.assertEqual(
+            original_config.agents_tracing_mode == "sensitive",
+            run_config.trace_include_sensitive_data,
+        )
 
     def test_run_agent_can_guard_reminder_claims_without_tool_context(self) -> None:
         class FakeMCPServer:
