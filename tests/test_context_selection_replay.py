@@ -337,6 +337,51 @@ class ContextSelectionReplayTests(unittest.TestCase):
             )
             self.assertFalse((repo_root / "data").exists())
 
+    @unittest.skipIf(os.name == "nt", "symlink creation is not reliably available")
+    def test_private_root_rejects_dangling_data_symlink(self) -> None:
+        from scripts import build_context_selection_replay as command
+
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            repo_root = base / "repo"
+            repo_root.mkdir()
+            (repo_root / ".gitignore").write_text("data/\n", encoding="utf-8")
+            (repo_root / "data").symlink_to(base / "missing", target_is_directory=True)
+            xdg_data_home = base / "xdg"
+            with patch.dict(os.environ, {"XDG_DATA_HOME": str(xdg_data_home)}):
+                private_root = command._private_root(repo_root)
+            self.assertEqual(
+                (xdg_data_home / "aigan-context-selection-v1").resolve(),
+                private_root,
+            )
+            with self.assertRaises(ValueError):
+                private_root.relative_to(repo_root.resolve())
+
+    @unittest.skipIf(os.name == "nt", "symlink creation is not reliably available")
+    def test_private_root_rejects_existing_intermediate_symlink(self) -> None:
+        from scripts import build_context_selection_replay as command
+
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            repo_root = base / "repo"
+            (repo_root / "data").mkdir(parents=True)
+            (repo_root / ".gitignore").write_text("data/\n", encoding="utf-8")
+            external_root = base / "external"
+            external_root.mkdir()
+            (repo_root / "data/research").symlink_to(
+                external_root,
+                target_is_directory=True,
+            )
+            xdg_data_home = base / "xdg"
+            with patch.dict(os.environ, {"XDG_DATA_HOME": str(xdg_data_home)}):
+                private_root = command._private_root(repo_root)
+            self.assertEqual(
+                (xdg_data_home / "aigan-context-selection-v1").resolve(),
+                private_root,
+            )
+            with self.assertRaises(ValueError):
+                private_root.relative_to(repo_root.resolve())
+
     def test_cli_bounds_corrupt_row_failures_without_payload(self) -> None:
         from scripts import build_context_selection_replay as command
 

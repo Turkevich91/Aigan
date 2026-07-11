@@ -18,14 +18,26 @@ from context_selection_replay import (
 )
 
 
+def _has_symlink_component(root: Path, relative_path: Path) -> bool:
+    current = root
+    for part in relative_path.parts:
+        current = current / part
+        if current.is_symlink():
+            return True
+    return False
+
+
 def _private_root(repo_root: Path) -> Path:
-    data_root = (repo_root / "data").resolve()
-    private_root = (repo_root / PRIVATE_ROOT_RELATIVE).resolve()
+    repo_root = repo_root.resolve()
+    data_root = repo_root / "data"
+    private_root = repo_root / PRIVATE_ROOT_RELATIVE
     try:
         private_root.relative_to(data_root)
     except ValueError as exc:
         raise ContextSelectionReplayError("private root escaped ignored data directory") from exc
-    if private_root.exists():
+    if _has_symlink_component(repo_root, PRIVATE_ROOT_RELATIVE):
+        data_writable = False
+    elif private_root.exists():
         data_writable = private_root.is_dir() and os.access(private_root, os.W_OK)
     elif data_root.exists():
         data_writable = data_root.is_dir() and os.access(data_root, os.W_OK)
