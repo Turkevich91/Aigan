@@ -904,6 +904,8 @@ class ModelPolicyRoutingIntegrationTests(unittest.TestCase):
             )
         )
         original_config = main.CONFIG
+        original_bot_id = main.BOT_ID
+        original_bot_username = main.BOT_USERNAME
         main.CONFIG = self.shadow_config()
         try:
             with patch.object(main, "remember_message_persistently", new=AsyncMock()):
@@ -918,6 +920,8 @@ class ModelPolicyRoutingIntegrationTests(unittest.TestCase):
                             )
         finally:
             main.CONFIG = original_config
+            main.BOT_ID = original_bot_id
+            main.BOT_USERNAME = original_bot_username
 
         image_handler.assert_awaited_once()
         router.assert_not_called()
