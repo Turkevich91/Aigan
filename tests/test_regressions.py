@@ -5277,8 +5277,9 @@ class ToolRuntimeTests(unittest.TestCase):
             main.CONFIG = replace(
                 main.CONFIG,
                 heavy_model_enabled=True,
-                heavy_model_base_url="not-an-http-endpoint",
+                heavy_model_base_url="https://heavy.invalid/v1",
                 heavy_model_model="configured-model",
+                heavy_model_extra_body_json="not-json",
             )
             adapter = main.build_heavy_model_adapter()
             main.set_heavy_model_adapter(adapter)
@@ -5293,6 +5294,19 @@ class ToolRuntimeTests(unittest.TestCase):
         finally:
             main.CONFIG = original_config
             main.set_heavy_model_adapter(original_adapter)
+
+    def test_invalid_heavy_model_extra_body_does_not_break_disabled_config_load(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "HEAVY_MODEL_ENABLED": "false",
+                "HEAVY_MODEL_EXTRA_BODY_JSON": "not-json",
+            },
+        ):
+            config = main.Config.from_env()
+
+        self.assertFalse(config.heavy_model_enabled)
+        self.assertEqual("not-json", config.heavy_model_extra_body_json)
 
     def test_null_media_acquisition_adapter_returns_disabled_sanitized_result(self) -> None:
         adapter = NullMediaAcquisitionAdapter()

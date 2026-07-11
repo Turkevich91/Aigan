@@ -290,6 +290,41 @@ class HeavyModelBackendTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("busy", second.failure_category)
         self.assertEqual(1, len(completions.calls))
 
+    async def test_concurrency_admission_is_atomic_under_burst(self):
+        release = asyncio.Event()
+        two_started = asyncio.Event()
+
+        class BurstCompletions(FakeCompletions):
+            async def create(self, **kwargs):
+                self.calls.append(kwargs)
+                if len(self.calls) == 2:
+                    two_started.set()
+                await release.wait()
+                return self.response
+
+        completions = BurstCompletions(response=success_response())
+        client = FakeClient(completions=completions)
+        adapter = OpenAICompatibleHeavyModelAdapter(
+            settings=settings(max_concurrency=2),
+            client_factory=lambda: client,
+        )
+        tasks = [
+            asyncio.create_task(adapter.analyze(HeavyModelRequest(prompt=f"request-{index}")))
+            for index in range(20)
+        ]
+
+        await asyncio.wait_for(two_started.wait(), timeout=1)
+        for _ in range(3):
+            await asyncio.sleep(0)
+        self.assertEqual(2, len(completions.calls))
+        self.assertEqual(2, adapter.health_summary()["active"])
+        release.set()
+        results = await asyncio.wait_for(asyncio.gather(*tasks), timeout=1)
+
+        self.assertEqual(2, sum(result.ok for result in results))
+        self.assertEqual(18, sum(result.failure_category == "busy" for result in results))
+        self.assertEqual(0, adapter.health_summary()["active"])
+
     async def test_provider_errors_are_categorized_without_raw_details(self):
         cases = (
             (FakeProviderError(401), "authentication_failed"),

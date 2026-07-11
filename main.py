@@ -145,8 +145,8 @@ def _csv_values(value: str) -> list[str]:
     return [item.strip() for item in value.split(",") if item.strip()]
 
 
-def _env_json_object(name: str) -> dict[str, Any]:
-    raw = os.getenv(name, "").strip()
+def _parse_json_object(raw_value: str, name: str) -> dict[str, Any]:
+    raw = str(raw_value or "").strip()
     if not raw:
         return {}
     try:
@@ -331,7 +331,7 @@ class Config:
     heavy_model_max_output_tokens: int
     heavy_model_max_result_chars: int
     heavy_model_max_concurrency: int
-    heavy_model_extra_body: dict[str, Any]
+    heavy_model_extra_body_json: str
     system_log_enabled: bool
     system_log_retention_days: int
     health_report_enabled: bool
@@ -630,7 +630,7 @@ class Config:
             heavy_model_max_output_tokens=int(os.getenv("HEAVY_MODEL_MAX_OUTPUT_TOKENS", "2000")),
             heavy_model_max_result_chars=int(os.getenv("HEAVY_MODEL_MAX_RESULT_CHARS", "40000")),
             heavy_model_max_concurrency=int(os.getenv("HEAVY_MODEL_MAX_CONCURRENCY", "1")),
-            heavy_model_extra_body=_env_json_object("HEAVY_MODEL_EXTRA_BODY_JSON"),
+            heavy_model_extra_body_json=os.getenv("HEAVY_MODEL_EXTRA_BODY_JSON", "").strip(),
             system_log_enabled=_env_bool("SYSTEM_LOG_ENABLED", True),
             system_log_retention_days=int(os.getenv("SYSTEM_LOG_RETENTION_DAYS", "14")),
             health_report_enabled=_env_bool("HEALTH_REPORT_ENABLED", False),
@@ -1227,7 +1227,10 @@ def build_heavy_model_adapter() -> HeavyModelAdapter:
                 max_output_tokens=CONFIG.heavy_model_max_output_tokens,
                 max_result_chars=CONFIG.heavy_model_max_result_chars,
                 max_concurrency=CONFIG.heavy_model_max_concurrency,
-                extra_body=CONFIG.heavy_model_extra_body,
+                extra_body=_parse_json_object(
+                    CONFIG.heavy_model_extra_body_json,
+                    "HEAVY_MODEL_EXTRA_BODY_JSON",
+                ),
             )
         )
     except Exception:

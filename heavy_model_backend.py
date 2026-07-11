@@ -260,7 +260,8 @@ class OpenAICompatibleHeavyModelAdapter:
         )
         self._client_factory = client_factory or self._default_client
         self._client: Any | None = None
-        self._semaphore = asyncio.Semaphore(self.settings.max_concurrency)
+        self._admission_lock = asyncio.Lock()
+        self._in_flight = 0
         self.error_count = 0
         self.rejected_count = 0
         self.busy_count = 0
@@ -287,7 +288,7 @@ class OpenAICompatibleHeavyModelAdapter:
                 media_count=media_count,
             )
 
-        if self._semaphore.locked():
+        if not await self._try_acquire_slot():
             self.busy_count += 1
             self.last_failure_category = "busy"
             return HeavyModelResult.failure(
@@ -299,7 +300,7 @@ class OpenAICompatibleHeavyModelAdapter:
                 media_count=media_count,
             )
 
-        async with self._semaphore:
+        try:
             try:
                 response = await self._create_chat_completion(request)
                 text = response_text(response)
@@ -344,6 +345,8 @@ class OpenAICompatibleHeavyModelAdapter:
                     duration_ms=elapsed_ms(started),
                     media_count=media_count,
                 )
+        finally:
+            await self._release_slot()
 
     async def probe(self) -> HeavyModelProbeResult:
         """List models without sending content or running an inference request."""
@@ -415,6 +418,7 @@ class OpenAICompatibleHeavyModelAdapter:
             "text_supported": "text" in self.settings.capabilities,
             "image_supported": "image" in self.settings.capabilities,
             "video_supported": "video" in self.settings.capabilities,
+            "active": self._in_flight,
         }
         if self.last_failure_category:
             details["last_failure_category"] = self.last_failure_category
@@ -501,6 +505,17 @@ class OpenAICompatibleHeavyModelAdapter:
             timeout=self.settings.timeout_seconds,
             max_retries=0,
         )
+
+    async def _try_acquire_slot(self) -> bool:
+        async with self._admission_lock:
+            if self._in_flight >= self.settings.max_concurrency:
+                return False
+            self._in_flight += 1
+            return True
+
+    async def _release_slot(self) -> None:
+        async with self._admission_lock:
+            self._in_flight = max(0, self._in_flight - 1)
 
     def _get_client(self) -> Any:
         if self._client is None:
