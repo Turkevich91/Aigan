@@ -91,6 +91,17 @@ class ModelRoutingPolicyTests(unittest.TestCase):
             ({"ambiguity": "medium", "reason_codes": ["high_ambiguity"]}, {}, "premium"),
             ({"complexity": "high", "reason_codes": ["high_complexity"]}, {}, "premium"),
             ({"freshness": "live", "reason_codes": ["current_grounding"]}, {}, "premium"),
+            (
+                {
+                    "task_class": "grounded_current",
+                    "freshness": "live",
+                    "selected_tier": "balanced",
+                    "reasoning_effort": "low",
+                    "reason_codes": ["current_grounding"],
+                },
+                {},
+                "premium",
+            ),
             ({}, {"route_bucket": "memory_recall"}, "premium"),
             ({}, {"route_bucket": "time_sensitive"}, "premium"),
             ({}, {"mutation_capability": True}, "premium"),

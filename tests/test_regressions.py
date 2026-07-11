@@ -799,17 +799,24 @@ class ModelPolicyRoutingIntegrationTests(unittest.TestCase):
             chat_id=700000001,
             message_id=504,
         )
+        message.reply_to_message = FakeMessage("bounded reference", message_id=505)
         self.assertEqual("create", main.deterministic_reminder_intent(prompt))
 
-        metadata = main.build_model_policy_router_metadata(
-            message,
-            prompt,
-            route="normal",
-            tool_route_decision=main.no_tool_route("reminder_crud_disabled"),
-        )
+        with patch.object(
+            main,
+            "build_reference_context",
+            side_effect=AssertionError("reference text must not be built"),
+        ):
+            metadata = main.build_model_policy_router_metadata(
+                message,
+                prompt,
+                route="normal",
+                tool_route_decision=main.no_tool_route("reminder_crud_disabled"),
+            )
 
         self.assertTrue(metadata["mutation_requested"])
         self.assertFalse(metadata["mutation_capability"])
+        self.assertTrue(metadata["has_reference"])
         self.assertTrue(metadata["has_url"])
         self.assertIn("[url]", metadata["trusted_text"])
         self.assertNotIn("private.example", metadata["trusted_text"])

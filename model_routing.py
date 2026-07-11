@@ -282,10 +282,10 @@ def _policy_floor(
         return "premium", "policy_floor_complexity"
     if ambiguity != "low":
         return "premium", "policy_floor_ambiguity"
-    if task_class in {"grounded_current", "tool_result_synthesis"}:
-        return "balanced", "policy_floor_task"
     if freshness == "live":
         return "premium", "policy_floor_freshness"
+    if task_class in {"grounded_current", "tool_result_synthesis"}:
+        return "balanced", "policy_floor_task"
     if source_context:
         return "balanced", "policy_floor_source"
     if complexity == "medium":

@@ -4510,7 +4510,12 @@ def has_current_context_payload(message: Message) -> bool:
 
 
 def referenced_context_available(message: Message) -> bool:
-    return build_reference_context(message) != "(none)"
+    quote = getattr(message, "quote", None)
+    return bool(
+        getattr(quote, "text", None)
+        or getattr(message, "reply_to_message", None) is not None
+        or getattr(message, "external_reply", None) is not None
+    )
 
 
 def is_translate_request(prompt: str) -> bool:
@@ -4845,7 +4850,7 @@ def build_model_policy_router_metadata(
         and getattr(reply, "from_user", None) is not None
         and getattr(reply.from_user, "id", None) == BOT_ID
     )
-    has_reference = build_reference_context(message) != "(none)"
+    has_reference = referenced_context_available(message)
     mutation_capability = bool(
         tool_route_decision is not None
         and tool_route_decision.allowed_toolsets
