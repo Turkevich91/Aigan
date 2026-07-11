@@ -131,6 +131,11 @@ from telegram.constants import ChatType, ParseMode
 from telegram.error import BadRequest, TimedOut
 
 import main
+from agents.items import ModelResponse
+from agents.models.interface import ModelTracing
+from agents.models.openai_responses import OpenAIResponsesModel
+from agents.usage import Usage
+from openai.types.responses import ResponseOutputMessage, ResponseOutputText
 from github_reporting import GitHubIssue, GitHubReporter, GitHubReportingError
 from outbound_reactions import EmotionPolicyDecision
 from provenance import extract_tool_provenance, make_tool_provenance
@@ -470,6 +475,634 @@ class AgentsSdkCompatibilityTests(unittest.TestCase):
         self.assertEqual({"effort": "low"}, request["reasoning"])
         self.assertEqual({"verbosity": "medium"}, request["text"])
         self.assertEqual(321, request["max_output_tokens"])
+
+
+class ModelTelemetryIntegrationTests(unittest.TestCase):
+    def use_isolated_store(self):
+        temporary = tempfile.TemporaryDirectory()
+        store = main.ModelTelemetryStore(Path(temporary.name) / "telemetry.sqlite3", retention_days=7)
+        original_store = main.MODEL_TELEMETRY
+        main.MODEL_TELEMETRY = store
+        self.addCleanup(temporary.cleanup)
+        self.addCleanup(store.close)
+        self.addCleanup(setattr, main, "MODEL_TELEMETRY", original_store)
+        return store
+
+    def test_agents_tracing_modes_map_explicitly_without_payload_metadata(self) -> None:
+        original_config = main.CONFIG
+        try:
+            for mode, tracing_disabled, includes_sensitive in (
+                ("disabled", True, False),
+                ("metadata_only", False, False),
+                ("sensitive", False, True),
+            ):
+                main.CONFIG = replace(original_config, agents_tracing_mode=mode)
+                config = main.build_agents_run_config(
+                    run_id="a" * 32,
+                    route_bucket="memory_recall",
+                )
+                self.assertEqual(tracing_disabled, config.tracing_disabled)
+                self.assertEqual(includes_sensitive, config.trace_include_sensitive_data)
+                self.assertIsInstance(config.model, main.TelemetryOpenAIResponsesModel)
+                self.assertEqual("a" * 32, config.group_id)
+                self.assertEqual(
+                    {
+                        "route_bucket": "memory_recall",
+                        "policy_version": "primary_sol_low_v1",
+                    },
+                    config.trace_metadata,
+                )
+        finally:
+            main.CONFIG = original_config
+
+    def test_project_tracing_mode_overrides_legacy_global_disable(self) -> None:
+        with patch.dict(os.environ, {"OPENAI_AGENTS_DISABLE_TRACING": "true"}):
+            with patch.object(main, "set_tracing_disabled") as setter:
+                self.assertEqual(
+                    "metadata_only",
+                    main.apply_agents_tracing_policy("metadata_only"),
+                )
+                setter.assert_called_once_with(False)
+
+        with patch.object(main, "set_tracing_disabled") as setter:
+            self.assertEqual("disabled", main.apply_agents_tracing_policy("disabled"))
+            setter.assert_called_once_with(True)
+
+    def test_hosted_trace_metadata_rejects_private_marker_values(self) -> None:
+        private_marker = "private_marker"
+        original_config = main.CONFIG
+        main.CONFIG = replace(
+            original_config,
+            agents_tracing_mode="metadata_only",
+            model_routing_policy_version=private_marker,
+        )
+        try:
+            config = main.build_agents_run_config(
+                run_id=private_marker,
+                route_bucket=private_marker,
+            )
+        finally:
+            main.CONFIG = original_config
+
+        self.assertRegex(config.group_id or "", r"^[0-9a-f]{32}$")
+        self.assertNotIn(private_marker, repr(config.trace_metadata))
+        self.assertEqual("other", config.trace_metadata["route_bucket"])
+        self.assertEqual("other", config.trace_metadata["policy_version"])
+
+    def test_invalid_agents_tracing_mode_fails_explicitly(self) -> None:
+        original_config = main.CONFIG
+        main.CONFIG = replace(original_config, agents_tracing_mode="maybe")
+        try:
+            with self.assertRaisesRegex(ValueError, "AGENTS_TRACING_MODE"):
+                main.build_agents_run_config(run_id="a" * 32)
+        finally:
+            main.CONFIG = original_config
+
+    def test_invalid_routing_policy_fails_configuration_explicitly(self) -> None:
+        with patch.dict(
+            os.environ,
+            {"MODEL_ROUTING_POLICY_VERSION": "private_marker"},
+            clear=False,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "MODEL_ROUTING_POLICY_VERSION"):
+                main.Config.from_env()
+
+    def test_direct_model_boundaries_record_provider_usage_and_actual_models(self) -> None:
+        store = self.use_isolated_store()
+        usage = SimpleNamespace(
+            requests=1,
+            input_tokens=10,
+            output_tokens=4,
+            total_tokens=14,
+            input_tokens_details=SimpleNamespace(cached_tokens=2, cache_write_tokens=0),
+            output_tokens_details=SimpleNamespace(reasoning_tokens=1),
+            request_usage_entries=[
+                SimpleNamespace(
+                    input_tokens=10,
+                    output_tokens=4,
+                    input_tokens_details=SimpleNamespace(cached_tokens=2, cache_write_tokens=0),
+                )
+            ],
+        )
+        embedding_usage = SimpleNamespace(prompt_tokens=3, total_tokens=3)
+        responses = [
+            SimpleNamespace(output_text='{"domains": [], "intent": "none"}', model="gpt-5.4-nano", usage=usage),
+            SimpleNamespace(
+                output_text="plain ok",
+                model="gpt-5.6-sol",
+                usage=usage,
+                reasoning=SimpleNamespace(effort="low"),
+            ),
+            SimpleNamespace(output_text="vision ok", model="gpt-5.4-mini", usage=usage),
+        ]
+        original_config = main.CONFIG
+        main.CONFIG = replace(
+            original_config,
+            **{"openai_api_key": "unit-test-openai-key", "memory_embedding_dimensions": 2},
+        )
+        try:
+            with patch.object(main, "OpenAI") as client_class:
+                client = client_class.return_value
+                client.responses.create.side_effect = responses
+                client.embeddings.create.return_value = SimpleNamespace(
+                    model="text-embedding-3-small",
+                    usage=embedding_usage,
+                    data=[SimpleNamespace(embedding=[3.0, 4.0])],
+                )
+
+                run_token = main.ACTIVE_MODEL_RUN_ID.set("f" * 32)
+                route_token = main.ACTIVE_MODEL_ROUTE_BUCKET.set("normal")
+                try:
+                    self.assertIn("none", main.run_tool_router_model_sync({"trusted_text": "safe"}))
+                    self.assertEqual(
+                        "plain ok",
+                        main.run_plain_model_sync(
+                            "safe prompt",
+                            route_bucket="character",
+                            task_class_bucket="character",
+                        ),
+                    )
+                    self.assertEqual(
+                        "vision ok",
+                        main.run_vision_sync(
+                            "safe prompt",
+                            ["data:image/png;base64,AA=="],
+                            route_bucket="vision",
+                        ),
+                    )
+                    self.assertEqual(
+                        [[0.6, 0.8]],
+                        main.create_embeddings_sync(
+                            ["safe text"],
+                            route_bucket="memory_search",
+                        ),
+                    )
+                finally:
+                    main.ACTIVE_MODEL_ROUTE_BUCKET.reset(route_token)
+                    main.ACTIVE_MODEL_RUN_ID.reset(run_token)
+        finally:
+            main.CONFIG = original_config
+
+        records = {record.stage_kind: record for record in store.latest_stages(10)}
+        self.assertEqual({"router", "plain", "vision", "embedding_query"}, set(records))
+        self.assertEqual("gpt-5.6-sol", records["plain"].actual_model)
+        self.assertEqual("provider_response", records["plain"].actual_model_source)
+        self.assertEqual("low", records["plain"].actual_reasoning_effort)
+        self.assertEqual(10, records["plain"].input_tokens)
+        self.assertEqual(2, records["plain"].cached_input_tokens)
+        self.assertEqual(1, records["plain"].reasoning_tokens)
+        self.assertEqual(3, records["embedding_query"].input_tokens)
+        self.assertTrue(all(record.run_id == "f" * 32 for record in records.values()))
+        self.assertEqual("router", records["router"].task_class_bucket)
+        self.assertEqual("character", records["plain"].task_class_bucket)
+        self.assertEqual("vision", records["vision"].task_class_bucket)
+        self.assertEqual("embedding_query", records["embedding_query"].task_class_bucket)
+        self.assertEqual("normal", records["router"].route_bucket)
+        self.assertEqual("character", records["plain"].route_bucket)
+        self.assertEqual("vision", records["vision"].route_bucket)
+        self.assertEqual("memory_search", records["embedding_query"].route_bucket)
+
+    def test_agents_hooks_record_each_response_usage_not_cumulative_context(self) -> None:
+        store = self.use_isolated_store()
+        hook = main.AiganRunHooks(
+            "b" * 32,
+            route_bucket="normal",
+            intended_model="gpt-5.6-sol",
+            reasoning_effort="low",
+        )
+        agent = SimpleNamespace(name="Aigan")
+
+        async def exercise() -> None:
+            await hook.on_llm_start(None, agent, "system", ["one"])
+            await hook.on_llm_end(
+                None,
+                agent,
+                SimpleNamespace(
+                    output=[SimpleNamespace(type="function_call")],
+                    usage=SimpleNamespace(requests=1, input_tokens=11, output_tokens=3, total_tokens=14),
+                ),
+            )
+            await hook.on_llm_start(None, agent, "system", ["two"])
+            await hook.on_llm_end(
+                None,
+                agent,
+                SimpleNamespace(
+                    output=[SimpleNamespace(type="message")],
+                    usage=SimpleNamespace(requests=1, input_tokens=5, output_tokens=7, total_tokens=12),
+                ),
+            )
+
+        asyncio.run(exercise())
+
+        records = sorted(store.latest_stages(10), key=lambda record: record.ordinal)
+        self.assertEqual(["agent_tool_turn", "final_answer"], [record.stage_kind for record in records])
+        self.assertEqual([11, 5], [record.input_tokens for record in records])
+        self.assertTrue(all(record.actual_model == "" for record in records))
+        self.assertTrue(all(record.actual_reasoning_effort == "" for record in records))
+        self.assertTrue(all(record.actual_model_source == "unavailable_sdk" for record in records))
+
+    def test_agents_hook_does_not_misreport_nonterminal_response(self) -> None:
+        store = self.use_isolated_store()
+        hook = main.AiganRunHooks("e" * 32, route_bucket="normal")
+        agent = SimpleNamespace(name="Aigan")
+        raw_response = SimpleNamespace(
+            id="resp_telemetry_test",
+            status="incomplete",
+            model="gpt-5.6-sol",
+            reasoning=SimpleNamespace(effort="low"),
+            output=[],
+            usage=SimpleNamespace(
+                input_tokens=4,
+                output_tokens=1,
+                total_tokens=5,
+                input_tokens_details={
+                    "cached_tokens": 0,
+                    "cache_write_tokens": 0,
+                },
+                output_tokens_details={"reasoning_tokens": 0},
+            ),
+        )
+
+        async def fake_sdk_fetch(_model, *args, **kwargs):
+            return raw_response
+
+        async def exercise() -> None:
+            await hook.on_llm_start(None, agent, "system", ["one"])
+            model = main.TelemetryOpenAIResponsesModel(
+                "gpt-5.6-sol",
+                SimpleNamespace(),
+            )
+            with patch.object(
+                OpenAIResponsesModel,
+                "_fetch_response",
+                new=fake_sdk_fetch,
+            ):
+                response = await model.get_response(
+                    None,
+                    [],
+                    main.ModelSettings(),
+                    [],
+                    None,
+                    [],
+                    ModelTracing.DISABLED,
+                )
+            self.assertFalse(hasattr(response, "status"))
+            await hook.on_llm_end(None, agent, response)
+
+        asyncio.run(exercise())
+
+        record = store.latest_stages(1)[0]
+        self.assertEqual("failed", record.status)
+        self.assertEqual("provider_incomplete", record.failure_class)
+        self.assertEqual("final_answer", record.stage_kind)
+        self.assertEqual("gpt-5.6-sol", record.actual_model)
+        self.assertEqual("provider_response", record.actual_model_source)
+        self.assertEqual("low", record.actual_reasoning_effort)
+
+    def test_agents_provider_metadata_is_isolated_between_concurrent_calls(self) -> None:
+        model = main.TelemetryOpenAIResponsesModel(
+            "gpt-5.6-sol",
+            SimpleNamespace(),
+        )
+        responses = {
+            "slow": SimpleNamespace(
+                id="resp_slow",
+                status="completed",
+                model="gpt-5.6-sol",
+                reasoning=SimpleNamespace(effort="low"),
+                output=[],
+                usage=None,
+            ),
+            "fast": SimpleNamespace(
+                id="resp_fast",
+                status="incomplete",
+                model="gpt-5.6-luna",
+                reasoning=SimpleNamespace(effort="minimal"),
+                output=[],
+                usage=None,
+            ),
+            "clean": SimpleNamespace(
+                id="resp_clean",
+                output=[],
+                usage=None,
+            ),
+        }
+
+        async def fake_sdk_fetch(_model, _system, input_value, *args, **kwargs):
+            if input_value == "slow":
+                await asyncio.sleep(0.01)
+            return responses[input_value]
+
+        barrier = asyncio.Barrier(2)
+
+        async def fake_sdk_get_response(_model, *args, **kwargs):
+            raw_response = await _model._fetch_response(*args[:6], stream=False)
+            if args[1] != "clean":
+                await barrier.wait()
+            return ModelResponse(
+                output=raw_response.output,
+                usage=Usage(),
+                response_id=raw_response.id,
+            )
+
+        async def call(input_value: str):
+            return await model.get_response(
+                None,
+                input_value,
+                main.ModelSettings(),
+                [],
+                None,
+                [],
+                ModelTracing.DISABLED,
+            )
+
+        async def exercise():
+            with patch.object(
+                OpenAIResponsesModel,
+                "_fetch_response",
+                new=fake_sdk_fetch,
+            ), patch.object(
+                OpenAIResponsesModel,
+                "get_response",
+                new=fake_sdk_get_response,
+            ):
+                slow, fast = await asyncio.gather(call("slow"), call("fast"))
+                clean = await call("clean")
+            return slow, fast, clean
+
+        slow, fast, clean = asyncio.run(exercise())
+
+        self.assertEqual(
+            ("completed", "gpt-5.6-sol", "low"),
+            (
+                slow._aigan_provider_status,
+                slow._aigan_provider_model,
+                slow._aigan_provider_reasoning_effort,
+            ),
+        )
+        self.assertEqual(
+            ("incomplete", "gpt-5.6-luna", "minimal"),
+            (
+                fast._aigan_provider_status,
+                fast._aigan_provider_model,
+                fast._aigan_provider_reasoning_effort,
+            ),
+        )
+        self.assertEqual(
+            ("", "", ""),
+            (
+                clean._aigan_provider_status,
+                clean._aigan_provider_model,
+                clean._aigan_provider_reasoning_effort,
+            ),
+        )
+
+    def test_run_config_adapter_preserves_agent_request_settings(self) -> None:
+        captured: dict[str, object] = {}
+        raw_response = SimpleNamespace(
+            id="resp_runner_adapter",
+            status="completed",
+            model="gpt-5.6-sol",
+            reasoning=SimpleNamespace(effort="low"),
+            output=[
+                ResponseOutputMessage(
+                    id="msg_runner_adapter",
+                    content=[
+                        ResponseOutputText(
+                            annotations=[],
+                            text="ok",
+                            type="output_text",
+                            logprobs=[],
+                        )
+                    ],
+                    role="assistant",
+                    status="completed",
+                    type="message",
+                )
+            ],
+            usage=None,
+        )
+
+        class FakeResponses:
+            async def create(self, **kwargs):
+                captured.update(kwargs)
+                return raw_response
+
+        original_config = main.CONFIG
+        main.CONFIG = replace(
+            original_config,
+            openai_model="gpt-5.6-sol",
+            model_reasoning_effort="low",
+            model_verbosity="medium",
+            max_output_tokens=321,
+        )
+        model = main.configured_agents_model()
+        original_client = model._client
+        model._client = SimpleNamespace(responses=FakeResponses())
+        try:
+            result = asyncio.run(
+                main.Runner.run(
+                    main.make_agent([]),
+                    "adapter settings probe",
+                    max_turns=1,
+                    run_config=main.build_agents_run_config(
+                        run_id="7" * 32,
+                        route_bucket="selfcheck",
+                    ),
+                )
+            )
+        finally:
+            model._client = original_client
+            main.CONFIG = original_config
+
+        self.assertEqual("ok", str(result.final_output))
+        self.assertEqual("gpt-5.6-sol", captured["model"])
+        self.assertEqual(321, captured["max_output_tokens"])
+        self.assertEqual("auto", captured["truncation"])
+        self.assertEqual("medium", captured["text"]["verbosity"])
+        self.assertEqual("low", getattr(captured["reasoning"], "effort", None))
+
+    def test_configured_agents_client_close_is_best_effort_and_resets_cache(self) -> None:
+        original_client = main._AGENTS_OPENAI_CLIENT
+        original_model = main._AGENTS_RESPONSE_MODEL
+        try:
+            for failure in (None, RuntimeError("private close detail")):
+                with self.subTest(failure=type(failure).__name__ if failure else "none"):
+                    client = SimpleNamespace(close=AsyncMock(side_effect=failure))
+                    main._AGENTS_OPENAI_CLIENT = client
+                    main._AGENTS_RESPONSE_MODEL = object()
+
+                    asyncio.run(main.close_configured_agents_model())
+
+                    client.close.assert_awaited_once_with()
+                    self.assertIsNone(main._AGENTS_OPENAI_CLIENT)
+                    self.assertIsNone(main._AGENTS_RESPONSE_MODEL)
+        finally:
+            main._AGENTS_OPENAI_CLIENT = original_client
+            main._AGENTS_RESPONSE_MODEL = original_model
+
+    def test_pending_agent_turn_is_terminalized_on_cancel(self) -> None:
+        store = self.use_isolated_store()
+        hook = main.AiganRunHooks("c" * 32, route_bucket="normal")
+        asyncio.run(hook.on_llm_start(None, SimpleNamespace(name="Aigan"), None, []))
+
+        hook.finalize_pending("cancelled", asyncio.CancelledError())
+
+        record = store.latest_stages(1)[0]
+        self.assertEqual("cancelled", record.status)
+        self.assertEqual("agent_turn", record.stage_kind)
+        self.assertEqual("cancellederror", record.failure_class)
+
+    def test_provider_exception_is_recorded_without_payload_and_propagated(self) -> None:
+        store = self.use_isolated_store()
+        with patch.object(main, "OpenAI") as client_class:
+            client_class.return_value.responses.create.side_effect = RuntimeError("private_payload_marker")
+            with self.assertRaises(RuntimeError):
+                main.run_plain_model_sync("raw private prompt")
+
+        record = store.latest_stages(1)[0]
+        self.assertEqual("failed", record.status)
+        self.assertEqual("runtimeerror", record.failure_class)
+        self.assertNotIn("private_payload_marker", repr(record).casefold())
+
+    def test_nonterminal_direct_response_status_is_never_recorded_as_success(self) -> None:
+        store = self.use_isolated_store()
+        with patch.object(main, "OpenAI") as client_class:
+            client_class.return_value.responses.create.return_value = SimpleNamespace(
+                output_text="partial output",
+                model="gpt-5.6-sol",
+                status="in_progress",
+                usage=None,
+            )
+            self.assertEqual("partial output", main.run_plain_model_sync("safe prompt"))
+
+        record = store.latest_stages(1)[0]
+        self.assertEqual("failed", record.status)
+        self.assertEqual("provider_in_progress", record.failure_class)
+        self.assertEqual("missing", record.usage_status)
+
+    def test_telemetry_sink_failure_does_not_change_model_result(self) -> None:
+        class BrokenTelemetry:
+            def begin_stage(self, **kwargs):
+                raise sqlite3.OperationalError("sink unavailable")
+
+        class ResponseWithBrokenTelemetryProperties:
+            output_text = "still ok"
+
+            @property
+            def model(self):
+                raise RuntimeError("model metadata unavailable")
+
+            @property
+            def reasoning(self):
+                raise RuntimeError("reasoning metadata unavailable")
+
+            @property
+            def status(self):
+                raise RuntimeError("status metadata unavailable")
+
+            @property
+            def usage(self):
+                raise RuntimeError("usage metadata unavailable")
+
+        original_store = main.MODEL_TELEMETRY
+        main.MODEL_TELEMETRY = BrokenTelemetry()
+        try:
+            with patch.object(main, "OpenAI") as client_class:
+                client_class.return_value.responses.create.return_value = ResponseWithBrokenTelemetryProperties()
+                self.assertEqual("still ok", main.run_plain_model_sync("safe prompt"))
+        finally:
+            main.MODEL_TELEMETRY = original_store
+
+    def test_prompt_wrapper_correlates_pre_route_work_with_outbound_provenance(self) -> None:
+        observed: dict[str, str] = {}
+
+        async def probe(message, context, prompt, allow_pending_wait, skip_cooldown=False):
+            observed["active_run_id"] = main.current_model_run_id()
+            observed["provenance_run_id"] = main.provenance_for_message(message, "normal").run_id
+            observed["route"] = main.current_model_route_bucket()
+
+        with patch.object(main, "_handle_prompt_generation", new=probe):
+            asyncio.run(main.handle_prompt_generation(FakeMessage("hello"), SimpleNamespace(), "hello", False))
+
+        self.assertRegex(observed["active_run_id"], r"^[0-9a-f]{32}$")
+        self.assertEqual(observed["active_run_id"], observed["provenance_run_id"])
+        self.assertEqual("pre_route", observed["route"])
+        self.assertEqual("", main.ACTIVE_MODEL_RUN_ID.get())
+
+    def test_model_diagnostics_are_sanitized_and_exporter_is_not_claimed_healthy(self) -> None:
+        store = self.use_isolated_store()
+        original_config = main.CONFIG
+        main.CONFIG = replace(original_config, agents_tracing_mode="metadata_only")
+        try:
+            text = main.model_telemetry_health_text(60)
+            row = {item.name: item for item in main.configured_capability_rows()}["model_telemetry"]
+        finally:
+            main.CONFIG = original_config
+
+        self.assertIn("configured_unverified", text)
+        self.assertEqual("configured_unverified", row.details["trace_exporter"])
+        self.assertNotIn(main.CONFIG.memory_db_path, text)
+        self.assertNotIn(main.CONFIG.openai_api_key, text)
+        self.assertNotIn("healthy", text.casefold())
+        self.assertIn("estimated_cost_usd: unavailable", text)
+        self.assertNotIn("estimated_cost_usd: 0.000000", text)
+
+        handle = store.begin_stage(
+            run_id="9" * 32,
+            route_bucket="normal",
+            task_class_bucket="plain",
+            stage_kind="plain",
+            intended_model="unknown-model",
+            endpoint="responses",
+        )
+        store.finish_stage(handle, status="succeeded", usage=None)
+        partial_text = main.model_telemetry_health_text(60)
+        self.assertIn("known_estimated_cost_usd: 0.000000", partial_text)
+        self.assertIn("partial; incomplete_stages=1", partial_text)
+
+    def test_youtube_mcp_environment_is_scoped_and_correlated(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "YOUTUBE_AUDIO_FALLBACK": "true",
+                "YOUTUBE_TRANSCRIPTION_MODEL": "gpt-4o-mini-transcribe",
+                "YOUTUBE_PRIVATE_TOKEN": "must-not-cross-boundary",
+                "UNRELATED_PRIVATE_VALUE": "must-not-cross-boundary",
+            },
+            clear=False,
+        ):
+            child_env = main.youtube_mcp_environment(
+                run_id="d" * 32,
+                route_bucket="time_sensitive",
+            )
+
+        self.assertEqual("d" * 32, child_env["AIGAN_MODEL_RUN_ID"])
+        self.assertEqual("time_sensitive", child_env["AIGAN_MODEL_ROUTE_BUCKET"])
+        self.assertEqual(main.CONFIG.openai_api_key, child_env["OPENAI_API_KEY"])
+        self.assertEqual("true", child_env["YOUTUBE_AUDIO_FALLBACK"])
+        self.assertNotIn("YOUTUBE_PRIVATE_TOKEN", child_env)
+        self.assertNotIn("UNRELATED_PRIVATE_VALUE", child_env)
+
+    def test_youtube_mcp_omits_model_secrets_when_audio_fallback_is_off(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "YOUTUBE_AUDIO_FALLBACK": "false",
+                "YOUTUBE_PRIVATE_TOKEN": "must-not-cross-boundary",
+            },
+            clear=False,
+        ):
+            child_env = main.youtube_mcp_environment(
+                run_id="d" * 32,
+                route_bucket="time_sensitive",
+            )
+
+        self.assertEqual("false", child_env["YOUTUBE_AUDIO_FALLBACK"])
+        self.assertNotIn("YOUTUBE_PRIVATE_TOKEN", child_env)
+        self.assertNotIn("OPENAI_API_KEY", child_env)
+        self.assertNotIn("MEMORY_DB_PATH", child_env)
+        self.assertNotIn("AIGAN_MODEL_RUN_ID", child_env)
 
 
 class PendingFlowTests(unittest.TestCase):
@@ -5883,6 +6516,7 @@ class PersistentMemoryTests(unittest.TestCase):
             asyncio.run(main.maybe_analyze_reaction_asset(spec, -1001))
 
         self.assertEqual(1, run_vision.await_count)
+        self.assertEqual("background", run_vision.await_args.kwargs["route_bucket"])
         asset = main.REACTION_MEMORY.asset_by_key(spec.reaction_key)
         self.assertEqual("analyzed", asset.analysis_status)
         self.assertIn("custom emoji", asset.visual_summary_uk)
