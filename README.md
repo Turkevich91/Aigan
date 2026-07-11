@@ -404,6 +404,15 @@ of 360 repeated outputs failed the strict conditional schema invariant. No
 runtime memory worker or live shadow is authorized.
 See [`docs/memory-extraction-eval.md`](docs/memory-extraction-eval.md).
 
+V2 is a separate, still-offline experiment with an exclusive nested output
+union, strict raw-evidence validation, text/identity-disjoint 160-case
+development and holdout fixtures, and a balanced frozen 48-case screen. It
+requires matrix-wide least-cost selection, a clean source commit, full
+preflight, and an atomic external one-time receipt before holdout can run.
+Development tests treat the v2 holdout as opaque bytes, and no v2 API or
+holdout result is recorded yet. Runtime memory and retrieval remain unchanged.
+See [`docs/memory-extraction-eval-v2.md`](docs/memory-extraction-eval-v2.md).
+
 
 The first live-runtime slice covers main Agents SDK model turns, direct router/plain/vision Responses calls, embeddings, and optional YouTube MCP audio transcription. Offline Telegram import/backfill is not covered. Coverage is call-site based, so a missing row is not proof that an uninstrumented path made no provider request.
 

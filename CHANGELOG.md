@@ -1,5 +1,12 @@
 # Aigan Changelog
 
+## 2026-07-11 - Preregistered bounded-memory extraction v2
+
+- Added a separate offline v2 schema with mutually exclusive candidate/no-candidate branches and strict rejection of model-owned values that require normalization.
+- Added text-, template-, and identity-disjoint 160-case development/holdout fixtures plus a frozen balanced 48-case multilingual screen; regular tests keep holdout labels closed.
+- Added cache-write-aware cost accounting, complete transitive artifact hashes, matrix-wide least-cost selection, clean-commit binding, pre-API validation, and an atomic external one-time holdout receipt.
+- Kept v1 immutable and permanently closed, recorded no v2 API/holdout result, and left runtime memory, SQLite, vector/FTS retrieval, Telegram behavior, and the Sol answer path unchanged.
+
 ## 2026-07-11 - Frozen bounded-memory extraction evaluation
 
 - Added separate 120-case development and 120-case holdout public-synthetic multilingual extraction blocks with explicit source, speaker, scope, correction/conflict, uncertainty, validity, forwarded, prior-bot, and tool-anchor labels.
