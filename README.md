@@ -390,6 +390,21 @@ reviewed change with a tier-aware provider seam and frozen quality/cost evals.
 The architecture, frozen-v1 result, and current active-routing `NO-GO` are
 recorded in [`docs/model-routing-shadow.md`](docs/model-routing-shadow.md).
 
+Issue #143 starts with an offline, frozen memory-extraction evaluation rather
+than a runtime worker. Separate 120-case development and 120-case holdout blocks
+check precision/recall with Wilson bounds, three-repeat stability, source
+attribution, correction versus conflict, uncertainty, forwarded material,
+prior-bot output, tool anchors, and cross-scope leakage. Fixture, split, prompt,
+schema, and evaluator/scorer hashes are gated. The evaluator sends `store=false`,
+persists neither model predictions nor fixture payloads locally, and emits
+aggregate metrics only. It cannot authorize runtime behavior; the current
+SQLite/FTS/vector compiler and Sol-low answer path remain unchanged.
+The locked v1 holdout result is `NO_GO`: candidate quality was perfect, but two
+of 360 repeated outputs failed the strict conditional schema invariant. No
+runtime memory worker or live shadow is authorized.
+See [`docs/memory-extraction-eval.md`](docs/memory-extraction-eval.md).
+
+
 The first live-runtime slice covers main Agents SDK model turns, direct router/plain/vision Responses calls, embeddings, and optional YouTube MCP audio transcription. Offline Telegram import/backfill is not covered. Coverage is call-site based, so a missing row is not proof that an uninstrumented path made no provider request.
 
 Each stage keeps opaque run/stage identifiers and bounded operational fields: route/task buckets, intended model, provider-returned actual model when available, requested/actual reasoning effort when exposed, endpoint, status/failure category, fallback/application-retry count, latency, token usage, price-snapshot version, and estimated cost. It never stores prompts, model output, tool arguments, search queries, URLs, transcripts, user text or identities, secrets, or private paths.
