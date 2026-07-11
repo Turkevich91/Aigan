@@ -773,9 +773,6 @@ def select_b1(selection_input: SelectionInput, config: SelectorConfig) -> Select
     for source in rank_b1_sources(selection_input, config):
         state.add_source(source)
     action = "answer" if state.selected else "clarify"
-    # Persistent event construction happens before query-time selection. This
-    # provisional, explicitly non-deduplicated ledger therefore includes every
-    # candidate event in the frozen snapshot, not only the selected anchor.
     return SelectionResult(
         arm="B1",
         selected_source_ids=tuple(state.selected),
@@ -848,6 +845,9 @@ def select_c1(selection_input: SelectionInput, config: SelectorConfig) -> Select
         state.add_source(source)
 
     action = "answer" if state.selected else "clarify"
+    # Persistent event construction happens before query-time selection. This
+    # provisional, explicitly non-deduplicated ledger therefore includes every
+    # candidate event in the frozen snapshot, not only the selected anchor.
     return SelectionResult(
         arm="C1",
         selected_source_ids=tuple(state.selected),
