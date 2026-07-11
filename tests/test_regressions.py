@@ -79,6 +79,15 @@ os.environ["TOOL_ROUTER_ENABLED"] = "false"
 os.environ["TOOL_ROUTER_MODEL"] = "gpt-5.4-nano"
 os.environ["TOOL_ROUTER_MAX_OUTPUT_TOKENS"] = "120"
 os.environ["TOOL_ROUTER_CONFIDENCE_THRESHOLD"] = "0.65"
+os.environ["MODEL_ROUTING_MODE"] = "off"
+os.environ["MODEL_ROUTING_POLICY_VERSION"] = "primary_sol_low_v1"
+os.environ["MODEL_ROUTER_MODEL"] = "gpt-5.4-nano"
+os.environ["MODEL_ROUTER_REASONING_EFFORT"] = "none"
+os.environ["MODEL_ROUTER_SCHEMA_VERSION"] = "model_policy_v1"
+os.environ["MODEL_ROUTER_PROMPT_VERSION"] = "model_policy_prompt_v1"
+os.environ["MODEL_TIER_ECONOMY_MODEL"] = "gpt-5.4-nano"
+os.environ["MODEL_TIER_BALANCED_MODEL"] = "gpt-5.6-terra"
+os.environ["MODEL_TIER_PREMIUM_MODEL"] = "gpt-5.6-sol"
 os.environ["PROMPT_PRIVACY_GUARD_ENABLED"] = "true"
 os.environ["MEMORY_ENABLED"] = "true"
 os.environ["MEMORY_DB_PATH"] = TEST_DB_PATH
@@ -476,6 +485,442 @@ class AgentsSdkCompatibilityTests(unittest.TestCase):
         self.assertEqual({"effort": "low"}, request["reasoning"])
         self.assertEqual({"verbosity": "medium"}, request["text"])
         self.assertEqual(321, request["max_output_tokens"])
+
+
+class ModelPolicyRoutingIntegrationTests(unittest.TestCase):
+    def use_isolated_store(self):
+        temporary = tempfile.TemporaryDirectory()
+        store = main.ModelTelemetryStore(Path(temporary.name) / "telemetry.sqlite3", retention_days=7)
+        original_store = main.MODEL_TELEMETRY
+        main.MODEL_TELEMETRY = store
+        self.addCleanup(temporary.cleanup)
+        self.addCleanup(store.close)
+        self.addCleanup(setattr, main, "MODEL_TELEMETRY", original_store)
+        return store
+
+    def shadow_config(self):
+        return replace(
+            main.CONFIG,
+            model_routing_mode="shadow",
+            model_routing_policy_version="shadow_tier_router_v1",
+            model_router_model="gpt-5.4-nano",
+            model_router_reasoning_effort="none",
+            model_router_max_output_tokens=240,
+            model_router_confidence_threshold=0.75,
+            model_router_timeout_seconds=8.0,
+            model_router_schema_version="model_policy_v1",
+            model_router_prompt_version="model_policy_prompt_v1",
+            model_tier_economy_model="gpt-5.4-nano",
+            model_tier_balanced_model="gpt-5.6-terra",
+            model_tier_premium_model="gpt-5.6-sol",
+            openai_model="gpt-5.6-sol",
+            model_reasoning_effort="low",
+        )
+
+    def test_shadow_config_requires_telemetry_policy_and_primary_alias_alignment(self) -> None:
+        valid = {
+            "MODEL_ROUTING_MODE": "shadow",
+            "MODEL_ROUTING_POLICY_VERSION": "shadow_tier_router_v1",
+            "MODEL_TELEMETRY_ENABLED": "true",
+            "MODEL_ROUTER_MODEL": "gpt-5.4-nano",
+            "MODEL_TIER_PREMIUM_MODEL": "gpt-5.6-sol",
+            "OPENAI_MODEL": "gpt-5.6-sol",
+        }
+        with patch.dict(os.environ, valid, clear=False):
+            config = main.Config.from_env()
+        self.assertEqual("shadow", config.model_routing_mode)
+        self.assertEqual("gpt-5.4-nano", config.model_tier_economy_model)
+        self.assertEqual("gpt-5.6-terra", config.model_tier_balanced_model)
+        self.assertEqual(config.openai_model, config.model_tier_premium_model)
+
+        with patch.dict(
+            os.environ,
+            {**valid, "MODEL_TELEMETRY_ENABLED": "false"},
+            clear=False,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "MODEL_TELEMETRY_ENABLED"):
+                main.Config.from_env()
+        with patch.dict(
+            os.environ,
+            {**valid, "MODEL_TIER_PREMIUM_MODEL": "gpt-5.5"},
+            clear=False,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "premium"):
+                main.Config.from_env()
+        with patch.dict(
+            os.environ,
+            {**valid, "MODEL_TIER_BALANCED_MODEL": "unpriced-private-alias"},
+            clear=False,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "price-snapshot"):
+                main.Config.from_env()
+        with patch.dict(
+            os.environ,
+            {**valid, "MODEL_ROUTER_PROMPT_VERSION": "unknown_prompt"},
+            clear=False,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "MODEL_ROUTER_PROMPT_VERSION"):
+                main.Config.from_env()
+
+    def test_router_provider_request_is_structured_bounded_and_telemetry_correlated(self) -> None:
+        store = self.use_isolated_store()
+        response = SimpleNamespace(
+            output_text=json.dumps(
+                {
+                    "task_class": "simple_utility",
+                    "complexity": "low",
+                    "freshness": "not_required",
+                    "risk": "low",
+                    "ambiguity": "low",
+                    "selected_tier": "economy",
+                    "reasoning_effort": "none",
+                    "confidence": 0.96,
+                    "reason_codes": ["bounded_extraction"],
+                    "fallback_chain": ["economy", "balanced", "premium"],
+                }
+            ),
+            status="completed",
+            model="gpt-5.4-nano",
+            reasoning=SimpleNamespace(effort="none"),
+            usage=SimpleNamespace(
+                input_tokens=100,
+                input_tokens_details=SimpleNamespace(cached_tokens=0),
+                output_tokens=20,
+                output_tokens_details=SimpleNamespace(reasoning_tokens=0),
+                total_tokens=120,
+            ),
+        )
+        original_config = main.CONFIG
+        main.CONFIG = self.shadow_config()
+        try:
+            with patch.object(main, "AsyncOpenAI") as client_class:
+                client = client_class.return_value.__aenter__.return_value
+                client.responses.create = AsyncMock(return_value=response)
+                result = asyncio.run(
+                    main.run_model_policy_router(
+                        {"trusted_text": "synthetic exact extraction"},
+                        run_id="1" * 32,
+                        route_bucket="normal",
+                    )
+                )
+                request = client.responses.create.await_args.kwargs
+        finally:
+            main.CONFIG = original_config
+
+        self.assertIn("simple_utility", result)
+        self.assertEqual("gpt-5.4-nano", request["model"])
+        self.assertEqual({"effort": "none"}, request["reasoning"])
+        self.assertEqual(0, client_class.call_args.kwargs["max_retries"])
+        self.assertTrue(request["text"]["format"]["strict"])
+        schema_properties = request["text"]["format"]["schema"]["properties"]
+        self.assertNotIn("allowed_toolsets", schema_properties)
+        stage = store.latest_stages(1)[0]
+        self.assertEqual("1" * 32, stage.run_id)
+        self.assertEqual("model_policy_router", stage.stage_kind)
+        self.assertEqual("router", stage.task_class_bucket)
+        self.assertEqual("gpt-5.4-nano", stage.actual_model)
+        self.assertEqual("none", stage.actual_reasoning_effort)
+
+        final_stage = store.begin_stage(
+            run_id="1" * 32,
+            route_bucket="normal",
+            task_class_bucket="agent",
+            stage_kind="final_answer",
+            intended_model="gpt-5.6-sol",
+            endpoint="agents",
+        )
+        store.finish_stage(final_stage, status="succeeded", usage=None)
+        run_task = store._conn.execute(
+            "SELECT task_class_bucket FROM model_telemetry_runs WHERE run_id = ?",
+            ("1" * 32,),
+        ).fetchone()[0]
+        self.assertEqual("agent", run_task)
+
+    def test_router_outer_timeout_is_terminal_and_retries_are_disabled(self) -> None:
+        store = self.use_isolated_store()
+
+        async def slow_response(**kwargs):
+            await asyncio.sleep(0.2)
+
+        original_config = main.CONFIG
+        main.CONFIG = replace(
+            self.shadow_config(),
+            model_router_timeout_seconds=0.01,
+        )
+        try:
+            with patch.object(main, "AsyncOpenAI") as client_class:
+                client = client_class.return_value.__aenter__.return_value
+                client.responses.create = AsyncMock(side_effect=slow_response)
+                with self.assertRaises(TimeoutError):
+                    asyncio.run(
+                        main.run_model_policy_router(
+                            {"trusted_text": "synthetic timeout"},
+                            run_id="a" * 32,
+                            route_bucket="normal",
+                        )
+                    )
+        finally:
+            main.CONFIG = original_config
+
+        self.assertEqual(0, client_class.call_args.kwargs["max_retries"])
+        stage = store.latest_stages(1)[0]
+        self.assertEqual("failed", stage.status)
+        self.assertEqual("timeouterror", stage.failure_class)
+
+    def test_shadow_economy_recommendation_records_premium_applied_model(self) -> None:
+        store = self.use_isolated_store()
+        run_id = "2" * 32
+        stage = store.begin_stage(
+            run_id=run_id,
+            route_bucket="normal",
+            task_class_bucket="model_policy_router",
+            policy_version="shadow_tier_router_v1",
+            stage_kind="model_policy_router",
+            intended_model="gpt-5.4-nano",
+            endpoint="responses",
+        )
+        store.finish_stage(stage, status="succeeded", usage=None)
+        router_json = json.dumps(
+            {
+                "task_class": "simple_utility",
+                "complexity": "low",
+                "freshness": "not_required",
+                "risk": "low",
+                "ambiguity": "low",
+                "selected_tier": "economy",
+                "reasoning_effort": "none",
+                "confidence": 0.97,
+                "reason_codes": ["low_complexity"],
+                "fallback_chain": ["economy", "balanced", "premium"],
+            }
+        )
+        metadata = {
+            "has_url": False,
+            "has_attachment": False,
+            "has_reference": False,
+            "short_followup": False,
+            "short_unanchored_followup": False,
+            "mutation_capability": False,
+            "mutation_requested": False,
+        }
+        original_config = main.CONFIG
+        main.CONFIG = self.shadow_config()
+        try:
+            with patch.object(
+                main,
+                "run_model_policy_router",
+                new=AsyncMock(return_value=router_json),
+            ):
+                decision = asyncio.run(
+                    main.evaluate_model_policy_shadow(
+                        metadata,
+                        run_id=run_id,
+                        route_bucket="normal",
+                        assignment_key=main.opaque_episode_key("secret", "episode"),
+                        assignment_scope="single_turn",
+                    )
+                )
+        finally:
+            main.CONFIG = original_config
+
+        self.assertEqual("economy", decision.selected_tier)
+        record = store.latest_routing_decisions(1)[0]
+        self.assertEqual("gpt-5.4-nano", record.selected_model)
+        self.assertEqual("model_policy_prompt_v1", record.router_prompt_version)
+        self.assertEqual("premium", record.applied_tier)
+        self.assertEqual("gpt-5.6-sol", record.applied_model)
+        self.assertEqual("low", record.applied_reasoning_effort)
+        self.assertTrue(record.canary_eligible)
+
+    def test_off_mode_schedules_no_router_and_shadow_uses_bounded_snapshot(self) -> None:
+        message = FakeMessage(
+            "extract alpha",
+            chat_type=ChatType.PRIVATE,
+            chat_id=700000001,
+            message_id=502,
+        )
+        provenance = main.new_outbound_provenance(
+            chat_id=message.chat_id,
+            route="normal",
+            trigger_message_id=message.message_id,
+        )
+
+        async def scenario() -> None:
+            application = FakeApplication()
+            context = SimpleNamespace(application=application)
+            original_config = main.CONFIG
+            try:
+                main.CONFIG = replace(original_config, model_routing_mode="off")
+                self.assertFalse(
+                    main.schedule_model_policy_shadow(
+                        message,
+                        context,
+                        "extract alpha",
+                        route="normal",
+                        outbound_provenance=provenance,
+                        tool_route_decision=None,
+                    )
+                )
+                self.assertEqual([], application.tasks)
+
+                main.CONFIG = self.shadow_config()
+                with patch.object(
+                    main,
+                    "evaluate_model_policy_shadow",
+                    new=AsyncMock(return_value=main.failed_model_routing_decision()),
+                ) as evaluator:
+                    self.assertTrue(
+                        main.schedule_model_policy_shadow(
+                            message,
+                            context,
+                            "extract alpha",
+                            route="normal",
+                            outbound_provenance=provenance,
+                            tool_route_decision=None,
+                        )
+                    )
+                    await application.drain()
+                evaluator.assert_awaited_once()
+                metadata = evaluator.await_args.args[0]
+                self.assertEqual("extract alpha", metadata["trusted_text"])
+                self.assertNotIn("chat_id", metadata)
+                self.assertNotIn("user_id", metadata)
+                self.assertNotIn("message_id", metadata)
+            finally:
+                main.CONFIG = original_config
+
+        asyncio.run(scenario())
+
+    def test_shadow_metadata_redacts_urls_and_floors_mutation_intent_without_tools(self) -> None:
+        prompt = "Remind me tomorrow at 09:00 to review https://private.example/secret"
+        message = FakeMessage(
+            prompt,
+            chat_type=ChatType.PRIVATE,
+            chat_id=700000001,
+            message_id=504,
+        )
+        self.assertEqual("create", main.deterministic_reminder_intent(prompt))
+
+        metadata = main.build_model_policy_router_metadata(
+            message,
+            prompt,
+            route="normal",
+            tool_route_decision=main.no_tool_route("reminder_crud_disabled"),
+        )
+
+        self.assertTrue(metadata["mutation_requested"])
+        self.assertFalse(metadata["mutation_capability"])
+        self.assertTrue(metadata["has_url"])
+        self.assertIn("[url]", metadata["trusted_text"])
+        self.assertNotIn("private.example", metadata["trusted_text"])
+
+    def test_non_thread_replies_are_single_turn_and_threads_are_sticky(self) -> None:
+        parent = FakeMessage("parent", message_id=601)
+        first_reply = FakeMessage("first", message_id=602)
+        first_reply.reply_to_message = parent
+        second_reply = FakeMessage("second", message_id=603)
+        second_reply.reply_to_message = first_reply
+
+        first_key, first_scope = main.model_routing_episode_identity(first_reply)
+        second_key, second_scope = main.model_routing_episode_identity(second_reply)
+        self.assertEqual("single_turn", first_scope)
+        self.assertEqual("single_turn", second_scope)
+        self.assertNotEqual(first_key, second_key)
+
+        first_thread = FakeMessage("one", message_id=604)
+        first_thread.message_thread_id = 77
+        second_thread = FakeMessage("two", message_id=605)
+        second_thread.message_thread_id = 77
+        self.assertEqual(
+            main.model_routing_episode_identity(first_thread),
+            main.model_routing_episode_identity(second_thread),
+        )
+
+    def test_shadow_scheduler_failure_is_fail_open_and_closes_coroutine(self) -> None:
+        message = FakeMessage(
+            "extract alpha",
+            chat_type=ChatType.PRIVATE,
+            chat_id=700000001,
+            message_id=606,
+        )
+        provenance = main.new_outbound_provenance(
+            chat_id=message.chat_id,
+            route="normal",
+            trigger_message_id=message.message_id,
+        )
+        original_config = main.CONFIG
+        main.CONFIG = self.shadow_config()
+        try:
+            with patch.object(
+                main,
+                "schedule_background_task",
+                side_effect=RuntimeError("synthetic scheduler failure"),
+            ):
+                with patch.object(main, "system_event") as event:
+                    scheduled = main.schedule_model_policy_shadow(
+                        message,
+                        SimpleNamespace(application=FakeApplication()),
+                        "extract alpha",
+                        route="normal",
+                        outbound_provenance=provenance,
+                        tool_route_decision=None,
+                    )
+        finally:
+            main.CONFIG = original_config
+
+        self.assertFalse(scheduled)
+        self.assertEqual("shadow_schedule_failed", event.call_args.kwargs["event_type"])
+        self.assertNotIn("synthetic scheduler failure", str(event.call_args))
+
+    def test_shadow_capability_is_configured_but_unverified(self) -> None:
+        self.use_isolated_store()
+        original_config = main.CONFIG
+        main.CONFIG = self.shadow_config()
+        try:
+            row = {
+                item.name: item for item in main.configured_capability_rows()
+            }["model_policy_router"]
+        finally:
+            main.CONFIG = original_config
+
+        self.assertTrue(row.enabled)
+        self.assertTrue(row.configured)
+        self.assertFalse(row.available)
+        self.assertEqual("configured_unverified", row.status)
+
+    def test_dedicated_vision_ingress_never_schedules_model_policy_router(self) -> None:
+        message = FakeMessage(
+            "describe this",
+            chat_type=ChatType.PRIVATE,
+            chat_id=700000001,
+            message_id=503,
+        )
+        message.photo = [FakePhoto()]
+        context = SimpleNamespace(
+            bot=SimpleNamespace(
+                id=123456,
+                username="test_bot",
+                send_chat_action=AsyncMock(),
+            )
+        )
+        original_config = main.CONFIG
+        main.CONFIG = self.shadow_config()
+        try:
+            with patch.object(main, "remember_message_persistently", new=AsyncMock()):
+                with patch.object(main, "remember_self_complaint_signal", return_value=None):
+                    with patch.object(main, "handle_image_prompt", new=AsyncMock()) as image_handler:
+                        with patch.object(main, "schedule_model_policy_shadow") as router:
+                            asyncio.run(
+                                main.text_message(
+                                    SimpleNamespace(effective_message=message),
+                                    context,
+                                )
+                            )
+        finally:
+            main.CONFIG = original_config
+
+        image_handler.assert_awaited_once()
+        router.assert_not_called()
 
 
 class ModelTelemetryIntegrationTests(unittest.TestCase):
@@ -2349,12 +2794,14 @@ class TelegramTurnCoalescingTests(unittest.TestCase):
             with patch.object(main, "remember_message_persistently", new=persistence):
                 with patch.object(main, "remember_self_complaint_signal", return_value=None):
                     with patch.object(main, "run_agent", new=run_agent):
-                        asyncio.run(
-                            main.text_message(SimpleNamespace(effective_message=message), context)
-                        )
+                        with patch.object(main, "schedule_model_policy_shadow") as model_router:
+                            asyncio.run(
+                                main.text_message(SimpleNamespace(effective_message=message), context)
+                            )
 
         persistence.assert_awaited_once()
         run_agent.assert_not_awaited()
+        model_router.assert_not_called()
         self.assertEqual([], message.reply_calls)
 
     def test_pending_event_details_never_include_prompt_or_forward_payload(self) -> None:

@@ -11,9 +11,25 @@ from pathlib import Path
 from typing import Any
 
 from model_pricing import CostEstimate, TokenUsage, estimate_token_cost
+from model_routing import (
+    AMBIGUITY_LEVELS,
+    COMPLEXITY_LEVELS,
+    ELIGIBILITY_REASONS,
+    EPISODE_SCOPES,
+    FALLBACK_REASONS as ROUTING_FALLBACK_REASONS,
+    FRESHNESS_LEVELS,
+    MODEL_TIERS,
+    REASON_CODES,
+    RISK_LEVELS,
+    ROUTER_OUTCOMES,
+    ROUTING_MODES,
+    TASK_CLASSES,
+    ModelRoutingDecision,
+    valid_assignment_key,
+)
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 5
 TERMINAL_STATUSES = {"succeeded", "failed", "cancelled", "abandoned"}
 ALLOWED_STAGE_KINDS = {
     "agent_turn",
@@ -21,6 +37,7 @@ ALLOWED_STAGE_KINDS = {
     "embedding_index",
     "embedding_query",
     "final_answer",
+    "model_policy_router",
     "plain",
     "router",
     "transcription",
@@ -63,6 +80,7 @@ TASK_CLASS_BUCKETS = {
     "embedding_index",
     "embedding_query",
     "final_answer",
+    "model_policy_router",
     "other",
     "plain",
     "prompt",
@@ -74,7 +92,7 @@ TASK_CLASS_BUCKETS = {
     "vision",
     "youtube_transcript",
 }
-POLICY_VERSIONS = {"primary_sol_low_v1"}
+POLICY_VERSIONS = {"primary_sol_low_v1", "shadow_tier_router_v1"}
 ENDPOINTS = {"agents", "audio_transcriptions", "embeddings", "responses"}
 REASONING_EFFORTS = {"none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"}
 ACTUAL_MODEL_SOURCES = {"not_reported", "provider_response", "unavailable_sdk"}
@@ -345,6 +363,41 @@ class ModelStageRecord:
     cost_basis_model: str
 
 
+@dataclass(frozen=True)
+class ModelRoutingDecisionRecord:
+    decision_id: str
+    run_id: str
+    route_bucket: str
+    policy_version: str
+    router_schema_version: str
+    router_prompt_version: str
+    mode: str
+    task_class: str
+    complexity: str
+    freshness: str
+    risk: str
+    ambiguity: str
+    requested_tier: str
+    selected_tier: str
+    selected_model: str
+    requested_reasoning_effort: str
+    reasoning_effort: str
+    applied_tier: str
+    applied_model: str
+    applied_reasoning_effort: str
+    confidence: float
+    reason_codes: tuple[str, ...]
+    fallback_chain: tuple[str, ...]
+    assignment_key: str
+    assignment_scope: str
+    canary_eligible: bool
+    eligibility_reason: str
+    outcome: str
+    fallback_reason: str
+    policy_adjusted: bool
+    created_at: str
+
+
 class ModelTelemetryStore:
     def __init__(self, db_path: Path | str, retention_days: int = 30) -> None:
         self.db_path = Path(db_path)
@@ -358,11 +411,15 @@ class ModelTelemetryStore:
             timeout=0.25,
         )
         self._conn.row_factory = sqlite3.Row
-        with self._lock:
-            self._conn.execute("PRAGMA journal_mode=WAL")
-            self._conn.execute("PRAGMA foreign_keys=ON")
-            self._conn.execute("PRAGMA busy_timeout=250")
-            self._migrate()
+        try:
+            with self._lock:
+                self._conn.execute("PRAGMA journal_mode=WAL")
+                self._conn.execute("PRAGMA foreign_keys=ON")
+                self._conn.execute("PRAGMA busy_timeout=250")
+                self._migrate()
+        except Exception:
+            self._conn.close()
+            raise
 
     @property
     def write_failure_count(self) -> int:
@@ -504,6 +561,54 @@ class ModelTelemetryStore:
                 """
             )
             self._set_schema_version(3)
+            version = 3
+        if version < 4:
+            self._conn.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS model_routing_decisions (
+                    decision_id TEXT PRIMARY KEY,
+                    run_id TEXT NOT NULL REFERENCES model_telemetry_runs(run_id) ON DELETE CASCADE,
+                    route_bucket TEXT NOT NULL DEFAULT 'other',
+                    policy_version TEXT NOT NULL DEFAULT '',
+                    router_schema_version TEXT NOT NULL DEFAULT '',
+                    mode TEXT NOT NULL CHECK(mode IN ('shadow')),
+                    task_class TEXT NOT NULL,
+                    complexity TEXT NOT NULL,
+                    freshness TEXT NOT NULL,
+                    risk TEXT NOT NULL,
+                    ambiguity TEXT NOT NULL,
+                    requested_tier TEXT NOT NULL,
+                    selected_tier TEXT NOT NULL,
+                    selected_model TEXT NOT NULL DEFAULT '',
+                    requested_reasoning_effort TEXT NOT NULL DEFAULT '',
+                    reasoning_effort TEXT NOT NULL DEFAULT '',
+                    applied_tier TEXT NOT NULL,
+                    applied_model TEXT NOT NULL DEFAULT '',
+                    applied_reasoning_effort TEXT NOT NULL DEFAULT '',
+                    confidence REAL NOT NULL,
+                    reason_codes TEXT NOT NULL DEFAULT '',
+                    fallback_chain TEXT NOT NULL DEFAULT '',
+                    assignment_key TEXT NOT NULL DEFAULT '',
+                    assignment_scope TEXT NOT NULL,
+                    canary_eligible INTEGER NOT NULL DEFAULT 0 CHECK(canary_eligible IN (0, 1)),
+                    eligibility_reason TEXT NOT NULL,
+                    outcome TEXT NOT NULL,
+                    fallback_reason TEXT NOT NULL DEFAULT '',
+                    policy_adjusted INTEGER NOT NULL DEFAULT 0 CHECK(policy_adjusted IN (0, 1)),
+                    created_at TEXT NOT NULL,
+                    UNIQUE(run_id)
+                );
+                """
+            )
+            self._set_schema_version(4)
+            version = 4
+        if version < 5:
+            self._ensure_column(
+                "model_routing_decisions",
+                "router_prompt_version",
+                "TEXT NOT NULL DEFAULT ''",
+            )
+            self._set_schema_version(5)
         self._conn.executescript(
             """
             CREATE INDEX IF NOT EXISTS idx_model_telemetry_stage_completed
@@ -516,6 +621,12 @@ class ModelTelemetryStore:
                 ON model_telemetry_stages(route_bucket, completed_at);
             CREATE INDEX IF NOT EXISTS idx_model_telemetry_stage_task
                 ON model_telemetry_stages(task_class_bucket, completed_at);
+            CREATE INDEX IF NOT EXISTS idx_model_routing_decision_created
+                ON model_routing_decisions(created_at, decision_id);
+            CREATE INDEX IF NOT EXISTS idx_model_routing_decision_tier
+                ON model_routing_decisions(selected_tier, created_at);
+            CREATE INDEX IF NOT EXISTS idx_model_routing_decision_task
+                ON model_routing_decisions(task_class, created_at);
             """
         )
         self._conn.commit()
@@ -788,6 +899,205 @@ class ModelTelemetryStore:
             ).fetchone()
         return str(row["intended_model"]) if row is not None else ""
 
+    def record_routing_decision(
+        self,
+        *,
+        run_id: str,
+        route_bucket: str,
+        policy_version: str,
+        router_schema_version: str,
+        router_prompt_version: str,
+        mode: str,
+        decision: ModelRoutingDecision,
+        selected_model: str,
+        applied_tier: str,
+        applied_model: str,
+        applied_reasoning_effort: str,
+        assignment_key: str,
+        assignment_scope: str,
+        canary_eligible: bool,
+        eligibility_reason: str,
+    ) -> bool:
+        try:
+            return self._record_routing_decision(
+                run_id=run_id,
+                route_bucket=route_bucket,
+                policy_version=policy_version,
+                router_schema_version=router_schema_version,
+                router_prompt_version=router_prompt_version,
+                mode=mode,
+                decision=decision,
+                selected_model=selected_model,
+                applied_tier=applied_tier,
+                applied_model=applied_model,
+                applied_reasoning_effort=applied_reasoning_effort,
+                assignment_key=assignment_key,
+                assignment_scope=assignment_scope,
+                canary_eligible=canary_eligible,
+                eligibility_reason=eligibility_reason,
+            )
+        except Exception:
+            self._note_write_failure()
+            return False
+
+    def _record_routing_decision(self, **values: Any) -> bool:
+        run_id = normalize_run_id(values.get("run_id"))
+        route_bucket = normalize_route_bucket(values.get("route_bucket"), "other")
+        policy_version = normalize_policy_version(values.get("policy_version"), "")
+        router_schema_version = normalize_bucket(
+            values.get("router_schema_version"), ""
+        )
+        router_prompt_version = normalize_bucket(
+            values.get("router_prompt_version"), ""
+        )
+        mode = normalize_choice(values.get("mode"), ROUTING_MODES - {"off"}, "")
+        decision = values.get("decision")
+        if not isinstance(decision, ModelRoutingDecision):
+            raise ValueError("A normalized model routing decision is required")
+        task_class = normalize_choice(decision.task_class, TASK_CLASSES, "unclassified")
+        complexity = normalize_choice(decision.complexity, COMPLEXITY_LEVELS, "high")
+        freshness = normalize_choice(decision.freshness, FRESHNESS_LEVELS, "unknown")
+        risk = normalize_choice(decision.risk, RISK_LEVELS, "high")
+        ambiguity = normalize_choice(decision.ambiguity, AMBIGUITY_LEVELS, "high")
+        requested_tier = normalize_choice(
+            decision.requested_tier, set(MODEL_TIERS), "premium"
+        )
+        selected_tier = normalize_choice(
+            decision.selected_tier, set(MODEL_TIERS), "premium"
+        )
+        selected_model = normalize_model(values.get("selected_model"))
+        requested_reasoning_effort = normalize_choice(
+            decision.requested_reasoning_effort, REASONING_EFFORTS, ""
+        )
+        reasoning_effort = normalize_choice(
+            decision.reasoning_effort, REASONING_EFFORTS, ""
+        )
+        applied_tier = normalize_choice(
+            values.get("applied_tier"), set(MODEL_TIERS), "premium"
+        )
+        applied_model = normalize_model(values.get("applied_model"))
+        applied_reasoning_effort = normalize_choice(
+            values.get("applied_reasoning_effort"), REASONING_EFFORTS, ""
+        )
+        confidence = float(decision.confidence)
+        if not 0.0 <= confidence <= 1.0:
+            raise ValueError("Routing confidence must be bounded")
+        reason_codes = tuple(
+            code
+            for code in dict.fromkeys(decision.reason_codes)
+            if code in REASON_CODES
+        )[:4]
+        fallback_chain = tuple(
+            tier for tier in decision.fallback_chain if tier in MODEL_TIERS
+        )[:3]
+        assignment_key = valid_assignment_key(values.get("assignment_key"))
+        assignment_scope = normalize_choice(
+            values.get("assignment_scope"), EPISODE_SCOPES, ""
+        )
+        canary_eligible = bool(values.get("canary_eligible"))
+        eligibility_reason = normalize_choice(
+            values.get("eligibility_reason"), ELIGIBILITY_REASONS, ""
+        )
+        outcome = normalize_choice(decision.outcome, ROUTER_OUTCOMES, "failed")
+        fallback_reason = normalize_choice(
+            decision.fallback_reason, ROUTING_FALLBACK_REASONS, ""
+        )
+        if not (
+            policy_version
+            and router_schema_version
+            and router_prompt_version
+            and mode
+            and selected_model
+            and applied_model
+            and assignment_key
+            and assignment_scope
+            and eligibility_reason
+            and reason_codes
+            and fallback_chain
+        ):
+            raise ValueError("Routing decision contains unconfigured or invalid fields")
+        now = format_datetime()
+        decision_id = secrets.token_hex(16)
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                cursor = self._conn.execute(
+                    """
+                    INSERT OR IGNORE INTO model_routing_decisions (
+                        decision_id, run_id, route_bucket, policy_version,
+                        router_schema_version, router_prompt_version, mode,
+                        task_class, complexity,
+                        freshness, risk, ambiguity, requested_tier,
+                        selected_tier, selected_model,
+                        requested_reasoning_effort, reasoning_effort,
+                        applied_tier, applied_model, applied_reasoning_effort,
+                        confidence, reason_codes, fallback_chain, assignment_key,
+                        assignment_scope, canary_eligible, eligibility_reason,
+                        outcome, fallback_reason, policy_adjusted, created_at
+                    ) VALUES (
+                        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                    )
+                    """,
+                    (
+                        decision_id,
+                        run_id,
+                        route_bucket,
+                        policy_version,
+                        router_schema_version,
+                        router_prompt_version,
+                        mode,
+                        task_class,
+                        complexity,
+                        freshness,
+                        risk,
+                        ambiguity,
+                        requested_tier,
+                        selected_tier,
+                        selected_model,
+                        requested_reasoning_effort,
+                        reasoning_effort,
+                        applied_tier,
+                        applied_model,
+                        applied_reasoning_effort,
+                        confidence,
+                        ",".join(reason_codes),
+                        ",".join(fallback_chain),
+                        assignment_key,
+                        assignment_scope,
+                        int(canary_eligible),
+                        eligibility_reason,
+                        outcome,
+                        fallback_reason,
+                        int(bool(decision.policy_adjusted)),
+                        now,
+                    ),
+                )
+                if cursor.rowcount:
+                    self._conn.execute(
+                        "UPDATE model_telemetry_runs SET updated_at = ? WHERE run_id = ?",
+                        (now, run_id),
+                    )
+                self._conn.commit()
+                return bool(cursor.rowcount)
+            except Exception:
+                self._conn.rollback()
+                raise
+
+    def latest_routing_decisions(
+        self, limit: int = 50
+    ) -> list[ModelRoutingDecisionRecord]:
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT * FROM model_routing_decisions
+                ORDER BY datetime(created_at) DESC, decision_id DESC
+                LIMIT ?
+                """,
+                (max(1, min(int(limit), 500)),),
+            ).fetchall()
+        return [row_to_routing_decision(row) for row in rows]
+
     def recover_abandoned(self, stale_after_seconds: int = 300) -> int:
         now = format_datetime()
         cutoff = format_datetime(
@@ -873,6 +1183,14 @@ class ModelTelemetryStore:
                 """,
                 (stale_cutoff,),
             ).fetchone()
+            routing_rows = self._conn.execute(
+                """
+                SELECT * FROM model_routing_decisions
+                WHERE created_at >= ?
+                ORDER BY created_at ASC, decision_id ASC
+                """,
+                (cutoff,),
+            ).fetchall()
         status_counts: dict[str, int] = {}
         stage_counts: dict[str, int] = {}
         route_counts: dict[str, int] = {}
@@ -928,6 +1246,33 @@ class ModelTelemetryStore:
             (str(row["completed_at"]) for row in rows if row["completed_at"]),
             default="",
         )
+        routing_task_counts: dict[str, int] = {}
+        routing_requested_tier_counts: dict[str, int] = {}
+        routing_selected_tier_counts: dict[str, int] = {}
+        routing_outcome_counts: dict[str, int] = {}
+        routing_fallback_count = 0
+        routing_policy_adjusted_count = 0
+        routing_canary_eligible_count = 0
+        for row in routing_rows:
+            routing_task = str(row["task_class"] or "unclassified")
+            requested_tier = str(row["requested_tier"] or "premium")
+            selected_tier = str(row["selected_tier"] or "premium")
+            outcome = str(row["outcome"] or "failed")
+            routing_task_counts[routing_task] = routing_task_counts.get(routing_task, 0) + 1
+            routing_requested_tier_counts[requested_tier] = (
+                routing_requested_tier_counts.get(requested_tier, 0) + 1
+            )
+            routing_selected_tier_counts[selected_tier] = (
+                routing_selected_tier_counts.get(selected_tier, 0) + 1
+            )
+            routing_outcome_counts[outcome] = routing_outcome_counts.get(outcome, 0) + 1
+            routing_fallback_count += int(bool(row["fallback_reason"]))
+            routing_policy_adjusted_count += int(bool(row["policy_adjusted"]))
+            routing_canary_eligible_count += int(bool(row["canary_eligible"]))
+        last_routing_decision_at = max(
+            (str(row["created_at"]) for row in routing_rows if row["created_at"]),
+            default="",
+        )
         return {
             "lookback_seconds": max(1, int(lookback_seconds)),
             "stage_count": len(rows),
@@ -945,6 +1290,17 @@ class ModelTelemetryStore:
             "cost_complete": bool(rows) and cost_incomplete == 0,
             "token_totals": totals,
             "last_completed_at": last_completed_at,
+            "routing": {
+                "decision_count": len(routing_rows),
+                "task_class_counts": routing_task_counts,
+                "requested_tier_counts": routing_requested_tier_counts,
+                "selected_tier_counts": routing_selected_tier_counts,
+                "outcome_counts": routing_outcome_counts,
+                "fallback_count": routing_fallback_count,
+                "policy_adjusted_count": routing_policy_adjusted_count,
+                "canary_eligible_count": routing_canary_eligible_count,
+                "last_decision_at": last_routing_decision_at,
+            },
             "write_failure_count": self.write_failure_count,
         }
 
@@ -996,4 +1352,44 @@ def row_to_stage(row: sqlite3.Row) -> ModelStageRecord:
         ),
         price_snapshot_version=str(row["price_snapshot_version"]),
         cost_basis_model=str(row["cost_basis_model"]),
+    )
+
+
+def row_to_routing_decision(row: sqlite3.Row) -> ModelRoutingDecisionRecord:
+    return ModelRoutingDecisionRecord(
+        decision_id=str(row["decision_id"]),
+        run_id=str(row["run_id"]),
+        route_bucket=str(row["route_bucket"] or "other"),
+        policy_version=str(row["policy_version"] or ""),
+        router_schema_version=str(row["router_schema_version"] or ""),
+        router_prompt_version=str(row["router_prompt_version"] or ""),
+        mode=str(row["mode"]),
+        task_class=str(row["task_class"]),
+        complexity=str(row["complexity"]),
+        freshness=str(row["freshness"]),
+        risk=str(row["risk"]),
+        ambiguity=str(row["ambiguity"]),
+        requested_tier=str(row["requested_tier"]),
+        selected_tier=str(row["selected_tier"]),
+        selected_model=str(row["selected_model"] or ""),
+        requested_reasoning_effort=str(row["requested_reasoning_effort"] or ""),
+        reasoning_effort=str(row["reasoning_effort"] or ""),
+        applied_tier=str(row["applied_tier"]),
+        applied_model=str(row["applied_model"] or ""),
+        applied_reasoning_effort=str(row["applied_reasoning_effort"] or ""),
+        confidence=float(row["confidence"]),
+        reason_codes=tuple(
+            item for item in str(row["reason_codes"] or "").split(",") if item
+        ),
+        fallback_chain=tuple(
+            item for item in str(row["fallback_chain"] or "").split(",") if item
+        ),
+        assignment_key=str(row["assignment_key"] or ""),
+        assignment_scope=str(row["assignment_scope"]),
+        canary_eligible=bool(row["canary_eligible"]),
+        eligibility_reason=str(row["eligibility_reason"]),
+        outcome=str(row["outcome"]),
+        fallback_reason=str(row["fallback_reason"] or ""),
+        policy_adjusted=bool(row["policy_adjusted"]),
+        created_at=str(row["created_at"]),
     )
