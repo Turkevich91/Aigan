@@ -561,6 +561,31 @@ class ModelPolicyRoutingIntegrationTests(unittest.TestCase):
         ):
             with self.assertRaisesRegex(RuntimeError, "MODEL_ROUTER_PROMPT_VERSION"):
                 main.Config.from_env()
+        with patch.dict(
+            os.environ,
+            {
+                **valid,
+                "MODEL_ROUTING_MODE": "off",
+                "MODEL_ROUTING_POLICY_VERSION": "primary_sol_low_v1",
+                "MODEL_ROUTER_SCHEMA_VERSION": "model_policy_v2",
+                "MODEL_ROUTER_PROMPT_VERSION": "model_policy_prompt_v2",
+            },
+            clear=False,
+        ):
+            staged = main.Config.from_env()
+        self.assertEqual("model_policy_v2", staged.model_router_schema_version)
+        self.assertEqual("model_policy_prompt_v2", staged.model_router_prompt_version)
+        with patch.dict(
+            os.environ,
+            {
+                **valid,
+                "MODEL_ROUTING_MODE": "off",
+                "MODEL_ROUTER_SCHEMA_VERSION": "unsafe version label",
+            },
+            clear=False,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "safe version label"):
+                main.Config.from_env()
 
     def test_router_provider_request_is_structured_bounded_and_telemetry_correlated(self) -> None:
         store = self.use_isolated_store()
@@ -711,15 +736,16 @@ class ModelPolicyRoutingIntegrationTests(unittest.TestCase):
                 "run_model_policy_router",
                 new=AsyncMock(return_value=router_json),
             ):
-                decision = asyncio.run(
-                    main.evaluate_model_policy_shadow(
-                        metadata,
-                        run_id=run_id,
-                        route_bucket="normal",
-                        assignment_key=main.opaque_episode_key("secret", "episode"),
-                        assignment_scope="single_turn",
+                with patch.object(main, "system_event") as event:
+                    decision = asyncio.run(
+                        main.evaluate_model_policy_shadow(
+                            metadata,
+                            run_id=run_id,
+                            route_bucket="NORMAL",
+                            assignment_key=main.opaque_episode_key("secret", "episode"),
+                            assignment_scope="single_turn",
+                        )
                     )
-                )
         finally:
             main.CONFIG = original_config
 
@@ -731,6 +757,7 @@ class ModelPolicyRoutingIntegrationTests(unittest.TestCase):
         self.assertEqual("gpt-5.6-sol", record.applied_model)
         self.assertEqual("low", record.applied_reasoning_effort)
         self.assertTrue(record.canary_eligible)
+        self.assertEqual("normal", event.call_args.kwargs["route"])
 
     def test_off_mode_schedules_no_router_and_shadow_uses_bounded_snapshot(self) -> None:
         message = FakeMessage(

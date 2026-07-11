@@ -363,15 +363,13 @@ class Config:
         model_router_schema_version = os.getenv(
             "MODEL_ROUTER_SCHEMA_VERSION", "model_policy_v1"
         ).strip().casefold()
-        if model_router_schema_version != "model_policy_v1":
-            raise RuntimeError("Set MODEL_ROUTER_SCHEMA_VERSION to model_policy_v1")
+        if not re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,63}", model_router_schema_version):
+            raise RuntimeError("MODEL_ROUTER_SCHEMA_VERSION must be a safe version label")
         model_router_prompt_version = os.getenv(
             "MODEL_ROUTER_PROMPT_VERSION", "model_policy_prompt_v1"
         ).strip().casefold()
-        if model_router_prompt_version != "model_policy_prompt_v1":
-            raise RuntimeError(
-                "Set MODEL_ROUTER_PROMPT_VERSION to model_policy_prompt_v1"
-            )
+        if not re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,63}", model_router_prompt_version):
+            raise RuntimeError("MODEL_ROUTER_PROMPT_VERSION must be a safe version label")
         tier_aliases = ModelTierAliases(
             economy=os.getenv("MODEL_TIER_ECONOMY_MODEL", "gpt-5.4-nano").strip(),
             balanced=os.getenv("MODEL_TIER_BALANCED_MODEL", "gpt-5.6-terra").strip(),
@@ -382,6 +380,14 @@ class Config:
         except ValueError as exc:
             raise RuntimeError(str(exc)) from exc
         if routing_mode == "shadow":
+            if model_router_schema_version != "model_policy_v1":
+                raise RuntimeError(
+                    "MODEL_ROUTING_MODE=shadow requires MODEL_ROUTER_SCHEMA_VERSION=model_policy_v1"
+                )
+            if model_router_prompt_version != "model_policy_prompt_v1":
+                raise RuntimeError(
+                    "MODEL_ROUTING_MODE=shadow requires MODEL_ROUTER_PROMPT_VERSION=model_policy_prompt_v1"
+                )
             if not telemetry_enabled:
                 raise RuntimeError("MODEL_ROUTING_MODE=shadow requires MODEL_TELEMETRY_ENABLED=true")
             if routing_policy_version != "shadow_tier_router_v1":
@@ -4995,6 +5001,7 @@ async def evaluate_model_policy_shadow(
     assignment_key: str,
     assignment_scope: str,
 ) -> ModelRoutingDecision:
+    route_bucket = normalize_route_bucket(route_bucket, "other")
     try:
         raw = await run_model_policy_router(
             metadata,
