@@ -47,6 +47,27 @@ from heavy_model_backend import (
     NullHeavyModelAdapter,
     OpenAICompatibleHeavyModelAdapter,
 )
+from image_intent import (
+    IMAGE_INTENT_ROUTER_SYSTEM_PROMPT,
+    IMAGE_INTENT_TRUSTED_TEXT_MAX_CHARS,
+    IMAGE_OPERATION_AUTHORIZER_SYSTEM_PROMPT,
+    ImageDeliveryPlan,
+    ImageIntentDecision,
+    ImageOperationAuthorization,
+    ImageRoutePolicy,
+    derive_image_route_policy,
+    failed_image_intent_decision,
+    failed_image_operation_authorization,
+    image_intent_schema,
+    image_operation_authorizer_schema,
+    image_operation_has_deterministic_deny_signal,
+    normalize_image_intent_decision,
+    normalize_image_operation_authorization,
+    normalize_image_intent_routing_mode,
+    public_image_scope_is_unsafe,
+    public_image_subject_is_sensitive,
+    semantic_image_claim_requires_guard,
+)
 from memory import DeliveryReceipt, EmbeddingCandidate, MemoryItem, MemoryStore, SemanticMemoryResult
 from media_acquisition import (
     MediaAcquisitionAdapter,
@@ -270,6 +291,21 @@ class Config:
     tool_router_model: str
     tool_router_max_output_tokens: int
     tool_router_confidence_threshold: float
+    image_intent_routing_mode: str
+    image_intent_router_model: str
+    image_intent_router_reasoning_effort: str
+    image_intent_router_max_output_tokens: int
+    image_intent_router_confidence_threshold: float
+    image_intent_router_timeout_seconds: float
+    image_intent_router_schema_version: str
+    image_intent_router_prompt_version: str
+    image_operation_authorizer_model: str
+    image_operation_authorizer_reasoning_effort: str
+    image_operation_authorizer_max_output_tokens: int
+    image_operation_authorizer_confidence_threshold: float
+    image_operation_authorizer_timeout_seconds: float
+    image_operation_authorizer_schema_version: str
+    image_operation_authorizer_prompt_version: str
     auto_react_enabled: bool
     auto_react_probability: float
     auto_react_keywords: list[str]
@@ -404,6 +440,73 @@ class Config:
         ).strip().casefold()
         if not re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,63}", model_router_prompt_version):
             raise RuntimeError("MODEL_ROUTER_PROMPT_VERSION must be a safe version label")
+        try:
+            image_intent_routing_mode = normalize_image_intent_routing_mode(
+                os.getenv("IMAGE_INTENT_ROUTING_MODE", "off")
+            )
+        except ValueError as exc:
+            raise RuntimeError(str(exc)) from exc
+        image_intent_router_model = os.getenv(
+            "IMAGE_INTENT_ROUTER_MODEL", "gpt-5.4-mini"
+        ).strip()
+        image_intent_router_reasoning_effort = os.getenv(
+            "IMAGE_INTENT_ROUTER_REASONING_EFFORT", "none"
+        ).strip().casefold()
+        if image_intent_router_reasoning_effort not in {"none", "low", "medium", "high"}:
+            raise RuntimeError(
+                "IMAGE_INTENT_ROUTER_REASONING_EFFORT must be one of: none, low, medium, high"
+            )
+        image_intent_router_schema_version = os.getenv(
+            "IMAGE_INTENT_ROUTER_SCHEMA_VERSION", "image_intent_v1"
+        ).strip().casefold()
+        if not re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,63}", image_intent_router_schema_version):
+            raise RuntimeError("IMAGE_INTENT_ROUTER_SCHEMA_VERSION must be a safe version label")
+        image_intent_router_prompt_version = os.getenv(
+            "IMAGE_INTENT_ROUTER_PROMPT_VERSION", "image_intent_prompt_v2"
+        ).strip().casefold()
+        if not re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,63}", image_intent_router_prompt_version):
+            raise RuntimeError("IMAGE_INTENT_ROUTER_PROMPT_VERSION must be a safe version label")
+        if image_intent_routing_mode != "off" and not image_intent_router_model:
+            raise RuntimeError("IMAGE_INTENT_ROUTING_MODE requires IMAGE_INTENT_ROUTER_MODEL")
+        image_operation_authorizer_model = os.getenv(
+            "IMAGE_OPERATION_AUTHORIZER_MODEL", "gpt-5.6-terra"
+        ).strip()
+        image_operation_authorizer_reasoning_effort = os.getenv(
+            "IMAGE_OPERATION_AUTHORIZER_REASONING_EFFORT", "none"
+        ).strip().casefold()
+        if image_operation_authorizer_reasoning_effort not in {"none", "low", "medium", "high"}:
+            raise RuntimeError(
+                "IMAGE_OPERATION_AUTHORIZER_REASONING_EFFORT must be one of: none, low, medium, high"
+            )
+        image_operation_authorizer_schema_version = os.getenv(
+            "IMAGE_OPERATION_AUTHORIZER_SCHEMA_VERSION", "image_operation_auth_v1"
+        ).strip().casefold()
+        if not re.fullmatch(
+            r"[a-z0-9][a-z0-9._-]{0,63}",
+            image_operation_authorizer_schema_version,
+        ):
+            raise RuntimeError("IMAGE_OPERATION_AUTHORIZER_SCHEMA_VERSION must be a safe version label")
+        image_operation_authorizer_prompt_version = os.getenv(
+            "IMAGE_OPERATION_AUTHORIZER_PROMPT_VERSION", "image_operation_auth_prompt_v1"
+        ).strip().casefold()
+        if not re.fullmatch(
+            r"[a-z0-9][a-z0-9._-]{0,63}",
+            image_operation_authorizer_prompt_version,
+        ):
+            raise RuntimeError("IMAGE_OPERATION_AUTHORIZER_PROMPT_VERSION must be a safe version label")
+        if image_intent_routing_mode != "off" and not image_operation_authorizer_model:
+            raise RuntimeError(
+                "IMAGE_INTENT_ROUTING_MODE requires IMAGE_OPERATION_AUTHORIZER_MODEL"
+            )
+        max_input_chars = int(os.getenv("MAX_INPUT_CHARS", "2500"))
+        if (
+            image_intent_routing_mode != "off"
+            and max_input_chars > IMAGE_INTENT_TRUSTED_TEXT_MAX_CHARS
+        ):
+            raise RuntimeError(
+                "MAX_INPUT_CHARS cannot exceed "
+                f"{IMAGE_INTENT_TRUSTED_TEXT_MAX_CHARS} while semantic image routing is enabled"
+            )
         tier_aliases = ModelTierAliases(
             economy=os.getenv("MODEL_TIER_ECONOMY_MODEL", "gpt-5.4-nano").strip(),
             balanced=os.getenv("MODEL_TIER_BALANCED_MODEL", "gpt-5.6-terra").strip(),
@@ -497,7 +600,7 @@ class Config:
                 "CHAT_INFLIGHT_SUPPRESS_ORDINARY_AUTO_REACT",
                 True,
             ),
-            max_input_chars=int(os.getenv("MAX_INPUT_CHARS", "2500")),
+            max_input_chars=max_input_chars,
             max_reply_chars=int(os.getenv("MAX_REPLY_CHARS", "12000")),
             telegram_text_chunk_chars=int(os.getenv("TELEGRAM_TEXT_CHUNK_CHARS", "3500")),
             max_reply_chunks=int(os.getenv("MAX_REPLY_CHUNKS", "4")),
@@ -557,6 +660,56 @@ class Config:
                 0.65,
                 minimum=0.0,
                 maximum=1.0,
+            ),
+            image_intent_routing_mode=image_intent_routing_mode,
+            image_intent_router_model=image_intent_router_model,
+            image_intent_router_reasoning_effort=image_intent_router_reasoning_effort,
+            image_intent_router_max_output_tokens=max(
+                120,
+                min(400, int(os.getenv("IMAGE_INTENT_ROUTER_MAX_OUTPUT_TOKENS", "240"))),
+            ),
+            image_intent_router_confidence_threshold=_env_float(
+                "IMAGE_INTENT_ROUTER_CONFIDENCE_THRESHOLD",
+                0.70,
+                minimum=0.0,
+                maximum=1.0,
+            ),
+            image_intent_router_timeout_seconds=_env_float(
+                "IMAGE_INTENT_ROUTER_TIMEOUT_SECONDS",
+                8.0,
+                minimum=1.0,
+                maximum=15.0,
+            ),
+            image_intent_router_schema_version=image_intent_router_schema_version,
+            image_intent_router_prompt_version=image_intent_router_prompt_version,
+            image_operation_authorizer_model=image_operation_authorizer_model,
+            image_operation_authorizer_reasoning_effort=(
+                image_operation_authorizer_reasoning_effort
+            ),
+            image_operation_authorizer_max_output_tokens=max(
+                160,
+                min(
+                    480,
+                    int(os.getenv("IMAGE_OPERATION_AUTHORIZER_MAX_OUTPUT_TOKENS", "300")),
+                ),
+            ),
+            image_operation_authorizer_confidence_threshold=_env_float(
+                "IMAGE_OPERATION_AUTHORIZER_CONFIDENCE_THRESHOLD",
+                0.80,
+                minimum=0.0,
+                maximum=1.0,
+            ),
+            image_operation_authorizer_timeout_seconds=_env_float(
+                "IMAGE_OPERATION_AUTHORIZER_TIMEOUT_SECONDS",
+                8.0,
+                minimum=1.0,
+                maximum=15.0,
+            ),
+            image_operation_authorizer_schema_version=(
+                image_operation_authorizer_schema_version
+            ),
+            image_operation_authorizer_prompt_version=(
+                image_operation_authorizer_prompt_version
             ),
             auto_react_enabled=_env_bool("AUTO_REACT_ENABLED", False),
             auto_react_probability=float(os.getenv("AUTO_REACT_PROBABILITY", "0")),
@@ -1404,6 +1557,7 @@ Tool use:
 - If a YouTube transcript is Russian, summarize and explain it in Ukrainian, not Russian.
 - If the user asks to translate referenced text, translate it directly; do not analyze it, search the web, or reuse old chat memory.
 - If the user asks to find, show, send, post, attach, or insert images, do not answer with image URLs, <a href> tags, or link lists. Image-send requests are handled by uploading fetched image bytes as Telegram photos.
+- Never claim that an image was attached, sent, posted, uploaded, or placed above unless the application explicitly supplied a confirmed Telegram delivery receipt. Web search or image candidates are not delivery.
 - Write coherent answers; do not split them manually into Telegram-sized parts. The delivery layer handles long-message splitting.
 
 Source handling:
@@ -1852,6 +2006,20 @@ class MemoryRecallIntent:
     query: str = ""
     reason: str = ""
     degraded: bool = False
+
+
+@dataclass(frozen=True)
+class RequestClassification:
+    route: str
+    recall_intent: MemoryRecallIntent | None = None
+    image_policy: ImageRoutePolicy | None = None
+    image_decision: ImageIntentDecision | None = None
+
+    def __iter__(self):
+        # Preserve the existing two-value internal API while carrying the
+        # validated delivery plan to the executor.
+        yield self.route
+        yield self.recall_intent
 
 
 @dataclass(frozen=True)
@@ -3139,6 +3307,190 @@ def guard_reminder_state_change_claims(
         "Не можу чесно підтвердити зміну нагадування: жоден reminder-tool не повернув успішну мутацію. "
         "Спробуй ще раз з точним id або датою/часом."
     )
+
+
+def guard_unconfirmed_image_delivery_claims(
+    output: str,
+    observations: Sequence[ToolProvenance] | None,
+    *,
+    required: bool = False,
+) -> str:
+    image_searches = [item for item in observations or () if item.tool_kind == "search_images"]
+    claim = image_delivery_claim_detected(output)
+    if not image_searches and (not required or not claim):
+        return output
+    search_completed = any(item.result_status == "ok" for item in image_searches)
+    system_event(
+        level="warning",
+        component="image_search",
+        event_type="delivery_claim_blocked",
+        message="search_is_not_delivery",
+        details={
+            "tool_kind": "search_images",
+            "search_attempted": bool(image_searches),
+            "search_completed": search_completed,
+            "claim_detected": claim,
+        },
+    )
+    if not image_searches:
+        return (
+            "Маршрут доставки зображень не запускався, а Telegram-доставку медіа не підтверджено. "
+            "Я не прикріпив фото."
+        )
+    if search_completed:
+        return (
+            "Пошук зображень завершився, але Telegram-доставку медіа не підтверджено. "
+            "Я не прикріпив фото; повтори явний запит на надсилання."
+        )
+    return (
+        "Пошук зображень завершився помилкою або залишився незавершеним, а Telegram-доставку медіа "
+        "не підтверджено. Я не прикріпив фото."
+    )
+
+
+async def guard_semantic_unconfirmed_image_delivery_claims(
+    message: Message,
+    prompt: str,
+    output: str,
+    observations: Sequence[ToolProvenance] | None,
+    decision: ImageIntentDecision | None,
+) -> str:
+    """Lazily verify a claim when the first semantic frame may be a false negative."""
+    if (
+        CONFIG.image_intent_routing_mode != "enforce"
+        or decision is None
+        or not (decision.degraded or decision.intent == "not_image")
+        or not image_delivery_claim_detected(output)
+    ):
+        return output
+
+    authorization = await evaluate_image_operation_authorization(message, prompt)
+    if not semantic_image_claim_requires_guard(decision, authorization):
+        return output
+
+    system_event(
+        level="warning",
+        component="image_search",
+        event_type="semantic_delivery_claim_blocked",
+        telegram_message=message,
+        route="normal",
+        message="unconfirmed_visual_operation",
+        details={
+            "first_frame_degraded": decision.degraded,
+            "first_frame_intent": decision.intent,
+            "second_frame_outcome": authorization.outcome,
+            "second_frame_operation": authorization.operation,
+            "second_frame_execution": authorization.execution,
+        },
+    )
+    return guard_unconfirmed_image_delivery_claims(
+        output,
+        observations,
+        required=True,
+    )
+
+
+def image_delivery_claim_detected(output: str) -> bool:
+    text = str(output or "").strip()
+    if not text:
+        return False
+    completed_action = (
+        r"(?:надіслав|надіслала|надіслали|надіслано|"
+        r"відправив|відправила|відправили|відправлено|"
+        r"прикріпив|прикріпила|прикріпили|прикріплено|"
+        r"додав|додала|додали|додано|"
+        r"отправил|отправила|отправили|отправлено|"
+        r"прикрепил|прикрепила|прикрепили|прикреплено|"
+        r"добавил|добавила|добавили|добавлено|"
+        r"sent|attached|posted|uploaded|added)"
+    )
+    strong_delivery_action = (
+        r"(?:надіслав|надіслала|надіслали|надіслано|"
+        r"відправив|відправила|відправили|відправлено|"
+        r"прикріпив|прикріпила|прикріпили|прикріплено|"
+        r"отправил|отправила|отправили|отправлено|"
+        r"прикрепил|прикрепила|прикрепили|прикреплено|"
+        r"sent|attached|uploaded)"
+    )
+    generic_terminal_completion = (
+        r"(?:додав|додала|додали|додано|"
+        r"добавил|добавила|добавили|добавлено|added|posted)"
+    )
+    delivery_status = (
+        rf"(?:{completed_action}|надіслан\w*|відправлен\w*|прикріплен\w*|додан\w*|"
+        r"отправлен\w*|прикреплен\w*|добавлен\w*)"
+    )
+    pronoun = r"(?:його|її|це|его|её|ее|это|it|this|that)"
+    relative_location = r"(?:вище|зверху|тут|сюди|выше|сверху|здесь|сюда|above|here)"
+    image_object = image_request_object_pattern()
+    claim_marker = re.compile(
+        rf"\b(?:готово|done|ось|лови|держи|вот|{completed_action}|{delivery_status}|"
+        rf"{relative_location})\b|\bhere\s+you\s+go\b",
+        flags=re.IGNORECASE | re.UNICODE,
+    )
+    claim_patterns = (
+        r"\b(?:готово|done)\b",
+        r"(?<!\w)(?:ось|лови|держи|вот)(?!\w)(?=\s*(?:[!?.…]+|$))",
+        r"\bhere\s+you\s+go\b",
+        rf"(?<!\w)(?:(?:я|ми|i|we)\s+(?:вже\s+|already\s+)?)?"
+        rf"{strong_delivery_action}(?!\w)(?=\s*(?:[!?.…]+|$))",
+        rf"(?<!\w)(?:(?:я|ми|i|we)\s+(?:вже\s+|already\s+)?)?"
+        rf"{generic_terminal_completion}(?!\w)(?=\s*(?:[!?.…]+|$))",
+        rf"\b{completed_action}\b\s+{pronoun}\b(?:\s+{relative_location})?"
+        rf"(?=\s*(?:[!?.…]+|$))",
+        rf"\b{completed_action}\b\s+{relative_location}\b(?=\s*(?:[!?.…]+|$))",
+        rf"\b{pronoun}\b(?:\s+[\w'’.-]+){{0,3}}\s+\b{completed_action}\b"
+        rf"(?=\s*(?:[!?.…]+|$))",
+        rf"\b{completed_action}\b.{{0,80}}\b{image_object}\b",
+        rf"\b{image_object}\b.{{0,80}}\b(?:{delivery_status}|{relative_location})\b",
+        rf"\b(?:it|this|that)\b\s+(?:is|'s|was)\s+\b{delivery_status}\b"
+        rf"(?:\s+{relative_location})?",
+        rf"\b(?:ось|лови|держи|вот|here(?:'s|\s+is|\s+are)?)\b.{{0,50}}"
+        rf"\b{image_object}\b",
+    )
+
+    def marker_is_locally_negated(marker_start: int) -> bool:
+        boundary_start = max(text.rfind(char, 0, marker_start) for char in "\n.!?;:") + 1
+        local_prefix = text[boundary_start:marker_start]
+        adversatives = list(
+            re.finditer(
+                r"\b(?:але|однак|проте|но|зато|but|however)\b",
+                local_prefix,
+                flags=re.IGNORECASE | re.UNICODE,
+            )
+        )
+        if adversatives:
+            local_prefix = local_prefix[adversatives[-1].end() :]
+        return bool(
+            re.search(r"\b(?:не|not)(?:\s+(?:ще|yet))?\s*$", local_prefix, flags=re.IGNORECASE)
+            or re.search(
+                r"\bне\s+(?:було|був|була|були|вдалося|удалося|зміг|змогла|змогли|"
+                r"смог|смогла|смогли|можу|можемо|можна|получилось|вийшло|вышло)"
+                r"(?:\s+[\w'’.-]+){0,3}\s*$",
+                local_prefix,
+                flags=re.IGNORECASE | re.UNICODE,
+            )
+            or re.search(
+                r"\b(?:did\s+not|didn't|could\s+not|couldn't|was\s+not|wasn't|"
+                r"were\s+not|weren't|has\s+not|hasn't|have\s+not|haven't|failed\s+to)"
+                r"(?:\s+[\w'’-]+){0,3}\s*$",
+                local_prefix,
+                flags=re.IGNORECASE | re.UNICODE,
+            )
+        )
+
+    for pattern in claim_patterns:
+        for claim_match in re.finditer(
+            pattern,
+            text,
+            flags=re.IGNORECASE | re.DOTALL | re.UNICODE,
+        ):
+            markers = list(claim_marker.finditer(claim_match.group(0)))
+            if markers and not marker_is_locally_negated(
+                claim_match.start() + markers[0].start()
+            ):
+                return True
+    return False
 
 
 def message_user_id(message: Message | None) -> int | None:
@@ -4635,6 +4987,39 @@ def referenced_context_available(message: Message) -> bool:
     return build_reference_context(message) != "(none)"
 
 
+def referenced_visual_context_available(message: Message) -> bool:
+    for source in (
+        getattr(message, "reply_to_message", None),
+        getattr(message, "external_reply", None),
+    ):
+        if source is None:
+            continue
+        if image_file_ref_from(source) is not None or visual_media_file_ref_from(source) is not None:
+            return True
+    return False
+
+
+def referenced_image_messages(message: Message) -> tuple[Message, ...]:
+    # ExternalReplyInfo is not a telegram.Message and must not enter the
+    # persistence path, which relies on Telegram Message identity fields.
+    source = getattr(message, "reply_to_message", None)
+    if source is None or image_file_ref_from(source) is None:
+        return ()
+    return (source,)
+
+
+def referenced_external_visual_available(message: Message) -> bool:
+    source = getattr(message, "external_reply", None)
+    if source is None:
+        return False
+    return image_file_ref_from(source) is not None or visual_media_file_ref_from(source) is not None
+
+
+def referenced_reply_visual_media_available(message: Message) -> bool:
+    source = getattr(message, "reply_to_message", None)
+    return source is not None and visual_media_file_ref_from(source) is not None
+
+
 def is_translate_request(prompt: str) -> bool:
     lowered = prompt.lower().strip()
     if re.search(r"\b(translate|translation)\b", lowered):
@@ -4896,6 +5281,332 @@ async def detect_memory_recall_intent(message: Message, prompt: str) -> MemoryRe
     return MemoryRecallIntent(False, confidence=confidence, query=query, reason="semantic_below_threshold")
 
 
+def build_image_intent_router_metadata(message: Message, prompt: str) -> dict[str, Any]:
+    if len(prompt) > IMAGE_INTENT_TRUSTED_TEXT_MAX_CHARS:
+        raise ValueError("image_intent_trusted_text_too_long")
+    reply = getattr(message, "reply_to_message", None)
+    external_reply = getattr(message, "external_reply", None)
+    return {
+        "trusted_text": str(prompt or ""),
+        "has_reply": reply is not None,
+        "has_reply_image": bool(reply is not None and image_file_ref_from(reply) is not None),
+        "has_reply_visual_media": bool(
+            reply is not None and visual_media_file_ref_from(reply) is not None
+        ),
+        "has_external_visual": bool(
+            external_reply is not None
+            and (
+                image_file_ref_from(external_reply) is not None
+                or visual_media_file_ref_from(external_reply) is not None
+            )
+        ),
+        "has_any_reference": referenced_context_available(message),
+    }
+
+
+def image_router_failure_fallback_signal(prompt: str, *, has_reference: bool = False) -> bool:
+    """Clarify-only fallback used when the semantic router itself is unavailable."""
+    return is_internet_image_request(prompt, has_reference=has_reference)
+
+
+async def run_image_intent_router(
+    metadata: dict[str, Any],
+    *,
+    run_id: str,
+) -> str:
+    stage = begin_model_stage(
+        stage_kind="router",
+        intended_model=CONFIG.image_intent_router_model,
+        reasoning_effort=CONFIG.image_intent_router_reasoning_effort,
+        endpoint="responses",
+        run_id=run_id,
+        route_bucket="pre_route",
+        task_class_bucket="router",
+    )
+    try:
+        async with asyncio.timeout(CONFIG.image_intent_router_timeout_seconds):
+            async with AsyncOpenAI(
+                api_key=CONFIG.openai_api_key,
+                timeout=CONFIG.image_intent_router_timeout_seconds,
+                max_retries=0,
+            ) as client:
+                response = await client.responses.create(
+                    model=CONFIG.image_intent_router_model,
+                    input=[
+                        {
+                            "role": "system",
+                            "content": [
+                                {
+                                    "type": "input_text",
+                                    "text": IMAGE_INTENT_ROUTER_SYSTEM_PROMPT,
+                                }
+                            ],
+                        },
+                        {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "input_text",
+                                    "text": json.dumps(metadata, ensure_ascii=False, sort_keys=True),
+                                }
+                            ],
+                        },
+                    ],
+                    reasoning={"effort": CONFIG.image_intent_router_reasoning_effort},
+                    max_output_tokens=CONFIG.image_intent_router_max_output_tokens,
+                    text={
+                        "format": {
+                            "type": "json_schema",
+                            "name": CONFIG.image_intent_router_schema_version,
+                            "strict": True,
+                            "schema": image_intent_schema(),
+                        }
+                    },
+                )
+    except asyncio.CancelledError as exc:
+        finish_model_stage(stage, status="cancelled", failure_class=exc)
+        raise
+    except Exception as exc:
+        finish_model_stage(stage, status="failed", failure_class=exc)
+        raise
+
+    status, failure_class = response_telemetry_status(response)
+    actual_model, actual_model_source = response_actual_model(response)
+    finish_model_stage(
+        stage,
+        status=status,
+        usage=response_usage(response),
+        actual_model=actual_model,
+        actual_model_source=actual_model_source,
+        actual_reasoning_effort=response_actual_reasoning_effort(response),
+        failure_class=failure_class,
+    )
+    if status != "succeeded":
+        raise RuntimeError("image_intent_router_provider_failure")
+    if response_requests_tools(response):
+        raise RuntimeError("image_intent_router_requested_tool")
+    output = str(getattr(response, "output_text", "") or "").strip()
+    if not output:
+        raise RuntimeError("image_intent_router_empty_output")
+    return output
+
+
+async def evaluate_image_intent(message: Message, prompt: str) -> ImageIntentDecision:
+    decision: ImageIntentDecision | None = None
+    attempts = 0
+    try:
+        metadata = build_image_intent_router_metadata(message, prompt)
+    except Exception as exc:
+        LOGGER.warning("Image intent metadata rejected error=%s", type(exc).__name__)
+        metadata = None
+
+    if metadata is not None:
+        for attempts in range(1, 3):
+            try:
+                raw = await run_image_intent_router(
+                    metadata,
+                    run_id=current_model_run_id(),
+                )
+                decision = normalize_image_intent_decision(
+                    json.loads(raw),
+                    trusted_prompt=prompt,
+                    confidence_threshold=CONFIG.image_intent_router_confidence_threshold,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                LOGGER.warning(
+                    "Image intent router attempt failed attempt=%s error=%s",
+                    attempts,
+                    type(exc).__name__,
+                )
+                decision = None
+            if decision is not None and not decision.degraded:
+                break
+    if decision is None:
+        decision = failed_image_intent_decision()
+
+    system_event(
+        level="warning" if decision.degraded else "info",
+        component="routing",
+        event_type="image_intent_decision",
+        telegram_message=message,
+        route="pre_route",
+        message=decision.intent,
+        details={
+            "mode": CONFIG.image_intent_routing_mode,
+            "outcome": decision.outcome,
+            "fallback_reason": decision.fallback_reason,
+            "attempts": attempts,
+            "confidence": confidence_bucket(decision.confidence),
+            "intent": decision.intent,
+            "target": decision.target,
+            "source_scope": decision.source_scope,
+            "subject_grounding": decision.subject_grounding,
+            "quantity_kind": decision.quantity_kind,
+            "language": decision.language,
+            "reason_codes": list(decision.reason_codes),
+            "schema_version": CONFIG.image_intent_router_schema_version,
+            "prompt_version": CONFIG.image_intent_router_prompt_version,
+        },
+    )
+    return decision
+
+
+async def run_image_operation_authorizer(
+    metadata: dict[str, Any],
+    *,
+    run_id: str,
+) -> str:
+    stage = begin_model_stage(
+        stage_kind="router",
+        intended_model=CONFIG.image_operation_authorizer_model,
+        reasoning_effort=CONFIG.image_operation_authorizer_reasoning_effort,
+        endpoint="responses",
+        run_id=run_id,
+        route_bucket="pre_route",
+        task_class_bucket="router",
+    )
+    try:
+        async with asyncio.timeout(CONFIG.image_operation_authorizer_timeout_seconds):
+            async with AsyncOpenAI(
+                api_key=CONFIG.openai_api_key,
+                timeout=CONFIG.image_operation_authorizer_timeout_seconds,
+                max_retries=0,
+            ) as client:
+                response = await client.responses.create(
+                    model=CONFIG.image_operation_authorizer_model,
+                    input=[
+                        {
+                            "role": "system",
+                            "content": [
+                                {
+                                    "type": "input_text",
+                                    "text": IMAGE_OPERATION_AUTHORIZER_SYSTEM_PROMPT,
+                                }
+                            ],
+                        },
+                        {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "input_text",
+                                    "text": json.dumps(
+                                        metadata,
+                                        ensure_ascii=False,
+                                        sort_keys=True,
+                                    ),
+                                }
+                            ],
+                        },
+                    ],
+                    reasoning={"effort": CONFIG.image_operation_authorizer_reasoning_effort},
+                    max_output_tokens=CONFIG.image_operation_authorizer_max_output_tokens,
+                    text={
+                        "format": {
+                            "type": "json_schema",
+                            "name": CONFIG.image_operation_authorizer_schema_version,
+                            "strict": True,
+                            "schema": image_operation_authorizer_schema(),
+                        }
+                    },
+                )
+    except asyncio.CancelledError as exc:
+        finish_model_stage(stage, status="cancelled", failure_class=exc)
+        raise
+    except Exception as exc:
+        finish_model_stage(stage, status="failed", failure_class=exc)
+        raise
+
+    status, failure_class = response_telemetry_status(response)
+    actual_model, actual_model_source = response_actual_model(response)
+    finish_model_stage(
+        stage,
+        status=status,
+        usage=response_usage(response),
+        actual_model=actual_model,
+        actual_model_source=actual_model_source,
+        actual_reasoning_effort=response_actual_reasoning_effort(response),
+        failure_class=failure_class,
+    )
+    if status != "succeeded":
+        raise RuntimeError("image_operation_authorizer_provider_failure")
+    if response_requests_tools(response):
+        raise RuntimeError("image_operation_authorizer_requested_tool")
+    output = str(getattr(response, "output_text", "") or "").strip()
+    if not output:
+        raise RuntimeError("image_operation_authorizer_empty_output")
+    return output
+
+
+async def evaluate_image_operation_authorization(
+    message: Message,
+    prompt: str,
+) -> ImageOperationAuthorization:
+    authorization: ImageOperationAuthorization | None = None
+    attempts = 0
+    metadata = build_image_intent_router_metadata(message, prompt)
+    for attempts in range(1, 3):
+        try:
+            raw = await run_image_operation_authorizer(
+                metadata,
+                run_id=current_model_run_id(),
+            )
+            authorization = normalize_image_operation_authorization(
+                json.loads(raw),
+                trusted_prompt=prompt,
+                confidence_threshold=(
+                    CONFIG.image_operation_authorizer_confidence_threshold
+                ),
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            LOGGER.warning(
+                "Image operation authorizer attempt failed attempt=%s error=%s",
+                attempts,
+                type(exc).__name__,
+            )
+            authorization = None
+        if authorization is not None and not authorization.degraded:
+            break
+    if authorization is None:
+        authorization = failed_image_operation_authorization()
+
+    system_event(
+        level="warning" if authorization.degraded else "info",
+        component="routing",
+        event_type="image_operation_authorization",
+        telegram_message=message,
+        route="pre_route",
+        message=authorization.verdict,
+        details={
+            "mode": CONFIG.image_intent_routing_mode,
+            "outcome": authorization.outcome,
+            "fallback_reason": authorization.fallback_reason,
+            "attempts": attempts,
+            "confidence": confidence_bucket(authorization.confidence),
+            "verdict": authorization.verdict,
+            "operation": authorization.operation,
+            "execution": authorization.execution,
+            "source": authorization.source,
+            "destination": authorization.destination,
+            "subject_grounding": authorization.subject_grounding,
+            "private_or_internal": authorization.private_or_internal,
+            "external_source_or_destination": (
+                authorization.external_source_or_destination
+            ),
+            "reference_dependent": authorization.reference_dependent,
+            "meta_or_classifier_test": authorization.meta_or_classifier_test,
+            "negated": authorization.negated,
+            "reason_codes": list(authorization.reason_codes),
+            "schema_version": CONFIG.image_operation_authorizer_schema_version,
+            "prompt_version": CONFIG.image_operation_authorizer_prompt_version,
+        },
+    )
+    return authorization
+
+
 def classify_request(message: Message, prompt: str) -> str:
     has_reference = referenced_context_available(message)
     if is_translate_request(prompt) and (has_reference or inline_translation_source(prompt)):
@@ -4907,20 +5618,117 @@ def classify_request(message: Message, prompt: str) -> str:
     return "normal"
 
 
-async def classify_request_with_intent(message: Message, prompt: str) -> tuple[str, MemoryRecallIntent | None]:
+async def classify_request_with_intent(message: Message, prompt: str) -> RequestClassification:
     has_reference = referenced_context_available(message)
     if is_translate_request(prompt) and (has_reference or inline_translation_source(prompt)):
-        return "translate_reference", None
-    if is_internet_image_request(prompt, has_reference=has_reference):
-        return "internet_image_send", None
+        return RequestClassification("translate_reference")
+
+    image_decision: ImageIntentDecision | None = None
+    image_policy: ImageRoutePolicy | None = None
+    if CONFIG.image_intent_routing_mode != "off":
+        image_decision = await evaluate_image_intent(message, prompt)
+        image_authorization: ImageOperationAuthorization | None = None
+        if (
+            not image_decision.degraded
+            and (
+                image_decision.intent in {"image_information", "ambiguous"}
+                or (
+                    image_decision.execution == "requested_now"
+                    and (
+                        image_decision.intent == "public_web_delivery"
+                        or (
+                            image_decision.intent == "referenced_visual_analysis"
+                            and bool(referenced_image_messages(message))
+                        )
+                    )
+                )
+            )
+        ):
+            image_authorization = await evaluate_image_operation_authorization(message, prompt)
+        operation_text = (
+            image_authorization.operation_text
+            if image_authorization is not None
+            else None
+        )
+        fallback_media_signal = bool(
+            image_decision.degraded
+            and image_decision.fallback_reason != "below_confidence"
+            and (
+                referenced_visual_context_available(message)
+                or image_router_failure_fallback_signal(
+                    prompt,
+                    has_reference=has_reference,
+                )
+            )
+        )
+        image_policy = derive_image_route_policy(
+            image_decision,
+            authorization=image_authorization,
+            fallback_media_signal=fallback_media_signal,
+            has_reply_image=bool(referenced_image_messages(message)),
+            has_external_visual=referenced_external_visual_available(message),
+            has_reply_visual_media=referenced_reply_visual_media_available(message),
+            unsafe_public_scope_signal=(
+                image_decision.intent == "public_web_delivery"
+                and (
+                    public_image_scope_is_unsafe(operation_text or prompt)
+                    or public_image_subject_is_sensitive(image_decision.subject_text)
+                    or (
+                        image_authorization is not None
+                        and public_image_subject_is_sensitive(
+                            image_authorization.subject_text
+                        )
+                    )
+                )
+            ),
+            deterministic_deny_signal=image_operation_has_deterministic_deny_signal(
+                prompt,
+                operation_text=operation_text,
+            )
+            if image_decision.intent
+            in {"public_web_delivery", "referenced_visual_analysis"}
+            else False,
+        )
+        if CONFIG.image_intent_routing_mode == "enforce" and image_policy.route != "normal":
+            return RequestClassification(
+                image_policy.route,
+                image_policy=image_policy,
+                image_decision=image_decision,
+            )
+        if CONFIG.image_intent_routing_mode != "enforce":
+            image_policy = None
+
+    if (
+        CONFIG.image_intent_routing_mode != "enforce"
+        and is_internet_image_request(prompt, has_reference=has_reference)
+    ):
+        return RequestClassification(
+            "internet_image_send",
+            image_decision=image_decision,
+        )
 
     recall_intent = await detect_memory_recall_intent(message, prompt)
     if recall_intent.is_recall:
-        return "memory_recall", recall_intent
+        return RequestClassification(
+            "memory_recall",
+            recall_intent,
+            image_policy=image_policy,
+            image_decision=image_decision,
+        )
 
     if is_time_sensitive_request(time_sensitive_signal_text(message, prompt)):
-        return "time_sensitive", recall_intent
-    return "normal", recall_intent
+        return RequestClassification(
+            "time_sensitive",
+            recall_intent,
+            image_policy=image_policy,
+            image_decision=image_decision,
+        )
+    return RequestClassification(
+        "normal",
+        recall_intent,
+        image_policy=image_policy,
+        image_decision=image_decision,
+    )
 
 
 def configured_model_tier_aliases() -> ModelTierAliases:
@@ -6127,6 +6935,7 @@ async def run_agent(
         name="web",
         params={"command": sys.executable, "args": [str(APP_DIR / "mcp_servers" / "web.py")]},
         cache_tools_list=True,
+        tool_filter={"blocked_tool_names": ["search_images"]},
         client_session_timeout_seconds=CONFIG.mcp_tool_timeout_seconds,
         failure_error_function=mcp_tool_failure_message,
     )
@@ -6193,14 +7002,15 @@ async def run_agent(
             finally:
                 run_hooks.finalize_pending("failed", "run_ended_with_pending_turn")
         output = str(result.final_output).strip()
+        sdk_observations = extract_tool_provenance(
+            getattr(result, "new_items", None),
+            secret=provenance_hash_secret(),
+            failure_classifier=classify_tool_result_failure,
+        )
         if active_provenance is not None:
-            sdk_observations = extract_tool_provenance(
-                getattr(result, "new_items", None),
-                secret=provenance_hash_secret(),
-                failure_classifier=classify_tool_result_failure,
-            )
             active_provenance.tools.extend(sdk_observations)
             active_provenance.tools[:] = renumber_tool_provenance(active_provenance.tools)
+        output = guard_unconfirmed_image_delivery_claims(output, sdk_observations)
         mutation_results = REMINDER_TOOL_MUTATIONS.get()
         mutation_attempted = reminder_mutation_tool_attempted(getattr(result, "new_items", None))
         if guard_reminder_claims or mutation_attempted or bool(mutation_results):
@@ -7696,6 +8506,59 @@ def configured_capability_rows() -> list[CapabilityRow]:
             ),
         )
     )
+    image_intent_router_enabled = CONFIG.image_intent_routing_mode != "off"
+    image_intent_router_configured = bool(
+        image_intent_router_enabled
+        and CONFIG.image_intent_router_model
+        and CONFIG.image_operation_authorizer_model
+    )
+    rows.append(
+        CapabilityRow(
+            name="semantic_image_intent_router",
+            family="routing",
+            enabled=image_intent_router_enabled,
+            configured=image_intent_router_configured,
+            available=image_intent_router_configured,
+            status=(
+                "ok"
+                if image_intent_router_configured
+                else ("unconfigured" if image_intent_router_enabled else "disabled")
+            ),
+            adapter="OpenAI Responses",
+            mode=CONFIG.image_intent_routing_mode,
+            backend=(
+                f"{CONFIG.image_intent_router_model} + "
+                f"{CONFIG.image_operation_authorizer_model}"
+            ),
+            details={
+                "schema_version": CONFIG.image_intent_router_schema_version,
+                "prompt_version": CONFIG.image_intent_router_prompt_version,
+                "confidence_threshold": CONFIG.image_intent_router_confidence_threshold,
+                "timeout_seconds": CONFIG.image_intent_router_timeout_seconds,
+                "max_output_tokens": CONFIG.image_intent_router_max_output_tokens,
+                "authorizer_model": CONFIG.image_operation_authorizer_model,
+                "authorizer_schema_version": (
+                    CONFIG.image_operation_authorizer_schema_version
+                ),
+                "authorizer_prompt_version": (
+                    CONFIG.image_operation_authorizer_prompt_version
+                ),
+                "authorizer_confidence_threshold": (
+                    CONFIG.image_operation_authorizer_confidence_threshold
+                ),
+                "authorizer_timeout_seconds": (
+                    CONFIG.image_operation_authorizer_timeout_seconds
+                ),
+                "side_effect_owner": "python_policy",
+                "success_source": "telegram_message_id",
+            },
+            next_action=(
+                "set IMAGE_INTENT_ROUTER_MODEL and IMAGE_OPERATION_AUTHORIZER_MODEL"
+                if image_intent_router_enabled and not image_intent_router_configured
+                else ""
+            ),
+        )
+    )
     tool_router_model_configured = bool(CONFIG.tool_router_model)
     tool_router_configured = CONFIG.tool_router_enabled and tool_router_model_configured
     tool_router_status = (
@@ -8249,6 +9112,28 @@ class WebImageDeliveryResult:
     intended_count: int
     ambiguous: bool = False
 
+    @property
+    def complete(self) -> bool:
+        return not self.ambiguous and len(self.deliveries) == self.intended_count
+
+    @property
+    def unconfirmed_count(self) -> int:
+        return max(0, self.intended_count - len(self.deliveries))
+
+
+@dataclass(frozen=True)
+class WebImageSendOutcome:
+    handled: bool
+    confirmed_media_count: int = 0
+    ambiguous: bool = False
+
+    def __bool__(self) -> bool:
+        return self.handled
+
+    @property
+    def confirmed_delivery(self) -> bool:
+        return self.confirmed_media_count > 0
+
 
 def image_stream(data: bytes, mime_type: str) -> io.BytesIO:
     stream = io.BytesIO(data)
@@ -8457,9 +9342,11 @@ async def send_web_image_results(
     images: list[WebImageResult],
     *,
     delivery_run_id: str = "",
+    intended_count: int | None = None,
 ) -> WebImageDeliveryResult:
+    requested_count = max(len(images), int(intended_count or 0))
     if not images:
-        return WebImageDeliveryResult((), 0)
+        return WebImageDeliveryResult((), requested_count)
     if len(images) == 1:
         try:
             delivered = await send_single_web_image(message, images[0])
@@ -8471,22 +9358,33 @@ async def send_web_image_results(
                 event_type="image_delivery_outcome_unknown",
                 telegram_message=message,
                 message=type(exc).__name__,
-                details={"intended_parts": 1, "run_id": delivery_run_id},
+                details={"intended_parts": requested_count, "run_id": delivery_run_id},
             )
-            return WebImageDeliveryResult((), 1, ambiguous=True)
-        deliveries = (DeliveredWebImage(images[0], delivered),) if delivered is not None else ()
-        return WebImageDeliveryResult(deliveries, 1)
+            return WebImageDeliveryResult((), requested_count, ambiguous=True)
+        if delivered is None:
+            return WebImageDeliveryResult((), requested_count)
+        if delivered_message_id(delivered) is None:
+            return WebImageDeliveryResult((), requested_count, ambiguous=True)
+        return WebImageDeliveryResult((DeliveredWebImage(images[0], delivered),), requested_count)
 
     try:
         delivered_messages = await send_photo_album_reply(message, images)
-        deliveries = tuple(
+        candidate_deliveries = tuple(
             DeliveredWebImage(image, delivered)
             for image, delivered in zip(images, delivered_messages)
         )
+        deliveries = tuple(
+            delivery
+            for delivery in candidate_deliveries
+            if delivered_message_id(delivery.telegram_message) is not None
+        )
         return WebImageDeliveryResult(
             deliveries,
-            len(images),
-            ambiguous=len(delivered_messages) != len(images),
+            requested_count,
+            ambiguous=(
+                len(delivered_messages) != len(images)
+                or len(deliveries) != len(candidate_deliveries)
+            ),
         )
     except BadRequest as exc:
         LOGGER.warning("Telegram rejected web image album; falling back to individual photos: %s", exc)
@@ -8498,9 +9396,9 @@ async def send_web_image_results(
             event_type="album_delivery_outcome_unknown",
             telegram_message=message,
             message=type(exc).__name__,
-            details={"intended_parts": len(images), "run_id": delivery_run_id},
+            details={"intended_parts": requested_count, "run_id": delivery_run_id},
         )
-        return WebImageDeliveryResult((), len(images), ambiguous=True)
+        return WebImageDeliveryResult((), requested_count, ambiguous=True)
 
     sent: list[DeliveredWebImage] = []
     total = len(images)
@@ -8517,14 +9415,17 @@ async def send_web_image_results(
                 message=type(exc).__name__,
                 details={
                     "delivered_parts": len(sent),
-                    "intended_parts": total,
+                    "intended_parts": requested_count,
                     "run_id": delivery_run_id,
                 },
             )
-            return WebImageDeliveryResult(tuple(sent), total, ambiguous=True)
-        if delivered is not None:
-            sent.append(DeliveredWebImage(image, delivered))
-    return WebImageDeliveryResult(tuple(sent), total)
+            return WebImageDeliveryResult(tuple(sent), requested_count, ambiguous=True)
+        if delivered is None:
+            continue
+        if delivered_message_id(delivered) is None:
+            return WebImageDeliveryResult(tuple(sent), requested_count, ambiguous=True)
+        sent.append(DeliveredWebImage(image, delivered))
+    return WebImageDeliveryResult(tuple(sent), requested_count)
 
 
 async def maybe_analyze_found_images(
@@ -8637,17 +9538,102 @@ def save_sent_web_images(
     return item_ids
 
 
+async def send_image_delivery_outcome_notice(
+    message: Message,
+    *,
+    confirmed_count: int,
+    intended_count: int,
+    ambiguous: bool,
+) -> None:
+    if confirmed_count and ambiguous:
+        text = (
+            "Telegram підтвердив доставку лише частини зображень. Статус решти невідомий, "
+            "тому я не повторюю їх автоматично."
+        )
+    elif confirmed_count:
+        text = (
+            f"Telegram підтвердив доставку {confirmed_count} із {intended_count} зображень; решту не було "
+            "підтверджено як надіслані. Я не стверджую, що надіслано весь альбом."
+        )
+    else:
+        text = (
+            "Telegram не підтвердив доставку зображення. Статус невідомий, тому я не стверджую, "
+            "що фото надіслано, і не повторюю спробу автоматично."
+        )
+    notice_provenance = provenance_for_message(message, "internet_image_delivery_notice")
+    try:
+        await send_reply(
+            message,
+            text,
+            memory_label="Aigan",
+            route="internet_image_delivery_notice",
+            outbound_provenance=notice_provenance,
+        )
+    except Exception as exc:
+        LOGGER.warning("Image delivery notice failed error=%s", type(exc).__name__)
+        system_event(
+            level="warning",
+            component="telegram_delivery",
+            event_type="image_delivery_notice_failed",
+            telegram_message=message,
+            message=type(exc).__name__,
+            details={
+                "confirmed_parts": max(0, int(confirmed_count)),
+                "intended_parts": max(0, int(intended_count)),
+            },
+        )
+
+
+def record_confirmed_image_delivery(
+    message: Message,
+    delivery_result: WebImageDeliveryResult,
+    outbound_provenance: OutboundProvenance | None,
+) -> None:
+    system_event(
+        component="telegram_delivery",
+        event_type="image_delivery_confirmed",
+        telegram_message=message,
+        message="confirmed",
+        details={
+            "run_id": outbound_provenance.run_id if outbound_provenance is not None else "",
+            "confirmed_parts": len(delivery_result.deliveries),
+            "intended_parts": delivery_result.intended_count,
+            "complete": delivery_result.complete,
+            "unconfirmed_parts": delivery_result.unconfirmed_count,
+            "ambiguous_remainder": delivery_result.ambiguous,
+        },
+    )
+
+
 async def maybe_send_internet_image(
     message: Message,
     prompt: str,
     *,
+    plan: ImageDeliveryPlan | None = None,
     outbound_provenance: OutboundProvenance | None = None,
-) -> bool:
-    if not CONFIG.web_image_search_enabled or not is_internet_image_request(prompt, referenced_context_available(message)):
-        return False
+) -> WebImageSendOutcome:
+    if plan is None:
+        if not is_internet_image_request(prompt, referenced_context_available(message)):
+            return WebImageSendOutcome(False)
+        count = requested_image_count(prompt)
+        plan = ImageDeliveryPlan(
+            query=image_search_query(prompt),
+            target_count=count,
+            requested_count=count,
+            quantity_kind="exact" if count > 1 else "singular",
+        )
+    if not CONFIG.web_image_search_enabled:
+        await send_reply(
+            message,
+            "Пошук і надсилання веб-зображень зараз вимкнено.",
+            memory_label="Aigan",
+            route="internet_image_send",
+            outbound_provenance=outbound_provenance,
+        )
+        return WebImageSendOutcome(True)
 
-    query = image_search_query(prompt)
-    target_count = requested_image_count(prompt)
+    query = plan.query
+    target_count = plan.target_count
     search_count = min(10, max(5, target_count * 4))
     presence = activity_presence_for_message(message, action=ChatAction.TYPING)
     await presence.start()
@@ -8688,7 +9674,7 @@ async def maybe_send_internet_image(
             route="internet_image_send",
             outbound_provenance=outbound_provenance,
         )
-        return True
+        return WebImageSendOutcome(True)
     finally:
         await presence.stop()
     system_event(
@@ -8714,9 +9700,16 @@ async def maybe_send_internet_image(
                 message,
                 [image],
                 delivery_run_id=outbound_provenance.run_id if outbound_provenance is not None else "",
+                intended_count=plan.requested_count,
             )
             if delivery_result.ambiguous and not delivery_result.deliveries:
-                return True
+                await send_image_delivery_outcome_notice(
+                    message,
+                    confirmed_count=0,
+                    intended_count=delivery_result.intended_count,
+                    ambiguous=True,
+                )
+                return WebImageSendOutcome(True, ambiguous=True)
             if not delivery_result.deliveries:
                 continue
             item_ids = save_sent_web_images(
@@ -8729,7 +9722,19 @@ async def maybe_send_internet_image(
             if summary and MEMORY is not None:
                 for item_id in item_ids:
                     MEMORY.update_vision_summary(item_id, summary)
-            return True
+            record_confirmed_image_delivery(message, delivery_result, outbound_provenance)
+            if not delivery_result.complete:
+                await send_image_delivery_outcome_notice(
+                    message,
+                    confirmed_count=len(delivery_result.deliveries),
+                    intended_count=delivery_result.intended_count,
+                    ambiguous=delivery_result.ambiguous,
+                )
+            return WebImageSendOutcome(
+                True,
+                confirmed_media_count=len(delivery_result.deliveries),
+                ambiguous=delivery_result.ambiguous,
+            )
     else:
         images: list[WebImageResult] = []
         for candidate in candidates:
@@ -8744,6 +9749,7 @@ async def maybe_send_internet_image(
             message,
             images,
             delivery_run_id=outbound_provenance.run_id if outbound_provenance is not None else "",
+            intended_count=plan.requested_count,
         )
         if delivery_result.deliveries:
             item_ids = save_sent_web_images(
@@ -8756,9 +9762,27 @@ async def maybe_send_internet_image(
             if summary and MEMORY is not None:
                 for item_id in item_ids:
                     MEMORY.update_vision_summary(item_id, summary)
-            return True
+            record_confirmed_image_delivery(message, delivery_result, outbound_provenance)
+            if not delivery_result.complete:
+                await send_image_delivery_outcome_notice(
+                    message,
+                    confirmed_count=len(delivery_result.deliveries),
+                    intended_count=delivery_result.intended_count,
+                    ambiguous=delivery_result.ambiguous,
+                )
+            return WebImageSendOutcome(
+                True,
+                confirmed_media_count=len(delivery_result.deliveries),
+                ambiguous=delivery_result.ambiguous,
+            )
         if delivery_result.ambiguous:
-            return True
+            await send_image_delivery_outcome_notice(
+                message,
+                confirmed_count=0,
+                intended_count=delivery_result.intended_count,
+                ambiguous=True,
+            )
+            return WebImageSendOutcome(True, ambiguous=True)
 
     await send_reply(
         message,
@@ -8779,7 +9803,7 @@ async def maybe_send_internet_image(
             "target_count": target_count,
         },
     )
-    return True
+    return WebImageSendOutcome(True)
 
 
 def normalize_outgoing_markup(text: str) -> str:
@@ -11099,7 +12123,10 @@ async def _handle_prompt_generation(
     histories[message.chat_id].append(f"{user_label(message)}: {prompt[:500]}")
 
     await send_activity_action(context.bot, message.chat_id, ChatAction.TYPING, message=message)
-    route, recall_intent = await classify_request_with_intent(message, prompt)
+    classification = await classify_request_with_intent(message, prompt)
+    route, recall_intent = classification
+    image_policy = getattr(classification, "image_policy", None)
+    image_decision = getattr(classification, "image_decision", None)
     ACTIVE_MODEL_ROUTE_BUCKET.set(normalize_route_bucket(route, "other"))
     LOGGER.info("Prompt route=%s chat_id=%s", route, message.chat_id)
     outbound_provenance = provenance_for_message(message, route)
@@ -11124,16 +12151,57 @@ async def _handle_prompt_generation(
                 "tool_intent": tool_route_decision.intent,
                 "toolsets": list(tool_route_decision.allowed_toolsets),
                 "tool_confidence": confidence_bucket(tool_route_decision.confidence),
+                "image_intent": image_decision.intent if image_decision is not None else "",
+                "image_intent_confidence": (
+                    confidence_bucket(image_decision.confidence) if image_decision is not None else ""
+                ),
             },
         )
 
-    if route == "internet_image_send" and await maybe_send_internet_image(
-        message,
-        prompt,
-        outbound_provenance=outbound_provenance,
-    ):
+    if route == "referenced_visual_analysis":
+        emit_prompt_route_decision(no_tool_route("referenced_visual_analysis"))
+        image_messages = referenced_image_messages(message)
+        if not image_messages:
+            await send_reply(
+                message,
+                "Я не бачу доступного зображення для аналізу. Надішли фото або відповідай на повідомлення з ним.",
+                memory_label="Aigan",
+                route="referenced_visual_unavailable",
+                outbound_provenance=outbound_provenance,
+            )
+            return
+        dedupe_prompt = image_prompt_dedupe_key(message, prompt, image_messages, ())
+        await handle_image_prompt_generation(
+            message,
+            prompt,
+            image_messages,
+            (),
+            dedupe_prompt,
+            skip_cooldown=True,
+        )
+        return
+
+    if image_policy is not None and image_policy.response_text:
+        emit_prompt_route_decision(no_tool_route(route))
+        delivery = await send_reply(
+            message,
+            image_policy.response_text,
+            memory_label="Aigan",
+            route=route,
+            outbound_provenance=outbound_provenance,
+        )
+        if delivery.delivered_chunks:
+            record_chat_answer(message, prompt, route)
+        return
+
+    if route == "internet_image_send":
+        image_send_kwargs: dict[str, Any] = {"outbound_provenance": outbound_provenance}
+        if image_policy is not None and image_policy.plan is not None:
+            image_send_kwargs["plan"] = image_policy.plan
+        outcome = await maybe_send_internet_image(message, prompt, **image_send_kwargs)
         emit_prompt_route_decision(no_tool_route("skipped_internet_image_send"))
-        record_chat_answer(message, prompt, route)
+        if bool(getattr(outcome, "confirmed_delivery", bool(outcome))):
+            record_chat_answer(message, prompt, route)
         return
 
     if route == "translate_reference":
@@ -11233,6 +12301,15 @@ async def _handle_prompt_generation(
             route=route,
             include_reminder_tool_guidance=reminder_context is not None,
         )
+        guard_image_delivery_claims = bool(
+            image_policy is not None and image_policy.guard_unconfirmed_delivery
+        )
+        if guard_image_delivery_claims:
+            agent_input += (
+                "\n\nTrusted application delivery state:\n"
+                "No Telegram image-delivery capability ran for this response. Do not claim that an image was "
+                "attached, sent, posted, uploaded, or placed above."
+            )
         remember_context_diagnostics(
             message.chat_id,
             route=route,
@@ -11268,6 +12345,20 @@ async def _handle_prompt_generation(
         else:
             agent_coro = run_agent_for_outbound(outbound_provenance, agent_input)
         response = await asyncio.wait_for(agent_coro, timeout=120)
+        if guard_image_delivery_claims:
+            response = guard_unconfirmed_image_delivery_claims(
+                response,
+                outbound_provenance.tools,
+                required=True,
+            )
+        else:
+            response = await guard_semantic_unconfirmed_image_delivery_claims(
+                message,
+                prompt,
+                response,
+                outbound_provenance.tools,
+                image_decision,
+            )
     except Exception:
         LOGGER.exception("Agent run failed")
         await message.reply_text("Запит не вдався. Деталі будуть у логах контейнера.")

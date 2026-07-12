@@ -180,6 +180,28 @@ IMAGE_MAX_BYTES=6000000
 
 Telegram link previews are not always delivered as images. If the bot says it did not receive the image, resend the picture as a photo/file or reply directly to the forwarded photo.
 
+With `IMAGE_INTENT_ROUTING_MODE=enforce`, every explicit bot invocation that reaches
+general request routing enters a strict semantic image frame; ordinary group messages
+still do not start a model run.
+This keeps intent routing independent of an ever-growing action or media-noun dictionary.
+`IMAGE_INTENT_ROUTER_MODEL` extracts the goal, source, destination, execution, subject
+grounding, and quantity. A separate `IMAGE_OPERATION_AUTHORIZER_MODEL`, which receives
+only the trusted current request and bounded reference flags, must independently agree
+before public-image delivery or referenced-image analysis can run. Python then applies
+deny-only private/external/meta/negation gates and boundary-checked exact-or-nested subject
+agreement, while screening both spans for sensitive identifiers. Neither model
+can call tools or authorize by a single label, and delivery succeeds only after Telegram
+returns a positive `message_id`. One malformed, low-confidence, or internally contradictory
+classifier or authorization frame gets one bounded independent retry; a second failure
+cannot run a side effect. If the first frame still says `not_image` or remains degraded but
+the generic answer itself looks like a delivery claim, the independent authorizer is called
+lazily as a deny-only semantic postcondition. It may suppress the claim but can never start
+search, vision, or Telegram delivery after the fact. The full accepted request is passed to
+both semantic gates without silent truncation, so semantic routing requires
+`MAX_INPUT_CHARS<=2500`. Use `shadow` to record sanitized decisions without changing the
+existing route. `python scripts/eval_image_intent.py` runs the synthetic UA-first two-model
+contract and prints both model, prompt, schema, and case hashes.
+
 ## Persistent Memory
 
 Aigan stores bounded chat memory in SQLite so it can use recent context after restarts:

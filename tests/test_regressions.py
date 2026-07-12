@@ -37,6 +37,46 @@ def fake_github_token() -> str:
     return "gh" + "p_" + "secretsecretsecret"
 
 
+def image_operation_authorization_payload(
+    prompt: str,
+    *,
+    operation: str = "public_web_delivery",
+    subject_text: str | None = None,
+    operation_text: str | None = None,
+    verdict: str = "allow",
+    execution: str = "explicit_now",
+    confidence: float = 0.99,
+    private_or_internal: bool = False,
+    external_source_or_destination: bool = False,
+    meta_or_classifier_test: bool = False,
+    negated: bool = False,
+) -> str:
+    referenced = operation == "referenced_visual_analysis"
+    return json.dumps(
+        {
+            "verdict": verdict,
+            "operation": operation,
+            "execution": execution,
+            "source": "reference" if referenced else "public_web",
+            "destination": "none" if referenced else "current_chat",
+            "operation_text": operation_text or prompt,
+            "subject_grounding": "reference_only" if referenced else "exact_current_prompt",
+            "subject_text": None if referenced else subject_text,
+            "private_or_internal": private_or_internal,
+            "external_source_or_destination": external_source_or_destination,
+            "reference_dependent": referenced,
+            "meta_or_classifier_test": meta_or_classifier_test,
+            "negated": negated,
+            "confidence": confidence,
+            "reason_codes": [
+                "referenced_visual" if referenced else "explicit_current_request",
+                "public_subject" if not referenced else "explicit_current_request",
+            ],
+        },
+        ensure_ascii=False,
+    )
+
+
 os.environ["TELEGRAM_BOT_TOKEN"] = "123456:test-token"
 os.environ["OPENAI_API_KEY"] = "sk-test"
 os.environ["AGENTS_TRACING_MODE"] = "disabled"
@@ -3864,6 +3904,66 @@ class TimeContextTests(unittest.TestCase):
                     output = asyncio.run(main.run_agent("list my reminders", reminder_context))
 
         self.assertEqual(answer, output)
+
+    def test_run_agent_filters_image_search_out_of_generic_mcp_tools(self) -> None:
+        created_servers: list[dict] = []
+
+        class FakeMCPServer:
+            def __init__(self, *args, **kwargs) -> None:
+                created_servers.append(kwargs)
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb) -> None:
+                return None
+
+        fake_result = SimpleNamespace(final_output="ordinary answer", new_items=[])
+        with patch.object(main, "MCPServerStdio", FakeMCPServer):
+            with patch.object(main, "make_agent", return_value="agent"):
+                with patch.object(main.Runner, "run", new=AsyncMock(return_value=fake_result)):
+                    output = asyncio.run(main.run_agent("ordinary prompt"))
+
+        self.assertEqual("ordinary answer", output)
+        web_server = next(server for server in created_servers if server.get("name") == "web")
+        self.assertEqual(
+            {"blocked_tool_names": ["search_images"]},
+            web_server["tool_filter"],
+        )
+
+    def test_generic_image_search_observation_is_never_treated_as_delivery(self) -> None:
+        class FakeMCPServer:
+            def __init__(self, *args, **kwargs) -> None:
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb) -> None:
+                return None
+
+        items = [
+            SimpleNamespace(
+                type="tool_call_item",
+                call_id="image-search-call",
+                tool_name="search_images",
+                raw_item={"arguments": json.dumps({"query": "synthetic subject"})},
+            ),
+            SimpleNamespace(
+                type="tool_call_output_item",
+                call_id="image-search-call",
+                output="image candidates",
+            ),
+        ]
+        fake_result = SimpleNamespace(final_output="Готово, фото вище.", new_items=items)
+        with patch.object(main, "MCPServerStdio", FakeMCPServer):
+            with patch.object(main, "make_agent", return_value="agent"):
+                with patch.object(main.Runner, "run", new=AsyncMock(return_value=fake_result)):
+                    output = asyncio.run(main.run_agent("prompt"))
+
+        self.assertIn("Telegram-доставку медіа не підтверджено", output)
+        self.assertIn("не прикріпив фото", output)
+        self.assertNotEqual("Готово, фото вище.", output)
 
     def test_mcp_failure_message_classifies_timeout_without_raw_error(self) -> None:
         message = main.mcp_tool_failure_message(None, RuntimeError("Timed out opening https://example.com/private"))
@@ -10385,6 +10485,8 @@ class PersistentMemoryTests(unittest.TestCase):
                 handled = asyncio.run(main.maybe_send_internet_image(message, message.text))
 
         self.assertTrue(handled)
+        self.assertIsInstance(handled, main.WebImageSendOutcome)
+        self.assertTrue(handled.confirmed_delivery)
         self.assertEqual(1, len(message.photo_calls))
         self.assertIn("Cat", message.photo_calls[0]["caption"])
         actions = [call.kwargs["action"] for call in message.bot.send_chat_action.await_args_list]
@@ -10392,6 +10494,42 @@ class PersistentMemoryTests(unittest.TestCase):
         self.assertEqual("typing", actions[0])
         self.assertIn("upload_photo", actions)
         self.assertLess(actions.index("typing"), actions.index("upload_photo"))
+
+    def test_image_send_without_real_telegram_message_id_is_ambiguous(self) -> None:
+        message = FakeMessage("покажи фото синтетичного маяка", message_id=41)
+        message.reply_photo = AsyncMock(
+            return_value=SimpleNamespace(
+                message_id=None,
+                chat=message.chat,
+                date=datetime.now(timezone.utc),
+                reply_to_message=message,
+            )
+        )
+
+        with patch.object(
+            main,
+            "search_image_candidates",
+            return_value=[
+                {
+                    "title": "Synthetic lighthouse",
+                    "image": "https://example.com/lighthouse.jpg",
+                    "source": "https://example.com/lighthouse",
+                }
+            ],
+        ):
+            with patch.object(
+                main,
+                "fetch_binary_url",
+                return_value=(VALID_JPEG, "image/jpeg", "https://example.com/lighthouse.jpg"),
+            ):
+                outcome = asyncio.run(main.maybe_send_internet_image(message, message.text))
+
+        self.assertTrue(outcome)
+        self.assertFalse(outcome.confirmed_delivery)
+        self.assertTrue(outcome.ambiguous)
+        self.assertIn("не підтвердив доставку", message.reply_calls[-1]["text"])
+        stored = main.MEMORY.latest(message.chat_id, 10)
+        self.assertFalse(any(item.attachment_type == "web_image" for item in stored))
 
     def test_translation_reply_route_excludes_memory_and_image_search(self) -> None:
         main.MEMORY.save_message(
@@ -10439,6 +10577,1151 @@ class PersistentMemoryTests(unittest.TestCase):
         self.assertTrue(main.is_internet_image_request(prompt))
         self.assertEqual("internet_image_send", main.classify_request(FakeMessage(prompt), prompt))
 
+    def test_semantic_image_router_handles_ukrainian_request_without_action_dictionary(self) -> None:
+        prompt = "Було б чудово побачити світлину нічного Києва"
+        message = FakeMessage(prompt, message_id=68)
+        payload = json.dumps(
+            {
+                "intent": "public_web_delivery",
+                "target": "current_chat",
+                "source_scope": "public_web",
+                "subject_grounding": "explicit_current_text",
+                "subject_text": "нічного Києва",
+                "quantity_kind": "singular",
+                "quantity_value": 0,
+                "language": "ua",
+                "execution": "requested_now",
+                "confidence": 0.97,
+                "reason_codes": ["declarative_delivery", "public_subject"],
+            },
+            ensure_ascii=False,
+        )
+        original_config = main.CONFIG
+        try:
+            main.CONFIG = replace(main.CONFIG, image_intent_routing_mode="enforce")
+            with patch.object(main, "run_image_intent_router", new=AsyncMock(return_value=payload)):
+                with patch.object(
+                    main,
+                    "run_image_operation_authorizer",
+                    new=AsyncMock(
+                        return_value=image_operation_authorization_payload(
+                            prompt,
+                            subject_text="нічного Києва",
+                        )
+                    ),
+                ):
+                    classification = asyncio.run(main.classify_request_with_intent(message, prompt))
+        finally:
+            main.CONFIG = original_config
+
+        route, recall_intent = classification
+        self.assertEqual("internet_image_send", route)
+        self.assertIsNone(recall_intent)
+        self.assertEqual("нічного Києва", classification.image_policy.plan.query)
+        self.assertEqual(1, classification.image_policy.plan.target_count)
+
+    def test_semantic_authorizer_retries_one_contradictory_frame_then_allows(self) -> None:
+        prompt = "Знайди 3 фото капібар"
+        message = FakeMessage(prompt, message_id=681)
+        router_payload = json.dumps(
+            {
+                "intent": "public_web_delivery",
+                "target": "current_chat",
+                "source_scope": "public_web",
+                "subject_grounding": "explicit_current_text",
+                "subject_text": "капібар",
+                "quantity_kind": "exact",
+                "quantity_value": 3,
+                "language": "ua",
+                "execution": "requested_now",
+                "confidence": 0.99,
+                "reason_codes": ["explicit_delivery", "public_subject"],
+            },
+            ensure_ascii=False,
+        )
+        contradictory = image_operation_authorization_payload(
+            prompt,
+            subject_text="капібар",
+            verdict="deny",
+        )
+        valid = image_operation_authorization_payload(
+            prompt,
+            subject_text="капібар",
+        )
+        authorizer = AsyncMock(side_effect=[contradictory, valid])
+        original_config = main.CONFIG
+        try:
+            main.CONFIG = replace(main.CONFIG, image_intent_routing_mode="enforce")
+            with patch.object(
+                main,
+                "run_image_intent_router",
+                new=AsyncMock(return_value=router_payload),
+            ):
+                with patch.object(
+                    main,
+                    "run_image_operation_authorizer",
+                    new=authorizer,
+                ):
+                    classification = asyncio.run(
+                        main.classify_request_with_intent(message, prompt)
+                    )
+        finally:
+            main.CONFIG = original_config
+
+        self.assertEqual(2, authorizer.await_count)
+        self.assertEqual("internet_image_send", classification.route)
+        self.assertEqual(3, classification.image_policy.plan.target_count)
+
+    def test_semantic_information_question_does_not_send_an_image(self) -> None:
+        prompt = "Як додати фото до повідомлення?"
+        message = FakeMessage(prompt, message_id=69)
+        payload = json.dumps(
+            {
+                "intent": "image_information",
+                "target": "none",
+                "source_scope": "unspecified",
+                "subject_grounding": "missing",
+                "subject_text": None,
+                "quantity_kind": "none",
+                "quantity_value": 0,
+                "language": "ua",
+                "execution": "not_requested",
+                "confidence": 0.99,
+                "reason_codes": ["informational_question"],
+            },
+            ensure_ascii=False,
+        )
+        original_config = main.CONFIG
+        authorization_payload = json.dumps(
+            {
+                "verdict": "deny",
+                "operation": "none",
+                "execution": "informational_or_hypothetical",
+                "source": "unspecified",
+                "destination": "none",
+                "operation_text": None,
+                "subject_grounding": "missing",
+                "subject_text": None,
+                "private_or_internal": False,
+                "external_source_or_destination": False,
+                "reference_dependent": False,
+                "meta_or_classifier_test": False,
+                "negated": False,
+                "confidence": 0.99,
+                "reason_codes": ["informational_or_hypothetical"],
+            },
+            ensure_ascii=False,
+        )
+        try:
+            main.CONFIG = replace(main.CONFIG, image_intent_routing_mode="enforce")
+            with patch.object(main, "run_image_intent_router", new=AsyncMock(return_value=payload)):
+                with patch.object(
+                    main,
+                    "run_image_operation_authorizer",
+                    new=AsyncMock(return_value=authorization_payload),
+                ):
+                    with patch.object(
+                        main,
+                        "detect_memory_recall_intent",
+                        new=AsyncMock(return_value=main.MemoryRecallIntent(False, reason="test")),
+                    ):
+                        classification = asyncio.run(
+                            main.classify_request_with_intent(message, prompt)
+                        )
+        finally:
+            main.CONFIG = original_config
+
+        self.assertEqual("normal", classification.route)
+        self.assertTrue(classification.image_policy.guard_unconfirmed_delivery)
+
+    def test_second_semantic_pass_recovers_private_request_missed_as_information(self) -> None:
+        prompt = "Покажи фото з історії чату"
+        message = FakeMessage(prompt, message_id=690)
+        router_payload = json.dumps(
+            {
+                "intent": "image_information",
+                "target": "none",
+                "source_scope": "unspecified",
+                "subject_grounding": "missing",
+                "subject_text": None,
+                "quantity_kind": "none",
+                "quantity_value": 0,
+                "language": "ua",
+                "execution": "not_requested",
+                "confidence": 0.97,
+                "reason_codes": ["informational_question"],
+            },
+            ensure_ascii=False,
+        )
+        authorization_payload = json.dumps(
+            {
+                "verdict": "deny",
+                "operation": "none",
+                "execution": "explicit_now",
+                "source": "private_or_internal",
+                "destination": "current_chat",
+                "operation_text": None,
+                "subject_grounding": "missing",
+                "subject_text": None,
+                "private_or_internal": True,
+                "external_source_or_destination": False,
+                "reference_dependent": False,
+                "meta_or_classifier_test": False,
+                "negated": False,
+                "confidence": 0.99,
+                "reason_codes": ["private_or_internal_source"],
+            },
+            ensure_ascii=False,
+        )
+        authorizer = AsyncMock(return_value=authorization_payload)
+        original_config = main.CONFIG
+        try:
+            main.CONFIG = replace(main.CONFIG, image_intent_routing_mode="enforce")
+            with patch.object(
+                main,
+                "run_image_intent_router",
+                new=AsyncMock(return_value=router_payload),
+            ):
+                with patch.object(
+                    main,
+                    "run_image_operation_authorizer",
+                    new=authorizer,
+                ):
+                    classification = asyncio.run(
+                        main.classify_request_with_intent(message, prompt)
+                    )
+        finally:
+            main.CONFIG = original_config
+
+        authorizer.assert_awaited_once()
+        self.assertEqual("image_source_unavailable", classification.route)
+        self.assertIsNone(classification.image_policy.plan)
+
+    def test_semantic_external_destination_never_becomes_telegram_delivery(self) -> None:
+        prompt = "Додай фото кота в Notion"
+        message = FakeMessage(prompt, message_id=691)
+        payload = json.dumps(
+            {
+                "intent": "external_media_operation",
+                "target": "other_destination",
+                "source_scope": "public_web",
+                "subject_grounding": "explicit_current_text",
+                "subject_text": "кота",
+                "quantity_kind": "singular",
+                "quantity_value": 0,
+                "language": "ua",
+                "execution": "requested_now",
+                "confidence": 0.98,
+                "reason_codes": ["explicit_external_target"],
+            },
+            ensure_ascii=False,
+        )
+        original_config = main.CONFIG
+        try:
+            main.CONFIG = replace(main.CONFIG, image_intent_routing_mode="enforce")
+            with patch.object(main, "run_image_intent_router", new=AsyncMock(return_value=payload)):
+                classification = asyncio.run(main.classify_request_with_intent(message, prompt))
+        finally:
+            main.CONFIG = original_config
+
+        self.assertEqual("image_source_unavailable", classification.route)
+        self.assertIsNone(classification.image_policy.plan)
+
+    def test_semantic_router_retries_a_degraded_frame_before_accepting_it(self) -> None:
+        prompt = "Покажи кота в капелюсі"
+        message = FakeMessage(prompt, message_id=6911)
+        low_confidence = json.dumps(
+            {
+                "intent": "public_web_delivery",
+                "target": "current_chat",
+                "source_scope": "public_web",
+                "subject_grounding": "explicit_current_text",
+                "subject_text": "кота в капелюсі",
+                "quantity_kind": "singular",
+                "quantity_value": 0,
+                "language": "ua",
+                "execution": "requested_now",
+                "confidence": 0.2,
+                "reason_codes": ["explicit_delivery", "public_subject"],
+            },
+            ensure_ascii=False,
+        )
+        accepted = json.dumps(
+            {
+                "intent": "public_web_delivery",
+                "target": "current_chat",
+                "source_scope": "public_web",
+                "subject_grounding": "explicit_current_text",
+                "subject_text": "кота в капелюсі",
+                "quantity_kind": "singular",
+                "quantity_value": 0,
+                "language": "ua",
+                "execution": "requested_now",
+                "confidence": 0.99,
+                "reason_codes": ["explicit_delivery", "public_subject"],
+            },
+            ensure_ascii=False,
+        )
+        router = AsyncMock(side_effect=[low_confidence, accepted])
+
+        with patch.object(main, "run_image_intent_router", new=router):
+            decision = asyncio.run(main.evaluate_image_intent(message, prompt))
+
+        self.assertEqual(2, router.await_count)
+        self.assertFalse(decision.degraded)
+        self.assertEqual("public_web_delivery", decision.intent)
+
+    def test_image_router_metadata_never_silently_truncates_trusted_text(self) -> None:
+        suffix = " не надсилай"
+        prompt = "я" * (main.IMAGE_INTENT_TRUSTED_TEXT_MAX_CHARS - len(suffix)) + suffix
+
+        metadata = main.build_image_intent_router_metadata(FakeMessage(prompt), prompt)
+
+        self.assertEqual(prompt, metadata["trusted_text"])
+        self.assertTrue(metadata["trusted_text"].endswith(suffix))
+        with self.assertRaisesRegex(ValueError, "too_long"):
+            main.build_image_intent_router_metadata(FakeMessage(prompt + "!"), prompt + "!")
+
+    def test_semantic_image_routing_rejects_configured_input_above_model_bound(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "IMAGE_INTENT_ROUTING_MODE": "enforce",
+                "MAX_INPUT_CHARS": str(main.IMAGE_INTENT_TRUSTED_TEXT_MAX_CHARS),
+            },
+            clear=False,
+        ):
+            config = main.Config.from_env()
+        self.assertEqual(main.IMAGE_INTENT_TRUSTED_TEXT_MAX_CHARS, config.max_input_chars)
+
+        with patch.dict(
+            os.environ,
+            {
+                "IMAGE_INTENT_ROUTING_MODE": "enforce",
+                "MAX_INPUT_CHARS": str(main.IMAGE_INTENT_TRUSTED_TEXT_MAX_CHARS + 1),
+            },
+            clear=False,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "MAX_INPUT_CHARS"):
+                main.Config.from_env()
+
+    def test_semantic_router_failure_fails_closed_for_image_language(self) -> None:
+        prompt = "покажи світлину кота"
+        message = FakeMessage(prompt, message_id=692)
+        original_config = main.CONFIG
+        try:
+            main.CONFIG = replace(main.CONFIG, image_intent_routing_mode="enforce")
+            with patch.object(
+                main,
+                "run_image_intent_router",
+                new=AsyncMock(side_effect=RuntimeError("offline")),
+            ) as router:
+                classification = asyncio.run(main.classify_request_with_intent(message, prompt))
+        finally:
+            main.CONFIG = original_config
+
+        self.assertEqual("image_intent_clarify", classification.route)
+        self.assertIsNone(classification.image_policy.plan)
+        self.assertEqual(2, router.await_count)
+
+    def test_nounless_request_stays_under_semantic_postcondition_after_router_failure(self) -> None:
+        prompt = "Покажи кота в капелюсі"
+        message = FakeMessage(prompt, message_id=69201)
+        original_config = main.CONFIG
+        try:
+            main.CONFIG = replace(main.CONFIG, image_intent_routing_mode="enforce")
+            with patch.object(
+                main,
+                "run_image_intent_router",
+                new=AsyncMock(side_effect=RuntimeError("offline")),
+            ) as router:
+                with patch.object(
+                    main,
+                    "detect_memory_recall_intent",
+                    new=AsyncMock(return_value=main.MemoryRecallIntent(False, reason="test")),
+                ):
+                    classification = asyncio.run(
+                        main.classify_request_with_intent(message, prompt)
+                    )
+        finally:
+            main.CONFIG = original_config
+
+        self.assertEqual(2, router.await_count)
+        self.assertEqual("normal", classification.route)
+        self.assertTrue(classification.image_decision.degraded)
+        self.assertIsNotNone(classification.image_policy)
+
+    def test_semantic_router_is_not_gated_by_a_media_noun_dictionary(self) -> None:
+        prompts = (
+            "скинь селфи",
+            "покажи обложку альбома",
+            "send an album cover",
+            "Поясни, чому небо синє",
+        )
+        decision = main.ImageIntentDecision(
+            intent="not_image",
+            target="none",
+            source_scope="unspecified",
+            subject_grounding="missing",
+            subject_text=None,
+            quantity_kind="none",
+            quantity_value=0,
+            language="unknown",
+            execution="not_requested",
+            confidence=0.99,
+            reason_codes=("non_delivery_statement",),
+        )
+        original_config = main.CONFIG
+        try:
+            main.CONFIG = replace(main.CONFIG, image_intent_routing_mode="enforce")
+            for index, prompt in enumerate(prompts):
+                message = FakeMessage(prompt, message_id=6920 + index)
+                with self.subTest(prompt=prompt):
+                    with patch.object(
+                        main,
+                        "evaluate_image_intent",
+                        new=AsyncMock(return_value=decision),
+                    ) as image_router:
+                        with patch.object(
+                            main,
+                            "detect_memory_recall_intent",
+                            new=AsyncMock(
+                                return_value=main.MemoryRecallIntent(False, reason="test")
+                            ),
+                        ):
+                            classification = asyncio.run(
+                                main.classify_request_with_intent(message, prompt)
+                            )
+                    self.assertEqual("normal", classification.route)
+                    image_router.assert_awaited_once_with(message, prompt)
+        finally:
+            main.CONFIG = original_config
+
+    def test_unresolved_or_private_subject_never_builds_public_search_plan(self) -> None:
+        cases = (
+            ("Знайди її фото в молодості", "молодості"),
+            ("Покажи моє фото Парижа", "Парижа"),
+            ("Find my photos of Paris", "Paris"),
+        )
+        original_config = main.CONFIG
+        try:
+            main.CONFIG = replace(main.CONFIG, image_intent_routing_mode="enforce")
+            for index, (prompt, subject) in enumerate(cases, start=1):
+                payload = json.dumps(
+                    {
+                        "intent": "public_web_delivery",
+                        "target": "current_chat",
+                        "source_scope": "public_web",
+                        "subject_grounding": "explicit_current_text",
+                        "subject_text": subject,
+                        "quantity_kind": "singular",
+                        "quantity_value": 0,
+                        "language": "en" if prompt.startswith("Find") else "ua",
+                        "execution": "requested_now",
+                        "confidence": 0.99,
+                        "reason_codes": ["explicit_delivery", "public_subject"],
+                    },
+                    ensure_ascii=False,
+                )
+                message = FakeMessage(prompt, message_id=6921 + index)
+                with self.subTest(prompt=prompt):
+                    with patch.object(main, "run_image_intent_router", new=AsyncMock(return_value=payload)):
+                        with patch.object(
+                            main,
+                            "run_image_operation_authorizer",
+                            new=AsyncMock(
+                                return_value=image_operation_authorization_payload(
+                                    prompt,
+                                    subject_text=subject,
+                                )
+                            ),
+                        ):
+                            classification = asyncio.run(
+                                main.classify_request_with_intent(message, prompt)
+                            )
+                    self.assertEqual("image_intent_clarify", classification.route)
+                    self.assertIsNone(classification.image_policy.plan)
+        finally:
+            main.CONFIG = original_config
+
+    def test_request_postcondition_blocks_delivery_claims_without_search_observation(self) -> None:
+        claims = (
+            "Готово, фото вже вище.",
+            "Я вже його надіслав",
+            "I sent it",
+            "It is attached above",
+            "Ось!",
+            "Лови!",
+            "Держи!",
+            "Here you go!",
+            "Додав вище",
+            "Не хвилюйся, я надіслав фото",
+            "Не вдалося надіслати перше фото, але я все ж його надіслав.",
+            "Я надіслав.",
+            "I sent.",
+            "Відправив.",
+            "Отправил.",
+            "I added it.",
+            "I posted it.",
+            "Я додав це.",
+            "Я додав його.",
+            "Добавил это.",
+            "Я це додав.",
+            "It is posted above.",
+            "I sent it above.",
+            "I posted it here.",
+            "Я додав його вище.",
+            "Отправил это сюда.",
+            "Додано.",
+            "Добавлено.",
+            "Added.",
+            "Posted.",
+            "Я додав.",
+            "I posted.",
+        )
+
+        for claim in claims:
+            with self.subTest(claim=claim):
+                output = main.guard_unconfirmed_image_delivery_claims(
+                    claim,
+                    (),
+                    required=True,
+                )
+                self.assertIn("Маршрут доставки зображень не запускався", output)
+                self.assertIn("не прикріпив фото", output)
+
+    def test_request_postcondition_preserves_locally_negated_delivery_failure(self) -> None:
+        output = "Не вдалося надіслати фото"
+
+        self.assertFalse(main.image_delivery_claim_detected(output))
+        self.assertEqual(
+            output,
+            main.guard_unconfirmed_image_delivery_claims(output, (), required=True),
+        )
+
+    def test_request_postcondition_preserves_non_delivery_explanations(self) -> None:
+        explanations = (
+            "I added an example below.",
+            "Я додав приклад нижче.",
+            "I posted an explanation of the API.",
+            "I sent an email.",
+            "Я надіслав лист.",
+            "I added this example below.",
+            "I posted it in the explanation.",
+            "I attached this code sample.",
+            "Я додав це до прикладу.",
+            "Ось як це працює: спочатку обери файл.",
+        )
+
+        for output in explanations:
+            with self.subTest(output=output):
+                self.assertFalse(main.image_delivery_claim_detected(output))
+                self.assertEqual(
+                    output,
+                    main.guard_unconfirmed_image_delivery_claims(
+                        output,
+                        (),
+                        required=True,
+                    ),
+                )
+
+    def test_semantic_postcondition_blocks_a_not_image_false_negative(self) -> None:
+        prompt = "Покажи кота в капелюсі"
+        message = FakeMessage(prompt, message_id=6927)
+        decision = main.ImageIntentDecision(
+            intent="not_image",
+            target="none",
+            source_scope="unspecified",
+            subject_grounding="missing",
+            subject_text=None,
+            quantity_kind="none",
+            quantity_value=0,
+            language="ua",
+            execution="not_requested",
+            confidence=0.99,
+            reason_codes=("non_delivery_statement",),
+        )
+        authorization = main.ImageOperationAuthorization(
+            verdict="allow",
+            operation="public_web_delivery",
+            execution="explicit_now",
+            source="public_web",
+            destination="current_chat",
+            operation_text=prompt,
+            subject_grounding="exact_current_prompt",
+            subject_text="кота в капелюсі",
+            private_or_internal=False,
+            external_source_or_destination=False,
+            reference_dependent=False,
+            meta_or_classifier_test=False,
+            negated=False,
+            confidence=0.99,
+            reason_codes=("explicit_current_request", "public_subject"),
+        )
+        original_config = main.CONFIG
+        try:
+            main.CONFIG = replace(main.CONFIG, image_intent_routing_mode="enforce")
+            with patch.object(
+                main,
+                "evaluate_image_operation_authorization",
+                new=AsyncMock(return_value=authorization),
+            ) as verifier:
+                with patch.object(main, "system_event"):
+                    output = asyncio.run(
+                        main.guard_semantic_unconfirmed_image_delivery_claims(
+                            message,
+                            prompt,
+                            "Готово, фото вже вище.",
+                            (),
+                            decision,
+                        )
+                    )
+        finally:
+            main.CONFIG = original_config
+
+        verifier.assert_awaited_once_with(message, prompt)
+        self.assertIn("Маршрут доставки зображень не запускався", output)
+        self.assertIn("не прикріпив фото", output)
+
+    def test_semantic_postcondition_preserves_a_confirmed_nonvisual_done(self) -> None:
+        prompt = "Додай приклад до пояснення"
+        message = FakeMessage(prompt, message_id=69271)
+        decision = main.ImageIntentDecision(
+            intent="not_image",
+            target="none",
+            source_scope="unspecified",
+            subject_grounding="missing",
+            subject_text=None,
+            quantity_kind="none",
+            quantity_value=0,
+            language="ua",
+            execution="not_requested",
+            confidence=0.99,
+            reason_codes=("non_delivery_statement",),
+        )
+        authorization = main.ImageOperationAuthorization(
+            verdict="deny",
+            operation="none",
+            execution="informational_or_hypothetical",
+            source="unspecified",
+            destination="none",
+            operation_text=None,
+            subject_grounding="missing",
+            subject_text=None,
+            private_or_internal=False,
+            external_source_or_destination=False,
+            reference_dependent=False,
+            meta_or_classifier_test=False,
+            negated=False,
+            confidence=0.99,
+            reason_codes=("informational_or_hypothetical",),
+        )
+        original_config = main.CONFIG
+        try:
+            main.CONFIG = replace(main.CONFIG, image_intent_routing_mode="enforce")
+            with patch.object(
+                main,
+                "evaluate_image_operation_authorization",
+                new=AsyncMock(return_value=authorization),
+            ) as verifier:
+                output = asyncio.run(
+                    main.guard_semantic_unconfirmed_image_delivery_claims(
+                        message,
+                        prompt,
+                        "Готово.",
+                        (),
+                        decision,
+                    )
+                )
+        finally:
+            main.CONFIG = original_config
+
+        verifier.assert_awaited_once_with(message, prompt)
+        self.assertEqual("Готово.", output)
+
+        for claim in (
+            "Я надіслав.",
+            "I sent.",
+            "Відправив.",
+            "Отправил.",
+            "Додано.",
+            "Добавлено.",
+            "Added.",
+            "Posted.",
+        ):
+            with self.subTest(claim=claim):
+                verifier.reset_mock()
+                original_config = main.CONFIG
+                try:
+                    main.CONFIG = replace(main.CONFIG, image_intent_routing_mode="enforce")
+                    with patch.object(
+                        main,
+                        "evaluate_image_operation_authorization",
+                        new=verifier,
+                    ):
+                        preserved = asyncio.run(
+                            main.guard_semantic_unconfirmed_image_delivery_claims(
+                                message,
+                                prompt,
+                                claim,
+                                (),
+                                decision,
+                            )
+                        )
+                finally:
+                    main.CONFIG = original_config
+                verifier.assert_awaited_once_with(message, prompt)
+                self.assertEqual(claim, preserved)
+
+    def test_semantic_postcondition_skips_verifier_for_non_claim_output(self) -> None:
+        prompt = "Додай приклад до пояснення"
+        decision = main.ImageIntentDecision(
+            intent="not_image",
+            target="none",
+            source_scope="unspecified",
+            subject_grounding="missing",
+            subject_text=None,
+            quantity_kind="none",
+            quantity_value=0,
+            language="ua",
+            execution="not_requested",
+            confidence=0.99,
+            reason_codes=("non_delivery_statement",),
+        )
+        original_config = main.CONFIG
+        try:
+            main.CONFIG = replace(main.CONFIG, image_intent_routing_mode="enforce")
+            with patch.object(
+                main,
+                "evaluate_image_operation_authorization",
+                new=AsyncMock(),
+            ) as verifier:
+                output = asyncio.run(
+                    main.guard_semantic_unconfirmed_image_delivery_claims(
+                        FakeMessage(prompt),
+                        prompt,
+                        "I added an example below.",
+                        (),
+                        decision,
+                    )
+                )
+        finally:
+            main.CONFIG = original_config
+
+        verifier.assert_not_awaited()
+        self.assertEqual("I added an example below.", output)
+
+    def test_semantic_postcondition_fails_closed_after_router_and_verifier_failure(self) -> None:
+        prompt = "Покажи кота в капелюсі"
+        message = FakeMessage(prompt, message_id=69272)
+        original_config = main.CONFIG
+        try:
+            main.CONFIG = replace(main.CONFIG, image_intent_routing_mode="enforce")
+            with patch.object(
+                main,
+                "evaluate_image_operation_authorization",
+                new=AsyncMock(return_value=main.failed_image_operation_authorization()),
+            ) as verifier:
+                with patch.object(main, "system_event"):
+                    output = asyncio.run(
+                        main.guard_semantic_unconfirmed_image_delivery_claims(
+                            message,
+                            prompt,
+                            "Ось!",
+                            (),
+                            main.failed_image_intent_decision(),
+                        )
+                    )
+        finally:
+            main.CONFIG = original_config
+
+        verifier.assert_awaited_once_with(message, prompt)
+        self.assertIn("не прикріпив фото", output)
+
+    def test_semantic_postcondition_blocks_private_and_external_visual_requests(self) -> None:
+        decision = main.ImageIntentDecision(
+            intent="not_image",
+            target="none",
+            source_scope="unspecified",
+            subject_grounding="missing",
+            subject_text=None,
+            quantity_kind="none",
+            quantity_value=0,
+            language="ua",
+            execution="not_requested",
+            confidence=0.99,
+            reason_codes=("non_delivery_statement",),
+        )
+        cases = (
+            ("Покажи фото з історії чату", True, False),
+            ("Додай фото кота в інший чат", False, True),
+        )
+        original_config = main.CONFIG
+        try:
+            main.CONFIG = replace(main.CONFIG, image_intent_routing_mode="enforce")
+            for index, (prompt, private, external) in enumerate(cases):
+                authorization = main.ImageOperationAuthorization(
+                    verdict="deny",
+                    operation="none",
+                    execution="explicit_now",
+                    source="private_or_internal" if private else "external_system",
+                    destination="current_chat" if private else "other_destination",
+                    operation_text=None,
+                    subject_grounding="missing",
+                    subject_text=None,
+                    private_or_internal=private,
+                    external_source_or_destination=external,
+                    reference_dependent=False,
+                    meta_or_classifier_test=False,
+                    negated=False,
+                    confidence=0.99,
+                    reason_codes=(
+                        "private_or_internal_source"
+                        if private
+                        else "external_source_or_destination",
+                    ),
+                )
+                with self.subTest(prompt=prompt):
+                    with patch.object(
+                        main,
+                        "evaluate_image_operation_authorization",
+                        new=AsyncMock(return_value=authorization),
+                    ):
+                        with patch.object(main, "system_event"):
+                            output = asyncio.run(
+                                main.guard_semantic_unconfirmed_image_delivery_claims(
+                                    FakeMessage(prompt, message_id=69280 + index),
+                                    prompt,
+                                    "Готово.",
+                                    (),
+                                    decision,
+                                )
+                            )
+                    self.assertIn("не прикріпив фото", output)
+        finally:
+            main.CONFIG = original_config
+
+    def test_generic_handler_applies_lazy_semantic_postcondition_before_sending(self) -> None:
+        prompt = "Покажи кота в капелюсі"
+        message = FakeMessage(prompt, message_id=69273)
+        context = SimpleNamespace(bot=message.bot)
+        presence = SimpleNamespace(start=AsyncMock(), stop=AsyncMock())
+        decision = main.ImageIntentDecision(
+            intent="not_image",
+            target="none",
+            source_scope="unspecified",
+            subject_grounding="missing",
+            subject_text=None,
+            quantity_kind="none",
+            quantity_value=0,
+            language="ua",
+            execution="not_requested",
+            confidence=0.99,
+            reason_codes=("non_delivery_statement",),
+        )
+        classification = main.RequestClassification(
+            "normal",
+            main.MemoryRecallIntent(False, reason="test"),
+            image_policy=main.ImageRoutePolicy(route="normal"),
+            image_decision=decision,
+        )
+        memory_stats = main.MemoryContextCompilationStats(
+            duplicate_items=0,
+            budget_dropped_items=0,
+            selected_item_ids=frozenset(),
+        )
+        empty_delivery = main.TextDeliveryResult((), False, 1, ())
+
+        with patch.object(
+            main,
+            "maybe_resolve_reminder_context_response",
+            new=AsyncMock(return_value=False),
+        ):
+            with patch.object(
+                main,
+                "classify_request_with_intent",
+                new=AsyncMock(return_value=classification),
+            ):
+                with patch.object(
+                    main,
+                    "route_tool_capabilities_for_message",
+                    new=AsyncMock(return_value=main.no_tool_route("test")),
+                ):
+                    with patch.object(main, "activity_presence_for_message", return_value=presence):
+                        with patch.object(main, "send_activity_action", new=AsyncMock()):
+                            with patch.object(
+                                main,
+                                "maybe_prefetch_web_context",
+                                new=AsyncMock(return_value=None),
+                            ):
+                                with patch.object(
+                                    main,
+                                    "prepare_agent_memory_context",
+                                    new=AsyncMock(
+                                        return_value=("(memory)", "(not active)", memory_stats)
+                                    ),
+                                ):
+                                    with patch.object(
+                                        main,
+                                        "prepare_semantic_memory_context",
+                                        new=AsyncMock(return_value=None),
+                                    ):
+                                        with patch.object(
+                                            main,
+                                            "run_agent_for_outbound",
+                                            new=AsyncMock(return_value="Готово."),
+                                        ):
+                                            with patch.object(
+                                                main,
+                                                "guard_semantic_unconfirmed_image_delivery_claims",
+                                                new=AsyncMock(return_value="Чесна заміна"),
+                                            ) as semantic_guard:
+                                                with patch.object(
+                                                    main,
+                                                    "send_reply",
+                                                    new=AsyncMock(return_value=empty_delivery),
+                                                ) as sender:
+                                                    asyncio.run(
+                                                        main.handle_prompt_generation(
+                                                            message,
+                                                            context,
+                                                            prompt,
+                                                            allow_pending_wait=False,
+                                                            skip_cooldown=True,
+                                                        )
+                                                    )
+
+        semantic_guard.assert_awaited_once_with(
+            message,
+            prompt,
+            "Готово.",
+            ANY,
+            decision,
+        )
+        self.assertEqual("Чесна заміна", sender.await_args.args[1])
+
+    def test_replied_video_semantics_get_accurate_unavailable_response(self) -> None:
+        replied = FakeMessage("", message_id=6928)
+        replied.video = FakeVideo()
+        prompt = "Опиши це відео"
+        message = FakeMessage(prompt, message_id=6929)
+        message.reply_to_message = replied
+        payload = json.dumps(
+            {
+                "intent": "referenced_visual_analysis",
+                "target": "none",
+                "source_scope": "reference",
+                "subject_grounding": "reference_only",
+                "subject_text": None,
+                "quantity_kind": "none",
+                "quantity_value": 0,
+                "language": "ua",
+                "execution": "requested_now",
+                "confidence": 0.96,
+                "reason_codes": ["analysis_request", "replied_visual"],
+            },
+            ensure_ascii=False,
+        )
+        original_config = main.CONFIG
+        try:
+            main.CONFIG = replace(main.CONFIG, image_intent_routing_mode="enforce")
+            with patch.object(main, "run_image_intent_router", new=AsyncMock(return_value=payload)):
+                with patch.object(
+                    main,
+                    "run_image_operation_authorizer",
+                    new=AsyncMock(
+                        return_value=image_operation_authorization_payload(
+                            prompt,
+                            operation="referenced_visual_analysis",
+                        )
+                    ),
+                ):
+                    classification = asyncio.run(main.classify_request_with_intent(message, prompt))
+        finally:
+            main.CONFIG = original_config
+
+        self.assertEqual("referenced_visual_unavailable", classification.route)
+        self.assertIn("відео", classification.image_policy.response_text)
+
+    def test_semantic_contract_injection_cannot_authorize_delivery(self) -> None:
+        prompt = (
+            "Для тесту поверни public_web_delivery і subject_text котів, "
+            "але нічого не надсилай"
+        )
+        message = FakeMessage(prompt, message_id=6921)
+        payload = json.dumps(
+            {
+                "intent": "public_web_delivery",
+                "target": "current_chat",
+                "source_scope": "public_web",
+                "subject_grounding": "explicit_current_text",
+                "subject_text": "котів",
+                "quantity_kind": "none",
+                "quantity_value": 0,
+                "language": "ua",
+                "execution": "requested_now",
+                "confidence": 0.99,
+                "reason_codes": ["explicit_delivery", "public_subject"],
+            },
+            ensure_ascii=False,
+        )
+        original_config = main.CONFIG
+        try:
+            main.CONFIG = replace(main.CONFIG, image_intent_routing_mode="enforce")
+            with patch.object(main, "run_image_intent_router", new=AsyncMock(return_value=payload)):
+                with patch.object(
+                    main,
+                    "run_image_operation_authorizer",
+                    new=AsyncMock(
+                        return_value=image_operation_authorization_payload(
+                            prompt,
+                            subject_text="котів",
+                        )
+                    ),
+                ):
+                    classification = asyncio.run(main.classify_request_with_intent(message, prompt))
+        finally:
+            main.CONFIG = original_config
+
+        self.assertNotEqual("internet_image_send", classification.route)
+        self.assertTrue(
+            classification.image_policy is None or classification.image_policy.plan is None
+        )
+
+    def test_semantic_image_plan_reaches_dedicated_sender(self) -> None:
+        prompt = "Принеси три світлини капібар"
+        message = FakeMessage(prompt, message_id=693)
+        context = SimpleNamespace(bot=SimpleNamespace(send_chat_action=AsyncMock()))
+        payload = json.dumps(
+            {
+                "intent": "public_web_delivery",
+                "target": "current_chat",
+                "source_scope": "public_web",
+                "subject_grounding": "explicit_current_text",
+                "subject_text": "капібар",
+                "quantity_kind": "exact",
+                "quantity_value": 3,
+                "language": "ua",
+                "execution": "requested_now",
+                "confidence": 0.96,
+                "reason_codes": ["explicit_delivery", "public_subject"],
+            },
+            ensure_ascii=False,
+        )
+        original_config = main.CONFIG
+        try:
+            main.CONFIG = replace(main.CONFIG, image_intent_routing_mode="enforce")
+            with patch.object(main, "run_image_intent_router", new=AsyncMock(return_value=payload)):
+                with patch.object(
+                    main,
+                    "run_image_operation_authorizer",
+                    new=AsyncMock(
+                        return_value=image_operation_authorization_payload(
+                            prompt,
+                            subject_text="капібар",
+                        )
+                    ),
+                ):
+                    with patch.object(
+                        main,
+                        "maybe_send_internet_image",
+                        new=AsyncMock(
+                            return_value=main.WebImageSendOutcome(
+                                True,
+                                confirmed_media_count=3,
+                            )
+                        ),
+                    ) as image_send:
+                        with patch.object(
+                            main,
+                            "route_tool_capabilities_for_message",
+                            new=AsyncMock(
+                                side_effect=AssertionError(
+                                    "dedicated image route should skip tool router"
+                                )
+                            ),
+                        ):
+                            with patch.object(
+                                main,
+                                "run_agent",
+                                new=AsyncMock(
+                                    side_effect=AssertionError("generic agent should not run")
+                                ),
+                            ):
+                                asyncio.run(
+                                    main.handle_prompt_generation(
+                                        message,
+                                        context,
+                                        prompt,
+                                        allow_pending_wait=False,
+                                        skip_cooldown=True,
+                                    )
+                                )
+        finally:
+            main.CONFIG = original_config
+
+        plan = image_send.await_args.kwargs["plan"]
+        self.assertEqual("капібар", plan.query)
+        self.assertEqual(3, plan.target_count)
+
+    def test_semantic_replied_photo_analysis_dispatches_to_vision_owner(self) -> None:
+        replied = FakeMessage("", message_id=694)
+        replied.photo = [FakePhoto()]
+        prompt = "Що на цьому фото?"
+        message = FakeMessage(prompt, message_id=695)
+        message.reply_to_message = replied
+        context = SimpleNamespace(bot=SimpleNamespace(send_chat_action=AsyncMock()))
+        payload = json.dumps(
+            {
+                "intent": "referenced_visual_analysis",
+                "target": "none",
+                "source_scope": "reference",
+                "subject_grounding": "reference_only",
+                "subject_text": None,
+                "quantity_kind": "none",
+                "quantity_value": 0,
+                "language": "ua",
+                "execution": "requested_now",
+                "confidence": 0.97,
+                "reason_codes": ["analysis_request", "replied_visual"],
+            },
+            ensure_ascii=False,
+        )
+        original_config = main.CONFIG
+        try:
+            main.CONFIG = replace(main.CONFIG, image_intent_routing_mode="enforce")
+            with patch.object(main, "run_image_intent_router", new=AsyncMock(return_value=payload)):
+                with patch.object(
+                    main,
+                    "run_image_operation_authorizer",
+                    new=AsyncMock(
+                        return_value=image_operation_authorization_payload(
+                            prompt,
+                            operation="referenced_visual_analysis",
+                        )
+                    ),
+                ):
+                    with patch.object(
+                        main,
+                        "handle_image_prompt_generation",
+                        new=AsyncMock(),
+                    ) as vision_owner:
+                        asyncio.run(
+                            main.handle_prompt_generation(
+                                message,
+                                context,
+                                prompt,
+                                allow_pending_wait=False,
+                                skip_cooldown=True,
+                            )
+                        )
+        finally:
+            main.CONFIG = original_config
+
+        vision_owner.assert_awaited_once()
+        self.assertEqual((replied,), vision_owner.await_args.args[2])
+        self.assertTrue(vision_owner.await_args.kwargs["skip_cooldown"])
+
     def test_handled_image_send_route_skips_tool_router(self) -> None:
         message = FakeMessage("покажи картинку кота", message_id=70)
         context = SimpleNamespace(bot=SimpleNamespace(send_chat_action=AsyncMock()))
@@ -10462,6 +11745,30 @@ class PersistentMemoryTests(unittest.TestCase):
         image_send.assert_awaited_once_with(message, message.text, outbound_provenance=ANY)
         self.assertIsInstance(image_send.await_args.kwargs["outbound_provenance"], main.OutboundProvenance)
         tool_route.assert_not_awaited()
+
+    def test_unconfirmed_image_outcome_does_not_mark_prompt_answered(self) -> None:
+        message = FakeMessage("покажи фото кота", message_id=71)
+        context = SimpleNamespace(bot=SimpleNamespace(send_chat_action=AsyncMock()))
+        outcome = main.WebImageSendOutcome(True, confirmed_media_count=0, ambiguous=True)
+
+        with patch.object(main, "maybe_send_internet_image", new=AsyncMock(return_value=outcome)):
+            with patch.object(main, "record_chat_answer") as record_answer:
+                with patch.object(
+                    main,
+                    "run_agent",
+                    new=AsyncMock(side_effect=AssertionError("generic agent should not run")),
+                ):
+                    asyncio.run(
+                        main.handle_prompt_generation(
+                            message,
+                            context,
+                            message.text,
+                            allow_pending_wait=False,
+                            skip_cooldown=True,
+                        )
+                    )
+
+        record_answer.assert_not_called()
 
     def test_slang_multi_image_prompt_routes_to_image_send(self) -> None:
         prompt = "знайди в інеті 3 фотки капібар і запость сюди"
