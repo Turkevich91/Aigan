@@ -115,6 +115,7 @@ from model_telemetry import (
     normalize_tracing_mode,
 )
 from operator_alerts import (
+    OPERATOR_ALERT_POLICY_VERSION,
     OperatorAlert,
     OperatorAlertService,
     OperatorAlertSettings,
@@ -3647,7 +3648,7 @@ def operator_alert_event(
         message=alert.code,
         details={
             "fingerprint": alert.fingerprint,
-            "policy_version": "operator_alert_v1",
+            "policy_version": OPERATOR_ALERT_POLICY_VERSION,
             **facts,
         },
     )

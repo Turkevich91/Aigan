@@ -13029,6 +13029,29 @@ class SystemHealthTests(unittest.TestCase):
         main.chat_generation_locks.clear()
         main.recent_chat_answers.clear()
 
+    def test_operator_alert_event_uses_shared_policy_version(self) -> None:
+        alert = main.OperatorAlert(
+            code="image_delivery_partial",
+            level="warning",
+            title_uk="",
+            issue_numbers=(),
+            facts=(),
+            fingerprint="synthetic-alert-fingerprint",
+        )
+
+        with patch.object(main, "OPERATOR_ALERT_POLICY_VERSION", "operator_alert_test_v2"):
+            with patch.object(main, "system_event") as emit:
+                main.operator_alert_event(
+                    "operator_alert_claimed",
+                    alert,
+                    {"confirmed_parts": 1},
+                )
+
+        self.assertEqual(
+            "operator_alert_test_v2",
+            emit.call_args.kwargs["details"]["policy_version"],
+        )
+
     def test_redaction_hides_api_and_telegram_secrets(self) -> None:
         text = f"OPENAI_API_KEY={fake_openai_secret()} TELEGRAM_BOT_TOKEN={fake_telegram_secret()}"
 
