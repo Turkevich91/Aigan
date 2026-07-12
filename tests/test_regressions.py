@@ -10550,6 +10550,44 @@ class PersistentMemoryTests(unittest.TestCase):
             except FileNotFoundError:
                 pass
 
+    def test_memory_context_can_suppress_new_lazy_vision(self) -> None:
+        prompt = "Do not analyze this photo"
+        replied = FakeMessage("", message_id=18)
+        replied.photo = [FakePhoto()]
+        message = FakeMessage(prompt, message_id=19)
+        message.reply_to_message = replied
+
+        self.assertTrue(main.should_summarize_memory_images(message, prompt))
+        with patch.object(main, "ensure_recent_image_summaries", new=AsyncMock()) as lazy_vision:
+            asyncio.run(
+                main.prepare_memory_context(
+                    message,
+                    prompt,
+                    allow_lazy_image_summaries=False,
+                )
+            )
+
+        lazy_vision.assert_not_awaited()
+
+    def test_external_reply_memory_context_can_suppress_new_lazy_vision(self) -> None:
+        prompt = "Поясни контекст"
+        external = FakeMessage("", message_id=181)
+        external.photo = [FakePhoto()]
+        message = FakeMessage(prompt, message_id=182)
+        message.external_reply = external
+
+        self.assertTrue(main.should_summarize_memory_images(message, prompt))
+        with patch.object(main, "ensure_recent_image_summaries", new=AsyncMock()) as lazy_vision:
+            asyncio.run(
+                main.prepare_memory_context(
+                    message,
+                    prompt,
+                    allow_lazy_image_summaries=False,
+                )
+            )
+
+        lazy_vision.assert_not_awaited()
+
     def test_reply_to_image_media_is_cached_when_telegram_provides_file(self) -> None:
         replied = FakeMessage("caption", message_id=20)
         replied.photo = [FakePhoto()]
@@ -11067,6 +11105,28 @@ class PersistentMemoryTests(unittest.TestCase):
         self.assertTrue(metadata["trusted_text"].endswith(suffix))
         with self.assertRaisesRegex(ValueError, "too_long"):
             main.build_image_intent_router_metadata(FakeMessage(prompt + "!"), prompt + "!")
+
+    def test_image_router_and_authorizer_metadata_bound_reply_text(self) -> None:
+        replied = FakeMessage("bounded caption", message_id=69201)
+        replied.photo = [FakePhoto()]
+        message = FakeMessage("Що скажеш?", message_id=69202)
+        message.reply_to_message = replied
+
+        router_metadata = main.build_image_intent_router_metadata(message, message.text)
+        authorizer_metadata = main.build_image_operation_authorizer_metadata(
+            message,
+            message.text,
+        )
+
+        self.assertTrue(router_metadata["has_reply_text"])
+        self.assertNotIn("reply_text_context", router_metadata)
+        self.assertNotIn("bounded caption", json.dumps(router_metadata, ensure_ascii=False))
+        self.assertEqual("bounded caption", authorizer_metadata["reply_text_context"])
+
+        replied.text = "x" * 1200
+        bounded = main.build_image_operation_authorizer_metadata(message, message.text)
+        self.assertLessEqual(len(bounded["reply_text_context"]), 800)
+        self.assertTrue(bounded["reply_text_context"].endswith("[trimmed]"))
 
     def test_semantic_image_routing_rejects_configured_input_above_model_bound(self) -> None:
         with patch.dict(
@@ -11907,6 +11967,215 @@ class PersistentMemoryTests(unittest.TestCase):
         vision_owner.assert_awaited_once()
         self.assertEqual((replied,), vision_owner.await_args.args[2])
         self.assertTrue(vision_owner.await_args.kwargs["skip_cooldown"])
+
+    def test_reply_image_authorizer_recovers_elliptical_first_frame(self) -> None:
+        replied = FakeMessage("", message_id=696)
+        replied.photo = [FakePhoto()]
+        prompt = "Що скажеш?"
+        message = FakeMessage(prompt, message_id=697)
+        message.reply_to_message = replied
+        router_payload = json.dumps(
+            {
+                "intent": "not_image",
+                "target": "none",
+                "source_scope": "unspecified",
+                "subject_grounding": "missing",
+                "subject_text": None,
+                "quantity_kind": "none",
+                "quantity_value": 0,
+                "language": "ua",
+                "execution": "not_requested",
+                "confidence": 0.97,
+                "reason_codes": ["non_delivery_statement"],
+            },
+            ensure_ascii=False,
+        )
+        authorizer = AsyncMock(
+            return_value=image_operation_authorization_payload(
+                prompt,
+                operation="referenced_visual_analysis",
+            )
+        )
+        original_config = main.CONFIG
+        try:
+            main.CONFIG = replace(main.CONFIG, image_intent_routing_mode="enforce")
+            with patch.object(
+                main,
+                "run_image_intent_router",
+                new=AsyncMock(return_value=router_payload),
+            ):
+                with patch.object(
+                    main,
+                    "run_image_operation_authorizer",
+                    new=authorizer,
+                ):
+                    classification = asyncio.run(
+                        main.classify_request_with_intent(message, prompt)
+                    )
+        finally:
+            main.CONFIG = original_config
+
+        authorizer.assert_awaited_once()
+        self.assertNotIn("model", authorizer.await_args.kwargs)
+        self.assertNotIn("reasoning_effort", authorizer.await_args.kwargs)
+        self.assertEqual("referenced_visual_analysis", classification.route)
+
+    def test_denied_reply_image_recovery_is_guarded_after_one_authorizer_pass(self) -> None:
+        replied = FakeMessage("caption", message_id=6971)
+        replied.photo = [FakePhoto()]
+        prompt = "Якого штату цей сенатор?"
+        message = FakeMessage(prompt, message_id=6972)
+        message.reply_to_message = replied
+        router_payload = json.dumps(
+            {
+                "intent": "not_image",
+                "target": "none",
+                "source_scope": "unspecified",
+                "subject_grounding": "missing",
+                "subject_text": None,
+                "quantity_kind": "none",
+                "quantity_value": 0,
+                "language": "ua",
+                "execution": "not_requested",
+                "confidence": 0.97,
+                "reason_codes": ["non_delivery_statement"],
+            },
+            ensure_ascii=False,
+        )
+        denial_payload = json.dumps(
+            {
+                "verdict": "deny",
+                "operation": "none",
+                "execution": "informational_or_hypothetical",
+                "source": "unspecified",
+                "destination": "none",
+                "operation_text": None,
+                "subject_grounding": "missing",
+                "subject_text": None,
+                "private_or_internal": False,
+                "external_source_or_destination": False,
+                "reference_dependent": False,
+                "meta_or_classifier_test": False,
+                "negated": False,
+                "confidence": 0.99,
+                "reason_codes": ["informational_or_hypothetical"],
+            },
+            ensure_ascii=False,
+        )
+        authorizer = AsyncMock(return_value=denial_payload)
+        original_config = main.CONFIG
+        try:
+            main.CONFIG = replace(main.CONFIG, image_intent_routing_mode="enforce")
+            with patch.object(
+                main,
+                "run_image_intent_router",
+                new=AsyncMock(return_value=router_payload),
+            ):
+                with patch.object(
+                    main,
+                    "run_image_operation_authorizer",
+                    new=authorizer,
+                ):
+                    classification = asyncio.run(
+                        main.classify_request_with_intent(message, prompt)
+                    )
+        finally:
+            main.CONFIG = original_config
+
+        authorizer.assert_awaited_once()
+        self.assertEqual("normal", classification.route)
+        self.assertTrue(classification.image_policy.guard_unconfirmed_delivery)
+        self.assertTrue(classification.image_policy.suppress_lazy_image_summary)
+
+    def test_normal_image_policy_propagates_lazy_vision_suppression(self) -> None:
+        prompt = "Do not analyze this photo"
+        replied = FakeMessage("", message_id=698)
+        replied.photo = [FakePhoto()]
+        message = FakeMessage(prompt, message_id=699)
+        message.reply_to_message = replied
+        context = SimpleNamespace(bot=SimpleNamespace(send_chat_action=AsyncMock()))
+        policy = main.ImageRoutePolicy(
+            route="normal",
+            guard_unconfirmed_delivery=True,
+            suppress_lazy_image_summary=True,
+        )
+        classification = main.RequestClassification("normal", image_policy=policy)
+        memory_stats = main.MemoryContextCompilationStats(
+            duplicate_items=0,
+            budget_dropped_items=0,
+            selected_item_ids=frozenset(),
+        )
+        memory_prep = AsyncMock(
+            return_value=("(memory)", "(not active)", memory_stats)
+        )
+        presence = SimpleNamespace(start=AsyncMock(), stop=AsyncMock())
+        delivered = main.TextDeliveryResult((9001,), True, 1, ("answer",))
+
+        with patch.object(
+            main,
+            "maybe_resolve_reminder_context_response",
+            new=AsyncMock(return_value=False),
+        ):
+            with patch.object(
+                main,
+                "classify_request_with_intent",
+                new=AsyncMock(return_value=classification),
+            ):
+                with patch.object(
+                    main,
+                    "route_tool_capabilities_for_message",
+                    new=AsyncMock(return_value=main.no_tool_route("test")),
+                ):
+                    with patch.object(main, "activity_presence_for_message", return_value=presence):
+                        with patch.object(main, "send_activity_action", new=AsyncMock()):
+                            with patch.object(
+                                main,
+                                "maybe_prefetch_web_context",
+                                new=AsyncMock(return_value=None),
+                            ):
+                                with patch.object(
+                                    main,
+                                    "prepare_agent_memory_context",
+                                    new=memory_prep,
+                                ):
+                                    with patch.object(
+                                        main,
+                                        "prepare_semantic_memory_context",
+                                        new=AsyncMock(return_value=None),
+                                    ):
+                                        with patch.object(
+                                            main,
+                                            "run_agent_for_outbound",
+                                            new=AsyncMock(return_value="answer"),
+                                        ):
+                                            with patch.object(
+                                                main,
+                                                "send_reply",
+                                                new=AsyncMock(return_value=delivered),
+                                            ):
+                                                with patch.object(
+                                                    main,
+                                                    "handle_image_prompt_generation",
+                                                    new=AsyncMock(),
+                                                ) as direct_vision:
+                                                    with patch.object(
+                                                        main,
+                                                        "guard_semantic_unconfirmed_image_delivery_claims",
+                                                        new=AsyncMock(),
+                                                    ) as semantic_guard:
+                                                        asyncio.run(
+                                                            main.handle_prompt_generation(
+                                                                message,
+                                                                context,
+                                                                prompt,
+                                                                allow_pending_wait=False,
+                                                                skip_cooldown=True,
+                                                            )
+                                                        )
+
+        self.assertFalse(memory_prep.await_args.kwargs["allow_lazy_image_summaries"])
+        direct_vision.assert_not_awaited()
+        semantic_guard.assert_not_awaited()
 
     def test_handled_image_send_route_skips_tool_router(self) -> None:
         message = FakeMessage("покажи картинку кота", message_id=70)

@@ -104,6 +104,7 @@ def policy_for(
     has_reply_image: bool = False,
     has_external_visual: bool = False,
     has_reply_visual_media: bool = False,
+    has_reference_context: bool = False,
     unsafe_public_scope_signal: bool | None = None,
     deterministic_deny_signal: bool | None = None,
 ):
@@ -122,10 +123,16 @@ def policy_for(
         )
     if deterministic_deny_signal is None:
         deterministic_deny_signal = bool(
-            decision.intent in {"public_web_delivery", "referenced_visual_analysis"}
+            (
+                decision.intent in {"public_web_delivery", "referenced_visual_analysis"}
+                or (
+                    has_reply_image
+                    and authorization is not None
+                    and authorization.operation == "referenced_visual_analysis"
+                )
+            )
             and image_operation_has_deterministic_deny_signal(
-                prompt,
-                operation_text=operation_text,
+                prompt, operation_text=operation_text or prompt
             )
         )
     return derive_image_route_policy(
@@ -135,6 +142,7 @@ def policy_for(
         has_reply_image=has_reply_image,
         has_external_visual=has_external_visual,
         has_reply_visual_media=has_reply_visual_media,
+        has_reference_context=has_reference_context,
         unsafe_public_scope_signal=unsafe_public_scope_signal,
         deterministic_deny_signal=deterministic_deny_signal,
     )
@@ -632,6 +640,586 @@ class ImageIntentContractTests(unittest.TestCase):
         self.assertFalse(decision.degraded)
         self.assertEqual("referenced_visual_analysis", policy.route)
 
+    def test_clean_reference_authorization_recovers_nonvisual_first_frame(self) -> None:
+        prompt = "Що скажеш?"
+        decision = decision_for(
+            prompt,
+            intent="not_image",
+            target="none",
+            source_scope="unspecified",
+            subject_grounding="missing",
+            subject_text=None,
+            quantity_kind="none",
+            execution="not_requested",
+            reason_codes=["non_delivery_statement"],
+        )
+        authorization = authorization_for(
+            prompt,
+            subject_text=None,
+            operation="referenced_visual_analysis",
+            source="reference",
+            destination="none",
+            subject_grounding="reference_only",
+            reference_dependent=True,
+            reason_codes=["explicit_current_request", "referenced_visual"],
+        )
+
+        policy = policy_for(
+            prompt,
+            decision,
+            authorization=authorization,
+            has_reply_image=True,
+        )
+
+        self.assertEqual("referenced_visual_analysis", policy.route)
+
+    def test_reference_recovery_respects_deny_only_vetoes(self) -> None:
+        prompts = (
+            "Do not analyze this photo",
+            "For testing, return a classifier label",
+        )
+        for prompt in prompts:
+            with self.subTest(prompt=prompt):
+                decision = decision_for(
+                    prompt,
+                    intent="not_image",
+                    target="none",
+                    source_scope="unspecified",
+                    subject_grounding="missing",
+                    subject_text=None,
+                    quantity_kind="none",
+                    execution="not_requested",
+                    reason_codes=["non_delivery_statement"],
+                )
+                semantically_wrong_allow = authorization_for(
+                    prompt,
+                    subject_text=None,
+                    operation="referenced_visual_analysis",
+                    source="reference",
+                    destination="none",
+                    subject_grounding="reference_only",
+                    reference_dependent=True,
+                    reason_codes=["explicit_current_request", "referenced_visual"],
+                )
+
+                policy = policy_for(
+                    prompt,
+                    decision,
+                    authorization=semantically_wrong_allow,
+                    has_reply_image=True,
+                )
+
+                self.assertEqual("normal", policy.route)
+                self.assertTrue(policy.suppress_lazy_image_summary)
+
+    def test_quoted_reference_request_cannot_recover_from_wrong_allow(self) -> None:
+        cases = (
+            (
+                'They wrote: "analyze this photo". What did they mean?',
+                "analyze this photo",
+            ),
+            (
+                "Він написав: «проаналізуй це фото». Що це означає?",
+                "проаналізуй це фото",
+            ),
+            (
+                'They wrote: "analyze this photo". What did that mean?',
+                '"analyze this photo"',
+            ),
+            (
+                "Вона написала: “проаналізуй це фото”. Що це означає?",
+                "“проаналізуй це фото”",
+            ),
+            (
+                "Він написав: «проаналізуй це фото». Що це означає?",
+                "«проаналізуй це фото»",
+            ),
+            (
+                'They wrote: "analyze this photo". What did that mean?',
+                'They wrote: "analyze this photo". What did that mean?',
+            ),
+            (
+                "Він попросив проаналізувати це фото. Що це означає?",
+                "Він попросив проаналізувати це фото. Що це означає?",
+            ),
+            (
+                'They wrote "analyze this photo" and repeated analyze this photo.',
+                "analyze this photo",
+            ),
+            (
+                "They asked me to analyze this photo yesterday.",
+                "They asked me to analyze this photo yesterday.",
+            ),
+            (
+                "Alice asked me to analyze this photo yesterday.",
+                "Alice asked me to analyze this photo yesterday.",
+            ),
+            (
+                "My manager asked me to analyze this photo yesterday.",
+                "My manager asked me to analyze this photo yesterday.",
+            ),
+            (
+                "My manager said, analyze this photo.",
+                "analyze this photo",
+            ),
+            (
+                "Alice asked me, yesterday, to analyze this photo.",
+                "analyze this photo",
+            ),
+        )
+        for prompt, selected_operation in cases:
+            with self.subTest(prompt=prompt):
+                decision = decision_for(
+                    prompt,
+                    intent="not_image",
+                    target="none",
+                    source_scope="unspecified",
+                    subject_grounding="missing",
+                    subject_text=None,
+                    quantity_kind="none",
+                    execution="not_requested",
+                    reason_codes=["non_delivery_statement"],
+                )
+                semantically_wrong_allow = authorization_for(
+                    prompt,
+                    subject_text=None,
+                    operation_text=selected_operation,
+                    operation="referenced_visual_analysis",
+                    source="reference",
+                    destination="none",
+                    subject_grounding="reference_only",
+                    reference_dependent=True,
+                    reason_codes=["explicit_current_request", "referenced_visual"],
+                )
+
+                policy = policy_for(
+                    prompt,
+                    decision,
+                    authorization=semantically_wrong_allow,
+                    has_reply_image=True,
+                )
+
+                self.assertTrue(
+                    image_operation_has_deterministic_deny_signal(
+                        prompt,
+                        operation_text=selected_operation,
+                    )
+                )
+                self.assertEqual("normal", policy.route)
+                self.assertTrue(policy.suppress_lazy_image_summary)
+
+    def test_quoted_public_delivery_span_with_delimiters_is_denied(self) -> None:
+        prompt = 'They wrote: "send a photo of cats". What did that mean?'
+        decision = decision_for(
+            prompt,
+            intent="public_web_delivery",
+            target="current_chat",
+            source_scope="public_web",
+            subject_grounding="explicit_current_text",
+            subject_text="cats",
+            quantity_kind="singular",
+            execution="requested_now",
+            language="en",
+            reason_codes=["explicit_delivery", "public_subject"],
+        )
+        semantically_wrong_allow = authorization_for(
+            prompt,
+            subject_text="cats",
+            operation_text='"send a photo of cats"',
+        )
+
+        policy = policy_for(
+            prompt,
+            decision,
+            authorization=semantically_wrong_allow,
+        )
+
+        self.assertTrue(
+            image_operation_has_deterministic_deny_signal(
+                prompt,
+                operation_text=semantically_wrong_allow.operation_text,
+            )
+        )
+        self.assertEqual("image_intent_clarify", policy.route)
+        self.assertIsNone(policy.plan)
+
+    def test_comma_delimited_reported_public_delivery_is_denied(self) -> None:
+        prompt = "My manager said, send a photo of cats."
+        decision = decision_for(
+            prompt,
+            intent="public_web_delivery",
+            target="current_chat",
+            source_scope="public_web",
+            subject_grounding="explicit_current_text",
+            subject_text="cats",
+            quantity_kind="singular",
+            execution="requested_now",
+            language="en",
+            reason_codes=["explicit_delivery", "public_subject"],
+        )
+        semantically_wrong_allow = authorization_for(
+            prompt,
+            subject_text="cats",
+            operation_text="send a photo of cats",
+        )
+
+        policy = policy_for(
+            prompt,
+            decision,
+            authorization=semantically_wrong_allow,
+        )
+
+        self.assertTrue(
+            image_operation_has_deterministic_deny_signal(
+                prompt,
+                operation_text=semantically_wrong_allow.operation_text,
+            )
+        )
+        self.assertEqual("image_intent_clarify", policy.route)
+        self.assertIsNone(policy.plan)
+
+    def test_repeated_current_analysis_request_is_not_treated_as_reported(self) -> None:
+        prompt = "analyze this photo and analyze this photo again"
+        decision = decision_for(
+            prompt,
+            intent="referenced_visual_analysis",
+            target="none",
+            source_scope="reference",
+            subject_grounding="reference_only",
+            subject_text=None,
+            quantity_kind="none",
+            execution="requested_now",
+            language="en",
+            reason_codes=["analysis_request", "replied_visual"],
+        )
+        authorization = authorization_for(
+            prompt,
+            subject_text=None,
+            operation_text="analyze this photo",
+            operation="referenced_visual_analysis",
+            source="reference",
+            destination="none",
+            subject_grounding="reference_only",
+            reference_dependent=True,
+            reason_codes=["explicit_current_request", "referenced_visual"],
+        )
+
+        policy = policy_for(
+            prompt,
+            decision,
+            authorization=authorization,
+            has_reply_image=True,
+        )
+
+        self.assertFalse(
+            image_operation_has_deterministic_deny_signal(
+                prompt,
+                operation_text=authorization.operation_text,
+            )
+        )
+        self.assertEqual("referenced_visual_analysis", policy.route)
+
+    def test_current_analysis_after_reported_adversative_is_allowed(self) -> None:
+        prompts = (
+            "They asked me to analyze this photo yesterday, but analyze this photo now.",
+            "They asked me to analyze this photo yesterday but analyze this photo now.",
+        )
+        for prompt in prompts:
+            with self.subTest(prompt=prompt):
+                decision = decision_for(
+                    prompt,
+                    intent="referenced_visual_analysis",
+                    target="none",
+                    source_scope="reference",
+                    subject_grounding="reference_only",
+                    subject_text=None,
+                    quantity_kind="none",
+                    execution="requested_now",
+                    language="en",
+                    reason_codes=["analysis_request", "replied_visual"],
+                )
+                authorization = authorization_for(
+                    prompt,
+                    subject_text=None,
+                    operation_text="analyze this photo now",
+                    operation="referenced_visual_analysis",
+                    source="reference",
+                    destination="none",
+                    subject_grounding="reference_only",
+                    reference_dependent=True,
+                    reason_codes=["explicit_current_request", "referenced_visual"],
+                )
+
+                policy = policy_for(
+                    prompt,
+                    decision,
+                    authorization=authorization,
+                    has_reply_image=True,
+                )
+
+                self.assertFalse(image_operation_has_deterministic_deny_signal(
+                    prompt,
+                    operation_text=authorization.operation_text,
+                ))
+                self.assertEqual("referenced_visual_analysis", policy.route)
+
+    def test_introductory_requested_phrase_does_not_block_current_analysis(self) -> None:
+        prompt = "As requested, analyze this photo now."
+        decision = decision_for(
+            prompt,
+            intent="referenced_visual_analysis",
+            target="none",
+            source_scope="reference",
+            subject_grounding="reference_only",
+            subject_text=None,
+            quantity_kind="none",
+            execution="requested_now",
+            language="en",
+            reason_codes=["analysis_request", "replied_visual"],
+        )
+        authorization = authorization_for(
+            prompt,
+            subject_text=None,
+            operation_text="analyze this photo now",
+            operation="referenced_visual_analysis",
+            source="reference",
+            destination="none",
+            subject_grounding="reference_only",
+            reference_dependent=True,
+            reason_codes=["explicit_current_request", "referenced_visual"],
+        )
+
+        policy = policy_for(
+            prompt,
+            decision,
+            authorization=authorization,
+            has_reply_image=True,
+        )
+
+        self.assertFalse(
+            image_operation_has_deterministic_deny_signal(
+                prompt,
+                operation_text=authorization.operation_text,
+            )
+        )
+        self.assertEqual("referenced_visual_analysis", policy.route)
+
+    def test_introductory_requested_phrase_does_not_block_public_delivery(self) -> None:
+        prompt = "As requested, send a photo of cats now."
+        decision = decision_for(
+            prompt,
+            intent="public_web_delivery",
+            target="current_chat",
+            source_scope="public_web",
+            subject_grounding="explicit_current_text",
+            subject_text="cats",
+            quantity_kind="singular",
+            execution="requested_now",
+            language="en",
+            reason_codes=["explicit_delivery", "public_subject"],
+        )
+        authorization = authorization_for(
+            prompt,
+            subject_text="cats",
+            operation_text="send a photo of cats now",
+        )
+
+        policy = policy_for(
+            prompt,
+            decision,
+            authorization=authorization,
+        )
+
+        self.assertFalse(
+            image_operation_has_deterministic_deny_signal(
+                prompt,
+                operation_text=authorization.operation_text,
+            )
+        )
+        self.assertEqual("internet_image_send", policy.route)
+        self.assertEqual("cats", policy.plan.query)
+
+    def test_clean_reference_denial_falls_back_to_normal_context(self) -> None:
+        prompt = "Поясни контекст допису"
+        decision = decision_for(
+            prompt,
+            intent="referenced_visual_analysis",
+            target="none",
+            source_scope="reference",
+            subject_grounding="missing",
+            subject_text=None,
+            quantity_kind="none",
+            reason_codes=["analysis_request", "replied_visual"],
+        )
+        authorization = authorization_for(
+            prompt,
+            subject_text=None,
+            operation_text=None,
+            verdict="deny",
+            operation="none",
+            execution="informational_or_hypothetical",
+            source="reference",
+            destination="none",
+            subject_grounding="reference_only",
+            reference_dependent=True,
+            reason_codes=["informational_or_hypothetical", "unresolved_reference"],
+        )
+
+        policy = policy_for(
+            prompt,
+            decision,
+            authorization=authorization,
+            has_reply_image=True,
+        )
+
+        self.assertFalse(authorization.degraded)
+        self.assertEqual("normal", policy.route)
+        self.assertTrue(policy.suppress_lazy_image_summary)
+
+    def test_degraded_reference_authorizer_fails_safe_without_new_vision(self) -> None:
+        prompt = "Подивись на картинку й поясни"
+        decision = decision_for(
+            prompt,
+            intent="referenced_visual_analysis",
+            target="none",
+            source_scope="reference",
+            subject_grounding="missing",
+            subject_text=None,
+            quantity_kind="none",
+            reason_codes=["analysis_request", "replied_visual"],
+        )
+        authorization = failed_image_operation_authorization("authorizer_invalid")
+
+        policy = policy_for(
+            prompt,
+            decision,
+            authorization=authorization,
+            has_reply_image=True,
+        )
+
+        self.assertTrue(authorization.degraded)
+        self.assertEqual("normal", policy.route)
+        self.assertTrue(policy.suppress_lazy_image_summary)
+
+    def test_reference_quantity_slot_does_not_block_readonly_analysis(self) -> None:
+        prompt = "Поясни, що це ти приніс"
+        decision = decision_for(
+            prompt,
+            intent="referenced_visual_analysis",
+            target="none",
+            source_scope="reference",
+            subject_grounding="explicit_current_text",
+            subject_text="що це ти приніс",
+            quantity_kind="singular",
+            reason_codes=["analysis_request", "replied_visual"],
+        )
+        authorization = authorization_for(
+            prompt,
+            subject_text=None,
+            operation="referenced_visual_analysis",
+            source="reference",
+            destination="none",
+            subject_grounding="reference_only",
+            reference_dependent=True,
+            reason_codes=["explicit_current_request", "referenced_visual"],
+        )
+
+        policy = policy_for(
+            prompt,
+            decision,
+            authorization=authorization,
+            has_reply_image=True,
+        )
+
+        self.assertEqual("referenced_visual_analysis", policy.route)
+
+    def test_visual_followup_without_direct_image_uses_normal_context(self) -> None:
+        prompt = "Що в кадрі здається підозрілим?"
+        decision = decision_for(
+            prompt,
+            intent="referenced_visual_analysis",
+            target="none",
+            source_scope="reference",
+            subject_grounding="missing",
+            subject_text=None,
+            quantity_kind="none",
+            reason_codes=["analysis_request", "replied_visual"],
+        )
+
+        policy = policy_for(
+            prompt,
+            decision,
+            has_reply_image=False,
+            has_reference_context=True,
+        )
+
+        self.assertEqual("normal", policy.route)
+        self.assertTrue(policy.suppress_lazy_image_summary)
+
+    def test_ambiguous_reply_image_denial_uses_normal_context(self) -> None:
+        prompt = "Поясни контекст допису"
+        decision = decision_for(
+            prompt,
+            intent="ambiguous",
+            target="none",
+            source_scope="reference",
+            subject_grounding="missing",
+            subject_text=None,
+            quantity_kind="none",
+            execution="ambiguous",
+            reason_codes=["unresolved_reference"],
+        )
+        authorization = authorization_for(
+            prompt,
+            subject_text=None,
+            operation_text=None,
+            verdict="deny",
+            operation="none",
+            execution="informational_or_hypothetical",
+            source="unspecified",
+            destination="none",
+            subject_grounding="missing",
+            reference_dependent=False,
+            reason_codes=["informational_or_hypothetical"],
+        )
+
+        policy = policy_for(
+            prompt,
+            decision,
+            authorization=authorization,
+            has_reply_image=True,
+            has_reference_context=True,
+        )
+
+        self.assertEqual("normal", policy.route)
+        self.assertTrue(policy.guard_unconfirmed_delivery)
+        self.assertTrue(policy.suppress_lazy_image_summary)
+
+    def test_external_visual_not_image_suppresses_lazy_vision(self) -> None:
+        prompt = "Поясни контекст"
+        decision = decision_for(
+            prompt,
+            intent="not_image",
+            target="none",
+            source_scope="unspecified",
+            subject_grounding="missing",
+            subject_text=None,
+            quantity_kind="none",
+            execution="not_requested",
+            reason_codes=["non_delivery_statement"],
+        )
+
+        policy = policy_for(
+            prompt,
+            decision,
+            has_external_visual=True,
+            has_reference_context=True,
+        )
+
+        self.assertEqual("normal", policy.route)
+        self.assertTrue(policy.guard_unconfirmed_delivery)
+        self.assertTrue(policy.suppress_lazy_image_summary)
+
     def test_subject_leak_is_not_canonicalized_without_real_reply_metadata(self) -> None:
         prompt = "Опиши це фото"
         decision = decision_for(
@@ -726,8 +1314,9 @@ class ImageIntentContractTests(unittest.TestCase):
         )
 
         self.assertTrue(deterministic_deny)
-        self.assertEqual("image_intent_clarify", policy.route)
+        self.assertEqual("normal", policy.route)
         self.assertNotEqual("referenced_visual_analysis", policy.route)
+        self.assertTrue(policy.suppress_lazy_image_summary)
 
     def test_nonexecuting_private_external_redelivery_and_similarity_are_normal(self) -> None:
         templates = {
@@ -785,6 +1374,7 @@ class ImageIntentContractTests(unittest.TestCase):
 
                     self.assertEqual("normal", policy.route)
                     self.assertTrue(policy.guard_unconfirmed_delivery)
+                    self.assertTrue(policy.suppress_lazy_image_summary)
                     self.assertIsNone(policy.plan)
 
     def test_informational_question_has_no_side_effect_route(self) -> None:
