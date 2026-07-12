@@ -522,7 +522,7 @@ class Config:
         ):
             raise RuntimeError("IMAGE_OPERATION_AUTHORIZER_SCHEMA_VERSION must be a safe version label")
         image_operation_authorizer_prompt_version = os.getenv(
-            "IMAGE_OPERATION_AUTHORIZER_PROMPT_VERSION", "image_operation_auth_prompt_v1"
+            "IMAGE_OPERATION_AUTHORIZER_PROMPT_VERSION", "image_operation_auth_prompt_v2"
         ).strip().casefold()
         if not re.fullmatch(
             r"[a-z0-9][a-z0-9._-]{0,63}",
@@ -5462,6 +5462,9 @@ def build_image_intent_router_metadata(message: Message, prompt: str) -> dict[st
     return {
         "trusted_text": str(prompt or ""),
         "has_reply": reply is not None,
+        # Bounded presence evidence only: the first router never receives
+        # private reply text.
+        "has_reply_text": bool(reply is not None and message_text(reply).strip()),
         "has_reply_image": bool(reply is not None and image_file_ref_from(reply) is not None),
         "has_reply_visual_media": bool(
             reply is not None and visual_media_file_ref_from(reply) is not None
@@ -5475,6 +5478,19 @@ def build_image_intent_router_metadata(message: Message, prompt: str) -> dict[st
         ),
         "has_any_reference": referenced_context_available(message),
     }
+
+
+def build_image_operation_authorizer_metadata(
+    message: Message,
+    prompt: str,
+) -> dict[str, Any]:
+    metadata = build_image_intent_router_metadata(message, prompt)
+    reply = getattr(message, "reply_to_message", None)
+    metadata["reply_text_context"] = clip_text_strict(
+        message_text(reply) if reply is not None else "",
+        800,
+    )
+    return metadata
 
 
 def image_router_failure_fallback_signal(prompt: str, *, has_reference: bool = False) -> bool:
@@ -5718,7 +5734,7 @@ async def evaluate_image_operation_authorization(
 ) -> ImageOperationAuthorization:
     authorization: ImageOperationAuthorization | None = None
     attempts = 0
-    metadata = build_image_intent_router_metadata(message, prompt)
+    metadata = build_image_operation_authorizer_metadata(message, prompt)
     for attempts in range(1, 3):
         try:
             raw = await run_image_operation_authorizer(
@@ -5755,6 +5771,8 @@ async def evaluate_image_operation_authorization(
         message=authorization.verdict,
         details={
             "mode": CONFIG.image_intent_routing_mode,
+            "model": CONFIG.image_operation_authorizer_model,
+            "reasoning_effort": CONFIG.image_operation_authorizer_reasoning_effort,
             "outcome": authorization.outcome,
             "fallback_reason": authorization.fallback_reason,
             "attempts": attempts,
@@ -5793,6 +5811,7 @@ def classify_request(message: Message, prompt: str) -> str:
 
 async def classify_request_with_intent(message: Message, prompt: str) -> RequestClassification:
     has_reference = referenced_context_available(message)
+    has_reply_image = bool(referenced_image_messages(message))
     if is_translate_request(prompt) and (has_reference or inline_translation_source(prompt)):
         return RequestClassification("translate_reference")
 
@@ -5805,19 +5824,23 @@ async def classify_request_with_intent(message: Message, prompt: str) -> Request
             not image_decision.degraded
             and (
                 image_decision.intent in {"image_information", "ambiguous"}
+                or (has_reply_image and image_decision.intent == "not_image")
                 or (
                     image_decision.execution == "requested_now"
                     and (
                         image_decision.intent == "public_web_delivery"
                         or (
                             image_decision.intent == "referenced_visual_analysis"
-                            and bool(referenced_image_messages(message))
+                            and has_reply_image
                         )
                     )
                 )
             )
         ):
-            image_authorization = await evaluate_image_operation_authorization(message, prompt)
+            image_authorization = await evaluate_image_operation_authorization(
+                message,
+                prompt,
+            )
         operation_text = (
             image_authorization.operation_text
             if image_authorization is not None
@@ -5838,9 +5861,10 @@ async def classify_request_with_intent(message: Message, prompt: str) -> Request
             image_decision,
             authorization=image_authorization,
             fallback_media_signal=fallback_media_signal,
-            has_reply_image=bool(referenced_image_messages(message)),
+            has_reply_image=has_reply_image,
             has_external_visual=referenced_external_visual_available(message),
             has_reply_visual_media=referenced_reply_visual_media_available(message),
+            has_reference_context=has_reference,
             unsafe_public_scope_signal=(
                 image_decision.intent == "public_web_delivery"
                 and (
@@ -5856,10 +5880,17 @@ async def classify_request_with_intent(message: Message, prompt: str) -> Request
             ),
             deterministic_deny_signal=image_operation_has_deterministic_deny_signal(
                 prompt,
-                operation_text=operation_text,
+                operation_text=operation_text or prompt,
             )
-            if image_decision.intent
-            in {"public_web_delivery", "referenced_visual_analysis"}
+            if (
+                image_decision.intent
+                in {"public_web_delivery", "referenced_visual_analysis"}
+                or (
+                    has_reply_image
+                    and image_authorization is not None
+                    and image_authorization.operation == "referenced_visual_analysis"
+                )
+            )
             else False,
         )
         if CONFIG.image_intent_routing_mode == "enforce" and image_policy.route != "normal":
@@ -7482,10 +7513,13 @@ async def prepare_memory_context(
     prompt: str,
     force_images: bool = False,
     state: MemoryContextState | None = None,
+    allow_lazy_image_summaries: bool = True,
 ) -> str:
     if MEMORY is None:
         return "(persistent memory disabled)"
-    if should_summarize_memory_images(message, prompt, force=force_images):
+    if allow_lazy_image_summaries and should_summarize_memory_images(
+        message, prompt, force=force_images
+    ):
         await ensure_recent_image_summaries(message.chat_id, force=force_images)
     state = state or new_memory_context_state()
     items = select_unique_memory_items(MEMORY.latest(message.chat_id, CONFIG.memory_context_messages), state)
@@ -7498,9 +7532,15 @@ async def prepare_agent_memory_context(
     prompt: str,
     route: str,
     state: MemoryContextState | None = None,
+    allow_lazy_image_summaries: bool = True,
 ) -> tuple[str, str | None, MemoryContextCompilationStats]:
     state = state or new_memory_context_state()
-    memory_context = await prepare_memory_context(message, prompt, state=state)
+    memory_context = await prepare_memory_context(
+        message,
+        prompt,
+        state=state,
+        allow_lazy_image_summaries=allow_lazy_image_summaries,
+    )
     if not should_expand_memory_for_prompt(route, prompt):
         return memory_context, None, MemoryContextCompilationStats(
             duplicate_items=state.duplicate_count,
@@ -12969,6 +13009,9 @@ async def _handle_prompt_generation(
     route, recall_intent = classification
     image_policy = getattr(classification, "image_policy", None)
     image_decision = getattr(classification, "image_decision", None)
+    allow_lazy_image_summaries = not bool(
+        image_policy is not None and image_policy.suppress_lazy_image_summary
+    )
     ACTIVE_MODEL_ROUTE_BUCKET.set(normalize_route_bucket(route, "other"))
     LOGGER.info("Prompt route=%s chat_id=%s", route, message.chat_id)
     outbound_provenance = provenance_for_message(message, route)
@@ -13124,12 +13167,14 @@ async def _handle_prompt_generation(
                 prompt,
                 route,
                 state=recall_state,
+                allow_lazy_image_summaries=allow_lazy_image_summaries,
             )
         else:
             memory_context, expanded_memory_context, memory_context_stats = await prepare_agent_memory_context(
                 message,
                 prompt,
                 route,
+                allow_lazy_image_summaries=allow_lazy_image_summaries,
             )
             semantic_memory_context = await prepare_semantic_memory_context(
                 message,

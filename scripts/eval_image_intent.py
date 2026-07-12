@@ -49,7 +49,7 @@ class EvalCase:
     count: int
     subject: str | None
     authorizer_called: bool | None
-    flags: tuple[tuple[str, bool], ...] = ()
+    flags: tuple[tuple[str, Any], ...] = ()
 
 
 def case(
@@ -65,7 +65,7 @@ def case(
     count: int = 0,
     subject: str | None = None,
     authorizer_called: bool | None = False,
-    **flags: bool,
+    **flags: Any,
 ) -> EvalCase:
     def accepted(value: str | set[str] | frozenset[str]) -> frozenset[str]:
         return frozenset({value}) if isinstance(value, str) else frozenset(value)
@@ -82,7 +82,7 @@ def case(
         count=count,
         subject=subject,
         authorizer_called=authorizer_called,
-        flags=tuple(sorted((str(key), bool(value)) for key, value in flags.items())),
+        flags=tuple(sorted((str(key), value) for key, value in flags.items())),
     )
 
 
@@ -419,6 +419,78 @@ CASES = (
         has_reply_image=True,
     ),
     case(
+        "ua_reply_elliptical_analysis",
+        "Що скажеш?",
+        {"not_image", "image_information", "ambiguous", "referenced_visual_analysis"},
+        owner="vision",
+        execution={"not_requested", "ambiguous", "requested_now"},
+        source={"unspecified", "reference"},
+        target={"none", "unspecified"},
+        route="referenced_visual_analysis",
+        authorizer_called=True,
+        has_reply=True,
+        has_reply_image=True,
+    ),
+    case(
+        "ua_reply_caption_context_fact",
+        "Якого штату цей сенатор?",
+        {"not_image", "image_information", "ambiguous", "referenced_visual_analysis"},
+        owner="normal",
+        execution={"not_requested", "ambiguous", "requested_now"},
+        source={"unspecified", "reference"},
+        target={"none", "unspecified"},
+        route="normal",
+        authorizer_called=True,
+        has_reply=True,
+        has_reply_text=True,
+        has_reply_image=True,
+        reply_text_context="Сенатор представляє штат Огайо.",
+    ),
+    case(
+        "ua_reply_captionless_identity",
+        "Якого штату цей сенатор?",
+        {"not_image", "image_information", "ambiguous", "referenced_visual_analysis"},
+        owner="vision",
+        execution={"not_requested", "ambiguous", "requested_now"},
+        source={"unspecified", "reference"},
+        target={"none", "unspecified"},
+        route="referenced_visual_analysis",
+        authorizer_called=True,
+        has_reply=True,
+        has_reply_text=False,
+        has_reply_image=True,
+        reply_text_context="",
+    ),
+    case(
+        "ua_reply_irrelevant_caption_identity",
+        "Якого штату цей сенатор?",
+        {"not_image", "image_information", "ambiguous", "referenced_visual_analysis"},
+        owner="vision",
+        execution={"not_requested", "ambiguous", "requested_now"},
+        source={"unspecified", "reference"},
+        target={"none", "unspecified"},
+        route="referenced_visual_analysis",
+        authorizer_called=True,
+        has_reply=True,
+        has_reply_text=True,
+        has_reply_image=True,
+        reply_text_context="🔥",
+    ),
+    case(
+        "ua_reply_quoted_analysis_report",
+        "Він написав: «проаналізуй це фото». Що це означає?",
+        {"not_image", "image_information", "ambiguous", "referenced_visual_analysis"},
+        owner="normal",
+        execution={"not_requested", "ambiguous", "requested_now"},
+        source={"unspecified", "reference"},
+        target={"none", "unspecified"},
+        route="normal",
+        authorizer_called=None,
+        has_reply=True,
+        has_reply_text=False,
+        has_reply_image=True,
+    ),
+    case(
         "ua_reply_analysis_negated",
         "Не аналізуй це фото",
         "referenced_visual_analysis",
@@ -538,6 +610,8 @@ CASES = (
     ),
 )
 
+CURATED_CASE_COUNT = 55
+
 
 OWNER_BY_ROUTE = {
     "internet_image_send": "web_image_sender",
@@ -551,8 +625,8 @@ OWNER_BY_ROUTE = {
 
 def validate_cases(cases: tuple[EvalCase, ...]) -> None:
     """Fail before network access when the curated oracle is internally vague."""
-    if len(cases) != 50:
-        raise ValueError(f"expected the curated 50-case corpus, got {len(cases)}")
+    if len(cases) != CURATED_CASE_COUNT:
+        raise ValueError(f"expected {CURATED_CASE_COUNT} curated cases, got {len(cases)}")
     ids = [item.id for item in cases]
     if len(ids) != len(set(ids)):
         raise ValueError("eval case ids must be unique")
@@ -612,7 +686,7 @@ def strict_semantic_checks(item: EvalCase, decision: Any) -> dict[str, bool]:
     }
 
 
-def metadata(prompt: str, flags: dict[str, bool]) -> dict[str, Any]:
+def metadata(prompt: str, flags: dict[str, Any]) -> dict[str, Any]:
     has_any_reference = bool(
         flags.get("has_any_reference")
         or flags.get("has_reply")
@@ -623,6 +697,8 @@ def metadata(prompt: str, flags: dict[str, bool]) -> dict[str, Any]:
     return {
         "trusted_text": prompt,
         "has_reply": False,
+        "has_reply_text": False,
+        "reply_text_context": "",
         "has_reply_image": False,
         "has_reply_visual_media": False,
         "has_external_visual": False,
@@ -734,6 +810,11 @@ async def main() -> None:
     async def evaluate(item: EvalCase) -> dict[str, Any]:
         flags = dict(item.flags)
         request_metadata = metadata(item.prompt, flags)
+        router_metadata = {
+            key: value
+            for key, value in request_metadata.items()
+            if key != "reply_text_context"
+        }
         started = time.monotonic()
         classifier_called = False
         authorizer_called = False
@@ -747,7 +828,7 @@ async def main() -> None:
                     router_client,
                     model=router_model,
                     system_prompt=IMAGE_INTENT_ROUTER_SYSTEM_PROMPT,
-                    request_metadata=request_metadata,
+                    request_metadata=router_metadata,
                     schema_name="image_intent_v1",
                     schema=image_intent_schema(),
                     max_output_tokens=240,
@@ -763,6 +844,7 @@ async def main() -> None:
                 not decision.degraded
                 and (
                     decision.intent in {"image_information", "ambiguous"}
+                    or (bool(flags.get("has_reply_image")) and decision.intent == "not_image")
                     or (
                         decision.execution == "requested_now"
                         and (
@@ -807,6 +889,7 @@ async def main() -> None:
                 has_reply_image=bool(flags.get("has_reply_image")),
                 has_external_visual=bool(flags.get("has_external_visual")),
                 has_reply_visual_media=bool(flags.get("has_reply_visual_media")),
+                has_reference_context=bool(request_metadata.get("has_any_reference")),
                 # These Python checks are deny-only. They can veto a semantic allow,
                 # but cannot create image intent or authorize a side effect.
                 unsafe_public_scope_signal=bool(
@@ -825,10 +908,17 @@ async def main() -> None:
                 deterministic_deny_signal=(
                     image_operation_has_deterministic_deny_signal(
                         item.prompt,
-                        operation_text=operation_text,
+                        operation_text=operation_text or item.prompt,
                     )
-                    if decision.intent
-                    in {"public_web_delivery", "referenced_visual_analysis"}
+                    if (
+                        decision.intent
+                        in {"public_web_delivery", "referenced_visual_analysis"}
+                        or (
+                            bool(flags.get("has_reply_image"))
+                            and authorization is not None
+                            and authorization.operation == "referenced_visual_analysis"
+                        )
+                    )
                     else False
                 ),
             )
