@@ -1,5 +1,16 @@
 # Aigan Changelog
 
+## 2026-07-11 - Semantic image routing with confirmed delivery
+
+- Replaced the action/media-noun candidate authority with a semantic image frame for every explicit invocation that reaches general request routing; ordinary group messages remain silent.
+- Added an independent Terra authorization frame before public image search or referenced-image analysis, bounded retry for malformed/contradictory frames, and Python-owned deny-only privacy, external-scope, negation, meta, exact-span, count, and sensitive-identifier gates.
+- Kept private/history/external media distinct from public-web search, preserved the existing vision owner for replied still images, and report unsupported video/reference operations honestly without claiming delivery.
+- Treat Telegram media delivery as successful only after positive message ids, persist only confirmed receipts, and block tool-less or search-only claims such as implicit "sent/attached" and bare "done/here you go" responses.
+- Added a lazy deny-only Terra postcondition for claim-like generic responses after a `not_image` or degraded first frame, bounded retries for both semantic frames, and a no-silent-truncation input invariant so an unseen suffix cannot change the operation scope.
+- Tightened the v2 classifier contract with an explicit semantic slot matrix for negation, private collections, external source versus destination, referenced similarity, missing subjects, and non-operative quoted/meta text.
+- Added a 50-case UA-first live two-model contract with model/prompt/schema/corpus hashes plus offline regressions for multilingual, mixed-clause, private, external, reference, injection, Unicode, partial/unknown delivery, and claim-postcondition behavior.
+- Left semantic routing disabled by default until credentials are rotated, deployment backups are verified, and the final reviewed commit is explicitly enabled.
+
 ## 2026-07-11 - Provider-neutral heavy local inference connector
 
 - Added a disabled-by-default `heavy_model` adapter boundary with null and OpenAI-compatible Chat Completions backends for bounded text, image, and video inference.
