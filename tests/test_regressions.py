@@ -134,6 +134,7 @@ os.environ["MEDIA_ACQUISITION_ENABLED"] = "false"
 os.environ["MEDIA_ACQUISITION_MAX_DURATION_SECONDS"] = "180"
 os.environ["MEDIA_ACQUISITION_MAX_DOWNLOAD_BYTES"] = "50000000"
 os.environ["MEDIA_ACQUISITION_SOCKET_TIMEOUT_SECONDS"] = "12"
+os.environ["HEAVY_MODEL_ENABLED"] = "false"
 
 import httpx
 from telegram import InputMediaPhoto, ReactionTypeCustomEmoji, ReactionTypeEmoji
@@ -5260,6 +5261,56 @@ class ToolRuntimeTests(unittest.TestCase):
         self.assertEqual("disabled", media_acquisition["status"])
         self.assertFalse(media_acquisition["enabled"])
         self.assertIn("media_acquisition", main.tool_runtime_health_text())
+
+    def test_main_tool_runtime_health_includes_disabled_heavy_model(self) -> None:
+        health = main.TOOL_RUNTIME.health_summary()
+        heavy_model = next(item for item in health["adapters"] if item["name"] == "heavy_model")
+
+        self.assertEqual("disabled", heavy_model["status"])
+        self.assertFalse(heavy_model["enabled"])
+        self.assertIn("heavy_model", main.tool_runtime_health_text())
+
+    def test_main_invalid_enabled_heavy_model_config_is_visible_as_unconfigured(self) -> None:
+        original_config = main.CONFIG
+        original_adapter = main.runtime_heavy_model_adapter()
+        try:
+            main.CONFIG = replace(
+                main.CONFIG,
+                heavy_model_enabled=True,
+                heavy_model_base_url="https://heavy.invalid/v1",
+                heavy_model_model="configured-model",
+                heavy_model_extra_body_json="not-json-operator-private-marker",
+            )
+            with self.assertLogs("aigan", level="WARNING") as captured:
+                adapter = main.build_heavy_model_adapter()
+            main.set_heavy_model_adapter(adapter)
+
+            health = main.TOOL_RUNTIME.health_summary()
+            heavy_model = next(item for item in health["adapters"] if item["name"] == "heavy_model")
+
+            self.assertEqual("unconfigured", heavy_model["status"])
+            self.assertTrue(heavy_model["enabled"])
+            self.assertFalse(heavy_model["configured"])
+            self.assertFalse(heavy_model["available"])
+            log_text = "\n".join(captured.output)
+            self.assertIn("RuntimeError", log_text)
+            self.assertNotIn("operator-private-marker", log_text)
+        finally:
+            main.CONFIG = original_config
+            main.set_heavy_model_adapter(original_adapter)
+
+    def test_invalid_heavy_model_extra_body_does_not_break_disabled_config_load(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "HEAVY_MODEL_ENABLED": "false",
+                "HEAVY_MODEL_EXTRA_BODY_JSON": "not-json",
+            },
+        ):
+            config = main.Config.from_env()
+
+        self.assertFalse(config.heavy_model_enabled)
+        self.assertEqual("not-json", config.heavy_model_extra_body_json)
 
     def test_null_media_acquisition_adapter_returns_disabled_sanitized_result(self) -> None:
         adapter = NullMediaAcquisitionAdapter()
