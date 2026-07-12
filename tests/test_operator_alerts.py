@@ -92,6 +92,29 @@ class OperatorAlertTests(unittest.TestCase):
         self.assertEqual("deduplicated", result.status)
         bot.send_message.assert_not_awaited()
 
+    def test_expired_in_memory_claims_are_pruned(self) -> None:
+        bot = AsyncMock()
+        clock_values = iter((0.0, 1.0, 12.0))
+        service = OperatorAlertService(
+            OperatorAlertSettings(enabled=True, chat_id=12345, cooldown_seconds=10),
+            clock=lambda: next(clock_values),
+        )
+
+        results = [
+            asyncio.run(
+                service.notify(
+                    bot,
+                    "image_delivery_partial",
+                    {"confirmed_parts": confirmed, "intended_parts": 5},
+                )
+            )
+            for confirmed in (1, 2, 3)
+        ]
+
+        self.assertEqual(["sent", "sent", "sent"], [result.status for result in results])
+        self.assertEqual(1, len(service._claimed_at))
+        self.assertEqual(3, bot.send_message.await_count)
+
     def test_delivery_failure_does_not_recurse_or_retry_inside_cooldown(self) -> None:
         events: list[str] = []
         bot = AsyncMock()

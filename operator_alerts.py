@@ -167,6 +167,7 @@ class OperatorAlertService:
         *,
         event_callback: AlertEventCallback | None = None,
         recent_claim_checker: RecentClaimChecker | None = None,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         min_level = normalize_alert_level(settings.min_level)
         self.settings = OperatorAlertSettings(
@@ -177,6 +178,7 @@ class OperatorAlertService:
         )
         self._event_callback = event_callback
         self._recent_claim_checker = recent_claim_checker
+        self._clock = clock
         self._lock = asyncio.Lock()
         self._claimed_at: dict[str, float] = {}
         self._counts: Counter[str] = Counter()
@@ -205,6 +207,12 @@ class OperatorAlertService:
         except Exception:
             return False
 
+    def _prune_expired_claims(self, now: float) -> None:
+        cutoff = now - self.settings.cooldown_seconds
+        for fingerprint, claimed_at in tuple(self._claimed_at.items()):
+            if claimed_at <= cutoff:
+                self._claimed_at.pop(fingerprint, None)
+
     async def notify(
         self,
         bot: Any,
@@ -228,7 +236,8 @@ class OperatorAlertService:
             return OperatorAlertResult("below_threshold", alert.fingerprint)
 
         async with self._lock:
-            now = time.monotonic()
+            now = self._clock()
+            self._prune_expired_claims(now)
             if self._recently_claimed(alert, now):
                 self._counts["deduplicated"] += 1
                 return OperatorAlertResult("deduplicated", alert.fingerprint)
