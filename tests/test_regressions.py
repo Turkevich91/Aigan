@@ -1,5 +1,4 @@
 import asyncio
-import base64
 import io
 import json
 import os
@@ -256,16 +255,7 @@ from tool_diagnostics import (
 from tool_runtime import NullToolAdapter, ToolRuntime
 from telegram_presence import ActivityPresence, ActivityPresenceSettings, activity_action_for_route, draft_supported_for_chat
 
-VALID_JPEG = base64.b64decode(
-    "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAP//////////////////////////////////////////////////////////////////////////////////////"
-    "2wBDAf//////////////////////////////////////////////////////////////////////////////////////"
-    "wAARCAABAAEDASIAAhEBAxEB/8QAFQABAQAAAAAAAAAAAAAAAAAAAAX/xAAUEAEAAAAAAAAAAAAAAAAAAAAA/"
-    "9oADAMBAAIQAxAAAAF//8QAFBABAAAAAAAAAAAAAAAAAAAAAP/aAAgBAQABBQJ//8QAFBEBAAAAAAAAAAAAAAAA"
-    "AAAAAP/aAAgBAwEBPwF//8QAFBEBAAAAAAAAAAAAAAAAAAAAAP/aAAgBAgEBPwF//8QAFBABAAAAAAAAAAAAAAAA"
-    "AAAAAP/aAAgBAQAGPwJ//8QAFBABAAAAAAAAAAAAAAAAAAAAAP/aAAgBAQABPyF//9oADAMBAAIAAwAAABD/xAAU"
-    "EQEAAAAAAAAAAAAAAAAAAAAA/9oACAEDAQE/EH//xAAUEQEAAAAAAAAAAAAAAAAAAAAA/9oACAECAQE/EH//xAAU"
-    "EAEAAAAAAAAAAAAAAAAAAAAA/9oACAEBAAE/EH//2Q=="
-)
+VALID_JPEG = TEST_VALID_JPEG
 
 
 class FakeUser:
@@ -353,10 +343,6 @@ class FakeMessage:
 
     def get_bot(self):
         return self.bot
-
-
-# Use a fully decodable fixture now that the web-image gate verifies containers.
-VALID_JPEG = TEST_VALID_JPEG
 
 
 class FakeApplication:
