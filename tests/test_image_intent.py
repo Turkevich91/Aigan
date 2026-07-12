@@ -197,7 +197,7 @@ class ImageIntentContractTests(unittest.TestCase):
         self.assertEqual(3, policy.plan.target_count)
         self.assertEqual("нічного Києва", policy.plan.query)
 
-    def test_exact_count_above_transport_limit_requires_clarification(self) -> None:
+    def test_exact_count_above_transport_limit_is_naturally_bounded(self) -> None:
         prompt = "Надішли 10 фото котів"
         decision = decision_for(
             prompt,
@@ -208,9 +208,10 @@ class ImageIntentContractTests(unittest.TestCase):
         authorization = authorization_for(prompt, subject_text="котів")
         policy = policy_for(prompt, decision, authorization=authorization)
 
-        self.assertEqual("image_intent_clarify", policy.route)
-        self.assertIn("до 5", policy.response_text)
-        self.assertIsNone(policy.plan)
+        self.assertEqual("internet_image_send", policy.route)
+        self.assertEqual(5, policy.plan.target_count)
+        self.assertEqual(10, policy.plan.requested_count)
+        self.assertEqual("", policy.response_text)
 
     def test_subject_must_be_an_exact_span_of_current_prompt(self) -> None:
         decision = decision_for(
@@ -597,6 +598,66 @@ class ImageIntentContractTests(unittest.TestCase):
         self.assertFalse(authorization.degraded)
         self.assertEqual("referenced_visual_analysis", policy.route)
         self.assertIsNone(policy.plan)
+
+    def test_real_reply_and_independent_authorizer_canonicalize_subject_leak(self) -> None:
+        prompt = "Опиши це фото"
+        decision = decision_for(
+            prompt,
+            intent="referenced_visual_analysis",
+            target="none",
+            source_scope="reference",
+            subject_grounding="explicit_current_text",
+            subject_text="це фото",
+            quantity_kind="none",
+            reason_codes=["analysis_request", "replied_visual"],
+        )
+        authorization = authorization_for(
+            prompt,
+            subject_text=None,
+            operation="referenced_visual_analysis",
+            source="reference",
+            destination="none",
+            subject_grounding="reference_only",
+            reference_dependent=True,
+            reason_codes=["explicit_current_request", "referenced_visual"],
+        )
+
+        policy = policy_for(
+            prompt,
+            decision,
+            authorization=authorization,
+            has_reply_image=True,
+        )
+
+        self.assertFalse(decision.degraded)
+        self.assertEqual("referenced_visual_analysis", policy.route)
+
+    def test_subject_leak_is_not_canonicalized_without_real_reply_metadata(self) -> None:
+        prompt = "Опиши це фото"
+        decision = decision_for(
+            prompt,
+            intent="referenced_visual_analysis",
+            target="none",
+            source_scope="reference",
+            subject_grounding="explicit_current_text",
+            subject_text="це фото",
+            quantity_kind="none",
+            reason_codes=["analysis_request", "unresolved_reference"],
+        )
+        authorization = authorization_for(
+            prompt,
+            subject_text=None,
+            operation="referenced_visual_analysis",
+            source="reference",
+            destination="none",
+            subject_grounding="reference_only",
+            reference_dependent=True,
+            reason_codes=["explicit_current_request", "referenced_visual"],
+        )
+
+        policy = policy_for(prompt, decision, authorization=authorization)
+
+        self.assertEqual("image_intent_clarify", policy.route)
 
     def test_replied_video_gets_accurate_unavailable_route(self) -> None:
         prompt = "Опиши це відео"

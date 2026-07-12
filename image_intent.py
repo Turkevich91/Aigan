@@ -3,7 +3,7 @@ from __future__ import annotations
 import math
 import re
 import unicodedata
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Mapping
 
 
@@ -1035,6 +1035,50 @@ def requested_count_for_decision(decision: ImageIntentDecision) -> int:
     return 1
 
 
+def canonicalize_referenced_analysis_decision(
+    decision: ImageIntentDecision,
+    authorization: ImageOperationAuthorization | None,
+    *,
+    has_reply_image: bool,
+) -> ImageIntentDecision:
+    """Repair only the subject slot that cannot exist for reply-image analysis.
+
+    The canonicalization is intentionally unavailable to the classifier alone.
+    Real Telegram reply metadata and a clean independent authorization must
+    agree on every safety-relevant reference slot first.
+    """
+    if (
+        decision.intent != "referenced_visual_analysis"
+        or decision.degraded
+        or not has_reply_image
+        or decision.target != "none"
+        or decision.source_scope != "reference"
+        or decision.execution != "requested_now"
+        or decision.quantity_kind != "none"
+        or decision.quantity_value != 0
+        or authorization is None
+        or authorization.degraded
+        or authorization.verdict != "allow"
+        or authorization.operation != "referenced_visual_analysis"
+        or authorization.execution != "explicit_now"
+        or authorization.source != "reference"
+        or authorization.destination != "none"
+        or authorization.subject_grounding != "reference_only"
+        or authorization.subject_text is not None
+        or not authorization.reference_dependent
+        or authorization.private_or_internal
+        or authorization.external_source_or_destination
+        or authorization.meta_or_classifier_test
+        or authorization.negated
+    ):
+        return decision
+    return replace(
+        decision,
+        subject_grounding="reference_only",
+        subject_text=None,
+    )
+
+
 def semantic_image_claim_requires_guard(
     decision: ImageIntentDecision,
     authorization: ImageOperationAuthorization | None,
@@ -1067,6 +1111,11 @@ def derive_image_route_policy(
     unsafe_public_scope_signal: bool = False,
     deterministic_deny_signal: bool = False,
 ) -> ImageRoutePolicy:
+    decision = canonicalize_referenced_analysis_decision(
+        decision,
+        authorization,
+        has_reply_image=has_reply_image,
+    )
     if decision.degraded and decision.fallback_reason != "below_confidence":
         if fallback_media_signal or has_reply_image or has_external_visual:
             return ImageRoutePolicy(
@@ -1165,20 +1214,11 @@ def derive_image_route_policy(
                 guard_unconfirmed_delivery=True,
             )
         requested_count = requested_count_for_decision(decision)
-        if requested_count > 5:
-            return ImageRoutePolicy(
-                route="image_intent_clarify",
-                response_text=(
-                    f"Ти попросив {requested_count} зображень. За один запит я можу безпечно надіслати до 5; "
-                    "скажи, скільки потрібно від 1 до 5."
-                ),
-                guard_unconfirmed_delivery=True,
-            )
         return ImageRoutePolicy(
             route="internet_image_send",
             plan=ImageDeliveryPlan(
                 query=decision.subject_text,
-                target_count=requested_count,
+                target_count=min(requested_count, 5),
                 requested_count=requested_count,
                 quantity_kind=decision.quantity_kind,
             ),
