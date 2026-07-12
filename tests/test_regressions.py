@@ -5279,9 +5279,10 @@ class ToolRuntimeTests(unittest.TestCase):
                 heavy_model_enabled=True,
                 heavy_model_base_url="https://heavy.invalid/v1",
                 heavy_model_model="configured-model",
-                heavy_model_extra_body_json="not-json",
+                heavy_model_extra_body_json="not-json-operator-private-marker",
             )
-            adapter = main.build_heavy_model_adapter()
+            with self.assertLogs("aigan", level="WARNING") as captured:
+                adapter = main.build_heavy_model_adapter()
             main.set_heavy_model_adapter(adapter)
 
             health = main.TOOL_RUNTIME.health_summary()
@@ -5291,6 +5292,9 @@ class ToolRuntimeTests(unittest.TestCase):
             self.assertTrue(heavy_model["enabled"])
             self.assertFalse(heavy_model["configured"])
             self.assertFalse(heavy_model["available"])
+            log_text = "\n".join(captured.output)
+            self.assertIn("RuntimeError", log_text)
+            self.assertNotIn("operator-private-marker", log_text)
         finally:
             main.CONFIG = original_config
             main.set_heavy_model_adapter(original_adapter)

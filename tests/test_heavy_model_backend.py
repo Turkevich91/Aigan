@@ -139,6 +139,8 @@ class HeavyModelBackendTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(result.ok)
         self.assertEqual("private generated summary", result.text)
+        self.assertNotIn("video_context", repr(request))
+        self.assertNotIn("video_context", repr(result))
         self.assertEqual(14, result.total_tokens)
         self.assertEqual(1, len(completions.calls))
         call = completions.calls[0]
@@ -283,12 +285,15 @@ class HeavyModelBackendTests(unittest.IsolatedAsyncioTestCase):
         first_task = asyncio.create_task(adapter.analyze(HeavyModelRequest(prompt="first")))
         await asyncio.wait_for(started.wait(), timeout=1)
         second = await adapter.analyze(HeavyModelRequest(prompt="second"))
+        probe = await adapter.probe()
         release.set()
         first = await asyncio.wait_for(first_task, timeout=1)
 
         self.assertTrue(first.ok)
         self.assertFalse(second.ok)
         self.assertEqual("busy", second.failure_category)
+        self.assertEqual("busy", probe.failure_category)
+        self.assertEqual(0, client.models.calls)
         self.assertEqual(1, len(completions.calls))
 
     async def test_concurrency_admission_is_atomic_under_burst(self):

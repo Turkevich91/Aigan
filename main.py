@@ -1233,8 +1233,11 @@ def build_heavy_model_adapter() -> HeavyModelAdapter:
                 ),
             )
         )
-    except Exception:
-        LOGGER.warning("Heavy-model connector configuration is invalid; using null adapter")
+    except Exception as exc:
+        LOGGER.warning(
+            "Heavy-model connector configuration is invalid; using null adapter error=%s",
+            type(exc).__name__,
+        )
         return NullHeavyModelAdapter(requested_enabled=True, failure_category="unconfigured")
 
 

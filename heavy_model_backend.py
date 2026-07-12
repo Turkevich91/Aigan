@@ -68,7 +68,7 @@ class HeavyMediaInput:
 class HeavyModelRequest:
     prompt: str = field(repr=False)
     media: tuple[HeavyMediaInput, ...] = ()
-    task_class: str = "heavy"
+    task_class: str = field(default="heavy", repr=False)
     max_output_tokens: int | None = None
     temperature: float | None = None
 
@@ -79,7 +79,7 @@ class HeavyModelResult:
     text: str = field(default="", repr=False)
     backend: str = "none"
     api_flavor: str = ""
-    task_class: str = "heavy"
+    task_class: str = field(default="heavy", repr=False)
     failure_category: str = ""
     user_message: str = ""
     duration_ms: int = 0
@@ -352,44 +352,58 @@ class OpenAICompatibleHeavyModelAdapter:
         """List models without sending content or running an inference request."""
 
         started = time.monotonic()
-        try:
-            response = await self._get_client().models.list()
-            models = sequence_value(response, "data")
-            model_ids = {str(value(item, "id") or "") for item in models}
-            model_present = self.settings.model in model_ids
-            self._available = model_present
-            if not model_present:
-                self.last_failure_category = "model_unavailable"
-                return HeavyModelProbeResult(
-                    ok=False,
-                    backend="openai_compatible",
-                    api_flavor=self.settings.api_flavor,
-                    failure_category="model_unavailable",
-                    user_message=FAILURE_MESSAGES["model_unavailable"],
-                    model_present=False,
-                    discovered_model_count=len(model_ids),
-                    duration_ms=elapsed_ms(started),
-                )
-            self.last_failure_category = ""
-            return HeavyModelProbeResult(
-                ok=True,
-                backend="openai_compatible",
-                api_flavor=self.settings.api_flavor,
-                model_present=True,
-                discovered_model_count=len(model_ids),
-                duration_ms=elapsed_ms(started),
-            )
-        except Exception as exc:
-            category = categorize_provider_exception(exc)
-            self._record_provider_failure(category)
+        if not await self._try_acquire_slot():
+            self.busy_count += 1
+            self.last_failure_category = "busy"
             return HeavyModelProbeResult(
                 ok=False,
                 backend="openai_compatible",
                 api_flavor=self.settings.api_flavor,
-                failure_category=category,
-                user_message=FAILURE_MESSAGES[category],
+                failure_category="busy",
+                user_message=FAILURE_MESSAGES["busy"],
                 duration_ms=elapsed_ms(started),
             )
+        try:
+            try:
+                response = await self._get_client().models.list()
+                models = sequence_value(response, "data")
+                model_ids = {str(value(item, "id") or "") for item in models}
+                model_present = self.settings.model in model_ids
+                self._available = model_present
+                if not model_present:
+                    self.last_failure_category = "model_unavailable"
+                    return HeavyModelProbeResult(
+                        ok=False,
+                        backend="openai_compatible",
+                        api_flavor=self.settings.api_flavor,
+                        failure_category="model_unavailable",
+                        user_message=FAILURE_MESSAGES["model_unavailable"],
+                        model_present=False,
+                        discovered_model_count=len(model_ids),
+                        duration_ms=elapsed_ms(started),
+                    )
+                self.last_failure_category = ""
+                return HeavyModelProbeResult(
+                    ok=True,
+                    backend="openai_compatible",
+                    api_flavor=self.settings.api_flavor,
+                    model_present=True,
+                    discovered_model_count=len(model_ids),
+                    duration_ms=elapsed_ms(started),
+                )
+            except Exception as exc:
+                category = categorize_provider_exception(exc)
+                self._record_provider_failure(category)
+                return HeavyModelProbeResult(
+                    ok=False,
+                    backend="openai_compatible",
+                    api_flavor=self.settings.api_flavor,
+                    failure_category=category,
+                    user_message=FAILURE_MESSAGES[category],
+                    duration_ms=elapsed_ms(started),
+                )
+        finally:
+            await self._release_slot()
 
     def health_summary(self) -> dict[str, Any]:
         if self.error_count:
