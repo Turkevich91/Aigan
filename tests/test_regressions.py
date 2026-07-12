@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import io
 import json
 import os
@@ -18,11 +19,14 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import ANY, AsyncMock, PropertyMock, patch
 
-TEST_DB_PATH = os.path.join(tempfile.gettempdir(), f"aigan-test-{os.getpid()}.sqlite3")
-try:
-    os.remove(TEST_DB_PATH)
-except FileNotFoundError:
-    pass
+from tests.support import (
+    TEST_DB_PATH,
+    VALID_JPEG as TEST_VALID_JPEG,
+    configure_test_environment,
+)
+
+
+configure_test_environment()
 
 
 def fake_openai_secret() -> str:
@@ -182,6 +186,18 @@ from telegram.constants import ChatType, ParseMode
 from telegram.error import BadRequest, TimedOut
 
 import main
+
+# Main may be imported first by another discovered test module. Reconcile the
+# shared process with this module's established environment without re-opening DBs.
+main.CONFIG = replace(
+    main.CONFIG,
+    admin_user_ids={
+        int(value.strip())
+        for value in os.environ.get("ADMIN_USER_IDS", "").split(",")
+        if value.strip()
+    },
+)
+
 from agents.items import ModelResponse
 from agents.models.interface import ModelTracing
 from agents.models.openai_responses import OpenAIResponsesModel
@@ -240,7 +256,16 @@ from tool_diagnostics import (
 from tool_runtime import NullToolAdapter, ToolRuntime
 from telegram_presence import ActivityPresence, ActivityPresenceSettings, activity_action_for_route, draft_supported_for_chat
 
-VALID_JPEG = b"\xff\xd8\xff\xe0" + b"valid-jpeg"
+VALID_JPEG = base64.b64decode(
+    "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAP//////////////////////////////////////////////////////////////////////////////////////"
+    "2wBDAf//////////////////////////////////////////////////////////////////////////////////////"
+    "wAARCAABAAEDASIAAhEBAxEB/8QAFQABAQAAAAAAAAAAAAAAAAAAAAX/xAAUEAEAAAAAAAAAAAAAAAAAAAAA/"
+    "9oADAMBAAIQAxAAAAF//8QAFBABAAAAAAAAAAAAAAAAAAAAAP/aAAgBAQABBQJ//8QAFBEBAAAAAAAAAAAAAAAA"
+    "AAAAAP/aAAgBAwEBPwF//8QAFBEBAAAAAAAAAAAAAAAAAAAAAP/aAAgBAgEBPwF//8QAFBABAAAAAAAAAAAAAAAA"
+    "AAAAAP/aAAgBAQAGPwJ//8QAFBABAAAAAAAAAAAAAAAAAAAAAP/aAAgBAQABPyF//9oADAMBAAIAAwAAABD/xAAU"
+    "EQEAAAAAAAAAAAAAAAAAAAAA/9oACAEDAQE/EH//xAAUEQEAAAAAAAAAAAAAAAAAAAAA/9oACAECAQE/EH//xAAU"
+    "EAEAAAAAAAAAAAAAAAAAAAAA/9oACAEBAAE/EH//2Q=="
+)
 
 
 class FakeUser:
@@ -328,6 +353,10 @@ class FakeMessage:
 
     def get_bot(self):
         return self.bot
+
+
+# Use a fully decodable fixture now that the web-image gate verifies containers.
+VALID_JPEG = TEST_VALID_JPEG
 
 
 class FakeApplication:
@@ -2669,7 +2698,7 @@ class TelegramTurnCoalescingTests(unittest.TestCase):
                         asyncio.run(main.handle_image_prompt(message, "Describe this image."))
 
         self.assertEqual(1, len(message.reply_calls))
-        self.assertIn("Не зміг проаналізувати зображення", message.reply_calls[0]["text"])
+        self.assertIn("Не зміг зараз розібрати зображення", message.reply_calls[0]["text"])
         presence.start.assert_awaited_once()
         presence.stop.assert_awaited_once()
 
@@ -3153,7 +3182,7 @@ class TelegramTurnCoalescingTests(unittest.TestCase):
         self.assertEqual(2, extract_images.await_count)
         run_vision.assert_not_awaited()
         self.assertEqual(1, len(first.reply_calls))
-        self.assertIn("Не зміг проаналізувати зображення", first.reply_calls[0]["text"])
+        self.assertIn("Не зміг зараз розібрати зображення", first.reply_calls[0]["text"])
         unavailable_events = [
             event for event in captured_events if event.get("event_type") == "image_part_unavailable"
         ]
@@ -3162,6 +3191,30 @@ class TelegramTurnCoalescingTests(unittest.TestCase):
             private_exception_marker,
             json.dumps(unavailable_events, sort_keys=True, default=str),
         )
+
+    def test_missing_image_payload_uses_natural_copy_without_transport_jargon(self) -> None:
+        message = FakeMessage(
+            "",
+            chat_type=ChatType.PRIVATE,
+            chat_id=next(iter(main.CONFIG.admin_user_ids)),
+            message_id=12145,
+        )
+        message.photo = [FakePhoto(file_id="missing", unique_id="missing-unique")]
+        presence = SimpleNamespace(start=AsyncMock(), stop=AsyncMock())
+
+        with patch.object(main, "activity_presence_for_message", return_value=presence):
+            with patch.object(
+                main,
+                "extract_image_data_urls",
+                new=AsyncMock(return_value=[]),
+            ):
+                asyncio.run(main.handle_image_prompt(message, "Що тут?"))
+
+        self.assertEqual(1, len(message.reply_calls))
+        reply = message.reply_calls[0]["text"]
+        self.assertIn("Самого зображення тут не бачу", reply)
+        for technical_word in ("Telegram", "delivery", "container", "logs"):
+            self.assertNotIn(technical_word, reply)
 
     def test_hard_expired_pending_is_removed_and_does_not_block_new_pending(self) -> None:
         original = FakeMessage("explain the next source", message_id=12151)
@@ -3679,7 +3732,8 @@ class WebSafetyTests(unittest.TestCase):
             def __exit__(self, exc_type, exc, tb) -> None:
                 return None
 
-            def images(self, query: str, max_results: int, region: str):
+            def images(self, query: str, max_results: int, region: str, safesearch: str):
+                self.assert_safe = safesearch
                 return [
                     {"title": "blocked", "image": "https://bad.ru/image.jpg", "url": "https://bad.ru/page"},
                     {"title": "ok", "image": "https://example.com/image.jpg", "url": "https://example.com/page"},
@@ -3691,6 +3745,44 @@ class WebSafetyTests(unittest.TestCase):
 
         self.assertEqual(1, len(results))
         self.assertEqual("ok", results[0]["title"])
+
+    def test_image_search_uses_strict_safe_search_and_worldwide_fallback(self) -> None:
+        calls: list[tuple[str, str]] = []
+
+        class FakeDDGS:
+            def __init__(self, *args, **kwargs) -> None:
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb) -> None:
+                return None
+
+            def images(self, query: str, max_results: int, region: str, safesearch: str):
+                calls.append((region, safesearch))
+                if region == "ua-uk":
+                    return [
+                        {"title": "one", "image": "https://example.com/one.jpg", "url": "https://example.com/one"}
+                    ]
+                return [
+                    {
+                        "title": f"fallback {index}",
+                        "image": f"https://example.com/fallback-{index}.jpg",
+                        "url": f"https://example.com/fallback-{index}",
+                    }
+                    for index in range(4)
+                ]
+
+        with patch.object(web.socket, "getaddrinfo", side_effect=self.fake_getaddrinfo):
+            with patch.object(web, "DDGS", FakeDDGS):
+                batch = web.search_image_candidate_batch("cats", max_results=5)
+
+        self.assertEqual([("ua-uk", "on"), ("wt-wt", "on")], calls)
+        self.assertEqual(5, len(batch.candidates))
+        self.assertEqual(5, batch.raw_count)
+        self.assertEqual(2, batch.search_passes)
+        self.assertEqual(0, batch.provider_failures)
 
     def test_web_search_and_image_search_use_configured_ddgs_timeout(self) -> None:
         captured_timeouts: list[float] = []
@@ -3708,8 +3800,15 @@ class WebSafetyTests(unittest.TestCase):
             def text(self, query: str, max_results: int, region: str):
                 return [{"title": "ok", "href": "https://example.com/page", "body": "body"}]
 
-            def images(self, query: str, max_results: int, region: str):
-                return [{"title": "ok", "image": "https://example.com/image.jpg", "url": "https://example.com/page"}]
+            def images(self, query: str, max_results: int, region: str, safesearch: str):
+                return [
+                    {
+                        "title": "ok",
+                        "image": f"https://example.com/image-{index}.jpg",
+                        "url": f"https://example.com/page-{index}",
+                    }
+                    for index in range(5)
+                ]
 
         with patch.dict(os.environ, {"WEB_SEARCH_TIMEOUT_SECONDS": "17"}):
             with patch.object(web, "DDGS", FakeDDGS):
@@ -3961,8 +4060,9 @@ class TimeContextTests(unittest.TestCase):
                 with patch.object(main.Runner, "run", new=AsyncMock(return_value=fake_result)):
                     output = asyncio.run(main.run_agent("prompt"))
 
-        self.assertIn("Telegram-доставку медіа не підтверджено", output)
-        self.assertIn("не прикріпив фото", output)
+        self.assertIn("Знайшов варіанти", output)
+        self.assertIn("фото не прикріпилося", output)
+        self.assertNotIn("Telegram", output)
         self.assertNotEqual("Готово, фото вище.", output)
 
     def test_mcp_failure_message_classifies_timeout_without_raw_error(self) -> None:
@@ -4792,7 +4892,7 @@ class OutboundIdentityAndProvenanceTests(unittest.TestCase):
         )
 
         with patch.object(Path, "write_bytes", side_effect=OSError("disk unavailable")):
-            item_id = main.save_external_image_memory(
+            result = main.save_external_image_memory_result(
                 message,
                 delivered=delivered,
                 data=VALID_JPEG,
@@ -4804,7 +4904,10 @@ class OutboundIdentityAndProvenanceTests(unittest.TestCase):
                 output_part_count=1,
             )
 
+        item_id = result.item_id
         item = main.MEMORY.message_by_message_id(message.chat_id, delivered.message_id)
+        self.assertTrue(result.persistence_available)
+        self.assertFalse(result.cache_persisted)
         self.assertEqual(item_id, item.id)
         self.assertEqual("", item.local_media_path)
         self.assertEqual("internet_image_send", main.MEMORY.provenance_for_output(item.id).route)
@@ -4816,7 +4919,7 @@ class OutboundIdentityAndProvenanceTests(unittest.TestCase):
         delivered = SimpleNamespace(message_id=8810, chat=message.chat, date=datetime.now(timezone.utc))
 
         with patch.object(Path, "mkdir", side_effect=OSError("disk unavailable")):
-            item_id = main.save_external_image_memory(
+            result = main.save_external_image_memory_result(
                 message,
                 delivered=delivered,
                 data=VALID_JPEG,
@@ -4828,6 +4931,9 @@ class OutboundIdentityAndProvenanceTests(unittest.TestCase):
                 output_part_count=1,
             )
 
+        item_id = result.item_id
+        self.assertTrue(result.persistence_available)
+        self.assertFalse(result.cache_persisted)
         self.assertEqual(item_id, main.MEMORY.message_by_message_id(message.chat_id, 8810).id)
         self.assertEqual("internet_image_send", main.MEMORY.provenance_for_output(item_id).route)
 
@@ -4838,7 +4944,7 @@ class OutboundIdentityAndProvenanceTests(unittest.TestCase):
         delivered = SimpleNamespace(message_id=8811, chat=message.chat, date=datetime.now(timezone.utc))
 
         with patch.object(main.MEMORY, "update_media", side_effect=RuntimeError("db unavailable")):
-            item_id = main.save_external_image_memory(
+            result = main.save_external_image_memory_result(
                 message,
                 delivered=delivered,
                 data=VALID_JPEG,
@@ -4850,7 +4956,10 @@ class OutboundIdentityAndProvenanceTests(unittest.TestCase):
                 output_part_count=1,
             )
 
+        item_id = result.item_id
         item = main.MEMORY.message_by_message_id(message.chat_id, 8811)
+        self.assertTrue(result.persistence_available)
+        self.assertFalse(result.cache_persisted)
         self.assertEqual(item_id, item.id)
         self.assertEqual("", item.local_media_path)
         self.assertFalse((main.MEMORY.media_dir / str(message.chat_id) / f"{item_id}-web.jpg").exists())
@@ -4961,13 +5070,14 @@ class OutboundIdentityAndProvenanceTests(unittest.TestCase):
         provenance = main.provenance_for_message(message, "internet_image_send")
 
         result = asyncio.run(main.send_web_image_results(message, self.web_images(3)))
-        item_ids = main.save_sent_web_images(
+        persistence = main.save_sent_web_images(
             message,
             result.deliveries,
             provenance,
             intended_count=result.intended_count,
         )
 
+        item_ids = persistence.item_ids
         self.assertEqual(2, len(result.deliveries))
         self.assertEqual(3, result.intended_count)
         self.assertEqual("partial_delivery", main.MEMORY.provenance_for_output(item_ids[0]).status)
@@ -4977,13 +5087,14 @@ class OutboundIdentityAndProvenanceTests(unittest.TestCase):
         self.save_trigger(message)
         image_provenance = main.provenance_for_message(message, "internet_image_send")
         delivery_result = asyncio.run(main.send_web_image_results(message, self.web_images(2)))
-        image_item_ids = main.save_sent_web_images(
+        image_persistence = main.save_sent_web_images(
             message,
             delivery_result.deliveries,
             image_provenance,
             intended_count=delivery_result.intended_count,
         )
 
+        image_item_ids = image_persistence.item_ids
         with patch.object(main, "run_vision", new=AsyncMock(return_value="image analysis")):
             summary = asyncio.run(
                 main.maybe_analyze_found_images(message, message.text, delivery_result.deliveries)
@@ -7115,7 +7226,30 @@ class PersistentMemoryTests(unittest.TestCase):
         main.set_reaction_adapter(main.NullReactionAdapter())
         main.TOOL_RUNTIME.clear_error_counts()
 
+        async def accept_all_reviews(
+            message,
+            query,
+            images,
+            outbound_provenance,
+            *,
+            target_count=None,
+        ):
+            return main.WebImageReviewResult(
+                tuple(images),
+                len(images),
+                0,
+                True,
+            )
+
+        self.image_review_patch = patch.object(
+            main,
+            "review_web_image_candidates",
+            new=AsyncMock(side_effect=accept_all_reviews),
+        )
+        self.image_review_patch.start()
+
     def tearDown(self) -> None:
+        self.image_review_patch.stop()
         if main.MEMORY is not None:
             main.MEMORY.clear_all()
         if main.SYSTEM_LOG is not None:
@@ -7130,6 +7264,17 @@ class PersistentMemoryTests(unittest.TestCase):
         main.embedding_queue = None
         main.set_reaction_adapter(main.NullReactionAdapter())
         main.TOOL_RUNTIME.clear_error_counts()
+
+    @staticmethod
+    def image_search_batch(candidates: list[dict[str, str]]) -> web.ImageSearchBatch:
+        return web.ImageSearchBatch(
+            tuple(candidates),
+            raw_count=len(candidates),
+            url_rejected_count=0,
+            duplicate_count=0,
+            search_passes=1,
+            provider_failures=0,
+        )
 
     def test_messages_persist_after_ram_context_is_cleared(self) -> None:
         self.assertIsNotNone(main.MEMORY)
@@ -10474,8 +10619,12 @@ class PersistentMemoryTests(unittest.TestCase):
 
         with patch.object(
             main,
-            "search_image_candidates",
-            return_value=[{"title": "Cat", "image": "https://example.com/cat.jpg", "source": "https://example.com/cat"}],
+            "search_image_candidate_batch",
+            return_value=self.image_search_batch(
+                [
+                    {"title": "Cat", "image": "https://example.com/cat.jpg", "source": "https://example.com/cat"}
+                ]
+            ),
         ):
             with patch.object(
                 main,
@@ -10488,12 +10637,61 @@ class PersistentMemoryTests(unittest.TestCase):
         self.assertIsInstance(handled, main.WebImageSendOutcome)
         self.assertTrue(handled.confirmed_delivery)
         self.assertEqual(1, len(message.photo_calls))
-        self.assertIn("Cat", message.photo_calls[0]["caption"])
+        self.assertEqual("", message.photo_calls[0]["caption"])
         actions = [call.kwargs["action"] for call in message.bot.send_chat_action.await_args_list]
         self.assertGreaterEqual(len(actions), 2)
         self.assertEqual("typing", actions[0])
         self.assertIn("upload_photo", actions)
         self.assertLess(actions.index("typing"), actions.index("upload_photo"))
+
+    def test_pre_send_review_rejects_cat_mask_before_telegram(self) -> None:
+        message = FakeMessage("покажи фото кота", message_id=401)
+        candidates = [
+            {"title": "Cat mask", "image": "https://example.com/mask.jpg", "source": "https://example.com/mask"},
+            {"title": "Real cat", "image": "https://example.com/cat.jpg", "source": "https://example.com/cat"},
+        ]
+        reviewed_cat = main.WebImageResult(
+            data=VALID_JPEG,
+            mime_type="image/jpeg",
+            source_url="https://example.com/cat",
+            source_title="Real cat",
+            final_url="https://example.com/cat.jpg",
+            vision_summary="Справжній кіт дивиться в камеру.",
+        )
+
+        with patch.object(
+            main,
+            "search_image_candidate_batch",
+            return_value=self.image_search_batch(candidates),
+        ):
+            with patch.object(
+                main,
+                "fetch_binary_url",
+                side_effect=[
+                    (VALID_JPEG, "image/jpeg", "https://example.com/mask.jpg"),
+                    (VALID_JPEG, "image/jpeg", "https://example.com/cat.jpg"),
+                ],
+            ):
+                with patch.object(
+                    main,
+                    "review_web_image_candidates",
+                    new=AsyncMock(
+                        return_value=main.WebImageReviewResult(
+                            (reviewed_cat,),
+                            2,
+                            1,
+                            True,
+                        )
+                    ),
+                ):
+                    outcome = asyncio.run(main.maybe_send_internet_image(message, message.text))
+
+        self.assertTrue(outcome.confirmed_delivery)
+        self.assertEqual(1, len(message.photo_calls))
+        stored = [item for item in main.MEMORY.latest(message.chat_id, 5) if item.attachment_type == "web_image"]
+        self.assertEqual(1, len(stored))
+        self.assertEqual("Real cat", stored[0].source_title)
+        self.assertNotEqual("Cat mask", stored[0].source_title)
 
     def test_image_send_without_real_telegram_message_id_is_ambiguous(self) -> None:
         message = FakeMessage("покажи фото синтетичного маяка", message_id=41)
@@ -10508,14 +10706,16 @@ class PersistentMemoryTests(unittest.TestCase):
 
         with patch.object(
             main,
-            "search_image_candidates",
-            return_value=[
+            "search_image_candidate_batch",
+            return_value=self.image_search_batch(
+                [
                 {
                     "title": "Synthetic lighthouse",
                     "image": "https://example.com/lighthouse.jpg",
                     "source": "https://example.com/lighthouse",
                 }
-            ],
+                ]
+            ),
         ):
             with patch.object(
                 main,
@@ -10527,7 +10727,7 @@ class PersistentMemoryTests(unittest.TestCase):
         self.assertTrue(outcome)
         self.assertFalse(outcome.confirmed_delivery)
         self.assertTrue(outcome.ambiguous)
-        self.assertIn("не підтвердив доставку", message.reply_calls[-1]["text"])
+        self.assertEqual([], message.reply_calls)
         stored = main.MEMORY.latest(message.chat_id, 10)
         self.assertFalse(any(item.attachment_type == "web_image" for item in stored))
 
@@ -11087,8 +11287,8 @@ class PersistentMemoryTests(unittest.TestCase):
                     (),
                     required=True,
                 )
-                self.assertIn("Маршрут доставки зображень не запускався", output)
-                self.assertIn("не прикріпив фото", output)
+                self.assertIn("Фото не прикріпилося", output)
+                self.assertNotIn("Telegram", output)
 
     def test_request_postcondition_preserves_locally_negated_delivery_failure(self) -> None:
         output = "Не вдалося надіслати фото"
@@ -11180,8 +11380,8 @@ class PersistentMemoryTests(unittest.TestCase):
             main.CONFIG = original_config
 
         verifier.assert_awaited_once_with(message, prompt)
-        self.assertIn("Маршрут доставки зображень не запускався", output)
-        self.assertIn("не прикріпив фото", output)
+        self.assertIn("Фото не прикріпилося", output)
+        self.assertNotIn("Telegram", output)
 
     def test_semantic_postcondition_preserves_a_confirmed_nonvisual_done(self) -> None:
         prompt = "Додай приклад до пояснення"
@@ -11336,7 +11536,7 @@ class PersistentMemoryTests(unittest.TestCase):
             main.CONFIG = original_config
 
         verifier.assert_awaited_once_with(message, prompt)
-        self.assertIn("не прикріпив фото", output)
+        self.assertIn("Фото не прикріпилося", output)
 
     def test_semantic_postcondition_blocks_private_and_external_visual_requests(self) -> None:
         decision = main.ImageIntentDecision(
@@ -11397,7 +11597,7 @@ class PersistentMemoryTests(unittest.TestCase):
                                     decision,
                                 )
                             )
-                    self.assertIn("не прикріпив фото", output)
+                    self.assertIn("Фото не прикріпилося", output)
         finally:
             main.CONFIG = original_config
 
@@ -11726,21 +11926,27 @@ class PersistentMemoryTests(unittest.TestCase):
         message = FakeMessage("покажи картинку кота", message_id=70)
         context = SimpleNamespace(bot=SimpleNamespace(send_chat_action=AsyncMock()))
 
-        with patch.object(main, "maybe_send_internet_image", new=AsyncMock(return_value=True)) as image_send:
-            with patch.object(
-                main,
-                "route_tool_capabilities_for_message",
-                new=AsyncMock(side_effect=AssertionError("handled image route should not route tools")),
-            ) as tool_route:
-                with patch.object(main, "run_agent", new=AsyncMock(side_effect=AssertionError("agent should not run"))):
-                    asyncio.run(
-                        main.handle_prompt_generation(
-                            message,
-                            context,
-                            message.text,
-                            allow_pending_wait=False,
+        classification = main.RequestClassification("internet_image_send")
+        with patch.object(
+            main,
+            "classify_request_with_intent",
+            new=AsyncMock(return_value=classification),
+        ):
+            with patch.object(main, "maybe_send_internet_image", new=AsyncMock(return_value=True)) as image_send:
+                with patch.object(
+                    main,
+                    "route_tool_capabilities_for_message",
+                    new=AsyncMock(side_effect=AssertionError("handled image route should not route tools")),
+                ) as tool_route:
+                    with patch.object(main, "run_agent", new=AsyncMock(side_effect=AssertionError("agent should not run"))):
+                        asyncio.run(
+                            main.handle_prompt_generation(
+                                message,
+                                context,
+                                message.text,
+                                allow_pending_wait=False,
+                            )
                         )
-                    )
 
         image_send.assert_awaited_once_with(message, message.text, outbound_provenance=ANY)
         self.assertIsInstance(image_send.await_args.kwargs["outbound_provenance"], main.OutboundProvenance)
@@ -11751,22 +11957,28 @@ class PersistentMemoryTests(unittest.TestCase):
         context = SimpleNamespace(bot=SimpleNamespace(send_chat_action=AsyncMock()))
         outcome = main.WebImageSendOutcome(True, confirmed_media_count=0, ambiguous=True)
 
-        with patch.object(main, "maybe_send_internet_image", new=AsyncMock(return_value=outcome)):
-            with patch.object(main, "record_chat_answer") as record_answer:
-                with patch.object(
-                    main,
-                    "run_agent",
-                    new=AsyncMock(side_effect=AssertionError("generic agent should not run")),
-                ):
-                    asyncio.run(
-                        main.handle_prompt_generation(
-                            message,
-                            context,
-                            message.text,
-                            allow_pending_wait=False,
-                            skip_cooldown=True,
+        classification = main.RequestClassification("internet_image_send")
+        with patch.object(
+            main,
+            "classify_request_with_intent",
+            new=AsyncMock(return_value=classification),
+        ):
+            with patch.object(main, "maybe_send_internet_image", new=AsyncMock(return_value=outcome)):
+                with patch.object(main, "record_chat_answer") as record_answer:
+                    with patch.object(
+                        main,
+                        "run_agent",
+                        new=AsyncMock(side_effect=AssertionError("generic agent should not run")),
+                    ):
+                        asyncio.run(
+                            main.handle_prompt_generation(
+                                message,
+                                context,
+                                message.text,
+                                allow_pending_wait=False,
+                                skip_cooldown=True,
+                            )
                         )
-                    )
 
         record_answer.assert_not_called()
 
@@ -11783,12 +11995,14 @@ class PersistentMemoryTests(unittest.TestCase):
 
         with patch.object(
             main,
-            "search_image_candidates",
-            return_value=[
+            "search_image_candidate_batch",
+            return_value=self.image_search_batch(
+                [
                 {"title": "Capybara 1", "image": "https://example.com/capy1.jpg", "source": "https://example.com/capy1"},
                 {"title": "Capybara 2", "image": "https://example.com/capy2.jpg", "source": "https://example.com/capy2"},
                 {"title": "Capybara 3", "image": "https://example.com/capy3.jpg", "source": "https://example.com/capy3"},
-            ],
+                ]
+            ),
         ) as search_images:
             with patch.object(
                 main,
@@ -11802,7 +12016,7 @@ class PersistentMemoryTests(unittest.TestCase):
                 handled = asyncio.run(main.maybe_send_internet_image(message, message.text))
 
         self.assertTrue(handled)
-        search_images.assert_called_once_with("капібар", 10)
+        search_images.assert_called_once_with("капібар", 20)
         self.assertEqual(1, message.media_group_attempts)
         self.assertEqual(1, len(message.media_group_calls))
         self.assertEqual(0, len(message.photo_calls))
@@ -11810,9 +12024,10 @@ class PersistentMemoryTests(unittest.TestCase):
         self.assertEqual(3, len(media))
         self.assertTrue(all(isinstance(item, InputMediaPhoto) for item in media))
         self.assertTrue(all(not str(item.media).startswith("http") for item in media))
-        self.assertIn("Capybara 1", media[0].caption)
+        self.assertEqual("Ось.", media[0].caption)
         self.assertLessEqual(len(media[0].caption), 1024)
-        self.assertNotIn("<a href", media[0].caption)
+        self.assertNotIn("Capybara", media[0].caption)
+        self.assertNotIn("example.com", media[0].caption)
         self.assertIsNone(media[1].caption)
         self.assertIsNone(media[2].caption)
         stored = main.MEMORY.latest(message.chat_id, 10)
@@ -11824,12 +12039,14 @@ class PersistentMemoryTests(unittest.TestCase):
 
         with patch.object(
             main,
-            "search_image_candidates",
-            return_value=[
+            "search_image_candidate_batch",
+            return_value=self.image_search_batch(
+                [
                 {"title": "Capybara 1", "image": "https://example.com/capy1.jpg", "source": "https://example.com/capy1"},
                 {"title": "Capybara 2", "image": "https://example.com/capy2.jpg", "source": "https://example.com/capy2"},
                 {"title": "Capybara 3", "image": "https://example.com/capy3.jpg", "source": "https://example.com/capy3"},
-            ],
+                ]
+            ),
         ):
             with patch.object(
                 main,
@@ -11846,20 +12063,71 @@ class PersistentMemoryTests(unittest.TestCase):
         self.assertEqual(1, message.media_group_attempts)
         self.assertEqual(0, len(message.media_group_calls))
         self.assertEqual(3, len(message.photo_calls))
-        self.assertIn("1/3. Capybara 1", message.photo_calls[0]["caption"])
+        self.assertTrue(all(call["caption"] == "" for call in message.photo_calls))
         stored = main.MEMORY.latest(message.chat_id, 10)
         self.assertEqual(3, len([item for item in stored if item.attachment_type == "web_image"]))
+
+    def test_album_fallback_backfills_failed_parts_from_reviewed_reserves(self) -> None:
+        message = FakeMessage("надішли 5 фото котів", message_id=731)
+        message.media_group_failures = 1
+        message.photo_failures = 2
+        candidates = [
+            {
+                "title": f"Cat {index}",
+                "image": f"https://example.com/reserve-{index}.jpg",
+                "source": f"https://example.com/reserve-{index}",
+            }
+            for index in range(7)
+        ]
+        plan = main.ImageDeliveryPlan(
+            query="котів",
+            target_count=5,
+            requested_count=5,
+            quantity_kind="exact",
+        )
+
+        with patch.object(
+            main,
+            "search_image_candidate_batch",
+            return_value=self.image_search_batch(candidates),
+        ):
+            with patch.object(
+                main,
+                "fetch_binary_url",
+                side_effect=[
+                    (VALID_JPEG, "image/jpeg", candidate["image"])
+                    for candidate in candidates
+                ],
+            ):
+                with patch.object(
+                    main,
+                    "notify_operator_alert",
+                    new=AsyncMock(return_value="sent"),
+                ) as notify:
+                    outcome = asyncio.run(
+                        main.maybe_send_internet_image(message, message.text, plan=plan)
+                    )
+
+        self.assertTrue(outcome.request_fulfilled)
+        self.assertEqual(1, message.media_group_attempts)
+        self.assertEqual(5, len(message.photo_calls))
+        self.assertEqual(5, outcome.confirmed_media_count)
+        self.assertFalse(
+            any(call.args[1] == "image_delivery_partial" for call in notify.await_args_list)
+        )
 
     def test_invalid_image_candidate_is_skipped_before_valid_photo(self) -> None:
         message = FakeMessage("покажи картинку кота", message_id=70)
 
         with patch.object(
             main,
-            "search_image_candidates",
-            return_value=[
+            "search_image_candidate_batch",
+            return_value=self.image_search_batch(
+                [
                 {"title": "Bad", "image": "https://example.com/bad.jpg", "source": "https://example.com/bad"},
                 {"title": "Good", "image": "https://example.com/good.jpg", "source": "https://example.com/good"},
-            ],
+                ]
+            ),
         ):
             with patch.object(
                 main,
@@ -11873,8 +12141,8 @@ class PersistentMemoryTests(unittest.TestCase):
 
         self.assertTrue(handled)
         self.assertEqual(1, len(message.photo_calls))
-        self.assertIn("Good", message.photo_calls[0]["caption"])
-        self.assertIn("Good", main.MEMORY.latest(message.chat_id, 1)[0].source_title)
+        self.assertEqual("", message.photo_calls[0]["caption"])
+        self.assertEqual("Good", main.MEMORY.latest(message.chat_id, 1)[0].source_title)
 
     def test_telegram_photo_failure_tries_next_candidate_without_storing_failed_image(self) -> None:
         message = FakeMessage("покажи картинку кота", message_id=71)
@@ -11882,11 +12150,13 @@ class PersistentMemoryTests(unittest.TestCase):
 
         with patch.object(
             main,
-            "search_image_candidates",
-            return_value=[
+            "search_image_candidate_batch",
+            return_value=self.image_search_batch(
+                [
                 {"title": "Rejected", "image": "https://example.com/rejected.jpg", "source": "https://example.com/rejected"},
                 {"title": "Accepted", "image": "https://example.com/accepted.jpg", "source": "https://example.com/accepted"},
-            ],
+                ]
+            ),
         ):
             with patch.object(
                 main,
@@ -11900,10 +12170,147 @@ class PersistentMemoryTests(unittest.TestCase):
 
         self.assertTrue(handled)
         self.assertEqual(1, len(message.photo_calls))
-        self.assertIn("Accepted", message.photo_calls[0]["caption"])
+        self.assertEqual("", message.photo_calls[0]["caption"])
         stored = main.MEMORY.latest(message.chat_id, 5)
         self.assertEqual(1, len([item for item in stored if item.attachment_type == "web_image"]))
         self.assertIn("Accepted", stored[-1].source_title)
+
+    def test_candidate_shortfall_uses_natural_copy_and_distinct_provenance(self) -> None:
+        message = FakeMessage("надішли 5 фото котів", message_id=710)
+        candidate = {
+            "title": "Cat",
+            "image": "https://example.com/cat.jpg",
+            "source": "https://example.com/cat",
+        }
+        plan = main.ImageDeliveryPlan(
+            query="котів",
+            target_count=5,
+            requested_count=5,
+            quantity_kind="exact",
+        )
+
+        with patch.object(
+            main,
+            "search_image_candidate_batch",
+            return_value=self.image_search_batch([candidate]),
+        ):
+            with patch.object(
+                main,
+                "fetch_binary_url",
+                return_value=(VALID_JPEG, "image/jpeg", "https://example.com/cat.jpg"),
+            ):
+                outcome = asyncio.run(
+                    main.maybe_send_internet_image(message, message.text, plan=plan)
+                )
+
+        self.assertFalse(outcome.confirmed_delivery)
+        self.assertFalse(outcome.request_fulfilled)
+        self.assertEqual(0, len(message.photo_calls))
+        self.assertEqual(0, len(message.media_group_calls))
+        self.assertEqual(1, len(message.reply_calls))
+        note = message.reply_calls[0]["text"]
+        self.assertIn("Нормального альбому не назбирав", note)
+        self.assertNotIn("Telegram", note)
+        self.assertNotIn("1 із 5", note)
+        events = main.SYSTEM_LOG.events_since(60, "error", 50)
+        self.assertFalse(
+            any(event.event_type == "post_delivery_persistence_failed" for event in events)
+        )
+
+    def test_two_relevant_candidates_form_partial_album_but_do_not_fulfill_five(self) -> None:
+        message = FakeMessage("надішли 5 фото котів", message_id=711)
+        candidates = [
+            {
+                "title": f"Cat {index}",
+                "image": f"https://example.com/cat-{index}.jpg",
+                "source": f"https://example.com/cat-{index}",
+            }
+            for index in range(2)
+        ]
+        plan = main.ImageDeliveryPlan(
+            query="котів",
+            target_count=5,
+            requested_count=5,
+            quantity_kind="exact",
+        )
+
+        with patch.object(
+            main,
+            "search_image_candidate_batch",
+            return_value=self.image_search_batch(candidates),
+        ):
+            with patch.object(
+                main,
+                "fetch_binary_url",
+                side_effect=[
+                    (VALID_JPEG, "image/jpeg", candidate["image"])
+                    for candidate in candidates
+                ],
+            ):
+                with patch.object(
+                    main,
+                    "notify_operator_alert",
+                    new=AsyncMock(return_value="sent"),
+                ) as notify:
+                    outcome = asyncio.run(
+                        main.maybe_send_internet_image(message, message.text, plan=plan)
+                    )
+
+        self.assertTrue(outcome.confirmed_delivery)
+        self.assertFalse(outcome.request_fulfilled)
+        self.assertEqual(2, outcome.confirmed_media_count)
+        self.assertEqual(1, len(message.media_group_calls))
+        self.assertEqual(2, len(message.media_group_calls[0]["media"]))
+        self.assertEqual(1, len(message.reply_calls))
+        self.assertIn("Більше справді доречних", message.reply_calls[0]["text"])
+        self.assertNotIn("Telegram", message.reply_calls[0]["text"])
+        self.assertFalse(
+            any(call.args[1] == "image_delivery_partial" for call in notify.await_args_list)
+        )
+        events = main.SYSTEM_LOG.events_since(60, "warning", 50)
+        self.assertTrue(any(event.event_type == "image_selection_shortfall" for event in events))
+
+    def test_ten_requested_delivers_capped_five_with_natural_explanation(self) -> None:
+        message = FakeMessage("надішли 10 фото котів", message_id=712)
+        candidates = [
+            {
+                "title": f"Cat {index}",
+                "image": f"https://example.com/cat-cap-{index}.jpg",
+                "source": f"https://example.com/cat-cap-{index}",
+            }
+            for index in range(5)
+        ]
+        plan = main.ImageDeliveryPlan(
+            query="котів",
+            target_count=5,
+            requested_count=10,
+            quantity_kind="exact",
+        )
+
+        with patch.object(
+            main,
+            "search_image_candidate_batch",
+            return_value=self.image_search_batch(candidates),
+        ):
+            with patch.object(
+                main,
+                "fetch_binary_url",
+                side_effect=[
+                    (VALID_JPEG, "image/jpeg", candidate["image"])
+                    for candidate in candidates
+                ],
+            ):
+                outcome = asyncio.run(
+                    main.maybe_send_internet_image(message, message.text, plan=plan)
+                )
+
+        self.assertTrue(outcome.request_fulfilled)
+        self.assertEqual(5, outcome.confirmed_media_count)
+        self.assertEqual(5, len(message.media_group_calls[0]["media"]))
+        self.assertEqual(1, len(message.reply_calls))
+        note = message.reply_calls[0]["text"]
+        self.assertIn("п’ять найкращих", note)
+        self.assertNotIn("Telegram", note)
 
     def test_time_sensitive_prompt_prefetches_web_context(self) -> None:
         prompt = "яка погода зараз в Атланті?"
@@ -14328,6 +14735,26 @@ class SystemHealthTests(unittest.TestCase):
         self.assertNotIn(fake_openai_secret(), prompt)
         self.assertIn("[redacted]", prompt)
         self.assertIn("health degraded", message.reply_calls[0]["text"])
+
+    def test_selfcheck_failure_does_not_expose_internal_log_jargon(self) -> None:
+        message = FakeMessage("/selfcheck")
+
+        with patch.object(
+            main,
+            "run_plain_model",
+            new=AsyncMock(side_effect=RuntimeError("private failure")),
+        ):
+            asyncio.run(
+                main.selfcheck_command(
+                    SimpleNamespace(effective_message=message),
+                    SimpleNamespace(),
+                )
+            )
+
+        reply = message.reply_calls[0]["text"]
+        self.assertIn("Самоаналіз зараз не вдався", reply)
+        self.assertNotIn("system", reply.casefold())
+        self.assertNotIn("log", reply.casefold())
 
 
 class LivingReminderTests(unittest.TestCase):

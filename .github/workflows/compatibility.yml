@@ -18,6 +18,8 @@ jobs:
   compatibility:
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    env:
+      LOG_LEVEL: CRITICAL
 
     steps:
       - name: Check out repository

@@ -1,6 +1,7 @@
 import ipaddress
 import os
 import socket
+from dataclasses import dataclass
 from urllib.parse import urljoin, urlparse
 
 import httpx
@@ -12,6 +13,17 @@ from mcp.server.fastmcp import FastMCP
 mcp = FastMCP("aigan-web")
 MAX_REDIRECTS = 5
 DEFAULT_WEB_SEARCH_TIMEOUT_SECONDS = 15.0
+
+
+@dataclass(frozen=True)
+class ImageSearchBatch:
+    candidates: tuple[dict[str, str], ...]
+    raw_count: int
+    url_rejected_count: int
+    duplicate_count: int
+    search_passes: int
+    provider_failures: int
+
 
 BLOCKED_RUSSIAN_HOSTS = {
     "dzen.ru",
@@ -118,35 +130,86 @@ def _safe_item_url(url: str) -> str:
         return ""
 
 
-def search_image_candidates(query: str, max_results: int = 5, region: str = "ua-uk") -> list[dict[str, str]]:
-    """Return safe public image candidates without exposing private/Russian hosts."""
+def search_image_candidate_batch(
+    query: str,
+    max_results: int = 5,
+    region: str = "ua-uk",
+) -> ImageSearchBatch:
+    """Return URL-safe public candidates plus payload-free pool diagnostics."""
     query = query.strip()
     if not query:
-        return []
-    max_results = max(1, min(int(max_results), 8))
+        return ImageSearchBatch((), 0, 0, 0, 0, 0)
+    # Internal album delivery oversamples so semantic review can reject bad matches.
+    max_results = max(1, min(int(max_results), 20))
     region = (region or "ua-uk").strip()
 
-    with DDGS(timeout=_web_search_timeout_seconds()) as ddgs:
-        raw_results = list(ddgs.images(query, max_results=max_results * 4, region=region))
-
     results: list[dict[str, str]] = []
-    for item in raw_results:
-        image_url = item.get("image") or item.get("thumbnail") or ""
-        source_url = item.get("url") or item.get("source") or item.get("href") or image_url
-        safe_image = _safe_item_url(image_url)
-        safe_source = _safe_item_url(source_url) if source_url else safe_image
-        if not safe_image:
+    seen_images: set[str] = set()
+    raw_count = 0
+    url_rejected_count = 0
+    duplicate_count = 0
+    provider_failures = 0
+    search_passes = 0
+    first_error: Exception | None = None
+    regions = tuple(dict.fromkeys((region, "wt-wt")))
+
+    for current_region in regions:
+        search_passes += 1
+        try:
+            with DDGS(timeout=_web_search_timeout_seconds()) as ddgs:
+                raw_results = list(
+                    ddgs.images(
+                        query,
+                        max_results=max_results * 4,
+                        region=current_region,
+                        safesearch="on",
+                    )
+                )
+        except Exception as exc:
+            provider_failures += 1
+            if first_error is None:
+                first_error = exc
             continue
-        results.append(
-            {
-                "title": item.get("title") or item.get("body") or "(untitled image)",
-                "image": safe_image,
-                "source": safe_source or safe_image,
-            }
-        )
+        raw_count += len(raw_results)
+        for item in raw_results:
+            image_url = item.get("image") or item.get("thumbnail") or ""
+            source_url = item.get("url") or item.get("source") or item.get("href") or image_url
+            safe_image = _safe_item_url(image_url)
+            if not safe_image:
+                url_rejected_count += 1
+                continue
+            if safe_image in seen_images:
+                duplicate_count += 1
+                continue
+            safe_source = _safe_item_url(source_url) if source_url else safe_image
+            seen_images.add(safe_image)
+            results.append(
+                {
+                    "title": item.get("title") or item.get("body") or "(untitled image)",
+                    "image": safe_image,
+                    "source": safe_source or safe_image,
+                }
+            )
+            if len(results) >= max_results:
+                break
         if len(results) >= max_results:
             break
-    return results
+
+    if not results and provider_failures == search_passes and first_error is not None:
+        raise first_error
+    return ImageSearchBatch(
+        tuple(results),
+        raw_count,
+        url_rejected_count,
+        duplicate_count,
+        search_passes,
+        provider_failures,
+    )
+
+
+def search_image_candidates(query: str, max_results: int = 5, region: str = "ua-uk") -> list[dict[str, str]]:
+    """Compatibility wrapper returning URL-safe public image candidates."""
+    return list(search_image_candidate_batch(query, max_results=max_results, region=region).candidates)
 
 
 def fetch_binary_url(url: str, max_bytes: int = 10_000_000, allowed_content_prefixes: tuple[str, ...] = ("image/",)) -> tuple[bytes, str, str]:

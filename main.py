@@ -14,6 +14,7 @@ import re
 import secrets
 import sys
 import time
+import warnings
 from collections import Counter, defaultdict, deque
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -35,17 +36,32 @@ from agents import (
 from agents.mcp import MCPServerStdio
 from agents.models.openai_responses import OpenAIResponsesModel
 from openai import AsyncOpenAI, OpenAI
+from PIL import Image, UnidentifiedImageError
 from telegram import Bot, InputMediaPhoto, Message, MessageEntity, Update
 from telegram.constants import ChatAction, ChatType, ParseMode
 from telegram.error import BadRequest, NetworkError
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, MessageReactionHandler, filters
 
-from mcp_servers.web import fetch_binary_url, fetch_url, search_image_candidates, search_web
+from mcp_servers.web import (
+    fetch_binary_url,
+    fetch_url,
+    search_image_candidate_batch,
+    search_web,
+)
 from heavy_model_backend import (
     HeavyModelAdapter,
     HeavyModelSettings,
     NullHeavyModelAdapter,
     OpenAICompatibleHeavyModelAdapter,
+)
+from image_candidate_review import (
+    IMAGE_CANDIDATE_REVIEW_PROMPT_VERSION,
+    IMAGE_CANDIDATE_REVIEW_SCHEMA_VERSION,
+    IMAGE_CANDIDATE_REVIEW_SYSTEM_PROMPT,
+    ImageCandidateReview,
+    image_candidate_review_schema,
+    normalize_image_candidate_reviews,
+    selected_candidate_indices,
 )
 from image_intent import (
     IMAGE_INTENT_ROUTER_SYSTEM_PROMPT,
@@ -97,6 +113,11 @@ from model_telemetry import (
     normalize_run_id,
     normalize_task_class_bucket,
     normalize_tracing_mode,
+)
+from operator_alerts import (
+    OperatorAlert,
+    OperatorAlertService,
+    OperatorAlertSettings,
 )
 from outbound_reactions import NullReactionAdapter, OutboundReactionAdapter, OutboundReactionConfig, ReactionAdapter
 from provenance import ToolProvenance, extract_tool_provenance, make_tool_provenance, renumber_tool_provenance
@@ -314,6 +335,14 @@ class Config:
     image_analysis_enabled: bool
     vision_model: str
     image_max_bytes: int
+    image_candidate_review_enabled: bool
+    image_candidate_review_model: str
+    image_candidate_review_max_output_tokens: int
+    image_candidate_review_confidence_threshold: float
+    image_candidate_review_timeout_seconds: float
+    image_candidate_review_max_total_bytes: int
+    web_image_pipeline_timeout_seconds: float
+    web_image_fetch_concurrency: int
     followup_debounce_seconds: float
     memory_enabled: bool
     memory_db_path: str
@@ -338,6 +367,7 @@ class Config:
     memory_recall_intent_threshold: float
     memory_recall_intent_ambiguous_threshold: float
     web_image_search_enabled: bool
+    web_image_candidate_max_bytes: int
     mcp_tool_timeout_seconds: float
     media_frame_extraction_enabled: bool
     media_frame_ffmpeg_path: str
@@ -376,6 +406,10 @@ class Config:
     health_report_lookback_seconds: int
     health_report_min_level: str
     health_report_cooldown_seconds: int
+    operator_alerts_enabled: bool
+    operator_alert_chat_id: int | None
+    operator_alert_min_level: str
+    operator_alert_cooldown_seconds: int
     github_reporting_enabled: bool
     github_token: str
     github_repository: str
@@ -550,6 +584,37 @@ class Config:
                     + ", ".join(sorted(unpriced))
                 )
 
+        vision_model = os.getenv("VISION_MODEL", openai_model).strip()
+        image_candidate_review_enabled = _env_bool("IMAGE_CANDIDATE_REVIEW_ENABLED", True)
+        image_candidate_review_model = os.getenv(
+            "IMAGE_CANDIDATE_REVIEW_MODEL",
+            vision_model,
+        ).strip()
+        if image_candidate_review_enabled and not image_candidate_review_model:
+            raise RuntimeError("IMAGE_CANDIDATE_REVIEW_ENABLED requires IMAGE_CANDIDATE_REVIEW_MODEL")
+        operator_alert_min_level = os.getenv(
+            "OPERATOR_ALERT_MIN_LEVEL",
+            "warning",
+        ).strip().casefold()
+        if operator_alert_min_level not in {"info", "warning", "error", "critical"}:
+            raise RuntimeError(
+                "OPERATOR_ALERT_MIN_LEVEL must be one of: info, warning, error, critical"
+            )
+        operator_alert_chat_id = optional_int(
+            os.getenv("OPERATOR_ALERT_CHAT_ID", os.getenv("HEALTH_REPORT_ADMIN_CHAT_ID", ""))
+        )
+        operator_alerts_enabled = _env_bool("OPERATOR_ALERTS_ENABLED", False)
+        admin_user_ids = _csv_ints(os.getenv("ADMIN_USER_IDS", ""))
+        if operator_alerts_enabled:
+            if operator_alert_chat_id is None or operator_alert_chat_id <= 0:
+                raise RuntimeError(
+                    "OPERATOR_ALERTS_ENABLED requires a positive private OPERATOR_ALERT_CHAT_ID"
+                )
+            if operator_alert_chat_id not in admin_user_ids:
+                raise RuntimeError(
+                    "OPERATOR_ALERT_CHAT_ID must identify an ADMIN_USER_IDS operator"
+                )
+
         return cls(
             telegram_token=token,
             openai_api_key=api_key,
@@ -590,7 +655,7 @@ class Config:
             bot_timezone=os.getenv("BOT_TIMEZONE", "America/New_York").strip() or "America/New_York",
             prompt_privacy_guard_enabled=_env_bool("PROMPT_PRIVACY_GUARD_ENABLED", True),
             allowed_chat_ids=_csv_ints(os.getenv("ALLOWED_CHAT_IDS", "")),
-            admin_user_ids=_csv_ints(os.getenv("ADMIN_USER_IDS", "")),
+            admin_user_ids=admin_user_ids,
             user_cooldown_seconds=int(os.getenv("USER_COOLDOWN_SECONDS", "20")),
             chat_cooldown_seconds=int(os.getenv("CHAT_COOLDOWN_SECONDS", "5")),
             chat_inflight_guard_enabled=_env_bool("CHAT_INFLIGHT_GUARD_ENABLED", True),
@@ -717,8 +782,40 @@ class Config:
             auto_react_cooldown_seconds=int(os.getenv("AUTO_REACT_COOLDOWN_SECONDS", "1800")),
             auto_react_min_chars=int(os.getenv("AUTO_REACT_MIN_CHARS", "25")),
             image_analysis_enabled=_env_bool("IMAGE_ANALYSIS_ENABLED", True),
-            vision_model=os.getenv("VISION_MODEL", os.getenv("OPENAI_MODEL", "gpt-5.4-mini")).strip(),
+            vision_model=vision_model,
             image_max_bytes=int(os.getenv("IMAGE_MAX_BYTES", "6000000")),
+            image_candidate_review_enabled=image_candidate_review_enabled,
+            image_candidate_review_model=image_candidate_review_model,
+            image_candidate_review_max_output_tokens=max(
+                400,
+                min(1600, int(os.getenv("IMAGE_CANDIDATE_REVIEW_MAX_OUTPUT_TOKENS", "1000"))),
+            ),
+            image_candidate_review_confidence_threshold=_env_float(
+                "IMAGE_CANDIDATE_REVIEW_CONFIDENCE_THRESHOLD",
+                0.80,
+                minimum=0.0,
+                maximum=1.0,
+            ),
+            image_candidate_review_timeout_seconds=_env_float(
+                "IMAGE_CANDIDATE_REVIEW_TIMEOUT_SECONDS", 30.0, minimum=5.0, maximum=90.0
+            ),
+            image_candidate_review_max_total_bytes=max(
+                1_000_000,
+                min(
+                    12_000_000,
+                    int(os.getenv("IMAGE_CANDIDATE_REVIEW_MAX_TOTAL_BYTES", "6000000")),
+                ),
+            ),
+            web_image_pipeline_timeout_seconds=_env_float(
+                "WEB_IMAGE_PIPELINE_TIMEOUT_SECONDS",
+                75.0,
+                minimum=20.0,
+                maximum=180.0,
+            ),
+            web_image_fetch_concurrency=max(
+                1,
+                min(8, int(os.getenv("WEB_IMAGE_FETCH_CONCURRENCY", "5"))),
+            ),
             followup_debounce_seconds=max(0.0, float(os.getenv("FOLLOWUP_DEBOUNCE_SECONDS", "0.5"))),
             memory_enabled=_env_bool("MEMORY_ENABLED", True),
             memory_db_path=os.getenv("MEMORY_DB_PATH", str(APP_DIR / "data" / "aigan.sqlite3")).strip(),
@@ -745,6 +842,9 @@ class Config:
                 os.getenv("MEMORY_RECALL_INTENT_AMBIGUOUS_THRESHOLD", "0.48")
             ),
             web_image_search_enabled=_env_bool("WEB_IMAGE_SEARCH_ENABLED", True),
+            web_image_candidate_max_bytes=max(
+                100_000, min(3_000_000, int(os.getenv("WEB_IMAGE_CANDIDATE_MAX_BYTES", "2000000")))
+            ),
             mcp_tool_timeout_seconds=max(1.0, float(os.getenv("MCP_TOOL_TIMEOUT_SECONDS", "30"))),
             media_frame_extraction_enabled=_env_bool("MEDIA_FRAME_EXTRACTION_ENABLED", False),
             media_frame_ffmpeg_path=os.getenv("MEDIA_FRAME_FFMPEG_PATH", "ffmpeg").strip() or "ffmpeg",
@@ -792,6 +892,10 @@ class Config:
             health_report_lookback_seconds=int(os.getenv("HEALTH_REPORT_LOOKBACK_SECONDS", "21600")),
             health_report_min_level=os.getenv("HEALTH_REPORT_MIN_LEVEL", "warning").strip().lower(),
             health_report_cooldown_seconds=int(os.getenv("HEALTH_REPORT_COOLDOWN_SECONDS", "3600")),
+            operator_alerts_enabled=operator_alerts_enabled,
+            operator_alert_chat_id=operator_alert_chat_id,
+            operator_alert_min_level=operator_alert_min_level,
+            operator_alert_cooldown_seconds=max(1, int(os.getenv("OPERATOR_ALERT_COOLDOWN_SECONDS", "3600"))),
             github_reporting_enabled=_env_bool("GITHUB_REPORTING_ENABLED", False),
             github_token=os.getenv("GITHUB_TOKEN", "").strip(),
             github_repository=os.getenv("GITHUB_REPOSITORY", "Turkevich91/Aigan").strip(),
@@ -832,10 +936,12 @@ def apply_agents_tracing_policy(mode: str) -> str:
 
 CONFIG = Config.from_env()
 apply_agents_tracing_policy(CONFIG.agents_tracing_mode)
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(
-    level=os.getenv("LOG_LEVEL", "INFO").upper(),
+    level=LOG_LEVEL,
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
+logging.getLogger().setLevel(LOG_LEVEL)
 LOGGER = logging.getLogger("aigan")
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
@@ -1222,13 +1328,14 @@ def new_outbound_provenance(
     subject_kind: str = "",
     subject_id: int | None = None,
     subject_key: str = "",
+    independent_run: bool = False,
 ) -> OutboundProvenance:
     input_memory_id = None
     if MEMORY is not None and trigger_message_id is not None:
         item = MEMORY.message_by_message_id(chat_id, trigger_message_id)
         input_memory_id = item.id if item is not None else None
     return OutboundProvenance(
-        run_id=current_model_run_id(),
+        run_id=normalize_run_id(secrets.token_hex(16)) if independent_run else current_model_run_id(),
         chat_id=int(chat_id),
         trigger_message_id=trigger_message_id,
         input_memory_id=input_memory_id,
@@ -1241,11 +1348,12 @@ def new_outbound_provenance(
     )
 
 
-def provenance_for_message(message: Message, route: str) -> OutboundProvenance:
+def provenance_for_message(message: Message, route: str, *, independent_run: bool = False) -> OutboundProvenance:
     return new_outbound_provenance(
         chat_id=message.chat_id,
         route=route,
         trigger_message_id=getattr(message, "message_id", None),
+        independent_run=independent_run,
     )
 
 
@@ -3333,19 +3441,10 @@ def guard_unconfirmed_image_delivery_claims(
         },
     )
     if not image_searches:
-        return (
-            "Маршрут доставки зображень не запускався, а Telegram-доставку медіа не підтверджено. "
-            "Я не прикріпив фото."
-        )
+        return "Фото не прикріпилося. Спробуй ще раз явним запитом — я пошукаю заново."
     if search_completed:
-        return (
-            "Пошук зображень завершився, але Telegram-доставку медіа не підтверджено. "
-            "Я не прикріпив фото; повтори явний запит на надсилання."
-        )
-    return (
-        "Пошук зображень завершився помилкою або залишився незавершеним, а Telegram-доставку медіа "
-        "не підтверджено. Я не прикріпив фото."
-    )
+        return "Знайшов варіанти, але фото не прикріпилося. Спробуй ще раз."
+    return "Цього разу фото не прикріпилося. Спробуй ще раз трохи пізніше."
 
 
 async def guard_semantic_unconfirmed_image_delivery_claims(
@@ -3528,6 +3627,79 @@ def system_event(
 
 
 TOOL_RUNTIME.set_event_callback(system_event)
+
+
+def operator_alert_event(
+    event_type: str,
+    alert: OperatorAlert,
+    facts: dict[str, int | bool],
+) -> None:
+    if event_type == "operator_alert_sent":
+        level = "info"
+    elif event_type == "operator_alert_delivery_failed":
+        level = "error"
+    else:
+        level = alert.level
+    system_event(
+        level=level,
+        component="operator_alerts",
+        event_type=event_type,
+        message=alert.code,
+        details={
+            "fingerprint": alert.fingerprint,
+            "policy_version": "operator_alert_v1",
+            **facts,
+        },
+    )
+
+
+def operator_alert_claimed_recently(fingerprint: str, cooldown_seconds: int) -> bool:
+    if SYSTEM_LOG is None:
+        return False
+    events = SYSTEM_LOG.events_since(max(1, cooldown_seconds), "info", 500)
+    return any(
+        event.component == "operator_alerts"
+        and event.event_type == "operator_alert_claimed"
+        and event.details.get("fingerprint") == fingerprint
+        for event in events
+    )
+
+
+OPERATOR_ALERTS = OperatorAlertService(
+    OperatorAlertSettings(
+        enabled=CONFIG.operator_alerts_enabled,
+        chat_id=CONFIG.operator_alert_chat_id,
+        min_level=CONFIG.operator_alert_min_level,
+        cooldown_seconds=CONFIG.operator_alert_cooldown_seconds,
+    ),
+    event_callback=operator_alert_event,
+    recent_claim_checker=operator_alert_claimed_recently,
+)
+
+
+async def notify_operator_alert(
+    message: Message,
+    code: str,
+    facts: dict[str, int | bool] | None = None,
+) -> str:
+    try:
+        result = await OPERATOR_ALERTS.notify(message.get_bot(), code, facts)
+    except Exception:
+        LOGGER.debug("Operator alert dispatch failed safely", exc_info=True)
+        return "failed"
+    return result.status
+
+
+def operator_alert_health_text() -> str:
+    health = OPERATOR_ALERTS.health_summary()
+    return (
+        "Operator alerts: "
+        f"status={health['status']} "
+        f"configured={health['configured']} "
+        f"sent={health['sent']} "
+        f"failed={health['failed']} "
+        f"deduplicated={health['deduplicated']}"
+    )
 
 
 def system_event_for_chat(
@@ -9075,7 +9247,59 @@ def detected_image_mime(data: bytes) -> str | None:
     return None
 
 
-def validate_image_bytes(data: bytes, mime_type: str, max_bytes: int) -> str:
+def validate_decoded_image_dimensions(width: int, height: int) -> None:
+    if width <= 0 or height <= 0 or width > 12_000 or height > 12_000:
+        raise ValueError("Image dimensions are outside the accepted bounds")
+    if width * height > 40_000_000:
+        raise ValueError("Image pixel count is outside the accepted bounds")
+
+
+def decoded_image_properties(data: bytes, mime_type: str) -> tuple[int, int, str]:
+    """Fully decode a still image and return dimensions plus a perceptual hash."""
+    if mime_type == "image/gif":
+        raise ValueError("Animated image candidates are not accepted")
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", Image.DecompressionBombWarning)
+            with Image.open(io.BytesIO(data)) as probe:
+                validate_decoded_image_dimensions(*probe.size)
+                probe.verify()
+            with Image.open(io.BytesIO(data)) as decoded:
+                width, height = decoded.size
+                validate_decoded_image_dimensions(width, height)
+                if int(getattr(decoded, "n_frames", 1) or 1) != 1:
+                    raise ValueError("Animated image candidates are not accepted")
+                decoded.load()
+                grayscale = decoded.convert("L").resize((8, 8), Image.Resampling.LANCZOS)
+                pixel_values = (
+                    grayscale.get_flattened_data()
+                    if hasattr(grayscale, "get_flattened_data")
+                    else grayscale.getdata()
+                )
+                pixels = tuple(int(value) for value in pixel_values)
+    except (Image.DecompressionBombError, Image.DecompressionBombWarning) as exc:
+        raise ValueError("Image dimensions are unsafe") from exc
+    except (UnidentifiedImageError, OSError, SyntaxError) as exc:
+        raise ValueError("Image container could not be decoded") from exc
+    average = sum(pixels) / len(pixels)
+    bits = 0
+    for value in pixels:
+        bits = (bits << 1) | int(value >= average)
+    return width, height, f"{bits:016x}"
+
+
+def perceptual_hash_distance(left: str, right: str) -> int:
+    try:
+        return (int(left, 16) ^ int(right, 16)).bit_count()
+    except (TypeError, ValueError):
+        return 64
+
+
+def validated_image_metadata(
+    data: bytes,
+    mime_type: str,
+    max_bytes: int,
+) -> tuple[str, str]:
     declared = (mime_type or "").split(";")[0].strip().lower()
     if not data:
         raise ValueError("Image body is empty")
@@ -9087,7 +9311,12 @@ def validate_image_bytes(data: bytes, mime_type: str, max_bytes: int) -> str:
     detected = detected_image_mime(data)
     if detected is None:
         raise ValueError("Image bytes do not match supported JPEG/PNG/WebP/GIF signatures")
-    return detected
+    width, height, fingerprint = decoded_image_properties(data, detected)
+    return detected, fingerprint
+
+
+def validate_image_bytes(data: bytes, mime_type: str, max_bytes: int) -> str:
+    return validated_image_metadata(data, mime_type, max_bytes)[0]
 
 
 @dataclass
@@ -9098,6 +9327,22 @@ class WebImageResult:
     source_title: str
     final_url: str
     vision_summary: str = ""
+    perceptual_hash: str = ""
+
+
+@dataclass(frozen=True)
+class WebImageReviewResult:
+    images: tuple[WebImageResult, ...]
+    reviewed_count: int
+    attempts: int
+    succeeded: bool
+    degraded: bool = False
+    unreviewed_count: int = 0
+    duplicate_count: int = 0
+
+    @property
+    def accepted_count(self) -> int:
+        return len(self.images)
 
 
 @dataclass(frozen=True)
@@ -9126,6 +9371,7 @@ class WebImageSendOutcome:
     handled: bool
     confirmed_media_count: int = 0
     ambiguous: bool = False
+    target_media_count: int = 0
 
     def __bool__(self) -> bool:
         return self.handled
@@ -9133,6 +9379,27 @@ class WebImageSendOutcome:
     @property
     def confirmed_delivery(self) -> bool:
         return self.confirmed_media_count > 0
+
+    @property
+    def request_fulfilled(self) -> bool:
+        return (
+            not self.ambiguous
+            and self.target_media_count > 0
+            and self.confirmed_media_count >= self.target_media_count
+        )
+
+
+@dataclass(frozen=True)
+class ExternalImageMemoryResult:
+    item_id: int | None
+    persistence_available: bool
+    cache_persisted: bool
+
+
+@dataclass(frozen=True)
+class SentWebImagesPersistenceResult:
+    item_ids: tuple[int, ...]
+    failed_parts: int = 0
 
 
 def image_stream(data: bytes, mime_type: str) -> io.BytesIO:
@@ -9155,7 +9422,7 @@ async def send_photo_reply(message: Message, data: bytes, mime_type: str, captio
         return await message.reply_photo(photo=stream, caption=render_plain_fallback(caption)[:1024])
 
 
-def save_external_image_memory(
+def save_external_image_memory_result(
     message: Message,
     *,
     delivered: Any,
@@ -9167,9 +9434,9 @@ def save_external_image_memory(
     output_ordinal: int,
     output_part_count: int,
     vision_summary: str = "",
-) -> int | None:
+) -> ExternalImageMemoryResult:
     if MEMORY is None:
-        return None
+        return ExternalImageMemoryResult(None, False, False)
     message_id = delivered_message_id(delivered)
     if message_id is None:
         raise ValueError("Telegram image delivery did not return a real message_id")
@@ -9192,6 +9459,7 @@ def save_external_image_memory(
         raw_note="web image search result",
     )
     media_path = MEMORY.media_dir / str(message.chat_id) / f"{item_id}-web{image_suffix_for_mime(mime_type)}"
+    cache_persisted = True
     try:
         media_path.parent.mkdir(parents=True, exist_ok=True)
         media_path.write_bytes(data)
@@ -9204,6 +9472,7 @@ def save_external_image_memory(
             raw_note="web image search result",
         )
     except Exception as exc:
+        cache_persisted = False
         LOGGER.error("Failed to cache delivered web image item_id=%s error=%s", item_id, type(exc).__name__)
         try:
             media_path.unlink(missing_ok=True)
@@ -9233,7 +9502,35 @@ def save_external_image_memory(
     finally:
         if REACTION_MEMORY is not None:
             REACTION_MEMORY.link_pending_targets(MEMORY, message.chat_id)
-    return item_id
+    return ExternalImageMemoryResult(item_id, True, cache_persisted)
+
+
+def save_external_image_memory(
+    message: Message,
+    *,
+    delivered: Any,
+    data: bytes,
+    mime_type: str,
+    source_url: str,
+    source_title: str,
+    outbound_provenance: OutboundProvenance,
+    output_ordinal: int,
+    output_part_count: int,
+    vision_summary: str = "",
+) -> int | None:
+    """Compatibility wrapper for callers that only need the durable message id."""
+    return save_external_image_memory_result(
+        message,
+        delivered=delivered,
+        data=data,
+        mime_type=mime_type,
+        source_url=source_url,
+        source_title=source_title,
+        outbound_provenance=outbound_provenance,
+        output_ordinal=output_ordinal,
+        output_part_count=output_part_count,
+        vision_summary=vision_summary,
+    ).item_id
 
 
 async def load_web_image_result(
@@ -9243,11 +9540,16 @@ async def load_web_image_result(
     image_url = candidate.get("image") or ""
     source_url = candidate.get("source") or image_url
     title = candidate.get("title") or "Зображення"
+    max_bytes = min(
+        CONFIG.image_max_bytes,
+        CONFIG.web_image_candidate_max_bytes,
+        10_000_000,
+    )
     try:
         data, mime_type, final_url = await asyncio.to_thread(
             fetch_binary_url,
             image_url,
-            min(CONFIG.image_max_bytes, 10_000_000),
+            max_bytes,
             ("image/",),
         )
     except Exception:
@@ -9261,7 +9563,7 @@ async def load_web_image_result(
         LOGGER.info("Skipping failed web image candidate")
         return None
     try:
-        mime_type = validate_image_bytes(data, mime_type, min(CONFIG.image_max_bytes, 10_000_000))
+        mime_type, perceptual_hash = validated_image_metadata(data, mime_type, max_bytes)
     except ValueError as exc:
         append_tool_provenance(
             outbound_provenance,
@@ -9285,30 +9587,374 @@ async def load_web_image_result(
         source_url=source_url or final_url,
         source_title=title,
         final_url=final_url,
+        perceptual_hash=perceptual_hash,
+    )
+
+
+async def load_web_image_results(
+    candidates: Sequence[dict[str, str]],
+    outbound_provenance: OutboundProvenance | None,
+) -> list[WebImageResult]:
+    semaphore = asyncio.Semaphore(CONFIG.web_image_fetch_concurrency)
+
+    async def load_one(candidate: dict[str, str]) -> WebImageResult | None:
+        async with semaphore:
+            return await load_web_image_result(candidate, outbound_provenance)
+
+    loaded = await asyncio.gather(*(load_one(candidate) for candidate in candidates))
+    return [image for image in loaded if image is not None]
+
+
+async def run_image_candidate_review(
+    query: str,
+    images: Sequence[WebImageResult],
+    *,
+    run_id: str,
+) -> tuple[ImageCandidateReview, ...]:
+    content: list[dict[str, Any]] = [
+        {
+            "type": "input_text",
+            "text": json.dumps(
+                {
+                    "requested_subject": query,
+                    "candidate_count": len(images),
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            ),
+        }
+    ]
+    for index, image in enumerate(images):
+        content.append({"type": "input_text", "text": f"Candidate index: {index}"})
+        content.append(
+            {
+                "type": "input_image",
+                "image_url": data_url_from_bytes(image.data, image.mime_type),
+                "detail": "low",
+            }
+        )
+
+    stage = begin_model_stage(
+        stage_kind="vision",
+        intended_model=CONFIG.image_candidate_review_model,
+        reasoning_effort="none",
+        endpoint="responses",
+        run_id=run_id,
+        route_bucket="internet_image_send",
+        task_class_bucket="vision",
+    )
+    try:
+        async with asyncio.timeout(CONFIG.image_candidate_review_timeout_seconds):
+            async with AsyncOpenAI(
+                api_key=CONFIG.openai_api_key,
+                timeout=CONFIG.image_candidate_review_timeout_seconds,
+                max_retries=0,
+            ) as client:
+                response = await client.responses.create(
+                    model=CONFIG.image_candidate_review_model,
+                    input=[
+                        {
+                            "role": "system",
+                            "content": [
+                                {
+                                    "type": "input_text",
+                                    "text": IMAGE_CANDIDATE_REVIEW_SYSTEM_PROMPT,
+                                }
+                            ],
+                        },
+                        {"role": "user", "content": content},
+                    ],
+                    reasoning={"effort": "none"},
+                    max_output_tokens=CONFIG.image_candidate_review_max_output_tokens,
+                    text={
+                        "format": {
+                            "type": "json_schema",
+                            "name": IMAGE_CANDIDATE_REVIEW_SCHEMA_VERSION,
+                            "strict": True,
+                            "schema": image_candidate_review_schema(len(images)),
+                        }
+                    },
+                )
+    except asyncio.CancelledError as exc:
+        finish_model_stage(stage, status="cancelled", failure_class=exc)
+        raise
+    except Exception as exc:
+        finish_model_stage(stage, status="failed", failure_class=exc)
+        raise
+
+    status, failure_class = response_telemetry_status(response)
+    actual_model, actual_model_source = response_actual_model(response)
+    finish_model_stage(
+        stage,
+        status=status,
+        usage=response_usage(response),
+        actual_model=actual_model,
+        actual_model_source=actual_model_source,
+        actual_reasoning_effort=response_actual_reasoning_effort(response),
+        failure_class=failure_class,
+    )
+    if status != "succeeded":
+        raise RuntimeError("image_candidate_review_provider_failure")
+    if response_requests_tools(response):
+        raise RuntimeError("image_candidate_review_requested_tool")
+    output = str(getattr(response, "output_text", "") or "").strip()
+    if not output:
+        raise RuntimeError("image_candidate_review_empty_output")
+    return normalize_image_candidate_reviews(
+        json.loads(output),
+        candidate_count=len(images),
+    )
+
+
+async def review_web_image_candidates(
+    message: Message,
+    query: str,
+    images: Sequence[WebImageResult],
+    outbound_provenance: OutboundProvenance | None,
+    *,
+    target_count: int | None = None,
+) -> WebImageReviewResult:
+    candidates = tuple(images[:20])
+    if not candidates:
+        return WebImageReviewResult((), 0, 0, True)
+    if not CONFIG.image_candidate_review_enabled:
+        system_event(
+            level="error",
+            component="image_search",
+            event_type="candidate_review_disabled",
+            telegram_message=message,
+            message="candidate review disabled",
+            details={"candidate_count": len(candidates)},
+        )
+        await notify_operator_alert(
+            message,
+            "image_candidate_review_failed",
+            {"candidate_count": len(candidates), "attempts": 0},
+        )
+        return WebImageReviewResult((), len(candidates), 0, False)
+
+    desired_count = max(1, min(int(target_count or len(candidates)), 5))
+    unique_candidates: list[WebImageResult] = []
+    exact_hashes: set[str] = set()
+    perceptual_hashes: list[str] = []
+    duplicate_count = 0
+    for image in candidates:
+        exact_hash = hashlib.sha256(image.data).hexdigest()
+        perceptual_hash = image.perceptual_hash
+        if not perceptual_hash:
+            try:
+                _width, _height, perceptual_hash = decoded_image_properties(
+                    image.data,
+                    image.mime_type,
+                )
+            except ValueError:
+                continue
+            image.perceptual_hash = perceptual_hash
+        if exact_hash in exact_hashes or any(
+            perceptual_hash_distance(perceptual_hash, seen) <= 5
+            for seen in perceptual_hashes
+        ):
+            duplicate_count += 1
+            continue
+        exact_hashes.add(exact_hash)
+        perceptual_hashes.append(perceptual_hash)
+        unique_candidates.append(image)
+
+    max_batch_bytes = CONFIG.image_candidate_review_max_total_bytes
+    batches: list[tuple[WebImageResult, ...]] = []
+    batch: list[WebImageResult] = []
+    batch_bytes = 0
+    for image in unique_candidates:
+        image_bytes = len(image.data)
+        if image_bytes > max_batch_bytes:
+            continue
+        if batch and (len(batch) >= 8 or batch_bytes + image_bytes > max_batch_bytes):
+            batches.append(tuple(batch))
+            batch = []
+            batch_bytes = 0
+        batch.append(image)
+        batch_bytes += image_bytes
+    if batch:
+        batches.append(tuple(batch))
+
+    candidate_positions = {id(image): index for index, image in enumerate(unique_candidates)}
+    ranked: list[tuple[int, float, int, WebImageResult, str]] = []
+    reviewed_ids: set[int] = set()
+    attempts = 0
+    max_review_calls = 10
+
+    async def review_batch(
+        review_images: Sequence[WebImageResult],
+    ) -> tuple[ImageCandidateReview, ...] | None:
+        nonlocal attempts
+        if attempts >= max_review_calls:
+            return None
+        attempts += 1
+        try:
+            return await run_image_candidate_review(
+                query,
+                review_images,
+                run_id=(
+                    outbound_provenance.run_id
+                    if outbound_provenance is not None
+                    else current_model_run_id()
+                ),
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            LOGGER.warning(
+                "Image candidate review attempt failed attempt=%s error=%s",
+                attempts,
+                type(exc).__name__,
+            )
+            return None
+
+    for current_batch in batches:
+        if attempts >= max_review_calls:
+            break
+        reviews = await review_batch(current_batch)
+        reviewed_sets: list[tuple[Sequence[WebImageResult], tuple[ImageCandidateReview, ...]]] = []
+        if reviews is not None:
+            reviewed_sets.append((current_batch, reviews))
+        else:
+            # A malformed or provider-rejected candidate must not poison every good image.
+            for image in current_batch:
+                if attempts >= max_review_calls:
+                    break
+                isolated_reviews = await review_batch((image,))
+                if isolated_reviews is None:
+                    continue
+                reviewed_sets.append(((image,), isolated_reviews))
+
+        for review_images, current_reviews in reviewed_sets:
+            reviewed_ids.update(id(image) for image in review_images)
+            for index in selected_candidate_indices(
+                current_reviews,
+                confidence_threshold=CONFIG.image_candidate_review_confidence_threshold,
+            ):
+                if index >= len(review_images):
+                    continue
+                image = review_images[index]
+                review = current_reviews[index]
+                ranked.append(
+                    (
+                        -review.score,
+                        -review.confidence,
+                        candidate_positions[id(image)],
+                        image,
+                        review.description_uk,
+                    )
+                )
+
+    reviewed_count = len(reviewed_ids)
+    unreviewed_count = max(0, len(unique_candidates) - reviewed_count)
+    degraded = unreviewed_count > 0
+    ranked.sort(key=lambda item: (item[0], item[1], item[2]))
+    selected_limit = min(8, desired_count + 2)
+    selected: list[WebImageResult] = []
+    for _score, _confidence, _position, image, description in ranked[:selected_limit]:
+        image.vision_summary = description
+        selected.append(image)
+
+    if not reviewed_ids:
+        append_tool_provenance(
+            outbound_provenance,
+            "vision_analysis",
+            {"purpose": "candidate_review", "candidate_count": len(unique_candidates)},
+            "review failed",
+            status="review_failed",
+        )
+        system_event(
+            level="error",
+            component="image_search",
+            event_type="candidate_review_failed",
+            telegram_message=message,
+            message="candidate review failed",
+            details={
+                "candidate_count": len(unique_candidates),
+                "attempts": attempts,
+                "prompt_version": IMAGE_CANDIDATE_REVIEW_PROMPT_VERSION,
+                "schema_version": IMAGE_CANDIDATE_REVIEW_SCHEMA_VERSION,
+            },
+        )
+        await notify_operator_alert(
+            message,
+            "image_candidate_review_failed",
+            {"candidate_count": len(unique_candidates), "attempts": attempts},
+        )
+        return WebImageReviewResult(
+            (),
+            reviewed_count,
+            attempts,
+            False,
+            degraded=True,
+            unreviewed_count=unreviewed_count,
+            duplicate_count=duplicate_count,
+        )
+
+    if degraded and len(ranked) < desired_count:
+        system_event(
+            level="warning",
+            component="image_search",
+            event_type="candidate_review_degraded",
+            telegram_message=message,
+            message="candidate review incomplete",
+            details={
+                "candidate_count": len(unique_candidates),
+                "reviewed_count": reviewed_count,
+                "unreviewed_count": unreviewed_count,
+                "accepted_count": len(ranked),
+                "target_count": desired_count,
+                "attempts": attempts,
+            },
+        )
+        await notify_operator_alert(
+            message,
+            "image_candidate_review_failed",
+            {"candidate_count": len(unique_candidates), "attempts": attempts},
+        )
+
+    append_tool_provenance(
+        outbound_provenance,
+        "vision_analysis",
+        {"purpose": "candidate_review", "candidate_count": reviewed_count},
+        f"accepted count {len(selected)}",
+        status="review_degraded" if degraded else "ok",
+    )
+    system_event(
+        component="image_search",
+        event_type="candidate_review_completed",
+        telegram_message=message,
+        message="candidate review",
+        details={
+            "candidate_count": reviewed_count,
+            "accepted_count": len(ranked),
+            "rejected_count": max(0, reviewed_count - len(ranked)),
+            "unreviewed_count": unreviewed_count,
+            "duplicate_count": duplicate_count,
+            "attempts": attempts,
+            "prompt_version": IMAGE_CANDIDATE_REVIEW_PROMPT_VERSION,
+            "schema_version": IMAGE_CANDIDATE_REVIEW_SCHEMA_VERSION,
+        },
+    )
+    return WebImageReviewResult(
+        tuple(selected),
+        reviewed_count,
+        attempts,
+        True,
+        degraded=degraded,
+        unreviewed_count=unreviewed_count,
+        duplicate_count=duplicate_count,
     )
 
 
 def single_image_caption(image: WebImageResult, index: int, total: int) -> str:
-    caption_title = clip_text(image.source_title, 160)
-    if total > 1:
-        caption_title = f"{index}/{total}. {caption_title}"
-    return "\n".join(
-        part
-        for part in (
-            caption_title,
-            f"Джерело: {image.source_url}" if image.source_url else "",
-        )
-        if part
-    )
+    return ""
 
 
 def album_caption(images: list[WebImageResult]) -> str:
-    lines = ["Знайдені зображення:"]
-    for index, image in enumerate(images, start=1):
-        title = clip_text(image.source_title, 72)
-        source = image.source_url or image.final_url
-        lines.append(f"{index}. {title} — {source}")
-    return clip_text("\n".join(lines), 1024)
+    return "Ось."
 
 
 async def send_single_web_image(
@@ -9343,6 +9989,7 @@ async def send_web_image_results(
     *,
     delivery_run_id: str = "",
     intended_count: int | None = None,
+    fallback_images: Sequence[WebImageResult] = (),
 ) -> WebImageDeliveryResult:
     requested_count = max(len(images), int(intended_count or 0))
     if not images:
@@ -9401,8 +10048,11 @@ async def send_web_image_results(
         return WebImageDeliveryResult((), requested_count, ambiguous=True)
 
     sent: list[DeliveredWebImage] = []
-    total = len(images)
-    for index, image in enumerate(images, start=1):
+    fallback_pool = [*images, *fallback_images]
+    total = requested_count
+    for index, image in enumerate(fallback_pool, start=1):
+        if len(sent) >= requested_count:
+            break
         try:
             delivered = await send_single_web_image(message, image, index=index, total=total)
         except Exception as exc:
@@ -9500,13 +10150,14 @@ def save_sent_web_images(
     outbound_provenance: OutboundProvenance,
     *,
     intended_count: int,
-) -> list[int]:
+) -> SentWebImagesPersistenceResult:
     item_ids: list[int] = []
+    failed_parts = 0
     part_count = max(1, int(intended_count))
     for ordinal, delivery in enumerate(deliveries):
         image = delivery.image
         try:
-            item_id = save_external_image_memory(
+            result = save_external_image_memory_result(
                 message,
                 delivered=delivery.telegram_message,
                 data=image.data,
@@ -9519,6 +10170,7 @@ def save_sent_web_images(
                 vision_summary=image.vision_summary,
             )
         except Exception as exc:
+            failed_parts += 1
             LOGGER.error("Delivered Telegram image could not be persisted error=%s", type(exc).__name__)
             system_event(
                 level="error",
@@ -9533,9 +10185,11 @@ def save_sent_web_images(
                 },
             )
             continue
-        if item_id is not None:
-            item_ids.append(item_id)
-    return item_ids
+        if result.item_id is not None:
+            item_ids.append(result.item_id)
+        if result.persistence_available and not result.cache_persisted:
+            failed_parts += 1
+    return SentWebImagesPersistenceResult(tuple(item_ids), failed_parts)
 
 
 async def send_image_delivery_outcome_notice(
@@ -9545,43 +10199,65 @@ async def send_image_delivery_outcome_notice(
     intended_count: int,
     ambiguous: bool,
 ) -> None:
-    if confirmed_count and ambiguous:
-        text = (
-            "Telegram підтвердив доставку лише частини зображень. Статус решти невідомий, "
-            "тому я не повторюю їх автоматично."
-        )
+    if ambiguous:
+        code = "image_delivery_ambiguous"
     elif confirmed_count:
-        text = (
-            f"Telegram підтвердив доставку {confirmed_count} із {intended_count} зображень; решту не було "
-            "підтверджено як надіслані. Я не стверджую, що надіслано весь альбом."
-        )
+        code = "image_delivery_partial"
     else:
-        text = (
-            "Telegram не підтвердив доставку зображення. Статус невідомий, тому я не стверджую, "
-            "що фото надіслано, і не повторюю спробу автоматично."
-        )
-    notice_provenance = provenance_for_message(message, "internet_image_delivery_notice")
+        code = "image_delivery_failed"
+    await notify_operator_alert(
+        message,
+        code,
+        {
+            "confirmed_parts": max(0, int(confirmed_count)),
+            "intended_parts": max(0, int(intended_count)),
+        },
+    )
+
+
+async def send_natural_image_notice(message: Message, text: str, route: str) -> None:
+    provenance = provenance_for_message(message, route, independent_run=True)
     try:
         await send_reply(
             message,
             text,
             memory_label="Aigan",
-            route="internet_image_delivery_notice",
-            outbound_provenance=notice_provenance,
+            route=route,
+            outbound_provenance=provenance,
         )
     except Exception as exc:
-        LOGGER.warning("Image delivery notice failed error=%s", type(exc).__name__)
+        LOGGER.warning("Natural image shortfall note failed error=%s", type(exc).__name__)
         system_event(
             level="warning",
             component="telegram_delivery",
-            event_type="image_delivery_notice_failed",
+            event_type="image_selection_shortfall_notice_failed",
             telegram_message=message,
             message=type(exc).__name__,
-            details={
-                "confirmed_parts": max(0, int(confirmed_count)),
-                "intended_parts": max(0, int(intended_count)),
-            },
         )
+
+
+async def send_image_selection_shortfall_notice(message: Message) -> None:
+    await send_natural_image_notice(
+        message,
+        "Більше справді доречних цього разу не знайшов.",
+        "internet_image_selection_shortfall",
+    )
+
+
+async def send_image_album_insufficient_notice(message: Message) -> None:
+    await send_natural_image_notice(
+        message,
+        "Нормального альбому не назбирав — одну випадкову картинку підсовувати не буду.",
+        "internet_image_album_insufficient",
+    )
+
+
+async def send_image_request_cap_notice(message: Message) -> None:
+    await send_natural_image_notice(
+        message,
+        "Відібрав п’ять найкращих — більше п’яти за раз не тягну.",
+        "internet_image_request_cap",
+    )
 
 
 def record_confirmed_image_delivery(
@@ -9605,6 +10281,95 @@ def record_confirmed_image_delivery(
     )
 
 
+class WebImageSearchPreparationError(RuntimeError):
+    pass
+
+
+async def prepare_web_image_review(
+    message: Message,
+    query: str,
+    *,
+    target_count: int,
+    requested_count: int,
+    search_count: int,
+    outbound_provenance: OutboundProvenance | None,
+) -> WebImageReviewResult:
+    try:
+        search_batch = await asyncio.to_thread(
+            search_image_candidate_batch,
+            query,
+            search_count,
+        )
+    except Exception as exc:
+        LOGGER.warning("Image search failed category=search_failed")
+        append_tool_provenance(
+            outbound_provenance,
+            "search_images",
+            {"query": query},
+            "search failed",
+            status="search_failed",
+        )
+        system_event(
+            level="error",
+            component="image_search",
+            event_type="search_failed",
+            telegram_message=message,
+            message="image search failed",
+            details={
+                "run_id": outbound_provenance.run_id if outbound_provenance is not None else "",
+                "query_chars": len(query),
+                "target_count": target_count,
+            },
+        )
+        await notify_operator_alert(
+            message,
+            "image_search_failed",
+            {"search_passes": 0, "requested_candidates": search_count},
+        )
+        raise WebImageSearchPreparationError("search_failed") from exc
+
+    candidates = list(search_batch.candidates)
+    append_tool_provenance(
+        outbound_provenance,
+        "search_images",
+        {"query": query},
+        (
+            f"raw count {search_batch.raw_count}; "
+            f"candidate count {len(candidates)}; "
+            f"url rejected {search_batch.url_rejected_count}; "
+            f"duplicates {search_batch.duplicate_count}; "
+            f"passes {search_batch.search_passes}"
+        ),
+        status="ok",
+    )
+    system_event(
+        component="image_search",
+        event_type="search_success",
+        telegram_message=message,
+        message="image candidates",
+        details={
+            "run_id": outbound_provenance.run_id if outbound_provenance is not None else "",
+            "query_chars": len(query),
+            "raw_count": search_batch.raw_count,
+            "candidate_count": len(candidates),
+            "url_rejected_count": search_batch.url_rejected_count,
+            "duplicate_count": search_batch.duplicate_count,
+            "search_passes": search_batch.search_passes,
+            "provider_failures": search_batch.provider_failures,
+            "target_count": target_count,
+            "requested_count": requested_count,
+        },
+    )
+    loaded_images = await load_web_image_results(candidates, outbound_provenance)
+    return await review_web_image_candidates(
+        message,
+        query,
+        loaded_images,
+        outbound_provenance,
+        target_count=target_count,
+    )
+
+
 async def maybe_send_internet_image(
     message: Message,
     prompt: str,
@@ -9625,7 +10390,7 @@ async def maybe_send_internet_image(
     if not CONFIG.web_image_search_enabled:
         await send_reply(
             message,
-            "Пошук і надсилання веб-зображень зараз вимкнено.",
+            "Зараз не можу принести фото.",
             memory_label="Aigan",
             route="internet_image_send",
             outbound_provenance=outbound_provenance,
@@ -9633,74 +10398,119 @@ async def maybe_send_internet_image(
         return WebImageSendOutcome(True)
 
     query = plan.query
-    target_count = plan.target_count
-    search_count = min(10, max(5, target_count * 4))
+    target_count = max(1, min(int(plan.target_count), 5))
+    search_count = 20
     presence = activity_presence_for_message(message, action=ChatAction.TYPING)
-    await presence.start()
     try:
-        candidates = await asyncio.to_thread(search_image_candidates, query, search_count)
-        append_tool_provenance(
-            outbound_provenance,
-            "search_images",
-            {"query": query},
-            f"candidate count {len(candidates)}",
-            status="ok",
+        async with presence:
+            async with asyncio.timeout(CONFIG.web_image_pipeline_timeout_seconds):
+                review_result = await prepare_web_image_review(
+                    message,
+                    query,
+                    target_count=target_count,
+                    requested_count=max(1, int(plan.requested_count)),
+                    search_count=search_count,
+                    outbound_provenance=outbound_provenance,
+                )
+    except WebImageSearchPreparationError:
+        await send_reply(
+            message,
+            "Цього разу нічого путнього не знайшов.",
+            memory_label="Aigan",
+            route="internet_image_send",
+            outbound_provenance=outbound_provenance,
         )
-    except Exception as exc:
-        LOGGER.warning("Image search failed category=search_failed")
+        return WebImageSendOutcome(True, target_media_count=target_count)
+    except TimeoutError:
+        LOGGER.warning("Image pipeline reached its overall deadline")
         append_tool_provenance(
             outbound_provenance,
-            "search_images",
-            {"query": query},
-            str(exc),
-            status="search_failed",
+            "vision_analysis",
+            {"purpose": "image_pipeline"},
+            "pipeline timeout",
+            status="tool_timeout",
         )
         system_event(
             level="error",
             component="image_search",
-            event_type="search_failed",
+            event_type="image_pipeline_timeout",
             telegram_message=message,
-            message="image search failed",
+            message="image pipeline timeout",
             details={
                 "run_id": outbound_provenance.run_id if outbound_provenance is not None else "",
-                "query_chars": len(query),
                 "target_count": target_count,
+                "timeout_seconds": int(CONFIG.web_image_pipeline_timeout_seconds),
+            },
+        )
+        await notify_operator_alert(
+            message,
+            "image_pipeline_timeout",
+            {
+                "target_count": target_count,
+                "timeout_seconds": int(CONFIG.web_image_pipeline_timeout_seconds),
             },
         )
         await send_reply(
             message,
-            "Не зміг знайти безпечне зображення за цим запитом.",
+            "Цього разу забарився з пошуком. Спробуй ще раз трохи пізніше.",
+            memory_label="Aigan",
+            route="internet_image_send",
+            outbound_provenance=outbound_provenance,
+        )
+        return WebImageSendOutcome(True, target_media_count=target_count)
+    if not review_result.succeeded:
+        await send_reply(
+            message,
+            "Нічого путнього не знайшов — абищо нести не буду.",
             memory_label="Aigan",
             route="internet_image_send",
             outbound_provenance=outbound_provenance,
         )
         return WebImageSendOutcome(True)
-    finally:
-        await presence.stop()
-    system_event(
-        component="image_search",
-        event_type="search_success",
-        telegram_message=message,
-        message="image candidates",
-        details={
-            "run_id": outbound_provenance.run_id if outbound_provenance is not None else "",
-            "query_chars": len(query),
-            "candidate_count": len(candidates),
-            "target_count": target_count,
-        },
-    )
+
+    accepted_images = list(review_result.images)
+    if not accepted_images:
+        await send_reply(
+            message,
+            "Нічого путнього не знайшов — абищо нести не буду.",
+            memory_label="Aigan",
+            route="internet_image_send",
+            outbound_provenance=outbound_provenance,
+        )
+        system_event(
+            level="warning",
+            component="image_search",
+            event_type="no_relevant_image",
+            telegram_message=message,
+            details={
+                "candidate_count": review_result.reviewed_count,
+                "target_count": target_count,
+            },
+        )
+        return WebImageSendOutcome(True)
+
+    if target_count > 1 and len(accepted_images) < 2:
+        system_event(
+            level="warning",
+            component="image_search",
+            event_type="album_candidate_pool_insufficient",
+            telegram_message=message,
+            details={
+                "accepted_count": len(accepted_images),
+                "target_count": target_count,
+            },
+        )
+        await send_image_album_insufficient_notice(message)
+        return WebImageSendOutcome(True, target_media_count=target_count)
 
     if target_count == 1:
-        for candidate in candidates:
-            image = await load_web_image_result(candidate, outbound_provenance)
-            if image is None:
-                continue
+        for image in accepted_images:
             await send_activity_action(message.get_bot(), message.chat_id, ChatAction.UPLOAD_PHOTO, message=message)
             delivery_result = await send_web_image_results(
                 message,
                 [image],
                 delivery_run_id=outbound_provenance.run_id if outbound_provenance is not None else "",
-                intended_count=plan.requested_count,
+                intended_count=1,
             )
             if delivery_result.ambiguous and not delivery_result.deliveries:
                 await send_image_delivery_outcome_notice(
@@ -9709,18 +10519,24 @@ async def maybe_send_internet_image(
                     intended_count=delivery_result.intended_count,
                     ambiguous=True,
                 )
-                return WebImageSendOutcome(True, ambiguous=True)
+                return WebImageSendOutcome(True, ambiguous=True, target_media_count=target_count)
             if not delivery_result.deliveries:
                 continue
-            item_ids = save_sent_web_images(
+            persistence = save_sent_web_images(
                 message,
                 delivery_result.deliveries,
                 outbound_provenance or provenance_for_message(message, "internet_image_send"),
                 intended_count=delivery_result.intended_count,
             )
+            if persistence.failed_parts:
+                await notify_operator_alert(
+                    message,
+                    "image_delivery_persistence_failed",
+                    {"failed_parts": persistence.failed_parts},
+                )
             summary = await maybe_analyze_found_images(message, prompt, delivery_result.deliveries)
             if summary and MEMORY is not None:
-                for item_id in item_ids:
+                for item_id in persistence.item_ids:
                     MEMORY.update_vision_summary(item_id, summary)
             record_confirmed_image_delivery(message, delivery_result, outbound_provenance)
             if not delivery_result.complete:
@@ -9734,33 +10550,34 @@ async def maybe_send_internet_image(
                 True,
                 confirmed_media_count=len(delivery_result.deliveries),
                 ambiguous=delivery_result.ambiguous,
+                target_media_count=target_count,
             )
     else:
-        images: list[WebImageResult] = []
-        for candidate in candidates:
-            image = await load_web_image_result(candidate, outbound_provenance)
-            if image is None:
-                continue
-            images.append(image)
-            if len(images) >= target_count:
-                break
+        images = accepted_images[:target_count]
         await send_activity_action(message.get_bot(), message.chat_id, ChatAction.UPLOAD_PHOTO, message=message)
         delivery_result = await send_web_image_results(
             message,
             images,
             delivery_run_id=outbound_provenance.run_id if outbound_provenance is not None else "",
-            intended_count=plan.requested_count,
+            intended_count=len(images),
+            fallback_images=accepted_images[target_count:],
         )
         if delivery_result.deliveries:
-            item_ids = save_sent_web_images(
+            persistence = save_sent_web_images(
                 message,
                 delivery_result.deliveries,
                 outbound_provenance or provenance_for_message(message, "internet_image_send"),
                 intended_count=delivery_result.intended_count,
             )
+            if persistence.failed_parts:
+                await notify_operator_alert(
+                    message,
+                    "image_delivery_persistence_failed",
+                    {"failed_parts": persistence.failed_parts},
+                )
             summary = await maybe_analyze_found_images(message, prompt, delivery_result.deliveries)
             if summary and MEMORY is not None:
-                for item_id in item_ids:
+                for item_id in persistence.item_ids:
                     MEMORY.update_vision_summary(item_id, summary)
             record_confirmed_image_delivery(message, delivery_result, outbound_provenance)
             if not delivery_result.complete:
@@ -9770,10 +10587,29 @@ async def maybe_send_internet_image(
                     intended_count=delivery_result.intended_count,
                     ambiguous=delivery_result.ambiguous,
                 )
+            if (
+                len(delivery_result.deliveries) == len(images)
+                and len(images) < target_count
+            ):
+                system_event(
+                    level="warning",
+                    component="image_search",
+                    event_type="image_selection_shortfall",
+                    telegram_message=message,
+                    details={
+                        "selected_count": len(images),
+                        "target_count": target_count,
+                        "review_degraded": review_result.degraded,
+                    },
+                )
+                await send_image_selection_shortfall_notice(message)
+            elif delivery_result.complete and int(plan.requested_count) > target_count:
+                await send_image_request_cap_notice(message)
             return WebImageSendOutcome(
                 True,
                 confirmed_media_count=len(delivery_result.deliveries),
                 ambiguous=delivery_result.ambiguous,
+                target_media_count=target_count,
             )
         if delivery_result.ambiguous:
             await send_image_delivery_outcome_notice(
@@ -9782,24 +10618,27 @@ async def maybe_send_internet_image(
                 intended_count=delivery_result.intended_count,
                 ambiguous=True,
             )
-            return WebImageSendOutcome(True, ambiguous=True)
+            return WebImageSendOutcome(True, ambiguous=True, target_media_count=target_count)
 
+    await notify_operator_alert(
+        message,
+        "image_delivery_failed",
+        {"intended_parts": target_count},
+    )
     await send_reply(
         message,
-        "Не знайшов валідне безпечне зображення, яке можна надіслати в чат.",
+        "Не вийшло цього разу. Спробуємо іншим разом.",
         memory_label="Aigan",
         route="internet_image_send",
         outbound_provenance=outbound_provenance,
     )
     system_event(
         level="warning",
-        component="image_search",
-        event_type="no_valid_image",
+        component="telegram_delivery",
+        event_type="image_delivery_failed",
         telegram_message=message,
         details={
             "run_id": outbound_provenance.run_id if outbound_provenance is not None else "",
-            "query_chars": len(query),
-            "candidate_count": len(candidates),
             "target_count": target_count,
         },
     )
@@ -10784,7 +11623,7 @@ async def handle_character_command(message: Message, context: ContextTypes.DEFAU
         )
     except Exception:
         LOGGER.exception("Character profile command failed")
-        await message.reply_text("Не зміг зібрати портрет. Деталі будуть у логах контейнера.")
+        await message.reply_text("Не зміг зараз зібрати портрет. Спробуй ще раз трохи пізніше.")
         return
     await send_reply(message, profile_coverage_text(selection, cleaned_pairs) + "\n\n" + response)
 
@@ -11349,6 +12188,8 @@ async def health_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         + "\n\n"
         + tool_runtime_health_text()
         + "\n\n"
+        + operator_alert_health_text()
+        + "\n\n"
         + reaction_health_diagnostics_text(CONFIG.health_report_lookback_seconds),
     )
 
@@ -11414,7 +12255,7 @@ Sanitized input:
     except Exception:
         LOGGER.exception("Selfcheck failed")
         system_event(level="error", component="self_analysis", event_type="selfcheck_failed", telegram_message=message)
-        await send_reply(message, "Самоаналіз не вдався. Подивись system logs.")
+        await send_reply(message, "Самоаналіз зараз не вдався. Спробуй ще раз трохи пізніше.")
         return
     system_event(component="self_analysis", event_type="selfcheck_completed", telegram_message=message)
     await send_reply(message, response)
@@ -12200,7 +13041,12 @@ async def _handle_prompt_generation(
             image_send_kwargs["plan"] = image_policy.plan
         outcome = await maybe_send_internet_image(message, prompt, **image_send_kwargs)
         emit_prompt_route_decision(no_tool_route("skipped_internet_image_send"))
-        if bool(getattr(outcome, "confirmed_delivery", bool(outcome))):
+        request_fulfilled = (
+            outcome.request_fulfilled
+            if isinstance(outcome, WebImageSendOutcome)
+            else bool(outcome)
+        )
+        if request_fulfilled:
             record_chat_answer(message, prompt, route)
         return
 
@@ -12224,7 +13070,7 @@ async def _handle_prompt_generation(
             )
         except Exception:
             LOGGER.exception("Translation route failed")
-            await message.reply_text("Не зміг перекласти. Деталі будуть у логах контейнера.")
+            await message.reply_text("Не зміг зараз перекласти. Спробуй ще раз трохи пізніше.")
             return
         finally:
             await presence.stop()
@@ -12361,7 +13207,7 @@ async def _handle_prompt_generation(
             )
     except Exception:
         LOGGER.exception("Agent run failed")
-        await message.reply_text("Запит не вдався. Деталі будуть у логах контейнера.")
+        await message.reply_text("Не вийшло відповісти. Спробуй ще раз.")
         return
     finally:
         await presence.stop()
@@ -12427,7 +13273,7 @@ async def handle_image_prompt(
         LOGGER.warning("Ignoring image from non-allowed chat_id=%s", message.chat_id)
         return
     if not CONFIG.image_analysis_enabled:
-        await message.reply_text("Аналіз зображень вимкнено в конфігурації.")
+        await message.reply_text("Зараз я не можу розбирати зображення.")
         return
 
     parts = list(image_messages or (message,))
@@ -12514,9 +13360,11 @@ async def handle_image_prompt_generation(
                 )
         if not image_data_urls:
             if failed_image_parts:
-                await message.reply_text("Не зміг проаналізувати зображення. Деталі будуть у логах контейнера.")
+                await message.reply_text("Не зміг зараз розібрати зображення. Спробуй ще раз або надішли його файлом.")
             else:
-                await message.reply_text("Telegram не передав мені саме зображення. Надішли фото як файл/фото або дай посилання.")
+                await message.reply_text(
+                    "Самого зображення тут не бачу. Надішли його фото/файлом або дай посилання."
+                )
             return
         memory_context = await prepare_memory_context(message, prompt)
         vision_prompt = f"""Telegram chat: {message.chat.title or message.chat_id} ({message.chat_id})
@@ -12559,7 +13407,7 @@ Explain the image(s) according to the current request. Ukrainian by default; Eng
         )
     except Exception:
         LOGGER.exception("Image analysis failed")
-        await message.reply_text("Не зміг проаналізувати зображення. Деталі будуть у логах контейнера.")
+        await message.reply_text("Не зміг зараз розібрати зображення. Спробуй ще раз або надішли його файлом.")
         return
     finally:
         await presence.stop()
