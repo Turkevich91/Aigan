@@ -8,4 +8,4 @@ pillow==12.3.0
 ddgs==9.14.4
 youtube-transcript-api==1.2.4
 yt-dlp[default,deno]==2026.7.4
-tzdata==2026.2
+tzdata==2026.3
