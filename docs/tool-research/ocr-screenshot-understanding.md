@@ -11,7 +11,9 @@ This note does not implement OCR, add dependencies, change Docker images, deploy
 ## Current Baseline
 
 - Aigan already accepts Telegram photos and image documents when Telegram delivers the file to the bot.
-- `IMAGE_ANALYSIS_ENABLED`, `VISION_MODEL`, `IMAGE_MAX_BYTES`, `MEMORY_IMAGE_SUMMARY_LIMIT`, and `MEMORY_EAGER_IMAGE_SUMMARY` control the existing vision path.
+- `IMAGE_ANALYSIS_ENABLED`, the purpose-specific `VISION_INTERACTIVE_MODEL` /
+  `VISION_BACKGROUND_MODEL` settings, `IMAGE_MAX_BYTES`, `MEMORY_IMAGE_SUMMARY_LIMIT`,
+  and `MEMORY_EAGER_IMAGE_SUMMARY` control the existing vision path.
 - Delivered images can be cached in memory and lazily summarized through the current vision model.
 - `MemoryStore` already stores image metadata through `content_kind="image"`, `attachment_type`, local media path, Telegram file ids, MIME type, and `vision_summary`.
 - FTS, keyword fallback, embeddings, `/memory_search`, and natural recall can search `vision_summary` and source context.

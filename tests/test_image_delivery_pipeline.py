@@ -124,6 +124,7 @@ class ImageDeliveryPipelineTests(unittest.TestCase):
         self.assertNotIn("UNTRUSTED SOURCE TITLE", serialized_input)
         self.assertNotIn("synthetic.invalid", serialized_input)
         self.assertTrue(request["text"]["format"]["strict"])
+        self.assertEqual("gpt-5.4-mini", request["model"])
         self.assertEqual({"effort": "none"}, request["reasoning"])
         self.assertEqual(0, client_class.call_args.kwargs["max_retries"])
 

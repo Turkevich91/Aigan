@@ -90,6 +90,8 @@ TASK_CLASS_BUCKETS = {
     "selfcheck",
     "transcription",
     "vision",
+    "vision_background",
+    "vision_interactive",
     "youtube_transcript",
 }
 POLICY_VERSIONS = {"primary_sol_low_v1", "shadow_tier_router_v1"}

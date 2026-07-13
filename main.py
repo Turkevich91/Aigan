@@ -21,7 +21,7 @@ from datetime import datetime, timedelta, timezone
 from functools import lru_cache
 from itertools import count
 from pathlib import Path
-from typing import AbstractSet, Any, Callable, Sequence, cast
+from typing import AbstractSet, Any, Callable, Literal, Sequence, cast
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from agents import (
@@ -334,7 +334,12 @@ class Config:
     auto_react_cooldown_seconds: int
     auto_react_min_chars: int
     image_analysis_enabled: bool
+    # Legacy compatibility alias. New code must choose a typed vision purpose.
     vision_model: str
+    vision_interactive_model: str
+    vision_interactive_reasoning_effort: str
+    vision_background_model: str
+    vision_background_reasoning_effort: str
     image_max_bytes: int
     image_candidate_review_enabled: bool
     image_candidate_review_model: str
@@ -585,11 +590,34 @@ class Config:
                     + ", ".join(sorted(unpriced))
                 )
 
-        vision_model = os.getenv("VISION_MODEL", openai_model).strip()
+        legacy_vision_model = os.getenv("VISION_MODEL", "").strip()
+        vision_interactive_model = os.getenv(
+            "VISION_INTERACTIVE_MODEL",
+            openai_model,
+        ).strip()
+        vision_background_model = os.getenv(
+            "VISION_BACKGROUND_MODEL",
+            legacy_vision_model or "gpt-5.4-mini",
+        ).strip()
+        vision_interactive_reasoning_effort = os.getenv(
+            "VISION_INTERACTIVE_REASONING_EFFORT",
+            "low",
+        ).strip().casefold()
+        vision_background_reasoning_effort = os.getenv(
+            "VISION_BACKGROUND_REASONING_EFFORT",
+            "none",
+        ).strip().casefold()
+        for name, effort in {
+            "VISION_INTERACTIVE_REASONING_EFFORT": vision_interactive_reasoning_effort,
+            "VISION_BACKGROUND_REASONING_EFFORT": vision_background_reasoning_effort,
+        }.items():
+            if effort not in {"none", "low", "medium", "high"}:
+                raise RuntimeError(f"{name} must be one of: none, low, medium, high")
+        vision_model = legacy_vision_model or vision_interactive_model
         image_candidate_review_enabled = _env_bool("IMAGE_CANDIDATE_REVIEW_ENABLED", True)
         image_candidate_review_model = os.getenv(
             "IMAGE_CANDIDATE_REVIEW_MODEL",
-            vision_model,
+            vision_background_model,
         ).strip()
         if image_candidate_review_enabled and not image_candidate_review_model:
             raise RuntimeError("IMAGE_CANDIDATE_REVIEW_ENABLED requires IMAGE_CANDIDATE_REVIEW_MODEL")
@@ -784,6 +812,10 @@ class Config:
             auto_react_min_chars=int(os.getenv("AUTO_REACT_MIN_CHARS", "25")),
             image_analysis_enabled=_env_bool("IMAGE_ANALYSIS_ENABLED", True),
             vision_model=vision_model,
+            vision_interactive_model=vision_interactive_model,
+            vision_interactive_reasoning_effort=vision_interactive_reasoning_effort,
+            vision_background_model=vision_background_model,
+            vision_background_reasoning_effort=vision_background_reasoning_effort,
             image_max_bytes=int(os.getenv("IMAGE_MAX_BYTES", "6000000")),
             image_candidate_review_enabled=image_candidate_review_enabled,
             image_candidate_review_model=image_candidate_review_model,
@@ -4471,7 +4503,7 @@ async def maybe_analyze_reaction_asset(spec: ReactionSpec, chat_id: int) -> None
         return
     if not REACTION_MEMORY.asset_needs_analysis(
         asset,
-        model=CONFIG.vision_model,
+        model=CONFIG.vision_background_model,
         prompt_version=CONFIG.reaction_analysis_prompt_version,
     ):
         return
@@ -4486,7 +4518,7 @@ async def maybe_analyze_reaction_asset(spec: ReactionSpec, chat_id: int) -> None
             inferred_meaning_uk=asset.inferred_meaning_uk or "local meaning is learned from usage",
             tone_tags=("metadata_only",),
             confidence=max(asset.confidence, 0.2),
-            model=CONFIG.vision_model,
+            model=CONFIG.vision_background_model,
             prompt_version=CONFIG.reaction_analysis_prompt_version,
             input_hash=input_hash,
             status="metadata_only",
@@ -4511,6 +4543,7 @@ set_name={asset.set_name or '(none)'}
             run_vision(
                 prompt,
                 [data_url],
+                purpose="background",
                 route_bucket="background",
             ),
             timeout=120,
@@ -4525,7 +4558,7 @@ set_name={asset.set_name or '(none)'}
         inferred_meaning_uk=inferred or summary or output,
         tone_tags=tags,
         confidence=0.72 if summary else 0.4,
-        model=CONFIG.vision_model,
+        model=CONFIG.vision_background_model,
         prompt_version=CONFIG.reaction_analysis_prompt_version,
         input_hash=input_hash,
         status="analyzed",
@@ -7369,14 +7402,34 @@ async def extract_image_data_urls(message: Message) -> list[str]:
     return [data_url_from_bytes(data, mime_type)]
 
 
+VisionPurpose = Literal["interactive", "background"]
+
+
+def vision_runtime_settings(purpose: VisionPurpose) -> tuple[str, str]:
+    if purpose == "interactive":
+        return (
+            CONFIG.vision_interactive_model,
+            CONFIG.vision_interactive_reasoning_effort,
+        )
+    if purpose == "background":
+        return (
+            CONFIG.vision_background_model,
+            CONFIG.vision_background_reasoning_effort,
+        )
+    raise ValueError("unsupported vision purpose")
+
+
 def run_vision_sync(
     prompt: str,
     image_data_urls: list[str],
     *,
+    purpose: VisionPurpose = "interactive",
     run_id: str = "",
     route_bucket: str = "",
-    task_class_bucket: str = "vision",
+    task_class_bucket: str = "",
 ) -> str:
+    model, reasoning_effort = vision_runtime_settings(purpose)
+    resolved_task_class = task_class_bucket or f"vision_{purpose}"
     content: list[dict[str, Any]] = [
         {
             "type": "input_text",
@@ -7398,17 +7451,19 @@ Request and Telegram context:
 
     stage = begin_model_stage(
         stage_kind="vision",
-        intended_model=CONFIG.vision_model,
+        intended_model=model,
+        reasoning_effort=reasoning_effort,
         endpoint="responses",
         run_id=run_id,
         route_bucket=route_bucket,
-        task_class_bucket=task_class_bucket,
+        task_class_bucket=resolved_task_class,
     )
     client = OpenAI()
     try:
         response = client.responses.create(
-            model=CONFIG.vision_model,
+            model=model,
             input=[{"role": "user", "content": content}],
+            reasoning={"effort": reasoning_effort},
             max_output_tokens=CONFIG.max_output_tokens,
         )
     except Exception as exc:
@@ -7435,9 +7490,10 @@ async def run_vision(
     prompt: str,
     image_data_urls: list[str],
     *,
+    purpose: VisionPurpose = "interactive",
     run_id: str = "",
     route_bucket: str = "",
-    task_class_bucket: str = "vision",
+    task_class_bucket: str = "",
 ) -> str:
     emit_agent_start_event(VISION_AGENT_NAME, run_id)
     emit_llm_start_event(VISION_AGENT_NAME, input_item_count=1, has_system_prompt=True, run_id=run_id)
@@ -7447,6 +7503,7 @@ async def run_vision(
             run_vision_sync,
             prompt,
             image_data_urls,
+            purpose=purpose,
             run_id=run_id,
             route_bucket=route_bucket,
             task_class_bucket=task_class_bucket,
@@ -7497,6 +7554,7 @@ Stored message context:
                 run_vision(
                     prompt,
                     [data_url],
+                    purpose="background",
                     route_bucket="memory_index",
                 ),
                 timeout=120,
@@ -8902,7 +8960,11 @@ def configured_capability_rows() -> list[CapabilityRow]:
             adapter="mcp_web",
         )
     )
-    vision_configured = CONFIG.image_analysis_enabled and bool(CONFIG.vision_model)
+    vision_configured = bool(
+        CONFIG.image_analysis_enabled
+        and CONFIG.vision_interactive_model
+        and CONFIG.vision_background_model
+    )
     rows.append(
         CapabilityRow(
             name="image_understanding",
@@ -8912,8 +8974,14 @@ def configured_capability_rows() -> list[CapabilityRow]:
             available=vision_configured,
             status="ok" if vision_configured else ("unconfigured" if CONFIG.image_analysis_enabled else "disabled"),
             adapter="vision",
-            backend=CONFIG.vision_model,
-            details={"max_bytes": CONFIG.image_max_bytes},
+            backend=CONFIG.vision_interactive_model,
+            details={
+                "interactive_model": CONFIG.vision_interactive_model,
+                "interactive_reasoning_effort": CONFIG.vision_interactive_reasoning_effort,
+                "background_model": CONFIG.vision_background_model,
+                "background_reasoning_effort": CONFIG.vision_background_reasoning_effort,
+                "max_bytes": CONFIG.image_max_bytes,
+            },
         )
     )
     rows.append(
@@ -10157,6 +10225,7 @@ Analyze the found web image or images according to the request. Reply in Ukraini
             run_vision(
                 vision_prompt,
                 [data_url_from_bytes(image.data, image.mime_type) for image in images],
+                purpose="interactive",
                 run_id=outbound_provenance.run_id,
                 route_bucket=outbound_provenance.route,
             ),
@@ -10182,6 +10251,12 @@ Analyze the found web image or images according to the request. Reply in Ukraini
         return summary
     except Exception as exc:
         LOGGER.warning("Found image analysis failed error=%s", type(exc).__name__)
+        await notify_operator_alert(
+            message,
+            "image_analysis_failed",
+            {"image_count": len(images)},
+        )
+        await message.reply_text("Не зміг зараз розібрати знайдені зображення. Спробуй ще раз трохи пізніше.")
         return ""
 
 
@@ -13412,7 +13487,11 @@ async def handle_image_prompt_generation(
                     "Самого зображення тут не бачу. Надішли його фото/файлом або дай посилання."
                 )
             return
-        memory_context = await prepare_memory_context(message, prompt)
+        memory_context = await prepare_memory_context(
+            message,
+            prompt,
+            allow_lazy_image_summaries=False,
+        )
         vision_prompt = f"""Telegram chat: {message.chat.title or message.chat_id} ({message.chat_id})
 Current user: {user_label(message)}
 
@@ -13439,6 +13518,7 @@ Explain the image(s) according to the current request. Ukrainian by default; Eng
             run_vision(
                 vision_prompt,
                 image_data_urls,
+                purpose="interactive",
                 run_id=outbound_provenance.run_id,
                 route_bucket=outbound_provenance.route,
             ),
@@ -13453,6 +13533,11 @@ Explain the image(s) according to the current request. Ukrainian by default; Eng
         )
     except Exception:
         LOGGER.exception("Image analysis failed")
+        await notify_operator_alert(
+            message,
+            "image_analysis_failed",
+            {"image_count": len(image_data_urls)},
+        )
         await message.reply_text("Не зміг зараз розібрати зображення. Спробуй ще раз або надішли його файлом.")
         return
     finally:
