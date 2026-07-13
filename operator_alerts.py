@@ -39,6 +39,12 @@ ALERT_DEFINITIONS: dict[str, AlertDefinition] = {
         (153, 158),
         {"target_count": "Ціль альбому", "timeout_seconds": "Дедлайн, с"},
     ),
+    "image_analysis_failed": AlertDefinition(
+        "error",
+        "Явний аналіз зображення завершився помилкою.",
+        (153, 158),
+        {"image_count": "Зображень"},
+    ),
     "image_delivery_partial": AlertDefinition(
         "warning",
         "Альбом доставлено лише частково.",

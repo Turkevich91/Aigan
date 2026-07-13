@@ -32,6 +32,19 @@ class OperatorAlertTests(unittest.TestCase):
         self.assertIn("#153", rendered)
         self.assertIn("#158", rendered)
 
+    def test_interactive_vision_failure_alert_is_bounded(self) -> None:
+        alert = build_operator_alert(
+            "image_analysis_failed",
+            {"image_count": 2, "exception": "PRIVATE FAILURE"},
+        )
+        rendered = render_operator_alert(alert)
+
+        self.assertEqual((("image_count", 2),), alert.facts)
+        self.assertIn("Явний аналіз зображення", rendered)
+        self.assertNotIn("PRIVATE FAILURE", rendered)
+        self.assertIn("#153", rendered)
+        self.assertIn("#158", rendered)
+
     def test_alert_is_private_and_only_identical_facts_are_deduplicated(self) -> None:
         events: list[str] = []
         bot = AsyncMock()

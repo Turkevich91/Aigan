@@ -498,6 +498,58 @@ class AgentsSdkCompatibilityTests(unittest.TestCase):
         self.assertEqual("gpt-5.6-sol", config.openai_model)
         self.assertEqual("low", config.model_reasoning_effort)
 
+    def test_vision_purpose_models_default_and_legacy_fallback_are_explicit(self) -> None:
+        environment = dict(os.environ)
+        for key in (
+            "VISION_MODEL",
+            "VISION_INTERACTIVE_MODEL",
+            "VISION_INTERACTIVE_REASONING_EFFORT",
+            "VISION_BACKGROUND_MODEL",
+            "VISION_BACKGROUND_REASONING_EFFORT",
+            "IMAGE_CANDIDATE_REVIEW_MODEL",
+        ):
+            environment.pop(key, None)
+
+        with patch.dict(os.environ, environment, clear=True):
+            config = main.Config.from_env()
+
+        self.assertEqual("gpt-5.6-sol", config.vision_interactive_model)
+        self.assertEqual("low", config.vision_interactive_reasoning_effort)
+        self.assertEqual("gpt-5.4-mini", config.vision_background_model)
+        self.assertEqual("none", config.vision_background_reasoning_effort)
+        self.assertEqual("gpt-5.4-mini", config.image_candidate_review_model)
+
+        environment["VISION_MODEL"] = "legacy-vision-model"
+        with patch.dict(os.environ, environment, clear=True):
+            legacy = main.Config.from_env()
+
+        self.assertEqual("gpt-5.6-sol", legacy.vision_interactive_model)
+        self.assertEqual("legacy-vision-model", legacy.vision_background_model)
+        self.assertEqual("legacy-vision-model", legacy.image_candidate_review_model)
+
+        environment.update(
+            {
+                "VISION_INTERACTIVE_MODEL": "interactive-model",
+                "VISION_BACKGROUND_MODEL": "background-model",
+                "IMAGE_CANDIDATE_REVIEW_MODEL": "review-model",
+            }
+        )
+        with patch.dict(os.environ, environment, clear=True):
+            purpose_specific = main.Config.from_env()
+
+        self.assertEqual("interactive-model", purpose_specific.vision_interactive_model)
+        self.assertEqual("background-model", purpose_specific.vision_background_model)
+        self.assertEqual("review-model", purpose_specific.image_candidate_review_model)
+
+    def test_invalid_vision_reasoning_effort_fails_configuration(self) -> None:
+        with patch.dict(
+            os.environ,
+            {"VISION_INTERACTIVE_REASONING_EFFORT": "sometimes"},
+            clear=False,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "VISION_INTERACTIVE_REASONING_EFFORT"):
+                main.Config.from_env()
+
     def test_main_agent_receives_configured_sol_reasoning_and_verbosity(self) -> None:
         original = main.CONFIG
         main.CONFIG = replace(
@@ -1158,7 +1210,12 @@ class ModelTelemetryIntegrationTests(unittest.TestCase):
                 usage=usage,
                 reasoning=SimpleNamespace(effort="low"),
             ),
-            SimpleNamespace(output_text="vision ok", model="gpt-5.4-mini", usage=usage),
+            SimpleNamespace(
+                output_text="vision ok",
+                model="gpt-5.6-sol",
+                usage=usage,
+                reasoning=SimpleNamespace(effort="low"),
+            ),
         ]
         original_config = main.CONFIG
         main.CONFIG = replace(
@@ -1220,7 +1277,10 @@ class ModelTelemetryIntegrationTests(unittest.TestCase):
         self.assertTrue(all(record.run_id == "f" * 32 for record in records.values()))
         self.assertEqual("router", records["router"].task_class_bucket)
         self.assertEqual("character", records["plain"].task_class_bucket)
-        self.assertEqual("vision", records["vision"].task_class_bucket)
+        self.assertEqual("vision_interactive", records["vision"].task_class_bucket)
+        self.assertEqual("gpt-5.6-sol", records["vision"].intended_model)
+        self.assertEqual("gpt-5.6-sol", records["vision"].actual_model)
+        self.assertEqual("low", records["vision"].actual_reasoning_effort)
         self.assertEqual("embedding_query", records["embedding_query"].task_class_bucket)
         self.assertEqual("normal", records["router"].route_bucket)
         self.assertEqual("character", records["plain"].route_bucket)
@@ -3611,6 +3671,58 @@ class TelegramTurnCoalescingTests(unittest.TestCase):
 
 
 class VisionLifecycleTests(unittest.TestCase):
+    def test_vision_runtime_settings_are_owned_by_typed_purpose(self) -> None:
+        original = main.CONFIG
+        main.CONFIG = replace(
+            original,
+            vision_interactive_model="gpt-5.6-sol",
+            vision_interactive_reasoning_effort="low",
+            vision_background_model="gpt-5.4-mini",
+            vision_background_reasoning_effort="none",
+        )
+        try:
+            self.assertEqual(
+                ("gpt-5.6-sol", "low"),
+                main.vision_runtime_settings("interactive"),
+            )
+            self.assertEqual(
+                ("gpt-5.4-mini", "none"),
+                main.vision_runtime_settings("background"),
+            )
+            with self.assertRaisesRegex(ValueError, "unsupported vision purpose"):
+                main.vision_runtime_settings("invalid")
+        finally:
+            main.CONFIG = original
+
+    def test_vision_request_uses_interactive_model_and_reasoning(self) -> None:
+        response = SimpleNamespace(
+            output_text="vision ok",
+            model="gpt-5.6-sol",
+            usage=None,
+            reasoning=SimpleNamespace(effort="low"),
+        )
+        original = main.CONFIG
+        main.CONFIG = replace(
+            original,
+            vision_interactive_model="gpt-5.6-sol",
+            vision_interactive_reasoning_effort="low",
+        )
+        try:
+            with patch.object(main, "OpenAI") as client_class:
+                client_class.return_value.responses.create.return_value = response
+                output = main.run_vision_sync(
+                    "safe prompt",
+                    ["data:image/jpeg;base64,AA=="],
+                    purpose="interactive",
+                )
+                request = client_class.return_value.responses.create.call_args.kwargs
+        finally:
+            main.CONFIG = original
+
+        self.assertEqual("vision ok", output)
+        self.assertEqual("gpt-5.6-sol", request["model"])
+        self.assertEqual({"effort": "low"}, request["reasoning"])
+
     def test_run_vision_emits_success_lifecycle_without_private_payloads(self) -> None:
         prompt = "PRIVATE_VISION_PROMPT_MARKER_27"
         image_url = "data:image/jpeg;base64,PRIVATE_IMAGE_MARKER_38"
@@ -3621,7 +3733,7 @@ class VisionLifecycleTests(unittest.TestCase):
             events.append(kwargs)
 
         with patch.object(main, "system_event", side_effect=capture_event):
-            with patch.object(main.asyncio, "to_thread", new=AsyncMock(return_value=output_marker)):
+            with patch.object(main.asyncio, "to_thread", new=AsyncMock(return_value=output_marker)) as to_thread:
                 output = asyncio.run(main.run_vision(prompt, [image_url]))
 
         self.assertEqual(output_marker, output)
@@ -3633,6 +3745,7 @@ class VisionLifecycleTests(unittest.TestCase):
         self.assertNotIn(prompt, serialized)
         self.assertNotIn(image_url, serialized)
         self.assertNotIn(output_marker, serialized)
+        self.assertEqual("interactive", to_thread.await_args.kwargs["purpose"])
 
     def test_run_vision_failure_emits_only_start_lifecycle(self) -> None:
         events = []
@@ -4474,8 +4587,8 @@ class OutboundIdentityAndProvenanceTests(unittest.TestCase):
         with patch.object(main, "MEMORY", None):
             with patch.object(main, "activity_presence_for_message", return_value=presence):
                 with patch.object(main, "extract_image_data_urls", new=AsyncMock(return_value=["data:image/jpeg;base64,AA=="])):
-                    with patch.object(main, "prepare_memory_context", new=AsyncMock(return_value="(memory)")):
-                        with patch.object(main, "run_vision", new=AsyncMock(return_value="vision answer")):
+                    with patch.object(main, "prepare_memory_context", new=AsyncMock(return_value="(memory)")) as prepare_context:
+                        with patch.object(main, "run_vision", new=AsyncMock(return_value="vision answer")) as run_vision:
                             with patch.object(main, "send_reply", new=AsyncMock(return_value=ambiguous)):
                                 with patch.object(main, "record_chat_answer") as record_answer:
                                     asyncio.run(
@@ -4490,6 +4603,50 @@ class OutboundIdentityAndProvenanceTests(unittest.TestCase):
                                     )
 
         record_answer.assert_not_called()
+        self.assertFalse(prepare_context.await_args.kwargs["allow_lazy_image_summaries"])
+        self.assertEqual("interactive", run_vision.await_args.kwargs["purpose"])
+
+    def test_interactive_vision_failure_alerts_privately_without_model_fallback(self) -> None:
+        message = FakeMessage("describe this", message_id=2819)
+        presence = SimpleNamespace(start=AsyncMock(), stop=AsyncMock())
+
+        with patch.object(main, "MEMORY", None):
+            with patch.object(main, "activity_presence_for_message", return_value=presence):
+                with patch.object(
+                    main,
+                    "extract_image_data_urls",
+                    new=AsyncMock(return_value=["data:image/jpeg;base64,AA=="]),
+                ):
+                    with patch.object(
+                        main,
+                        "prepare_memory_context",
+                        new=AsyncMock(return_value="(memory)"),
+                    ):
+                        with patch.object(
+                            main,
+                            "run_vision",
+                            new=AsyncMock(side_effect=RuntimeError("provider unavailable")),
+                        ) as run_vision:
+                            with patch.object(
+                                main,
+                                "notify_operator_alert",
+                                new=AsyncMock(return_value="sent"),
+                            ) as notify:
+                                asyncio.run(
+                                    main.handle_image_prompt_generation(
+                                        message,
+                                        message.text,
+                                        (message,),
+                                        (),
+                                        "vision-failure-dedupe-key",
+                                        skip_cooldown=True,
+                                    )
+                                )
+
+        self.assertEqual(1, run_vision.await_count)
+        self.assertEqual("interactive", run_vision.await_args.kwargs["purpose"])
+        notify.assert_awaited_once_with(message, "image_analysis_failed", {"image_count": 1})
+        self.assertIn("Не зміг зараз розібрати зображення", message.reply_calls[-1]["text"])
 
     def test_provenance_failure_after_send_never_resends(self) -> None:
         message = FakeMessage("trigger", message_id=2803)
@@ -5110,6 +5267,34 @@ class OutboundIdentityAndProvenanceTests(unittest.TestCase):
         chain_ids = {item.id for item in chain}
         self.assertTrue(set(image_item_ids).issubset(chain_ids))
         self.assertIn(analysis_item.id, chain_ids)
+
+    def test_found_image_analysis_failure_alerts_without_model_fallback(self) -> None:
+        message = FakeMessage("analyze this image", message_id=2810)
+        delivery_result = asyncio.run(main.send_web_image_results(message, self.web_images(1)))
+
+        with patch.object(
+            main,
+            "run_vision",
+            new=AsyncMock(side_effect=RuntimeError("provider unavailable")),
+        ) as run_vision:
+            with patch.object(
+                main,
+                "notify_operator_alert",
+                new=AsyncMock(return_value="sent"),
+            ) as notify:
+                summary = asyncio.run(
+                    main.maybe_analyze_found_images(
+                        message,
+                        message.text,
+                        delivery_result.deliveries,
+                    )
+                )
+
+        self.assertEqual("", summary)
+        self.assertEqual(1, run_vision.await_count)
+        self.assertEqual("interactive", run_vision.await_args.kwargs["purpose"])
+        notify.assert_awaited_once_with(message, "image_analysis_failed", {"image_count": 1})
+        self.assertIn("Не зміг зараз розібрати", message.reply_calls[-1]["text"])
 
 
 class ActivityPresenceTests(unittest.TestCase):
@@ -7111,7 +7296,13 @@ class ToolRuntimeTests(unittest.TestCase):
     def test_image_understanding_blank_model_is_unconfigured(self) -> None:
         original_config = main.CONFIG
         try:
-            main.CONFIG = replace(main.CONFIG, image_analysis_enabled=True, vision_model="")
+            main.CONFIG = replace(
+                main.CONFIG,
+                image_analysis_enabled=True,
+                vision_model="",
+                vision_interactive_model="",
+                vision_background_model="",
+            )
             row = {item.name: item for item in main.configured_capability_rows()}["image_understanding"]
         finally:
             main.CONFIG = original_config
@@ -10543,6 +10734,9 @@ class PersistentMemoryTests(unittest.TestCase):
                 asyncio.run(main.ensure_recent_image_summaries(-1001))
 
             self.assertEqual(3, run_vision.await_count)
+            self.assertTrue(
+                all(call.kwargs["purpose"] == "background" for call in run_vision.await_args_list)
+            )
             self.assertEqual(1, len(main.MEMORY.unsummarized_recent_images(-1001, 10)))
         finally:
             try:
