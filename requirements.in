@@ -1,7 +1,7 @@
 openai==2.45.0
 openai-agents==0.18.1
 python-telegram-bot==22.8
-mcp==1.28.1
+mcp==1.29.0
 httpx==0.28.1
 beautifulsoup4==4.15.0
 pillow==12.3.0
