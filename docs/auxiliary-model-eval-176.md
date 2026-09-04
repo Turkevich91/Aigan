@@ -177,7 +177,16 @@ question preparation. Across both studies, known estimated cost was
 the unpriced Terra attempt reservation. Both family caps and the total ceiling
 were respected.
 
-Docker build passed. The isolated full suite ran 926 tests: **925 passed and one
+Post-measurement review also added owner-only, exclusive output creation to the
+classifier CLI and atomic admission against the two embedding-generation
+budgets. A rejected shared-budget reservation now leaves both attempt counters
+unchanged. These changes affect file protection and refused-call bookkeeping;
+successful provider requests and completed scores are unchanged. Original
+measured sources and artifacts remain preserved, and neither study was replayed.
+The retained classifier output directory and five run artifacts were also
+restricted to owner-only access; every artifact hash remained unchanged.
+
+Docker build passed. The isolated full suite ran 931 tests: **930 passed and one
 was skipped**. Independent method and aggregate-evidence review covered case
 denominators, clustered uncertainty, current contract conflicts, cost ledgers,
 blind labels, dimension parity and the absence of runtime promotion. Public

@@ -5,6 +5,9 @@ using Aigan's current retrieval functions and an isolated copy of retained
 memory. It never changes the running service, its environment, or its index.
 The research decision is `INCONCLUSIVE_NO_RUNTIME_PROMOTION`.
 
+The completed measurements, independent audit counts, resource results and
+adoption decisions are in the [combined results report](auxiliary-model-eval-176.md).
+
 ## Corpus and evidence levels
 
 The first frozen cohort contains 24 synthetic families, with two paraphrased

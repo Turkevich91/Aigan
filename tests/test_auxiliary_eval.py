@@ -1,6 +1,10 @@
 """Budget and production retry parity checks; all provider calls are synthetic."""
 import asyncio
 import json
+import os
+from pathlib import Path
+import stat
+import tempfile
 import unittest
 from dataclasses import replace
 from types import SimpleNamespace
@@ -12,6 +16,52 @@ import main as app
 from scripts import eval_auxiliary_models as evaluation
 from tests.test_image_intent import frame, authorization_payload
 from tests.test_model_routing import valid_payload
+
+
+@unittest.skipUnless(os.name == "posix", "private outputs require the POSIX evaluation container")
+class PrivateOutputTests(unittest.TestCase):
+    def test_output_is_private_even_with_permissive_umask(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            previous = os.umask(0)
+            try:
+                output = evaluation.prepare_private_output(Path(temporary) / "results")
+                for name in ("manifest.json", "decisions.jsonl", "summary.json"):
+                    path = output / name
+                    with evaluation.private_text_file(path) as stream:
+                        stream.write("synthetic")
+                    self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+                self.assertEqual(stat.S_IMODE(output.stat().st_mode), 0o700)
+            finally:
+                os.umask(previous)
+
+    def test_existing_unsafe_or_nonempty_directory_is_rejected(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / "results"
+            output.mkdir()
+            output.chmod(0o755)
+            with self.assertRaisesRegex(ValueError, "mode_0700"):
+                evaluation.prepare_private_output(output)
+            self.assertEqual(stat.S_IMODE(output.stat().st_mode), 0o755)
+            output.chmod(0o700)
+            (output / "existing").write_text("preserve")
+            with self.assertRaisesRegex(ValueError, "must_be_empty"):
+                evaluation.prepare_private_output(output)
+
+    def test_symlinks_and_existing_files_are_never_overwritten(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            output = evaluation.prepare_private_output(Path(temporary) / "results")
+            alias = Path(temporary) / "alias"
+            alias.symlink_to(output, target_is_directory=True)
+            with self.assertRaisesRegex(ValueError, "symlink"):
+                evaluation.prepare_private_output(alias)
+            existing = output / "existing"
+            existing.write_text("preserve")
+            link = output / "link"
+            link.symlink_to(existing)
+            for path in (existing, link):
+                with self.assertRaises(FileExistsError):
+                    evaluation.private_text_file(path)
+            self.assertEqual(existing.read_text(), "preserve")
 
 
 class BudgetTests(unittest.TestCase):

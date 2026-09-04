@@ -17,6 +17,7 @@ import json
 import logging
 import os
 import random
+import stat
 import statistics
 import sys
 import time
@@ -64,6 +65,47 @@ SETTINGS = {
 def digest(value: Any) -> str:
     return hashlib.sha256(json.dumps(value, ensure_ascii=False, sort_keys=True,
                                      separators=(",", ":")).encode()).hexdigest()
+
+
+def prepare_private_output(path: Path) -> Path:
+    """Require an empty owner-only directory in the documented POSIX container."""
+    if os.name != "posix":
+        raise ValueError("private_output_requires_posix_container")
+    if path.is_symlink():
+        raise ValueError("output_directory_must_not_be_symlink")
+    output = path.resolve()
+    if output.is_relative_to(ROOT):
+        raise ValueError("output_must_be_outside_repository")
+    try:
+        output.mkdir(mode=0o700, parents=True)
+    except FileExistsError:
+        pass
+    details = output.lstat()
+    if (not stat.S_ISDIR(details.st_mode) or details.st_uid != os.geteuid()
+            or stat.S_IMODE(details.st_mode) != 0o700):
+        raise ValueError("output_directory_must_be_owned_and_mode_0700")
+    if any(output.iterdir()):
+        raise ValueError("output_directory_must_be_empty")
+    return output
+
+
+def private_text_file(path: Path):
+    """Create a new mode-0600 file without following or replacing existing paths."""
+    directory_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        details = os.fstat(directory_fd)
+        if details.st_uid != os.geteuid() or stat.S_IMODE(details.st_mode) != 0o700:
+            raise ValueError("output_directory_must_be_owned_and_mode_0700")
+        fd = os.open(path.name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                     0o600, dir_fd=directory_fd)
+    finally:
+        os.close(directory_fd)
+    try:
+        os.fchmod(fd, 0o600)
+        return os.fdopen(fd, "w", encoding="utf-8")
+    except BaseException:
+        os.close(fd)
+        raise
 
 
 class BudgetExceeded(RuntimeError):
@@ -485,12 +527,7 @@ async def run(args):
     api_key = os.getenv("OPENAI_API_KEY", "")
     if not args.plan_only and not api_key:
         raise ValueError("OPENAI_API_KEY_required")
-    output = args.output.resolve()
-    if output.is_relative_to(ROOT):
-        raise ValueError("output_must_be_outside_repository")
-    output.mkdir(parents=True, exist_ok=True)
-    if any(output.iterdir()):
-        raise ValueError("output_directory_must_be_empty")
+    output = prepare_private_output(args.output)
     app = initialize_runtime(api_key or "sk-test")
     image_eval.validate_cases(image_eval.CASES)
     jobs = [("model_policy", m, rep, c) for c in routing_eval.fixture_cases(routing_eval.DEFAULT_FIXTURE)
@@ -499,7 +536,8 @@ async def run(args):
              for rep in range(2) for m in ("gpt-5.4-mini", "gpt-5.6-luna")]
     random.Random(SEED).shuffle(jobs)
     manifest = build_manifest(app, jobs, args.budget_usd)
-    (output / "manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    with private_text_file(output / "manifest.json") as stream:
+        stream.write(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
     if args.plan_only:
         print(json.dumps({"plan_only": True, "jobs": len(jobs), "manifest_sha256": digest(manifest)}))
         return
@@ -510,7 +548,7 @@ async def run(args):
     install_image_tracking(app)
     semaphore = asyncio.Semaphore(2)
     rows = []
-    with (output / "decisions.jsonl").open("w", encoding="utf-8") as stream:
+    with private_text_file(output / "decisions.jsonl") as stream:
         tasks = [asyncio.create_task(evaluate(app, baseline, job, semaphore, budget)) for job in jobs]
         for completed in asyncio.as_completed(tasks):
             row = await completed
@@ -520,7 +558,8 @@ async def run(args):
             if len(rows) % 25 == 0:
                 print(json.dumps({"completed": len(rows), "total": len(jobs), "budget": budget.summary()}), flush=True)
     summary = summarize(rows, manifest, budget)
-    (output / "summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    with private_text_file(output / "summary.json") as stream:
+        stream.write(json.dumps(summary, indent=2, sort_keys=True) + "\n")
     print(json.dumps(summary, sort_keys=True), flush=True)
 
 

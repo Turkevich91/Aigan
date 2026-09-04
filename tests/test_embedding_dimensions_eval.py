@@ -1,9 +1,28 @@
 from __future__ import annotations
 import unittest
+from types import SimpleNamespace
+from unittest.mock import Mock
 from embedding_dimensions_eval import Budget, source_metrics, paired_family_interval, validate_source_probe
+from scripts.eval_embedding_dimensions import mini_json
 
 
 class EmbeddingDimensionEvaluationTests(unittest.TestCase):
+    def test_total_budget_refusal_does_not_count_undispatched_generation_call(self):
+        generation, total = Budget(.2), Budget(.00001)
+        before = [vars(account).copy() for account in (generation, total)]
+        provider = SimpleNamespace(responses=SimpleNamespace(create=Mock()))
+        with self.assertRaises(ValueError):
+            mini_json(provider, "synthetic prompt", {"TARGET": "synthetic source"}, generation, total)
+        self.assertEqual([vars(account) for account in (generation, total)], before)
+        provider.responses.create.assert_not_called()
+
+    def test_joint_budget_admission_counts_once_in_each_account(self):
+        generation, total = Budget(.2), Budget(.5)
+        Budget.reserve_all((generation, total), .1)
+        for account in (generation, total):
+            self.assertEqual(account.calls, 1)
+            self.assertEqual(account.reserved, .1)
+
     def test_usage_above_reservation_is_charged_and_stops_budget(self):
         budget = Budget(.5)
         budget.reserve(.1)

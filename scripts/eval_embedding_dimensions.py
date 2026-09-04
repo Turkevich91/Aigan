@@ -187,12 +187,7 @@ def prepare(args, output):
 def mini_json(client, prompt, payload, budget, total):
     text = json.dumps(payload, ensure_ascii=False)
     reservation = ((len((prompt + text).encode("utf-8")) + 1024) * .75 + 220 * 4.5) / 1_000_000
-    budget.reserve(reservation)
-    try:
-        total.reserve(reservation)
-    except Exception:
-        budget.reserved -= reservation
-        raise
+    Budget.reserve_all((budget, total), reservation)
     start = time.perf_counter()
     try:
         response = client.responses.create(model=MINI, instructions=prompt, input=text,

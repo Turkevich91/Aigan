@@ -27,10 +27,20 @@ class Budget:
         self.stopped = False
 
     def reserve(self, amount):
-        if self.stopped or amount < 0 or self.actual + self.unknown + self.reserved + amount > self.limit:
-            raise ValueError("budget_exceeded")
-        self.reserved += amount
-        self.calls += 1
+        self.reserve_all((self,), amount)
+
+    @staticmethod
+    def reserve_all(accounts, amount):
+        """Admit one call against all accounts before changing any counters."""
+        accounts = tuple(accounts)
+        if len({id(account) for account in accounts}) != len(accounts):
+            raise ValueError("duplicate_budget_account")
+        for account in accounts:
+            if account.stopped or amount < 0 or account.actual + account.unknown + account.reserved + amount > account.limit:
+                raise ValueError("budget_exceeded")
+        for account in accounts:
+            account.reserved += amount
+            account.calls += 1
 
     def settle(self, reserved, actual=None):
         self.reserved -= reserved
