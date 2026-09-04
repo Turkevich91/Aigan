@@ -21,6 +21,15 @@ Rejected sources are not replaced. All accepted questions and labels are frozen
 before either embedding arm runs. These are machine-checked development probes,
 not naturally occurring user questions, independent human labels or a holdout.
 
+An independent agent then reviews every generated source-question family without
+seeing vectors or rankings. It can accept or reject the frozen question, but
+cannot rewrite it or replace its source. A private `query-audit.json` binds these
+decisions to the original query-freeze hash. The runner requires exactly one
+Boolean acceptance decision for every generated family and writes a separate
+reviewed-query freeze before embedding. Agent review does not create human gold
+labels. The completed experiment's selection counts are recorded in the results
+report, separately from the maximum planned cohort size.
+
 Twelve constructed missing-answer questions measure exposure to retrieved
 neighbors. The current retriever has no abstention threshold, so returning
 neighbors does not establish a false answer or hallucination. Twelve isolation
@@ -75,8 +84,15 @@ No Telegram polling or delivery is started.
 ```sh
 python scripts/eval_embedding_dimensions.py prepare --snapshot "$AIGAN_PRIVATE_SNAPSHOT" --output-dir "$AIGAN_PRIVATE_EVAL"
 python scripts/eval_embedding_dimensions.py generate --output-dir "$AIGAN_PRIVATE_EVAL"
+# Independent blind review writes query-audit.json in the private output directory.
 python scripts/eval_embedding_dimensions.py run --output-dir "$AIGAN_PRIVATE_EVAL"
 ```
+
+The audit must contain `query_freeze_sha256` (the SHA-256 of the unchanged
+`query-freeze.json`) and a `decisions` array. Each entry contains the original
+`family` and an `accepted` Boolean; private rejection reasons may also be retained.
+Do not run the final command before this review or regenerate questions after
+seeing rankings.
 
 The embedding table stores only one vector per message. Increasing the
 dimension in the live environment alone is not a migration: it can make older

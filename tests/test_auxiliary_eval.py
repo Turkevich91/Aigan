@@ -11,6 +11,7 @@ configure_test_environment()
 import main as app
 from scripts import eval_auxiliary_models as evaluation
 from tests.test_image_intent import frame, authorization_payload
+from tests.test_model_routing import valid_payload
 
 
 class BudgetTests(unittest.TestCase):
@@ -46,6 +47,18 @@ class BudgetTests(unittest.TestCase):
                 for model, repeat in (("gpt-5.4-mini", 0), ("gpt-5.4-mini", 1), ("gpt-5.6-luna", 0))]
         self.assertEqual(evaluation.paired_bootstrap(rows, "image_intent", "gpt-5.4-mini", "gpt-5.6-luna", samples=100), {})
 
+    def test_cost_ledger_includes_attempt_before_administrative_abort(self):
+        budget = evaluation.Budget(4.5)
+        rows = [{"role": "image_intent", "model": "gpt-5.6-luna", "case_id": "a", "repeat": 0,
+                 "administrative_abort": "budget_reservation_refused", "attempts": [{
+                     "known_cost_nano_usd": 1234, "reserved_nano_usd": 9999,
+                     "failure_class": "", "stage": "image_intent_v1", "provider_status": "completed"}]}]
+        result = evaluation.summarize(rows, {"fixtures": {"model_policy": "synthetic"}}, budget)
+        report = next(r for r in result["reports"] if r["role"] == "image_intent" and r["candidate_model"] == "gpt-5.6-luna")
+        self.assertEqual(report["decisions"], 0)
+        self.assertEqual(report["known_pipeline_cost_usd"], 1234 / 1e9)
+        self.assertEqual(result["completion"], "INCOMPLETE")
+
 
 class RuntimeParityTests(unittest.IsolatedAsyncioTestCase):
     async def run_case(self, role, case, responses):
@@ -62,7 +75,10 @@ class RuntimeParityTests(unittest.IsolatedAsyncioTestCase):
                 value = responses.pop(0)
                 if isinstance(value, Exception):
                     raise value
-                return SimpleNamespace(model=request["model"], status="completed", output=[],
+                status = "completed"
+                if isinstance(value, tuple):
+                    value, status = value
+                return SimpleNamespace(model=request["model"], status=status, output=[],
                     error=None, incomplete_details=None, reasoning=SimpleNamespace(effort="none"),
                     output_text=value if isinstance(value, str) else json.dumps(value),
                     usage=SimpleNamespace(input_tokens=100, output_tokens=40,
@@ -117,6 +133,15 @@ class RuntimeParityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(budget.unknown, sum(a["reserved_nano_usd"] for a in row["attempts"]))
         self.assertEqual(row["route"], "image_intent_clarify")
         self.assertFalse(row["semantic_pass"])
+
+    async def test_incomplete_response_is_billed_and_never_strict_valid(self):
+        case = evaluation.routing_eval.fixture_cases(evaluation.routing_eval.DEFAULT_FIXTURE)[0]
+        row, calls, budget = await self.run_case("model_policy", case, [(valid_payload(), "incomplete")])
+        self.assertEqual(row["attempts"][0]["provider_status"], "incomplete")
+        self.assertFalse(row["structured_valid"])
+        self.assertFalse(row["strict_completion_valid"])
+        self.assertGreater(budget.known, 0)
+        self.assertEqual(budget.unknown, 0)
 
 
 if __name__ == "__main__":

@@ -21,7 +21,7 @@ import statistics
 import sys
 import time
 from collections import Counter, defaultdict
-from dataclasses import asdict, replace
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -394,9 +394,12 @@ def summarize(rows, manifest, budget):
     for role, models, repeats in (("model_policy", ("gpt-5.4-nano", "gpt-5.6-luna"), 3),
                                   ("image_intent", ("gpt-5.4-mini", "gpt-5.6-luna"), 2)):
         for model in models:
-            selected = [r for r in rows if r["role"] == role and r["model"] == model and
+            family_rows = [r for r in rows if r["role"] == role and r["model"] == model]
+            selected = [r for r in family_rows if
                         not r.get("skipped_budget") and not r.get("administrative_abort")]
-            attempts = [a for r in selected for a in r["attempts"]]
+            # Cost attribution includes every dispatched attempt, even when a
+            # later administrative abort excludes that decision from scoring.
+            attempts = [a for r in family_rows for a in r["attempts"]]
             if role == "model_policy":
                 report = routing_eval.aggregate([routing_result(r) for r in selected],
                     fixture_hash=manifest["fixtures"]["model_policy"], model=model,
@@ -442,7 +445,8 @@ def summarize(rows, manifest, budget):
                     "end_to_end_passed": sum(r.get("end_to_end_pass", False) for r in block) if role == "image_intent" else None,
                     "strict_completion_valid": sum(r.get("strict_completion_valid", False) for r in block)})
             reports.append(report)
-    complete = len(rows) == 940 and not any(r.get("skipped_budget") or r.get("administrative_abort") for r in rows)
+    complete = len(rows) == 940 and not any(r.get("skipped_budget") or r.get("administrative_abort")
+                                          or r.get("evaluation_failure") for r in rows)
     return {"purpose": "development_comparison_no_promotion", "completion": "COMPLETE" if complete else "INCOMPLETE",
         "manifest_sha256": digest(manifest),
         "reports": reports, "budget": budget.summary(),
