@@ -92,7 +92,7 @@ from media_acquisition import (
     YtDlpMediaAcquisitionAdapter,
 )
 from media_frames import FfmpegMediaFrameAdapter, MediaFrameAdapter, MediaFrameLimits, NullMediaFrameAdapter
-from model_pricing import PRICE_SNAPSHOT_VERSION, token_price_for_model
+from runtime_model_pricing import PRICE_SNAPSHOT_VERSION, token_price_for_model
 from model_routing import (
     MODEL_POLICY_ROUTER_SYSTEM_PROMPT,
     ModelPolicyRouter,
@@ -450,10 +450,18 @@ class Config:
         if not api_key or api_key.startswith("put_"):
             raise RuntimeError("Set OPENAI_API_KEY in .env")
         proactive_chat_id = os.getenv("PROACTIVE_CHAT_ID", "").strip()
-        openai_model = os.getenv("OPENAI_MODEL", "gpt-5.6-sol").strip()
+        openai_model = os.getenv("OPENAI_MODEL", "gpt-6-astra").strip()
+        model_reasoning_effort = os.getenv("MODEL_REASONING_EFFORT", "low").strip()
+        if openai_model == "gpt-6-astra" and model_reasoning_effort not in {
+            "low", "medium", "high", "xhigh", "max"
+        }:
+            raise RuntimeError(
+                "MODEL_REASONING_EFFORT for gpt-6-astra must be one of: "
+                "low, medium, high, xhigh, max"
+            )
         telemetry_enabled = _env_bool("MODEL_TELEMETRY_ENABLED", True)
         routing_policy_version = normalize_policy_version(
-            os.getenv("MODEL_ROUTING_POLICY_VERSION", "primary_sol_low_v1"),
+            os.getenv("MODEL_ROUTING_POLICY_VERSION", "primary_astra_low_v1"),
             "",
         )
         if not routing_policy_version:
@@ -607,6 +615,14 @@ class Config:
             "VISION_BACKGROUND_REASONING_EFFORT",
             "none",
         ).strip().casefold()
+        if (
+            vision_interactive_model == "gpt-6-astra"
+            and vision_interactive_reasoning_effort not in {"low", "medium", "high"}
+        ):
+            raise RuntimeError(
+                "VISION_INTERACTIVE_REASONING_EFFORT for gpt-6-astra "
+                "must be one of: low, medium, high"
+            )
         for name, effort in {
             "VISION_INTERACTIVE_REASONING_EFFORT": vision_interactive_reasoning_effort,
             "VISION_BACKGROUND_REASONING_EFFORT": vision_background_reasoning_effort,
@@ -649,7 +665,7 @@ class Config:
             openai_api_key=api_key,
             bot_username=os.getenv("BOT_USERNAME", "").strip().lstrip("@") or None,
             openai_model=openai_model,
-            model_reasoning_effort=os.getenv("MODEL_REASONING_EFFORT", "low").strip(),
+            model_reasoning_effort=model_reasoning_effort,
             model_verbosity=os.getenv("MODEL_VERBOSITY", "low").strip(),
             max_output_tokens=int(os.getenv("MAX_OUTPUT_TOKENS", "900")),
             agents_tracing_mode=normalize_tracing_mode(os.getenv("AGENTS_TRACING_MODE", "disabled")),

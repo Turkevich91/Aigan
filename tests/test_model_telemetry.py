@@ -5,7 +5,7 @@ from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
-from model_pricing import TokenUsage, estimate_token_cost
+from runtime_model_pricing import TokenUsage, estimate_token_cost
 from model_routing import normalize_model_routing_decision, opaque_episode_key
 from model_telemetry import (
     ModelTelemetryStore,
@@ -54,7 +54,7 @@ class ModelPricingTests(unittest.TestCase):
 
         self.assertTrue(estimate.complete)
         self.assertEqual("estimated", estimate.status)
-        self.assertEqual(6_175_000, estimate.nano_usd)
+        self.assertEqual(4_740_000, estimate.nano_usd)
 
     def test_unknown_model_and_missing_usage_never_become_zero_cost(self) -> None:
         unknown = estimate_token_cost(
@@ -89,10 +89,10 @@ class ModelPricingTests(unittest.TestCase):
         )
 
         self.assertEqual("partial", input_only.status)
-        self.assertEqual(500_000, input_only.nano_usd)
+        self.assertEqual(400_000, input_only.nano_usd)
         self.assertFalse(input_only.complete)
         self.assertEqual("partial", output_only.status)
-        self.assertEqual(300_000, output_only.nano_usd)
+        self.assertEqual(200_000, output_only.nano_usd)
         self.assertFalse(output_only.complete)
 
     def test_long_context_surcharge_is_applied_per_request(self) -> None:
@@ -104,8 +104,8 @@ class ModelPricingTests(unittest.TestCase):
             ],
         )
 
-        expected = (300_000 * 5_000 * 2) + (10 * 30_000 * 3 // 2)
-        expected += (100 * 5_000) + (10 * 30_000)
+        expected = (300_000 * 4_000 * 2) + (10 * 20_000 * 3 // 2)
+        expected += (100 * 4_000) + (10 * 20_000)
         self.assertEqual(expected, estimate.nano_usd)
 
 
@@ -348,7 +348,7 @@ class ModelTelemetryStoreTests(unittest.TestCase):
         self.assertEqual("low", row.actual_reasoning_effort)
         self.assertEqual(1000, row.input_tokens)
         self.assertEqual(20, row.reasoning_tokens)
-        self.assertEqual(6_175_000, row.estimated_cost_nano_usd)
+        self.assertEqual(4_740_000, row.estimated_cost_nano_usd)
         self.assertEqual("estimated", row.cost_status)
 
     def test_terminal_stage_kind_can_reclassify_an_agent_turn(self) -> None:
