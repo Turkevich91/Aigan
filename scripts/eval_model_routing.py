@@ -21,7 +21,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from model_pricing import TokenUsage, estimate_token_cost  # noqa: E402
+from runtime_model_pricing import TokenUsage, estimate_token_cost  # noqa: E402
 from model_routing import (  # noqa: E402
     MODEL_POLICY_ROUTER_SYSTEM_PROMPT,
     MODEL_TIERS,

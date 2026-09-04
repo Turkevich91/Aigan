@@ -82,6 +82,7 @@ def image_operation_authorization_payload(
 
 os.environ["TELEGRAM_BOT_TOKEN"] = "123456:test-token"
 os.environ["OPENAI_API_KEY"] = "sk-test"
+os.environ["OPENAI_MODEL"] = "gpt-5.6-sol"
 os.environ["AGENTS_TRACING_MODE"] = "disabled"
 os.environ["ALLOWED_CHAT_IDS"] = "-1001"
 os.environ["ADMIN_USER_IDS"] = "407892151"
@@ -487,16 +488,120 @@ class AgentsSdkCompatibilityTests(unittest.TestCase):
 
         self.assertTrue(model.called)
 
-    def test_primary_model_defaults_to_sol_with_low_reasoning(self) -> None:
+    def test_astra_defaults_replace_only_primary_quality_roles(self) -> None:
         environment = dict(os.environ)
-        environment.pop("OPENAI_MODEL", None)
-        environment.pop("MODEL_REASONING_EFFORT", None)
+        for key in (
+            "OPENAI_MODEL",
+            "MODEL_REASONING_EFFORT",
+            "MODEL_ROUTING_MODE",
+            "MODEL_ROUTING_POLICY_VERSION",
+            "MODEL_ROUTER_MODEL",
+            "MODEL_TIER_PREMIUM_MODEL",
+            "MODEL_TIER_BALANCED_MODEL",
+            "MODEL_TIER_ECONOMY_MODEL",
+            "TOOL_ROUTER_MODEL",
+            "IMAGE_INTENT_ROUTER_MODEL",
+            "IMAGE_OPERATION_AUTHORIZER_MODEL",
+            "VISION_MODEL",
+            "VISION_INTERACTIVE_MODEL",
+            "VISION_INTERACTIVE_REASONING_EFFORT",
+            "VISION_BACKGROUND_MODEL",
+            "VISION_BACKGROUND_REASONING_EFFORT",
+            "IMAGE_CANDIDATE_REVIEW_MODEL",
+            "MEMORY_EMBEDDING_MODEL",
+        ):
+            environment.pop(key, None)
 
         with patch.dict(os.environ, environment, clear=True):
             config = main.Config.from_env()
 
-        self.assertEqual("gpt-5.6-sol", config.openai_model)
+        self.assertEqual("gpt-6-astra", config.openai_model)
+        self.assertEqual("gpt-6-astra", config.model_tier_premium_model)
+        self.assertEqual("gpt-6-astra", config.vision_interactive_model)
         self.assertEqual("low", config.model_reasoning_effort)
+        self.assertEqual("low", config.vision_interactive_reasoning_effort)
+        self.assertEqual("off", config.model_routing_mode)
+        self.assertEqual("primary_astra_low_v1", config.model_routing_policy_version)
+        self.assertEqual("gpt-5.4-nano", config.model_router_model)
+        self.assertEqual("", config.tool_router_model)
+        self.assertFalse(config.tool_router_enabled)
+        self.assertEqual("gpt-5.4-nano", config.model_tier_economy_model)
+        self.assertEqual("gpt-5.6-terra", config.model_tier_balanced_model)
+        self.assertEqual("gpt-5.4-mini", config.image_intent_router_model)
+        self.assertEqual("gpt-5.6-terra", config.image_operation_authorizer_model)
+        self.assertEqual("gpt-5.4-mini", config.vision_background_model)
+        self.assertEqual("none", config.vision_background_reasoning_effort)
+        self.assertEqual("gpt-5.4-mini", config.image_candidate_review_model)
+        self.assertEqual("text-embedding-3-small", config.memory_embedding_model)
+
+    def test_explicit_model_and_legacy_reasoning_overrides_remain_supported(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "OPENAI_MODEL": "gpt-5.6-sol",
+                "MODEL_TIER_PREMIUM_MODEL": "gpt-5.6-sol",
+                "MODEL_REASONING_EFFORT": "none",
+                "MODEL_ROUTING_POLICY_VERSION": "primary_sol_low_v1",
+                "VISION_INTERACTIVE_MODEL": "gpt-5.4-mini",
+                "VISION_INTERACTIVE_REASONING_EFFORT": "none",
+            },
+            clear=False,
+        ):
+            config = main.Config.from_env()
+
+        self.assertEqual("gpt-5.6-sol", config.openai_model)
+        self.assertEqual("gpt-5.6-sol", config.model_tier_premium_model)
+        self.assertEqual("none", config.model_reasoning_effort)
+        self.assertEqual("primary_sol_low_v1", config.model_routing_policy_version)
+        self.assertEqual("gpt-5.4-mini", config.vision_interactive_model)
+        self.assertEqual("none", config.vision_interactive_reasoning_effort)
+
+    def test_astra_shadow_config_accepts_supported_primary_efforts(self) -> None:
+        for effort in ("low", "medium", "high", "xhigh", "max"):
+            with self.subTest(effort=effort), patch.dict(
+                os.environ,
+                {
+                    "OPENAI_MODEL": "gpt-6-astra",
+                    "MODEL_TIER_PREMIUM_MODEL": "gpt-6-astra",
+                    "MODEL_REASONING_EFFORT": effort,
+                    "VISION_INTERACTIVE_MODEL": "gpt-6-astra",
+                    "VISION_INTERACTIVE_REASONING_EFFORT": "low",
+                    "MODEL_ROUTING_MODE": "shadow",
+                    "MODEL_ROUTING_POLICY_VERSION": "shadow_tier_router_v1",
+                    "MODEL_TELEMETRY_ENABLED": "true",
+                },
+                clear=False,
+            ):
+                config = main.Config.from_env()
+                self.assertEqual("shadow", config.model_routing_mode)
+                self.assertEqual("shadow_tier_router_v1", config.model_routing_policy_version)
+                self.assertEqual("gpt-6-astra", config.openai_model)
+                self.assertEqual("gpt-6-astra", config.model_tier_premium_model)
+                self.assertEqual(effort, config.model_reasoning_effort)
+                self.assertEqual("gpt-5.4-nano", config.model_router_model)
+                self.assertEqual("gpt-5.4-nano", config.model_tier_economy_model)
+                self.assertEqual("gpt-5.6-terra", config.model_tier_balanced_model)
+
+    def test_astra_rejects_unsupported_reasoning_before_provider_calls(self) -> None:
+        for effort in ("none", "minimal", "", "ultra"):
+            for role in ("primary", "interactive"):
+                with self.subTest(role=role, effort=effort):
+                    field = (
+                        "MODEL_REASONING_EFFORT"
+                        if role == "primary"
+                        else "VISION_INTERACTIVE_REASONING_EFFORT"
+                    )
+                    environment = {
+                        "OPENAI_MODEL": "gpt-6-astra",
+                        "MODEL_TIER_PREMIUM_MODEL": "gpt-6-astra",
+                        "MODEL_REASONING_EFFORT": "low",
+                        "VISION_INTERACTIVE_MODEL": "gpt-6-astra",
+                        "VISION_INTERACTIVE_REASONING_EFFORT": "low",
+                        field: effort,
+                    }
+                    with patch.dict(os.environ, environment, clear=False):
+                        with self.assertRaisesRegex(RuntimeError, field):
+                            main.Config.from_env()
 
     def test_vision_purpose_models_default_and_legacy_fallback_are_explicit(self) -> None:
         environment = dict(os.environ)
@@ -550,11 +655,11 @@ class AgentsSdkCompatibilityTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "VISION_INTERACTIVE_REASONING_EFFORT"):
                 main.Config.from_env()
 
-    def test_main_agent_receives_configured_sol_reasoning_and_verbosity(self) -> None:
+    def test_main_agent_receives_configured_astra_reasoning_and_verbosity(self) -> None:
         original = main.CONFIG
         main.CONFIG = replace(
             original,
-            openai_model="gpt-5.6-sol",
+            openai_model="gpt-6-astra",
             model_reasoning_effort="low",
             model_verbosity="medium",
             max_output_tokens=321,
@@ -564,7 +669,7 @@ class AgentsSdkCompatibilityTests(unittest.TestCase):
         finally:
             main.CONFIG = original
 
-        self.assertEqual("gpt-5.6-sol", agent.model)
+        self.assertEqual("gpt-6-astra", agent.model)
         self.assertEqual(321, agent.model_settings.max_tokens)
         self.assertEqual("medium", agent.model_settings.verbosity)
         self.assertEqual("low", agent.model_settings.reasoning.effort)
@@ -573,7 +678,7 @@ class AgentsSdkCompatibilityTests(unittest.TestCase):
         original = main.CONFIG
         main.CONFIG = replace(
             original,
-            openai_model="gpt-5.6-sol",
+            openai_model="gpt-6-astra",
             model_reasoning_effort="low",
             model_verbosity="medium",
             max_output_tokens=321,
@@ -581,15 +686,15 @@ class AgentsSdkCompatibilityTests(unittest.TestCase):
         try:
             with patch.object(main, "OpenAI") as client_class:
                 client_class.return_value.responses.create.return_value = SimpleNamespace(
-                    output_text="  AIGAN_SOL_LOW_OK  "
+                    output_text="  AIGAN_ASTRA_LOW_OK  "
                 )
                 result = main.run_plain_model_sync("synthetic smoke")
                 request = client_class.return_value.responses.create.call_args.kwargs
         finally:
             main.CONFIG = original
 
-        self.assertEqual("AIGAN_SOL_LOW_OK", result)
-        self.assertEqual("gpt-5.6-sol", request["model"])
+        self.assertEqual("AIGAN_ASTRA_LOW_OK", result)
+        self.assertEqual("gpt-6-astra", request["model"])
         self.assertEqual({"effort": "low"}, request["reasoning"])
         self.assertEqual({"verbosity": "medium"}, request["text"])
         self.assertEqual(321, request["max_output_tokens"])
@@ -3697,14 +3802,14 @@ class VisionLifecycleTests(unittest.TestCase):
     def test_vision_request_uses_interactive_model_and_reasoning(self) -> None:
         response = SimpleNamespace(
             output_text="vision ok",
-            model="gpt-5.6-sol",
+            model="gpt-6-astra",
             usage=None,
             reasoning=SimpleNamespace(effort="low"),
         )
         original = main.CONFIG
         main.CONFIG = replace(
             original,
-            vision_interactive_model="gpt-5.6-sol",
+            vision_interactive_model="gpt-6-astra",
             vision_interactive_reasoning_effort="low",
         )
         try:
@@ -3720,7 +3825,7 @@ class VisionLifecycleTests(unittest.TestCase):
             main.CONFIG = original
 
         self.assertEqual("vision ok", output)
-        self.assertEqual("gpt-5.6-sol", request["model"])
+        self.assertEqual("gpt-6-astra", request["model"])
         self.assertEqual({"effort": "low"}, request["reasoning"])
 
     def test_run_vision_emits_success_lifecycle_without_private_payloads(self) -> None:

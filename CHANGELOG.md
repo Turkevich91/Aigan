@@ -1,5 +1,11 @@
 # Aigan Changelog
 
+## 2026-09-04 - Astra model integration
+
+- Use GPT-6 Astra with low reasoning for the former Sol primary, premium, and interactive-vision roles; preserve specialized auxiliary models and shadow-only routing.
+- Refresh runtime token prices while preserving the frozen pricing evidence used by the memory-extraction experiment.
+- Record the current auxiliary-model comparison and developmental Nano/Luna results; neither classifier passed the promotion gates, so their assignments remain unchanged.
+
 ## 2026-07-11 - Semantic image routing with confirmed delivery
 
 - Replaced the action/media-noun candidate authority with a semantic image frame for every explicit invocation that reaches general request routing; ordinary group messages remain silent.

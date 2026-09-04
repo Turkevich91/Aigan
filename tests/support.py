@@ -18,6 +18,8 @@ _CONFIGURED = False
 _TEST_ENV = {
     "TELEGRAM_BOT_TOKEN": "123456:test-token",
     "OPENAI_API_KEY": "sk-test",
+    # Pin historical fixtures; default-model tests clear these explicit settings.
+    "OPENAI_MODEL": "gpt-5.6-sol",
     "AGENTS_TRACING_MODE": "disabled",
     "LOG_LEVEL": "CRITICAL",
     "ALLOWED_CHAT_IDS": "-1001",

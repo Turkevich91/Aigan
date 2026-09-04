@@ -10,7 +10,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-from model_pricing import CostEstimate, TokenUsage, estimate_token_cost
+from runtime_model_pricing import CostEstimate, TokenUsage, estimate_token_cost
 from model_routing import (
     AMBIGUITY_LEVELS,
     COMPLEXITY_LEVELS,
@@ -94,7 +94,7 @@ TASK_CLASS_BUCKETS = {
     "vision_interactive",
     "youtube_transcript",
 }
-POLICY_VERSIONS = {"primary_sol_low_v1", "shadow_tier_router_v1"}
+POLICY_VERSIONS = {"primary_astra_low_v1", "primary_sol_low_v1", "shadow_tier_router_v1"}
 ENDPOINTS = {"agents", "audio_transcriptions", "embeddings", "responses"}
 REASONING_EFFORTS = {"none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"}
 ACTUAL_MODEL_SOURCES = {"not_reported", "provider_response", "unavailable_sdk"}

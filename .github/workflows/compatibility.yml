@@ -34,7 +34,8 @@ jobs:
 
       - name: Check dependency lock
         run: |
-          python -m pip install "pip-tools==7.5.3"
+          # Use the pip version tested by pip-tools 7.5.3; runner defaults can drift.
+          python -m pip install "pip==26.0" "pip-tools==7.5.3"
           PYTHON=python ./scripts/compile_requirements.sh
           git diff --exit-code -- requirements.txt
 

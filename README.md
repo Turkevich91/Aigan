@@ -2,7 +2,7 @@
 
 Telegram group assistant backed by OpenAI Agents SDK and local MCP tools.
 
-Default main-chat model: `gpt-5.6-sol` with `low` reasoning effort. Vision and tool routing remain independently configurable so lightweight work can continue using smaller models.
+Default main-chat and interactive-vision model: `gpt-6-astra` with `low` reasoning effort. Specialized routing, background vision, image review, and embedding models remain independently configured. Astra replaces the former Sol roles; it does not activate answer-tier routing.
 
 ## What is included
 
@@ -174,7 +174,7 @@ Image analysis is enabled by default for photos and image documents that Telegra
 
 ```env
 IMAGE_ANALYSIS_ENABLED=true
-VISION_INTERACTIVE_MODEL=gpt-5.6-sol
+VISION_INTERACTIVE_MODEL=gpt-6-astra
 VISION_INTERACTIVE_REASONING_EFFORT=low
 VISION_BACKGROUND_MODEL=gpt-5.4-mini
 VISION_BACKGROUND_REASONING_EFFORT=none
@@ -187,6 +187,17 @@ Lazy memory summaries and reaction-asset descriptions use the background model, 
 public-web candidate safety/relevance review keeps its dedicated reviewer. The legacy
 `VISION_MODEL` key remains a background compatibility fallback; interactive vision never
 inherits it, so an old Mini setting cannot silently weaken an explicit image answer.
+
+For an existing Sol deployment, update only `OPENAI_MODEL`,
+`MODEL_TIER_PREMIUM_MODEL`, and `VISION_INTERACTIVE_MODEL` where they currently
+select `gpt-5.6-sol`, using `gpt-6-astra` and keeping both reasoning efforts at
+`low`. The current OpenAI API key is reused. Explicit environment values override
+repository defaults, so a code update alone does not change a pinned model.
+Keep specialized model choices and routing mode unchanged. In shadow mode retain
+`MODEL_ROUTING_POLICY_VERSION=shadow_tier_router_v1`; the new off-mode default is
+`primary_astra_low_v1`. Astra does not support `none` or `minimal` reasoning.
+Primary Astra accepts `low`, `medium`, `high`, `xhigh`, and `max`; interactive
+vision retains its existing `low`, `medium`, and `high` controls.
 
 Telegram link previews are not always delivered as images. If the bot says it did not receive the image, resend the picture as a photo/file or reply directly to the forwarded photo.
 
@@ -377,7 +388,7 @@ Per-stage model telemetry is a separate local SQLite ledger for routing and cost
 ```env
 MODEL_TELEMETRY_ENABLED=true
 MODEL_TELEMETRY_RETENTION_DAYS=30
-MODEL_ROUTING_POLICY_VERSION=primary_sol_low_v1
+MODEL_ROUTING_POLICY_VERSION=primary_astra_low_v1
 ```
 
 Model-responsibility routing is off by default. The first experiment supports
@@ -396,14 +407,14 @@ MODEL_ROUTER_SCHEMA_VERSION=model_policy_v1
 MODEL_ROUTER_PROMPT_VERSION=model_policy_prompt_v1
 MODEL_TIER_ECONOMY_MODEL=gpt-5.4-nano
 MODEL_TIER_BALANCED_MODEL=gpt-5.6-terra
-MODEL_TIER_PREMIUM_MODEL=gpt-5.6-sol
+MODEL_TIER_PREMIUM_MODEL=gpt-6-astra
 ```
 
 To enable shadow collection, also set
 `MODEL_ROUTING_POLICY_VERSION=shadow_tier_router_v1`. Shadow mode requires the
 payload-free model telemetry store. The premium alias must equal
 `OPENAI_MODEL`; this prevents a configuration label from drifting away from
-the actual Sol answer path.
+the actual primary answer path.
 
 The classifier receives only the trusted current request plus bounded flags;
 URLs in that request are replaced by a `[url]` marker before the provider call.
@@ -413,7 +424,7 @@ never passed into `RunConfig.model`. A deterministic safety floor upgrades
 memory, current, risky, ambiguous, creative, complex, mutation-requesting, and
 unanchored-follow-up work to premium. Any timeout, invalid output, unavailable
 model, or low-confidence result also records a premium fallback without
-blocking the Sol answer.
+blocking the primary answer.
 
 The additive routing ledger stores only enums, configured model aliases,
 confidence, an opaque keyed episode handle, and outcome metadata. It never
