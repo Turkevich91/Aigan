@@ -1,0 +1,146 @@
+[
+  {
+    "id": "ua_old_choice",
+    "language": "ua",
+    "expected_recall": true,
+    "text": "Ми минулого тижня обирали між двома наметами. Який зрештою погодили в цій переписці?"
+  },
+  {
+    "id": "ua_old_place",
+    "language": "ua",
+    "expected_recall": true,
+    "text": "Повернися до нашого листування про велопрогулянку: де ми домовилися зустрітися?"
+  },
+  {
+    "id": "ua_old_recipe",
+    "language": "ua",
+    "expected_recall": true,
+    "text": "Я вже надсилав сюди рецепт із сочевицею. Витягни з тієї розмови кількість води."
+  },
+  {
+    "id": "ua_old_reason",
+    "language": "ua",
+    "expected_recall": true,
+    "text": "Переглянь попередні повідомлення тут і віднови причину, через яку ми відмовилися від синього варіанта."
+  },
+  {
+    "id": "ru_old_vendor",
+    "language": "ru",
+    "expected_recall": true,
+    "text": "В нашей переписке уже называли поставщика этих ламп. Найди, кто это был."
+  },
+  {
+    "id": "ru_old_amount",
+    "language": "ru",
+    "expected_recall": true,
+    "text": "Какую сумму мы согласовали здесь для прошлой поездки? Посмотри старые сообщения."
+  },
+  {
+    "id": "ru_old_book",
+    "language": "ru",
+    "expected_recall": true,
+    "text": "Я потерял название книги, которую ты рекомендовал в этом чате раньше. Восстанови его по переписке."
+  },
+  {
+    "id": "ru_old_change",
+    "language": "ru",
+    "expected_recall": true,
+    "text": "Подними наше прежнее обсуждение проекта и напомни последнее согласованное изменение."
+  },
+  {
+    "id": "en_old_choice",
+    "language": "en",
+    "expected_recall": true,
+    "text": "We picked a tent in this conversation last week. Which one did we settle on?"
+  },
+  {
+    "id": "en_old_place",
+    "language": "en",
+    "expected_recall": true,
+    "text": "Look through our earlier messages here and recover the meeting place we agreed on."
+  },
+  {
+    "id": "en_old_reason",
+    "language": "en",
+    "expected_recall": true,
+    "text": "Why did we reject the blue option when we discussed it here before?"
+  },
+  {
+    "id": "en_old_amount",
+    "language": "en",
+    "expected_recall": true,
+    "text": "Can you locate the amount I quoted in this chat for the previous trip?"
+  },
+  {
+    "id": "ua_general_memory",
+    "language": "ua",
+    "expected_recall": false,
+    "text": "Поясни різницю між оперативною пам'яттю та SSD простими словами."
+  },
+  {
+    "id": "ua_new_recipe",
+    "language": "ua",
+    "expected_recall": false,
+    "text": "Запропонуй новий рецепт супу з сочевиці на дві порції."
+  },
+  {
+    "id": "ua_translation",
+    "language": "ua",
+    "expected_recall": false,
+    "text": "Переклади українською: The lantern is blue."
+  },
+  {
+    "id": "ua_new_plan",
+    "language": "ua",
+    "expected_recall": false,
+    "text": "Склади план першої велопрогулянки для початківця."
+  },
+  {
+    "id": "ru_general_history",
+    "language": "ru",
+    "expected_recall": false,
+    "text": "Расскажи кратко историю появления электрических ламп."
+  },
+  {
+    "id": "ru_new_comparison",
+    "language": "ru",
+    "expected_recall": false,
+    "text": "Сравни преимущества палаток из полиэстера и нейлона в дождь."
+  },
+  {
+    "id": "ru_new_reminder",
+    "language": "ru",
+    "expected_recall": false,
+    "text": "Создай новое напоминание выпить воды завтра в 10:00."
+  },
+  {
+    "id": "ru_general_embedding",
+    "language": "ru",
+    "expected_recall": false,
+    "text": "Объясни, как работают векторные представления текста."
+  },
+  {
+    "id": "en_general_memory",
+    "language": "en",
+    "expected_recall": false,
+    "text": "How does computer memory differ from long-term disk storage?"
+  },
+  {
+    "id": "en_new_recipe",
+    "language": "en",
+    "expected_recall": false,
+    "text": "Suggest a new lentil soup recipe for two people."
+  },
+  {
+    "id": "en_new_image",
+    "language": "en",
+    "expected_recall": false,
+    "text": "Find and send one public photograph of a red panda."
+  },
+  {
+    "id": "en_new_math",
+    "language": "en",
+    "expected_recall": false,
+    "text": "Calculate the total price of three notebooks costing seven dollars each."
+  }
+]
