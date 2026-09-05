@@ -89,6 +89,11 @@ from memory import (
     MemorySearchBatch, MemoryStore, SemanticMemoryResult, fuse_memory_search_batches,
     legacy_memory_result_merge,
 )
+from recall_intent_model import MODEL as RECALL_INTENT_MODEL, classify_recall_intent, recall_model_metadata
+from memory_recall import (
+    normalize_recall_policy_mode,
+    resolve_recall_rollout,
+)
 from media_acquisition import (
     MediaAcquisitionAdapter,
     MediaAcquisitionLimits,
@@ -377,6 +382,7 @@ class Config:
     memory_vector_backfill_limit: int
     memory_recall_intent_threshold: float
     memory_recall_intent_ambiguous_threshold: float
+    memory_recall_policy_mode: str
     web_image_search_enabled: bool
     web_image_candidate_max_bytes: int
     mcp_tool_timeout_seconds: float
@@ -892,6 +898,7 @@ class Config:
             memory_embedding_batch_size=int(os.getenv("MEMORY_EMBEDDING_BATCH_SIZE", "64")),
             memory_vector_backfill_on_start=_env_bool("MEMORY_VECTOR_BACKFILL_ON_START", True),
             memory_vector_backfill_limit=int(os.getenv("MEMORY_VECTOR_BACKFILL_LIMIT", "1000")),
+            memory_recall_policy_mode=normalize_recall_policy_mode(os.getenv("MEMORY_RECALL_POLICY_MODE", "off")),
             memory_recall_intent_threshold=float(os.getenv("MEMORY_RECALL_INTENT_THRESHOLD", "0.62")),
             memory_recall_intent_ambiguous_threshold=float(
                 os.getenv("MEMORY_RECALL_INTENT_AMBIGUOUS_THRESHOLD", "0.48")
@@ -5476,7 +5483,7 @@ async def memory_recall_embedding_confidence(prompt: str) -> float:
     return max((sum(a * b for a, b in zip(prompt_vector, archetype)) for archetype in archetype_vectors), default=0.0)
 
 
-async def detect_memory_recall_intent(message: Message, prompt: str) -> MemoryRecallIntent:
+async def detect_legacy_memory_recall_intent(message: Message, prompt: str) -> MemoryRecallIntent:
     if MEMORY is None or not prompt.strip():
         return MemoryRecallIntent(False, reason="memory_disabled_or_empty")
     if is_translate_request(prompt) or is_internet_image_request(prompt, has_reference=referenced_context_available(message)):
@@ -5509,6 +5516,102 @@ async def detect_memory_recall_intent(message: Message, prompt: str) -> MemoryRe
     ):
         return MemoryRecallIntent(True, confidence=confidence, query=query, reason="semantic_ambiguous_with_hint")
     return MemoryRecallIntent(False, confidence=confidence, query=query, reason="semantic_below_threshold")
+
+
+async def run_recall_intent_classifier(message: Message, prompt: str):
+    """Use the bounded classifier transport and the existing telemetry owner."""
+    metadata = recall_model_metadata(
+        prompt,
+        has_reply_text=bool(
+            getattr(getattr(message, "reply_to_message", None), "text", None)
+            or getattr(getattr(message, "reply_to_message", None), "caption", None)
+            or getattr(getattr(message, "quote", None), "text", None)
+        ),
+        has_reply_image=referenced_visual_context_available(message),
+    )
+    stage = begin_model_stage(
+        stage_kind="router", intended_model=RECALL_INTENT_MODEL,
+        reasoning_effort="none", endpoint="responses", route_bucket="pre_route",
+        task_class_bucket="memory_recall",
+    )
+    try:
+        result = await classify_recall_intent(metadata, api_key=CONFIG.openai_api_key)
+    except asyncio.CancelledError as exc:
+        finish_model_stage(stage, status="cancelled", failure_class=exc)
+        raise
+    except Exception as exc:
+        finish_model_stage(stage, status="failed", failure_class=exc)
+        raise
+    finish_model_stage(
+        stage, status="succeeded" if result.status == "succeeded" else "failed",
+        usage={
+            "input_tokens": result.usage.input_tokens,
+            "output_tokens": result.usage.output_tokens,
+            "input_tokens_details": {
+                "cached_tokens": result.usage.cached_input_tokens,
+                "cache_write_tokens": result.usage.cache_write_tokens,
+            },
+        },
+        actual_model=result.actual_model or "",
+        actual_model_source="provider_response" if result.actual_model else "not_reported",
+        actual_reasoning_effort=result.actual_reasoning_effort or "",
+        failure_class=result.failure_class or None,
+    )
+    return result
+
+
+async def detect_memory_recall_intent(message: Message, prompt: str) -> MemoryRecallIntent:
+    """Off preserves legacy; shadow compares; enforce uses one classifier call."""
+    mode = CONFIG.memory_recall_policy_mode
+    if mode == "off":
+        return await detect_legacy_memory_recall_intent(message, prompt)
+    if MEMORY is None or not prompt.strip():
+        return MemoryRecallIntent(False, reason="memory_disabled_or_empty")
+    if is_translate_request(prompt) or is_internet_image_request(
+        prompt, has_reference=referenced_context_available(message)
+    ):
+        return MemoryRecallIntent(False, reason="excluded_route")
+
+    legacy = await detect_legacy_memory_recall_intent(message, prompt) if mode == "shadow" else None
+    candidate = None
+    failure_class = ""
+    try:
+        candidate = await run_recall_intent_classifier(message, prompt)
+        if candidate.is_recall is None:
+            failure_class = candidate.failure_class or "invalid_candidate"
+    except Exception as exc:
+        failure_class = type(exc).__name__
+        candidate = None
+    failed = candidate is None or candidate.is_recall is None
+    if failed and legacy is None:
+        legacy = await detect_legacy_memory_recall_intent(message, prompt)
+    resolution = resolve_recall_rollout(
+        mode=mode,
+        legacy_is_recall=legacy.is_recall if legacy is not None else False,
+        candidate_is_recall=candidate.is_recall if candidate is not None else None,
+        candidate_failed=failed,
+    )
+    system_event(
+        component="memory_vector", event_type="memory_recall_policy", telegram_message=message,
+        details={
+            "mode": mode, "policy_version": "recall_luna_v2",
+            "legacy_recall": legacy.is_recall if legacy is not None else None,
+            "candidate_recall": candidate.is_recall if candidate is not None else None,
+            "candidate_intent": candidate.intent if candidate is not None else None,
+            "candidate_latency_ms": candidate.latency_ms if candidate is not None else None,
+            "applied_recall": resolution.applied_is_recall,
+            "differs": resolution.differs if legacy is not None else None,
+            "fallback_reason": resolution.fallback_reason,
+            "failure_class": failure_class,
+        },
+    )
+    if resolution.applied_source == "legacy":
+        return legacy
+    variants = memory_recall_query_variants(prompt)
+    return MemoryRecallIntent(
+        candidate.is_recall, query=variants[0] if variants else prompt.strip(),
+        reason="luna_" + candidate.intent,
+    )
 
 
 def build_image_intent_router_metadata(message: Message, prompt: str) -> dict[str, Any]:

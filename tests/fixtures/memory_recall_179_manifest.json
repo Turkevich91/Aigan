@@ -1,0 +1,125 @@
+{
+  "authorization": {
+    "claim_retained_after_failure": true,
+    "exclusive_claim_before_payload_parse": true,
+    "required_fields": [
+      "authorized",
+      "fixture_sha256",
+      "fixture_manifest_sha256",
+      "protocol_sha256",
+      "evaluator_source_sha256",
+      "candidate_source_sha256",
+      "candidate_config_sha256",
+      "development_report_sha256",
+      "development_cache_manifest_sha256",
+      "nonce",
+      "scope"
+    ],
+    "schema_version": "recall179-holdout-authorization-v1",
+    "scope": "one_holdout_run_no_tuning"
+  },
+  "baseline_policy": {
+    "ambiguous_threshold": 0.48,
+    "archetype_count": 10,
+    "archetypes_canonical_json_sha256": "2c902785f6949d19568ca6f7369c9ab96247d96eb8dae798a08851a983d985fa",
+    "function_sha256": {
+      "detect_memory_recall_intent": "dd02597de46f91417fe49c2304f73f429e692c085095cbd294910b5a0484f27c",
+      "has_explicit_memory_context_hint": "c24579bac39b5fa260005b5684f29db36f6fd73a4bf98773736394cd1f46575e",
+      "memory_recall_embedding_confidence": "8d0ed1e9a5a1de5f0d7a48f360082a8212ce67eeadf20943f6e28aab54123f6c",
+      "memory_recall_fallback_intent": "aca4b78b91428f48c2157f48fb1ab418fab17185556e5410f607c2b14e992779"
+    },
+    "main_sha256": "8117c14b80df560a8df00acc4e4289945e1e17889738e764cb2ba8ff7a7c652a",
+    "strong_threshold": 0.62
+  },
+  "baseline_sha": "a0d5028bab91ba64daff379375b1f52a46c9dd0b",
+  "cache": {
+    "dimensions": 512,
+    "key_inputs": [
+      "exact_provider_input_sha256",
+      "model",
+      "dimensions",
+      "normalization_version"
+    ],
+    "model": "text-embedding-3-small",
+    "paired_query_vectors": true
+  },
+  "development": {
+    "boundary_cases": 12,
+    "critical_negative": 15,
+    "efficacy_cases": 72,
+    "families": 24,
+    "language_variants_per_family": 3,
+    "negative": 36,
+    "path": "tests/fixtures/memory_recall_development_v1.json",
+    "per_language_negative": 12,
+    "per_language_positive": 12,
+    "positive": 36,
+    "sha256": "2109575596776ead7ec5e29abe05f8fd1dd11c8345b7209c52ccee809358991d"
+  },
+  "fixture_schema_version": "recall-admission-fixture-v1",
+  "frozen_before_candidate_comparison": true,
+  "gates": {
+    "holdout_critical_false_positives_max": 0,
+    "holdout_false_positives_max": 1,
+    "holdout_net_true_positive_gain_min": 8,
+    "holdout_true_positives_min": 33,
+    "incomplete_or_unexplained_cases_max": 0,
+    "invocation_boundary_violations_max": 0,
+    "separate_failure_precedence_scope_and_rollout_checks_required": true
+  },
+  "holdout": {
+    "boundary_cases": 12,
+    "critical_negative": 15,
+    "efficacy_cases": 72,
+    "exposure_at_freeze": "independent_custodian_only",
+    "families": 24,
+    "language_variants_per_family": 3,
+    "negative": 36,
+    "payload_in_git": false,
+    "per_language_negative": 12,
+    "per_language_positive": 12,
+    "positive": 36,
+    "sha256": "c77bf08c8e08a25f39c1fb65a3b3d2d35d3a66f71f324c89a432c95adf470888"
+  },
+  "human_gold": false,
+  "issue": 179,
+  "metrics": {
+    "bootstrap": {
+      "confidence": 0.95,
+      "keep_all_language_variants": true,
+      "method": "paired_family_percentile",
+      "precision": "positive_and_negative_families_resampled_separately",
+      "recall": "positive_families",
+      "replicates": 10000,
+      "seed": 179
+    },
+    "confusion_counts": true,
+    "language_breakdown": [
+      "ua",
+      "ru",
+      "en"
+    ],
+    "primary": [
+      "precision",
+      "recall",
+      "specificity",
+      "false_positive_rate"
+    ],
+    "undefined_precision": "null"
+  },
+  "protocol": {
+    "path": "docs/recall-admission-179-eval.md",
+    "sha256": "dfc95a2341736ee3f05249b56a61caddb654599ae605e9993c048e2b31de0bea"
+  },
+  "provider_calls_by_custodian": 0,
+  "schema_version": "recall-admission-eval-manifest-v1",
+  "shared_provider_budget": {
+    "issues": [
+      179,
+      180
+    ],
+    "reserve_before_dispatch": true,
+    "unknown_usage_is_not_free": true,
+    "usd": 5
+  }
+}

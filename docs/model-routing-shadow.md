@@ -125,3 +125,13 @@ Official model references used for the initial candidates:
 - https://developers.openai.com/api/docs/models/gpt-5.4-nano
 - https://developers.openai.com/api/docs/models/gpt-5.6-terra
 - https://developers.openai.com/api/docs/models/gpt-5.6-sol
+
+## September 2026 evidence update
+
+Read-only follow-up to #176/#178: no active-routing or gate change is made by the current memory work (#179/#180).
+
+- The retained historical shadow population contains 264 decisions in the August 6 through September 4 UTC window: 263 Nano and one Luna. Three were marked eligible and six used the memory-recall route. This is not a representative Luna field sample.
+- The preserved Luna development run contains 360 decisions from 120 synthetic cases repeated three times: 55 class mismatches, 11 choices above the fixture's minimum tier, zero unsafe downgrades, and economy precision/recall 1.0 on 60 repeated decisions. Mean confidence on class mismatches is 0.9633. These observed fixtures are not fresh holdout evidence.
+- The three historically eligible requests incurred USD 0.1074425 in recorded primary-model cost. That amount is a fixed-cohort counterfactual ceiling even for a free replacement, not a forecast of monthly savings with Luna or Astra. Historical primary stages totaled approximately USD 15.51 under mixed historical price snapshots; some other failed attempts have unknown usage.
+
+The snapshot supports distinguishing task-class quality from tier selection and investigating confidence calibration. It does not establish future routing economics or authorize a canary. Luna remains in shadow; any future proposal must use new evidence and state the target population and complete-request cost explicitly.

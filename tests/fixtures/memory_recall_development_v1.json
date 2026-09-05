@@ -1,0 +1,1621 @@
+{
+  "schema_version": "recall-admission-fixture-v1",
+  "fixture_id": "recall-admission-179-development-v1",
+  "split": "development",
+  "baseline_sha": "a0d5028bab91ba64daff379375b1f52a46c9dd0b",
+  "anchor_datetime_utc": "2026-09-01T12:00:00Z",
+  "label_authority": "independent_agent_synthetic",
+  "human_gold": false,
+  "cases": [
+    {
+      "case_id": "development-p01-ua",
+      "family_id": "development-p01",
+      "language": "ua",
+      "category": "earlier_material",
+      "prompt": "Знайди в нашій переписці, яку деревину ми вказували для полиці «Клен».",
+      "context": {
+        "chat_type": "private",
+        "invoked": true,
+        "has_reply_text": false,
+        "has_reply_image": false,
+        "reply_text": ""
+      },
+      "expected": {
+        "is_recall": true,
+        "critical_negative": false,
+        "reason": "Retrieve an earlier specified material."
+      }
+    },
+    {
+      "case_id": "development-p01-ru",
+      "family_id": "development-p01",
+      "language": "ru",
+      "category": "earlier_material",
+      "prompt": "Найди в нашей переписке, какую древесину мы указывали для полки «Клён».",
+      "context": {
+        "chat_type": "private",
+        "invoked": true,
+        "has_reply_text": false,
+        "has_reply_image": false,
+        "reply_text": ""
+      },
+      "expected": {
+        "is_recall": true,
+        "critical_negative": false,
+        "reason": "Retrieve an earlier specified material."
+      }
+    },
+    {
+      "case_id": "development-p01-en",
+      "family_id": "development-p01",
+      "language": "en",
+      "category": "earlier_material",
+      "prompt": "Find which wood we specified for the Maple shelf in our earlier messages.",
+      "context": {
+        "chat_type": "private",
+        "invoked": true,
+        "has_reply_text": false,
+        "has_reply_image": false,
+        "reply_text": ""
+      },
+      "expected": {
+        "is_recall": true,
+        "critical_negative": false,
+        "reason": "Retrieve an earlier specified material."
+      }
+    },
+    {
+      "case_id": "development-p02-ua",
+      "family_id": "development-p02",
+      "language": "ua",
+      "category": "prior_choice",
+      "prompt": "Який колір значків ми зрештою обрали на попередній зустрічі?",
+      "context": {
+        "chat_type": "private",
+        "invoked": true,
+        "has_reply_text": false,
+        "has_reply_image": false,
+        "reply_text": ""
+      },
+      "expected": {
+        "is_recall": true,
+        "critical_negative": false,
+        "reason": "Retrieve the group's prior choice."
+      }
+    },
+    {
+      "case_id": "development-p02-ru",
+      "family_id": "development-p02",
+      "language": "ru",
+      "category": "prior_choice",
+      "prompt": "Какой цвет значков мы в итоге выбрали на предыдущей встрече?",
+      "context": {
+        "chat_type": "private",
+        "invoked": true,
+        "has_reply_text": false,
+        "has_reply_image": false,
+        "reply_text": ""
+      },
+      "expected": {
+        "is_recall": true,
+        "critical_negative": false,
+        "reason": "Retrieve the group's prior choice."
+      }
+    },
+    {
+      "case_id": "development-p02-en",
+      "family_id": "development-p02",
+      "language": "en",
+      "category": "prior_choice",
+      "prompt": "Which badge color did we finally choose at the previous meeting?",
+      "context": {
+        "chat_type": "private",
+        "invoked": true,
+        "has_reply_text": false,
+        "has_reply_image": false,
+        "reply_text": ""
+      },
+      "expected": {
+        "is_recall": true,
+        "critical_negative": false,
+        "reason": "Retrieve the group's prior choice."
+      }
+    },
+    {
+      "case_id": "development-p03-ua",
+      "family_id": "development-p03",
+      "language": "ua",
+      "category": "previous_amount",
+      "prompt": "Скільки грошей на пальне ми називали, коли минулого разу планували поїздку до озера?",
+      "context": {
+        "chat_type": "private",
+        "invoked": true,
+        "has_reply_text": false,
+        "has_reply_image": false,
+        "reply_text": ""
+      },
+      "expected": {
+        "is_recall": true,
+        "critical_negative": false,
+        "reason": "Retrieve an amount previously discussed."
+      }
+    },
+    {
+      "case_id": "development-p03-ru",
+      "family_id": "development-p03",
+      "language": "ru",
+      "category": "previous_amount",
+      "prompt": "Сколько денег на топливо мы называли, когда в прошлый раз планировали поездку к озеру?",
+      "context": {
+        "chat_type": "private",
+        "invoked": true,
+        "has_reply_text": false,
+        "has_reply_image": false,
+        "reply_text": ""
+      },
+      "expected": {
+        "is_recall": true,
+        "critical_negative": false,
+        "reason": "Retrieve an amount previously discussed."
+      }
+    },
+    {
+      "case_id": "development-p03-en",
+      "family_id": "development-p03",
+      "language": "en",
+      "category": "previous_amount",
+      "prompt": "What fuel budget did we mention when we planned the lake trip last time?",
+      "context": {
+        "chat_type": "private",
+        "invoked": true,
+        "has_reply_text": false,
+        "has_reply_image": false,
+        "reply_text": ""
+      },
+      "expected": {
+        "is_recall": true,
+        "critical_negative": false,
+        "reason": "Retrieve an amount previously discussed."
+      }
+    },
+    {
+      "case_id": "development-p04-ua",
+      "family_id": "development-p04",
+      "language": "ua",
+      "category": "previous_place",
+      "prompt": "Де ми тоді домовилися проводити обмін книжками? Підніми старе обговорення.",
+      "context": {
+        "chat_type": "private",
+        "invoked": true,
+        "has_reply_text": false,
+        "has_reply_image": false,
+        "reply_text": ""
+      },
+      "expected": {
+        "is_recall": true,
+        "critical_negative": false,
+        "reason": "Retrieve the location from an earlier arrangement."
+      }
+    },
+    {
+      "case_id": "development-p04-ru",
+      "family_id": "development-p04",
+      "language": "ru",
+      "category": "previous_place",
+      "prompt": "Где мы тогда договорились проводить обмен книгами? Подними старое обсуждение.",
+      "context": {
+        "chat_type": "private",
+        "invoked": true,
+        "has_reply_text": false,
+        "has_reply_image": false,
+        "reply_text": ""
+      },
+      "expected": {
+        "is_recall": true,
+        "critical_negative": false,
+        "reason": "Retrieve the location from an earlier arrangement."
+      }
+    },
+    {
+      "case_id": "development-p04-en",
+      "family_id": "development-p04",
+      "language": "en",
+      "category": "previous_place",
+      "prompt": "Where had we agreed to hold the book swap? Check the earlier discussion.",
+      "context": {
+        "chat_type": "private",
+        "invoked": true,
+        "has_reply_text": false,
+        "has_reply_image": false,
+        "reply_text": ""
+      },
+      "expected": {
+        "is_recall": true,
+        "critical_negative": false,
+        "reason": "Retrieve the location from an earlier arrangement."
+      }
+    },
+    {
+      "case_id": "development-p05-ua",
+      "family_id": "development-p05",
+      "language": "ua",
+      "category": "previous_reason",
+      "prompt": "Чому ми минулого разу відклали випуск клубної розсилки? Нагадай саме наші тодішні аргументи.",
+      "context": {
+        "chat_type": "private",
+        "invoked": true,
+        "has_reply_text": false,
+        "has_reply_image": false,
+        "reply_text": ""
+      },
+      "expected": {
+        "is_recall": true,
+        "critical_negative": false,
+        "reason": "Retrieve reasoning actually given earlier."
+      }
+    },
+    {
+      "case_id": "development-p05-ru",
+      "family_id": "development-p05",
+      "language": "ru",
+      "category": "previous_reason",
+      "prompt": "Почему мы в прошлый раз отложили выпуск клубной рассылки? Напомни именно наши тогдашние аргументы.",
+      "context": {
+        "chat_type": "private",
+        "invoked": true,
+        "has_reply_text": false,
+        "has_reply_image": false,
+        "reply_text": ""
+      },
+      "expected": {
+        "is_recall": true,
+        "critical_negative": false,
+        "reason": "Retrieve reasoning actually given earlier."
+      }
+    },
+    {
+      "case_id": "development-p05-en",
+      "family_id": "development-p05",
+      "language": "en",
+      "category": "previous_reason",
+      "prompt": "Why did we postpone the club newsletter last time? Remind me of the reasons we gave then.",
+      "context": {
+        "chat_type": "private",
+        "invoked": true,
+        "has_reply_text": false,
+        "has_reply_image": false,
+        "reply_text": ""
+      },
+      "expected": {
+        "is_recall": true,
+        "critical_negative": false,
+        "reason": "Retrieve reasoning actually given earlier."
+      }
+    },
+    {
+      "case_id": "development-p06-ua",
+      "family_id": "development-p06",
+      "language": "ua",
+      "category": "speaker_attribution",
+      "prompt": "Хто раніше пропонував накрити стенд від дощу? Знайди те повідомлення.",
+      "context": {
+        "chat_type": "private",
+        "invoked": true,
+        "has_reply_text": false,
+        "has_reply_image": false,
+        "reply_text": ""
+      },
+      "expected": {
+        "is_recall": true,
+        "critical_negative": false,
+        "reason": "Retrieve attribution from earlier messages."
+      }
+    },
+    {
+      "case_id": "development-p06-ru",
+      "family_id": "development-p06",
+      "language": "ru",
+      "category": "speaker_attribution",
+      "prompt": "Кто раньше предлагал накрыть стенд от дождя? Найди то сообщение.",
+      "context": {
+        "chat_type": "private",
+        "invoked": true,
+        "has_reply_text": false,
+        "has_reply_image": false,
+        "reply_text": ""
+      },
+      "expected": {
+        "is_recall": true,
+        "critical_negative": false,
+        "reason": "Retrieve attribution from earlier messages."
+      }
+    },
+    {
+      "case_id": "development-p06-en",
+      "family_id": "development-p06",
+      "language": "en",
+      "category": "speaker_attribution",
+      "prompt": "Who previously suggested covering the stall against rain? Find that message.",
+      "context": {
+        "chat_type": "private",
+        "invoked": true,
+        "has_reply_text": false,
+        "has_reply_image": false,
+        "reply_text": ""
+      },
+      "expected": {
+        "is_recall": true,
+        "critical_negative": false,
+        "reason": "Retrieve attribution from earlier messages."
+      }
+    },
+    {
+      "case_id": "development-p07-ua",
+      "family_id": "development-p07",
+      "language": "ua",
+      "category": "earlier_attachment",
+      "prompt": "Як називався файл зі списком насіння, який сюди надсилали минулого тижня?",
+      "context": {
+        "chat_type": "private",
+        "invoked": true,
+        "has_reply_text": false,
+        "has_reply_image": false,
+        "reply_text": ""
+      },
+      "expected": {
+        "is_recall": true,
+        "critical_negative": false,
+        "reason": "Identify a previously shared attachment from chat evidence."
+      }
+    },
+    {
+      "case_id": "development-p07-ru",
+      "family_id": "development-p07",
+      "language": "ru",
+      "category": "earlier_attachment",
+      "prompt": "Как назывался файл со списком семян, который сюда присылали на прошлой неделе?",
+      "context": {
+        "chat_type": "private",
+        "invoked": true,
+        "has_reply_text": false,
+        "has_reply_image": false,
+        "reply_text": ""
+      },
+      "expected": {
+        "is_recall": true,
+        "critical_negative": false,
+        "reason": "Identify a previously shared attachment from chat evidence."
+      }
+    },
+    {
+      "case_id": "development-p07-en",
+      "family_id": "development-p07",
+      "language": "en",
+      "category": "earlier_attachment",
+      "prompt": "What was the filename of the seed list shared here last week?",
+      "context": {
+        "chat_type": "private",
+        "invoked": true,
+        "has_reply_text": false,
+        "has_reply_image": false,
+        "reply_text": ""
+      },
+      "expected": {
+        "is_recall": true,
+        "critical_negative": false,
+        "reason": "Identify a previously shared attachment from chat evidence."
+      }
+    },
+    {
+      "case_id": "development-p08-ua",
+      "family_id": "development-p08",
+      "language": "ua",
+      "category": "prior_correction",
+      "prompt": "На яку температуру ми потім виправили пробний режим печі для кераміки? Перевір останнє виправлення в тій розмові.",
+      "context": {
+        "chat_type": "private",
+        "invoked": true,
+        "has_reply_text": false,
+        "has_reply_image": false,
+        "reply_text": ""
+      },
+      "expected": {
+        "is_recall": true,
+        "critical_negative": false,
+        "reason": "Retrieve a correction to an earlier stated fact."
+      }
+    },
+    {
+      "case_id": "development-p08-ru",
+      "family_id": "development-p08",
+      "language": "ru",
+      "category": "prior_correction",
+      "prompt": "На какую температуру мы потом исправили пробный режим печи для керамики? Проверь последнее исправление в том разговоре.",
+      "context": {
+        "chat_type": "private",
+        "invoked": true,
+        "has_reply_text": false,
+        "has_reply_image": false,
+        "reply_text": ""
+      },
+      "expected": {
+        "is_recall": true,
+        "critical_negative": false,
+        "reason": "Retrieve a correction to an earlier stated fact."
+      }
+    },
+    {
+      "case_id": "development-p08-en",
+      "family_id": "development-p08",
+      "language": "en",
+      "category": "prior_correction",
+      "prompt": "What temperature did we later correct the pottery kiln trial setting to? Check the last correction in that conversation.",
+      "context": {
+        "chat_type": "private",
+        "invoked": true,
+        "has_reply_text": false,
+        "has_reply_image": false,
+        "reply_text": ""
+      },
+      "expected": {
+        "is_recall": true,
+        "critical_negative": false,
+        "reason": "Retrieve a correction to an earlier stated fact."
+      }
+    },
+    {
+      "case_id": "development-p09-ua",
+      "family_id": "development-p09",
+      "language": "ua",
+      "category": "quoted_history_fragment",
+      "prompt": "Пошукай, у якому старому повідомленні тут була фраза «тихий трамвай».",
+      "context": {
+        "chat_type": "private",
+        "invoked": true,
+        "has_reply_text": false,
+        "has_reply_image": false,
+        "reply_text": ""
+      },
+      "expected": {
+        "is_recall": true,
+        "critical_negative": false,
+        "reason": "Locate a quoted fragment in earlier chat evidence."
+      }
+    },
+    {
+      "case_id": "development-p09-ru",
+      "family_id": "development-p09",
+      "language": "ru",
+      "category": "quoted_history_fragment",
+      "prompt": "Поищи, в каком старом сообщении здесь была фраза «тихий трамвай».",
+      "context": {
+        "chat_type": "private",
+        "invoked": true,
+        "has_reply_text": false,
+        "has_reply_image": false,
+        "reply_text": ""
+      },
+      "expected": {
+        "is_recall": true,
+        "critical_negative": false,
+        "reason": "Locate a quoted fragment in earlier chat evidence."
+      }
+    },
+    {
+      "case_id": "development-p09-en",
+      "family_id": "development-p09",
+      "language": "en",
+      "category": "quoted_history_fragment",
+      "prompt": "Find the old message here that contained the phrase “quiet tram”.",
+      "context": {
+        "chat_type": "private",
+        "invoked": true,
+        "has_reply_text": false,
+        "has_reply_image": false,
+        "reply_text": ""
+      },
+      "expected": {
+        "is_recall": true,
+        "critical_negative": false,
+        "reason": "Locate a quoted fragment in earlier chat evidence."
+      }
+    },
+    {
+      "case_id": "development-p10-ua",
+      "family_id": "development-p10",
+      "language": "ua",
+      "category": "past_options",
+      "prompt": "Нагадай два варіанти велопарковки, які ми тут раніше порівнювали.",
+      "context": {
+        "chat_type": "private",
+        "invoked": true,
+        "has_reply_text": false,
+        "has_reply_image": false,
+        "reply_text": ""
+      },
+      "expected": {
+        "is_recall": true,
+        "critical_negative": false,
+        "reason": "Recover the alternatives compared earlier."
+      }
+    },
+    {
+      "case_id": "development-p10-ru",
+      "family_id": "development-p10",
+      "language": "ru",
+      "category": "past_options",
+      "prompt": "Напомни два варианта велопарковки, которые мы здесь раньше сравнивали.",
+      "context": {
+        "chat_type": "private",
+        "invoked": true,
+        "has_reply_text": false,
+        "has_reply_image": false,
+        "reply_text": ""
+      },
+      "expected": {
+        "is_recall": true,
+        "critical_negative": false,
+        "reason": "Recover the alternatives compared earlier."
+      }
+    },
+    {
+      "case_id": "development-p10-en",
+      "family_id": "development-p10",
+      "language": "en",
+      "category": "past_options",
+      "prompt": "Remind me of the two bicycle parking options we compared here before.",
+      "context": {
+        "chat_type": "private",
+        "invoked": true,
+        "has_reply_text": false,
+        "has_reply_image": false,
+        "reply_text": ""
+      },
+      "expected": {
+        "is_recall": true,
+        "critical_negative": false,
+        "reason": "Recover the alternatives compared earlier."
+      }
+    },
+    {
+      "case_id": "development-p11-ua",
+      "family_id": "development-p11",
+      "language": "ua",
+      "category": "anchored_prior_decision",
+      "prompt": "А що ми про це домовлялися раніше? Знайди попереднє рішення.",
+      "context": {
+        "chat_type": "private",
+        "invoked": true,
+        "has_reply_text": true,
+        "has_reply_image": false,
+        "reply_text": "Ярмарок гуртка: розташування столів."
+      },
+      "expected": {
+        "is_recall": true,
+        "critical_negative": false,
+        "reason": "Retrieve an earlier decision about the replied topic."
+      }
+    },
+    {
+      "case_id": "development-p11-ru",
+      "family_id": "development-p11",
+      "language": "ru",
+      "category": "anchored_prior_decision",
+      "prompt": "А о чём мы по этому поводу договаривались раньше? Найди предыдущее решение.",
+      "context": {
+        "chat_type": "private",
+        "invoked": true,
+        "has_reply_text": true,
+        "has_reply_image": false,
+        "reply_text": "Ярмарка кружка: расположение столов."
+      },
+      "expected": {
+        "is_recall": true,
+        "critical_negative": false,
+        "reason": "Retrieve an earlier decision about the replied topic."
+      }
+    },
+    {
+      "case_id": "development-p11-en",
+      "family_id": "development-p11",
+      "language": "en",
+      "category": "anchored_prior_decision",
+      "prompt": "What had we agreed about this before? Find the previous decision.",
+      "context": {
+        "chat_type": "private",
+        "invoked": true,
+        "has_reply_text": true,
+        "has_reply_image": false,
+        "reply_text": "Club fair: table arrangement."
+      },
+      "expected": {
+        "is_recall": true,
+        "critical_negative": false,
+        "reason": "Retrieve an earlier decision about the replied topic."
+      }
+    },
+    {
+      "case_id": "development-p12-ua",
+      "family_id": "development-p12",
+      "language": "ua",
+      "category": "recover_old_outline",
+      "prompt": "Минулого разу ми вже складали порядок майстерні з паперу. Віднови той порядок із попередніх повідомлень.",
+      "context": {
+        "chat_type": "private",
+        "invoked": true,
+        "has_reply_text": false,
+        "has_reply_image": false,
+        "reply_text": ""
+      },
+      "expected": {
+        "is_recall": true,
+        "critical_negative": false,
+        "reason": "Recover an earlier outline without asking for a new draft."
+      }
+    },
+    {
+      "case_id": "development-p12-ru",
+      "family_id": "development-p12",
+      "language": "ru",
+      "category": "recover_old_outline",
+      "prompt": "В прошлый раз мы уже составляли порядок мастерской по бумаге. Восстанови тот порядок из предыдущих сообщений.",
+      "context": {
+        "chat_type": "private",
+        "invoked": true,
+        "has_reply_text": false,
+        "has_reply_image": false,
+        "reply_text": ""
+      },
+      "expected": {
+        "is_recall": true,
+        "critical_negative": false,
+        "reason": "Recover an earlier outline without asking for a new draft."
+      }
+    },
+    {
+      "case_id": "development-p12-en",
+      "family_id": "development-p12",
+      "language": "en",
+      "category": "recover_old_outline",
+      "prompt": "We already outlined the paper workshop last time. Recover that outline from the earlier messages.",
+      "context": {
+        "chat_type": "private",
+        "invoked": true,
+        "has_reply_text": false,
+        "has_reply_image": false,
+        "reply_text": ""
+      },
+      "expected": {
+        "is_recall": true,
+        "critical_negative": false,
+        "reason": "Recover an earlier outline without asking for a new draft."
+      }
+    },
+    {
+      "case_id": "development-n01-ua",
+      "family_id": "development-n01",
+      "language": "ua",
+      "category": "technical_memory",
+      "prompt": "Поясни, як обсяг оперативної пам'яті впливає на кількість відкритих вкладок.",
+      "context": {
+        "chat_type": "private",
+        "invoked": true,
+        "has_reply_text": false,
+        "has_reply_image": false,
+        "reply_text": ""
+      },
+      "expected": {
+        "is_recall": false,
+        "critical_negative": false,
+        "reason": "Explain computer memory, not retrieve chat evidence."
+      }
+    },
+    {
+      "case_id": "development-n01-ru",
+      "family_id": "development-n01",
+      "language": "ru",
+      "category": "technical_memory",
+      "prompt": "Объясни, как объём оперативной памяти влияет на количество открытых вкладок.",
+      "context": {
+        "chat_type": "private",
+        "invoked": true,
+        "has_reply_text": false,
+        "has_reply_image": false,
+        "reply_text": ""
+      },
+      "expected": {
+        "is_recall": false,
+        "critical_negative": false,
+        "reason": "Explain computer memory, not retrieve chat evidence."
+      }
+    },
+    {
+      "case_id": "development-n01-en",
+      "family_id": "development-n01",
+      "language": "en",
+      "category": "technical_memory",
+      "prompt": "Explain how RAM capacity affects the number of browser tabs I can keep open.",
+      "context": {
+        "chat_type": "private",
+        "invoked": true,
+        "has_reply_text": false,
+        "has_reply_image": false,
+        "reply_text": ""
+      },
+      "expected": {
+        "is_recall": false,
+        "critical_negative": false,
+        "reason": "Explain computer memory, not retrieve chat evidence."
+      }
+    },
+    {
+      "case_id": "development-n02-ua",
+      "family_id": "development-n02",
+      "language": "ua",
+      "category": "public_history",
+      "prompt": "Розкажи коротко історію появи маяків як навігаційних споруд.",
+      "context": {
+        "chat_type": "private",
+        "invoked": true,
+        "has_reply_text": false,
+        "has_reply_image": false,
+        "reply_text": ""
+      },
+      "expected": {
+        "is_recall": false,
+        "critical_negative": false,
+        "reason": "Answer a general history question."
+      }
+    },
+    {
+      "case_id": "development-n02-ru",
+      "family_id": "development-n02",
+      "language": "ru",
+      "category": "public_history",
+      "prompt": "Расскажи кратко историю появления маяков как навигационных сооружений.",
+      "context": {
+        "chat_type": "private",
+        "invoked": true,
+        "has_reply_text": false,
+        "has_reply_image": false,
+        "reply_text": ""
+      },
+      "expected": {
+        "is_recall": false,
+        "critical_negative": false,
+        "reason": "Answer a general history question."
+      }
+    },
+    {
+      "case_id": "development-n02-en",
+      "family_id": "development-n02",
+      "language": "en",
+      "category": "public_history",
+      "prompt": "Give a brief history of lighthouses as navigational structures.",
+      "context": {
+        "chat_type": "private",
+        "invoked": true,
+        "has_reply_text": false,
+        "has_reply_image": false,
+        "reply_text": ""
+      },
+      "expected": {
+        "is_recall": false,
+        "critical_negative": false,
+        "reason": "Answer a general history question."
+      }
+    },
+    {
+      "case_id": "development-n03-ua",
+      "family_id": "development-n03",
+      "language": "ua",
+      "category": "quoted_instruction",
+      "prompt": "Перефразуй речення «Що ми вирішили раніше?» ввічливіше. Саме рішення не шукай.",
+      "context": {
+        "chat_type": "private",
+        "invoked": true,
+        "has_reply_text": false,
+        "has_reply_image": false,
+        "reply_text": ""
+      },
+      "expected": {
+        "is_recall": false,
+        "critical_negative": true,
+        "reason": "Treat quoted recall wording as an editing object."
+      }
+    },
+    {
+      "case_id": "development-n03-ru",
+      "family_id": "development-n03",
+      "language": "ru",
+      "category": "quoted_instruction",
+      "prompt": "Перефразируй предложение «Что мы решили раньше?» вежливее. Само решение не ищи.",
+      "context": {
+        "chat_type": "private",
+        "invoked": true,
+        "has_reply_text": false,
+        "has_reply_image": false,
+        "reply_text": ""
+      },
+      "expected": {
+        "is_recall": false,
+        "critical_negative": true,
+        "reason": "Treat quoted recall wording as an editing object."
+      }
+    },
+    {
+      "case_id": "development-n03-en",
+      "family_id": "development-n03",
+      "language": "en",
+      "category": "quoted_instruction",
+      "prompt": "Make the sentence “What did we decide earlier?” more polite. Do not look up the decision.",
+      "context": {
+        "chat_type": "private",
+        "invoked": true,
+        "has_reply_text": false,
+        "has_reply_image": false,
+        "reply_text": ""
+      },
+      "expected": {
+        "is_recall": false,
+        "critical_negative": true,
+        "reason": "Treat quoted recall wording as an editing object."
+      }
+    },
+    {
+      "case_id": "development-n04-ua",
+      "family_id": "development-n04",
+      "language": "ua",
+      "category": "explicit_no_history",
+      "prompt": "Не шукай стару переписку. Просто порахуй 18 помножити на 7.",
+      "context": {
+        "chat_type": "private",
+        "invoked": true,
+        "has_reply_text": false,
+        "has_reply_image": false,
+        "reply_text": ""
+      },
+      "expected": {
+        "is_recall": false,
+        "critical_negative": true,
+        "reason": "Respect explicit negation of history retrieval."
+      }
+    },
+    {
+      "case_id": "development-n04-ru",
+      "family_id": "development-n04",
+      "language": "ru",
+      "category": "explicit_no_history",
+      "prompt": "Не ищи старую переписку. Просто посчитай 18 умножить на 7.",
+      "context": {
+        "chat_type": "private",
+        "invoked": true,
+        "has_reply_text": false,
+        "has_reply_image": false,
+        "reply_text": ""
+      },
+      "expected": {
+        "is_recall": false,
+        "critical_negative": true,
+        "reason": "Respect explicit negation of history retrieval."
+      }
+    },
+    {
+      "case_id": "development-n04-en",
+      "family_id": "development-n04",
+      "language": "en",
+      "category": "explicit_no_history",
+      "prompt": "Do not search earlier messages. Just calculate 18 times 7.",
+      "context": {
+        "chat_type": "private",
+        "invoked": true,
+        "has_reply_text": false,
+        "has_reply_image": false,
+        "reply_text": ""
+      },
+      "expected": {
+        "is_recall": false,
+        "critical_negative": true,
+        "reason": "Respect explicit negation of history retrieval."
+      }
+    },
+    {
+      "case_id": "development-n05-ua",
+      "family_id": "development-n05",
+      "language": "ua",
+      "category": "future_reminder",
+      "prompt": "Нагадай мені завтра о дев'ятій полити вазони.",
+      "context": {
+        "chat_type": "private",
+        "invoked": true,
+        "has_reply_text": false,
+        "has_reply_image": false,
+        "reply_text": ""
+      },
+      "expected": {
+        "is_recall": false,
+        "critical_negative": false,
+        "reason": "A future reminder request is not recall of earlier evidence."
+      }
+    },
+    {
+      "case_id": "development-n05-ru",
+      "family_id": "development-n05",
+      "language": "ru",
+      "category": "future_reminder",
+      "prompt": "Напомни мне завтра в девять полить растения.",
+      "context": {
+        "chat_type": "private",
+        "invoked": true,
+        "has_reply_text": false,
+        "has_reply_image": false,
+        "reply_text": ""
+      },
+      "expected": {
+        "is_recall": false,
+        "critical_negative": false,
+        "reason": "A future reminder request is not recall of earlier evidence."
+      }
+    },
+    {
+      "case_id": "development-n05-en",
+      "family_id": "development-n05",
+      "language": "en",
+      "category": "future_reminder",
+      "prompt": "Remind me tomorrow at nine to water the plants.",
+      "context": {
+        "chat_type": "private",
+        "invoked": true,
+        "has_reply_text": false,
+        "has_reply_image": false,
+        "reply_text": ""
+      },
+      "expected": {
+        "is_recall": false,
+        "critical_negative": false,
+        "reason": "A future reminder request is not recall of earlier evidence."
+      }
+    },
+    {
+      "case_id": "development-n06-ua",
+      "family_id": "development-n06",
+      "language": "ua",
+      "category": "new_web_image",
+      "prompt": "Знайди в інтернеті фото зеленої деревної жаби.",
+      "context": {
+        "chat_type": "private",
+        "invoked": true,
+        "has_reply_text": false,
+        "has_reply_image": false,
+        "reply_text": ""
+      },
+      "expected": {
+        "is_recall": false,
+        "critical_negative": true,
+        "reason": "Preserve a request for new public images."
+      }
+    },
+    {
+      "case_id": "development-n06-ru",
+      "family_id": "development-n06",
+      "language": "ru",
+      "category": "new_web_image",
+      "prompt": "Найди в интернете фото зелёной древесной лягушки.",
+      "context": {
+        "chat_type": "private",
+        "invoked": true,
+        "has_reply_text": false,
+        "has_reply_image": false,
+        "reply_text": ""
+      },
+      "expected": {
+        "is_recall": false,
+        "critical_negative": true,
+        "reason": "Preserve a request for new public images."
+      }
+    },
+    {
+      "case_id": "development-n06-en",
+      "family_id": "development-n06",
+      "language": "en",
+      "category": "new_web_image",
+      "prompt": "Find a photo of a green tree frog on the internet.",
+      "context": {
+        "chat_type": "private",
+        "invoked": true,
+        "has_reply_text": false,
+        "has_reply_image": false,
+        "reply_text": ""
+      },
+      "expected": {
+        "is_recall": false,
+        "critical_negative": true,
+        "reason": "Preserve a request for new public images."
+      }
+    },
+    {
+      "case_id": "development-n07-ua",
+      "family_id": "development-n07",
+      "language": "ua",
+      "category": "translation_precedence",
+      "prompt": "Переклади українською: \"Find what we discussed here before.\"",
+      "context": {
+        "chat_type": "private",
+        "invoked": true,
+        "has_reply_text": false,
+        "has_reply_image": false,
+        "reply_text": ""
+      },
+      "expected": {
+        "is_recall": false,
+        "critical_negative": true,
+        "reason": "Translate supplied text rather than execute its quoted request."
+      }
+    },
+    {
+      "case_id": "development-n07-ru",
+      "family_id": "development-n07",
+      "language": "ru",
+      "category": "translation_precedence",
+      "prompt": "Переведи на русский: \"Find what we discussed here before.\"",
+      "context": {
+        "chat_type": "private",
+        "invoked": true,
+        "has_reply_text": false,
+        "has_reply_image": false,
+        "reply_text": ""
+      },
+      "expected": {
+        "is_recall": false,
+        "critical_negative": true,
+        "reason": "Translate supplied text rather than execute its quoted request."
+      }
+    },
+    {
+      "case_id": "development-n07-en",
+      "family_id": "development-n07",
+      "language": "en",
+      "category": "translation_precedence",
+      "prompt": "Translate into English: «Знайди, що ми тут обговорювали раніше».",
+      "context": {
+        "chat_type": "private",
+        "invoked": true,
+        "has_reply_text": false,
+        "has_reply_image": false,
+        "reply_text": ""
+      },
+      "expected": {
+        "is_recall": false,
+        "critical_negative": true,
+        "reason": "Translate supplied text rather than execute its quoted request."
+      }
+    },
+    {
+      "case_id": "development-n08-ua",
+      "family_id": "development-n08",
+      "language": "ua",
+      "category": "supplied_current_source",
+      "prompt": "Поясни пункт 2 у документі, на який я відповідаю. Старі повідомлення не потрібні.",
+      "context": {
+        "chat_type": "private",
+        "invoked": true,
+        "has_reply_text": true,
+        "has_reply_image": false,
+        "reply_text": "План зараз: 1. Розкласти інструменти. 2. Перевірити комплектність."
+      },
+      "expected": {
+        "is_recall": false,
+        "critical_negative": true,
+        "reason": "Use the currently supplied source and respect the history exclusion."
+      }
+    },
+    {
+      "case_id": "development-n08-ru",
+      "family_id": "development-n08",
+      "language": "ru",
+      "category": "supplied_current_source",
+      "prompt": "Объясни пункт 2 в документе, на который я отвечаю. Старые сообщения не нужны.",
+      "context": {
+        "chat_type": "private",
+        "invoked": true,
+        "has_reply_text": true,
+        "has_reply_image": false,
+        "reply_text": "Текущий план: 1. Разложить инструменты. 2. Проверить комплектность."
+      },
+      "expected": {
+        "is_recall": false,
+        "critical_negative": true,
+        "reason": "Use the currently supplied source and respect the history exclusion."
+      }
+    },
+    {
+      "case_id": "development-n08-en",
+      "family_id": "development-n08",
+      "language": "en",
+      "category": "supplied_current_source",
+      "prompt": "Explain item 2 in the document I am replying to. Earlier messages are not needed.",
+      "context": {
+        "chat_type": "private",
+        "invoked": true,
+        "has_reply_text": true,
+        "has_reply_image": false,
+        "reply_text": "Current plan: 1. Lay out the tools. 2. Check that the set is complete."
+      },
+      "expected": {
+        "is_recall": false,
+        "critical_negative": true,
+        "reason": "Use the currently supplied source and respect the history exclusion."
+      }
+    },
+    {
+      "case_id": "development-n09-ua",
+      "family_id": "development-n09",
+      "language": "ua",
+      "category": "general_refresher",
+      "prompt": "Нагадай, як перетворити відсоток на десятковий дріб; достатньо загального правила.",
+      "context": {
+        "chat_type": "private",
+        "invoked": true,
+        "has_reply_text": false,
+        "has_reply_image": false,
+        "reply_text": ""
+      },
+      "expected": {
+        "is_recall": false,
+        "critical_negative": false,
+        "reason": "Refresh general knowledge without requesting prior-chat evidence."
+      }
+    },
+    {
+      "case_id": "development-n09-ru",
+      "family_id": "development-n09",
+      "language": "ru",
+      "category": "general_refresher",
+      "prompt": "Напомни, как перевести процент в десятичную дробь; достаточно общего правила.",
+      "context": {
+        "chat_type": "private",
+        "invoked": true,
+        "has_reply_text": false,
+        "has_reply_image": false,
+        "reply_text": ""
+      },
+      "expected": {
+        "is_recall": false,
+        "critical_negative": false,
+        "reason": "Refresh general knowledge without requesting prior-chat evidence."
+      }
+    },
+    {
+      "case_id": "development-n09-en",
+      "family_id": "development-n09",
+      "language": "en",
+      "category": "general_refresher",
+      "prompt": "Remind me how to convert a percentage to a decimal; the general rule is enough.",
+      "context": {
+        "chat_type": "private",
+        "invoked": true,
+        "has_reply_text": false,
+        "has_reply_image": false,
+        "reply_text": ""
+      },
+      "expected": {
+        "is_recall": false,
+        "critical_negative": false,
+        "reason": "Refresh general knowledge without requesting prior-chat evidence."
+      }
+    },
+    {
+      "case_id": "development-n10-ua",
+      "family_id": "development-n10",
+      "language": "ua",
+      "category": "unanchored_followup",
+      "prompt": "А скільки?",
+      "context": {
+        "chat_type": "private",
+        "invoked": true,
+        "has_reply_text": false,
+        "has_reply_image": false,
+        "reply_text": ""
+      },
+      "expected": {
+        "is_recall": false,
+        "critical_negative": false,
+        "reason": "An unanchored short question does not establish recall intent."
+      }
+    },
+    {
+      "case_id": "development-n10-ru",
+      "family_id": "development-n10",
+      "language": "ru",
+      "category": "unanchored_followup",
+      "prompt": "А сколько?",
+      "context": {
+        "chat_type": "private",
+        "invoked": true,
+        "has_reply_text": false,
+        "has_reply_image": false,
+        "reply_text": ""
+      },
+      "expected": {
+        "is_recall": false,
+        "critical_negative": false,
+        "reason": "An unanchored short question does not establish recall intent."
+      }
+    },
+    {
+      "case_id": "development-n10-en",
+      "family_id": "development-n10",
+      "language": "en",
+      "category": "unanchored_followup",
+      "prompt": "And how many?",
+      "context": {
+        "chat_type": "private",
+        "invoked": true,
+        "has_reply_text": false,
+        "has_reply_image": false,
+        "reply_text": ""
+      },
+      "expected": {
+        "is_recall": false,
+        "critical_negative": false,
+        "reason": "An unanchored short question does not establish recall intent."
+      }
+    },
+    {
+      "case_id": "development-n11-ua",
+      "family_id": "development-n11",
+      "language": "ua",
+      "category": "history_feature_help",
+      "prompt": "Як очистити історію переглядів у браузері?",
+      "context": {
+        "chat_type": "private",
+        "invoked": true,
+        "has_reply_text": false,
+        "has_reply_image": false,
+        "reply_text": ""
+      },
+      "expected": {
+        "is_recall": false,
+        "critical_negative": false,
+        "reason": "Explain a product history feature, not retrieve this chat."
+      }
+    },
+    {
+      "case_id": "development-n11-ru",
+      "family_id": "development-n11",
+      "language": "ru",
+      "category": "history_feature_help",
+      "prompt": "Как очистить историю просмотров в браузере?",
+      "context": {
+        "chat_type": "private",
+        "invoked": true,
+        "has_reply_text": false,
+        "has_reply_image": false,
+        "reply_text": ""
+      },
+      "expected": {
+        "is_recall": false,
+        "critical_negative": false,
+        "reason": "Explain a product history feature, not retrieve this chat."
+      }
+    },
+    {
+      "case_id": "development-n11-en",
+      "family_id": "development-n11",
+      "language": "en",
+      "category": "history_feature_help",
+      "prompt": "How do I clear the browsing history in a browser?",
+      "context": {
+        "chat_type": "private",
+        "invoked": true,
+        "has_reply_text": false,
+        "has_reply_image": false,
+        "reply_text": ""
+      },
+      "expected": {
+        "is_recall": false,
+        "critical_negative": false,
+        "reason": "Explain a product history feature, not retrieve this chat."
+      }
+    },
+    {
+      "case_id": "development-n12-ua",
+      "family_id": "development-n12",
+      "language": "ua",
+      "category": "new_memory_statement",
+      "prompt": "Запам'ятай для цього вигаданого тесту: картонна вежа має синій прапорець.",
+      "context": {
+        "chat_type": "private",
+        "invoked": true,
+        "has_reply_text": false,
+        "has_reply_image": false,
+        "reply_text": ""
+      },
+      "expected": {
+        "is_recall": false,
+        "critical_negative": false,
+        "reason": "A new fact to remember is not a retrieval request."
+      }
+    },
+    {
+      "case_id": "development-n12-ru",
+      "family_id": "development-n12",
+      "language": "ru",
+      "category": "new_memory_statement",
+      "prompt": "Запомни для этого вымышленного теста: у картонной башни синий флажок.",
+      "context": {
+        "chat_type": "private",
+        "invoked": true,
+        "has_reply_text": false,
+        "has_reply_image": false,
+        "reply_text": ""
+      },
+      "expected": {
+        "is_recall": false,
+        "critical_negative": false,
+        "reason": "A new fact to remember is not a retrieval request."
+      }
+    },
+    {
+      "case_id": "development-n12-en",
+      "family_id": "development-n12",
+      "language": "en",
+      "category": "new_memory_statement",
+      "prompt": "Remember this for the fictional test: the cardboard tower has a blue flag.",
+      "context": {
+        "chat_type": "private",
+        "invoked": true,
+        "has_reply_text": false,
+        "has_reply_image": false,
+        "reply_text": ""
+      },
+      "expected": {
+        "is_recall": false,
+        "critical_negative": false,
+        "reason": "A new fact to remember is not a retrieval request."
+      }
+    }
+  ],
+  "boundary_cases": [
+    {
+      "case_id": "development-boundary1-ua",
+      "family_id": "development-boundary1",
+      "language": "ua",
+      "boundary_kind": "ordinary_group_recall_shaped",
+      "prompt": "Знайди, що ми раніше вирішили про клубний плакат.",
+      "context": {
+        "chat_type": "supergroup",
+        "invoked": false,
+        "reply_to_bot": false,
+        "has_reply_text": false,
+        "has_reply_image": false,
+        "reply_text": ""
+      },
+      "expected": {
+        "invocation_eligible": false,
+        "recall_stage_calls": 0,
+        "telegram_deliveries": 0
+      }
+    },
+    {
+      "case_id": "development-boundary1-ru",
+      "family_id": "development-boundary1",
+      "language": "ru",
+      "boundary_kind": "ordinary_group_recall_shaped",
+      "prompt": "Найди, что мы раньше решили о клубном плакате.",
+      "context": {
+        "chat_type": "supergroup",
+        "invoked": false,
+        "reply_to_bot": false,
+        "has_reply_text": false,
+        "has_reply_image": false,
+        "reply_text": ""
+      },
+      "expected": {
+        "invocation_eligible": false,
+        "recall_stage_calls": 0,
+        "telegram_deliveries": 0
+      }
+    },
+    {
+      "case_id": "development-boundary1-en",
+      "family_id": "development-boundary1",
+      "language": "en",
+      "boundary_kind": "ordinary_group_recall_shaped",
+      "prompt": "Find what we previously decided about the club poster.",
+      "context": {
+        "chat_type": "supergroup",
+        "invoked": false,
+        "reply_to_bot": false,
+        "has_reply_text": false,
+        "has_reply_image": false,
+        "reply_text": ""
+      },
+      "expected": {
+        "invocation_eligible": false,
+        "recall_stage_calls": 0,
+        "telegram_deliveries": 0
+      }
+    },
+    {
+      "case_id": "development-boundary2-ua",
+      "family_id": "development-boundary2",
+      "language": "ua",
+      "boundary_kind": "ordinary_group_statement",
+      "prompt": "Сьогодні надворі приємно.",
+      "context": {
+        "chat_type": "supergroup",
+        "invoked": false,
+        "reply_to_bot": false,
+        "has_reply_text": false,
+        "has_reply_image": false,
+        "reply_text": ""
+      },
+      "expected": {
+        "invocation_eligible": false,
+        "recall_stage_calls": 0,
+        "telegram_deliveries": 0
+      }
+    },
+    {
+      "case_id": "development-boundary2-ru",
+      "family_id": "development-boundary2",
+      "language": "ru",
+      "boundary_kind": "ordinary_group_statement",
+      "prompt": "Сегодня на улице приятно.",
+      "context": {
+        "chat_type": "supergroup",
+        "invoked": false,
+        "reply_to_bot": false,
+        "has_reply_text": false,
+        "has_reply_image": false,
+        "reply_text": ""
+      },
+      "expected": {
+        "invocation_eligible": false,
+        "recall_stage_calls": 0,
+        "telegram_deliveries": 0
+      }
+    },
+    {
+      "case_id": "development-boundary2-en",
+      "family_id": "development-boundary2",
+      "language": "en",
+      "boundary_kind": "ordinary_group_statement",
+      "prompt": "The weather feels pleasant today.",
+      "context": {
+        "chat_type": "supergroup",
+        "invoked": false,
+        "reply_to_bot": false,
+        "has_reply_text": false,
+        "has_reply_image": false,
+        "reply_text": ""
+      },
+      "expected": {
+        "invocation_eligible": false,
+        "recall_stage_calls": 0,
+        "telegram_deliveries": 0
+      }
+    },
+    {
+      "case_id": "development-boundary3-ua",
+      "family_id": "development-boundary3",
+      "language": "ua",
+      "boundary_kind": "explicit_group_invocation",
+      "prompt": "Підніми наше попереднє рішення щодо розміру сценічної завіси.",
+      "context": {
+        "chat_type": "supergroup",
+        "invoked": true,
+        "reply_to_bot": false,
+        "has_reply_text": false,
+        "has_reply_image": false,
+        "reply_text": ""
+      },
+      "expected": {
+        "invocation_eligible": true,
+        "recall_stage_calls": null,
+        "telegram_deliveries": null
+      }
+    },
+    {
+      "case_id": "development-boundary3-ru",
+      "family_id": "development-boundary3",
+      "language": "ru",
+      "boundary_kind": "explicit_group_invocation",
+      "prompt": "Подними наше предыдущее решение о размере сценического занавеса.",
+      "context": {
+        "chat_type": "supergroup",
+        "invoked": true,
+        "reply_to_bot": false,
+        "has_reply_text": false,
+        "has_reply_image": false,
+        "reply_text": ""
+      },
+      "expected": {
+        "invocation_eligible": true,
+        "recall_stage_calls": null,
+        "telegram_deliveries": null
+      }
+    },
+    {
+      "case_id": "development-boundary3-en",
+      "family_id": "development-boundary3",
+      "language": "en",
+      "boundary_kind": "explicit_group_invocation",
+      "prompt": "Pull up our earlier decision about the stage curtain size.",
+      "context": {
+        "chat_type": "supergroup",
+        "invoked": true,
+        "reply_to_bot": false,
+        "has_reply_text": false,
+        "has_reply_image": false,
+        "reply_text": ""
+      },
+      "expected": {
+        "invocation_eligible": true,
+        "recall_stage_calls": null,
+        "telegram_deliveries": null
+      }
+    },
+    {
+      "case_id": "development-boundary4-ua",
+      "family_id": "development-boundary4",
+      "language": "ua",
+      "boundary_kind": "reply_to_bot",
+      "prompt": "А який варіант ми тоді погодили для цього?",
+      "context": {
+        "chat_type": "supergroup",
+        "invoked": false,
+        "reply_to_bot": true,
+        "has_reply_text": true,
+        "has_reply_image": false,
+        "reply_text": "Тема поточного повідомлення: розміщення декорацій."
+      },
+      "expected": {
+        "invocation_eligible": true,
+        "recall_stage_calls": null,
+        "telegram_deliveries": null
+      }
+    },
+    {
+      "case_id": "development-boundary4-ru",
+      "family_id": "development-boundary4",
+      "language": "ru",
+      "boundary_kind": "reply_to_bot",
+      "prompt": "А какой вариант мы тогда согласовали для этого?",
+      "context": {
+        "chat_type": "supergroup",
+        "invoked": false,
+        "reply_to_bot": true,
+        "has_reply_text": true,
+        "has_reply_image": false,
+        "reply_text": "Тема текущего сообщения: размещение декораций."
+      },
+      "expected": {
+        "invocation_eligible": true,
+        "recall_stage_calls": null,
+        "telegram_deliveries": null
+      }
+    },
+    {
+      "case_id": "development-boundary4-en",
+      "family_id": "development-boundary4",
+      "language": "en",
+      "boundary_kind": "reply_to_bot",
+      "prompt": "Which option had we agreed on for this?",
+      "context": {
+        "chat_type": "supergroup",
+        "invoked": false,
+        "reply_to_bot": true,
+        "has_reply_text": true,
+        "has_reply_image": false,
+        "reply_text": "Current message topic: placement of decorations."
+      },
+      "expected": {
+        "invocation_eligible": true,
+        "recall_stage_calls": null,
+        "telegram_deliveries": null
+      }
+    }
+  ]
+}
