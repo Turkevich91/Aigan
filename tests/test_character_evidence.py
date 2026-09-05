@@ -330,6 +330,20 @@ class CharacterEvidenceTests(unittest.TestCase):
         self.assertNotIn("«починати без перевірки.", rendered)
         self.assertNotIn("«Не варто", rendered)
 
+    def test_single_line_quote_cannot_hide_another_line_of_examined_source(self):
+        ids = self.seed()
+        identity = self.save("Не роби цього:\nПочинай без перевірки.", day=5)
+        session = self.session()
+        report = self.report([identity], quote="Починай без перевірки.")
+        report.facets[0].observation = "Наголошує, що починати без перевірки не варто."
+        report.facets[0].evidence.append(EvidenceReference(id=ids[0], quote="Перевірмо факти"))
+        self.assertIs(report, session.validate(report))
+        rendered = session.render(report)
+        self.assertIn(report.facets[0].observation, rendered)
+        self.assertIn("«Перевірмо факти»", rendered)
+        self.assertNotIn("«Починай без перевірки.", rendered)
+        self.assertEqual(0, session.rejected_facet_count)
+
     def test_literal_delivery_fallback_preserves_source_and_default_formatting(self):
         source = "**Приклад** <b>дослівно</b> & дані"
         sender = AsyncMock(side_effect=[main.BadRequest("synthetic rejection"), SimpleNamespace(message_id=1)])

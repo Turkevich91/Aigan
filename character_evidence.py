@@ -320,10 +320,10 @@ class CharacterEvidenceSession:
             row = examined[reference.id]
             start = row["text"].index(reference.quote)
             copied = row["text"][start:start + len(reference.quote)]
-            # Do not crop a multiline quotation: its preceding line may negate
-            # or qualify the next one. Try another complete supporting excerpt.
-            source_lines = copied.splitlines()
-            if len(source_lines) != 1 or source_lines[0] != copied:
+            # Do not publish a line from multiline evidence: another source
+            # line may negate or qualify it, even when the selected quote is short.
+            source_lines = row["text"].splitlines()
+            if len(source_lines) != 1 or source_lines[0] != row["text"]:
                 continue
             quote = copied
             date = _time(row["created_at"]).date().isoformat()

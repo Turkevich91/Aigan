@@ -34,9 +34,10 @@ observation allows up to 650 characters; a cited contrasting observation allows
 Internal uncertainty is not mechanically appended to every paragraph.
 
 Up to three distinct source excerpts are copied by the host from validated,
-actually examined text, with their dates. Multiline quotations remain valid
-internal evidence but are skipped as visible examples: cropping a line could
-remove its qualifying context, and paragraph packing could change it. Repeated
+actually examined text, with their dates. Multiline examined sources remain valid
+internal evidence but are skipped as visible examples, even when the selected
+quotation is a single line: another source line may qualify or negate it, and
+paragraph packing could change a multiline quotation. Repeated
 references do not fill the example allowance. Sources retain their original
 language; the surrounding model-written portrait is requested in Ukrainian.
 The entire grounded-character reply uses literal delivery: HTML and Markdown
