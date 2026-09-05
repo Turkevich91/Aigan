@@ -14,6 +14,7 @@ from unittest.mock import patch
 
 from history_retrieval import (
     HISTORY_SCAN_LIMIT, HistorySearchScope, preflight_history_retrieval, retrieve_history,
+    history_query_embedding_available, normalize_history_vector,
 )
 from memory import MemoryStore
 
@@ -282,6 +283,34 @@ class HistoryRetrievalTests(unittest.TestCase):
         result = self.search(scope)
         self.assertEqual("empty_scope", result.coverage.status)
         self.assertEqual("no_match", result.status)
+
+    def test_provider_admission_stops_at_first_fully_valid_vector(self):
+        for _ in range(4):
+            self.add(embedding=vector())
+        scope = self.scope()
+        with patch("history_retrieval.normalize_history_vector", wraps=normalize_history_vector) as validate:
+            self.assertTrue(history_query_embedding_available(self.store, scope))
+            self.assertEqual(1, validate.call_count)
+        self.assertEqual(4, preflight_history_retrieval(self.store, scope).indexed_rows)
+        self.assertEqual(4, len(self.search(scope, mode="semantic").rows))
+
+    def test_provider_admission_rejects_invalid_all_and_finds_valid_after_invalid(self):
+        stale = self.add(embedding=vector())
+        self.change_embedding(stale, content_hash="stale")
+        self.add(embedding=vector(float("nan")))
+        self.add(embedding=vector(0, 0))
+        self.assertFalse(history_query_embedding_available(self.store, self.scope()))
+        self.add(embedding=vector())
+        self.assertTrue(history_query_embedding_available(self.store, self.scope()))
+
+    def test_provider_admission_checks_complete_scope_cap_before_first_valid_vector(self):
+        for _ in range(3):
+            self.add(embedding=vector())
+        scope = self.scope()
+        with patch("history_retrieval.HISTORY_SCAN_LIMIT", 2), \
+             patch("history_retrieval.normalize_history_vector", wraps=normalize_history_vector) as validate:
+            self.assertFalse(history_query_embedding_available(self.store, scope))
+            validate.assert_not_called()
 
 
 if __name__ == "__main__":

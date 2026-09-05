@@ -46,7 +46,10 @@ awaiting timeout is ten seconds and the explicit tool's transport timeout is
 eight seconds, with retries disabled. Automatic context and indexing retain
 their existing transport policy.
 
-Preflight occurs before any provider call. After a provider await, retrieval
+Provider admission checks the complete scope cap and stops vector validation at
+the first fully valid vector. This boolean check authorizes no source and claims
+no complete index counts. The separate aggregate preflight API remains available
+for diagnostics. After a provider await, retrieval
 reads a fresh snapshot rather than caching source content across that await.
 Cancellation cannot publish candidates from a continuing SQLite worker. Failed
 or timed-out embeddings retain literal search with a specific fallback reason;
@@ -77,3 +80,57 @@ No model roles, embedding dimensions, database schema, index contents or global
 lookback are changed by this feature. Rollback is compatible with the existing
 index and database. Disabling the existing vector configuration makes these
 explicit modes report literal fallback; ordinary history access remains usable.
+
+## Cached regression replay
+
+A provider-free replay reused the previously observed #176/#180 frozen archive:
+5420 retained records, 4776 small/512 embeddings and 84 verified cached query
+vectors. Original archive and vector hashes were verified before reading; the
+historical files were mounted read-only and a disposable copy was used. There
+were **zero new provider calls, tokens or dollars**, and no Telegram delivery.
+
+The main replay included 81 queries with a fixed request cutoff and an explicit
+date lower bound matching the automatic backend's 30-day filter. Three original
+trigger-boundary controls used their actual retained trigger ID/time separately.
+The 60 positive cases are paired below; this is observed regression evidence,
+not a new holdout or a test of generated answer quality.
+
+| Retrieval path | Controlled hit@6 (48) | Source-derived hit@6 (12) |
+| --- | ---: | ---: |
+| Existing automatic hybrid/RRF backend | 30 | 10 |
+| Explicit hybrid history tool | 30 | 10 |
+| Explicit semantic history tool | 34 | 10 |
+
+Hybrid preserved each positive case's hit/miss result. Semantic gained 8.33
+percentage points on controlled cases versus the hybrid baseline; the paired
+case-bootstrap 95% interval was +2.08 to +16.67 points. This describes the frozen
+cases, not independent families or production success. The encoder and its dimensions
+did not change. The source-derived cohort was unchanged.
+
+All three paths returned neighbors on all 12 constructed no-answer cases. A
+nonempty result therefore remains insufficient evidence of answerability.
+There were no duplicate results. Cross-chat and explicit date-boundary controls
+returned no prohibited rows; the three separate trigger-cutoff controls also
+returned no prohibited rows. The new hybrid tool returned the three bot replies
+that the old automatic-prefetch fixture excluded. Focused checks confirmed all
+three were in the permitted chat/date/cutoff scope: conversational history
+intentionally allows bot replies. Those bot controls have different eligibility
+rules and are not claimed as unchanged backend isolation behavior.
+
+One cached pass on one CPU measured the original integrated implementation:
+
+| Path before admission optimization | Median | p95 |
+| --- | ---: | ---: |
+| Existing hybrid backend | 863 ms | 1213 ms |
+| Explicit hybrid tool, including publication | 2025 ms | 2081 ms |
+| Explicit semantic tool, including publication | 2022 ms | 2142 ms |
+
+A focused CPU profile identified full vector normalization in both aggregate
+preflight and final retrieval as the dominant extra work. Provider admission now
+uses the boolean early exit described above; full post-await validation remains.
+One bounded six-case comparison, alternating arm order, preserved the entire
+emitted payload in 6/6 cases except random reference tokens. Median latency fell
+from 2058 to 1371 ms (33.4%); observed ranges were 1973–2135 and 1332–1421 ms.
+This small comparison does not establish a new p95. The broad quality replay was
+not repeated after the shared-validator refactor. Neither timing includes
+provider network latency or primary-model generation cost.

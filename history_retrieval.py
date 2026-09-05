@@ -101,37 +101,60 @@ def normalize_history_vector(values: Sequence[float] | None) -> tuple[float, ...
         return None
 
 
-def _read_snapshot(store: MemoryStore, scope: HistorySearchScope, query: str = ""):
-    rows, overflow, fts_scores, fts_available = store.read_history_retrieval_candidates(
+def _read_candidates(store: MemoryStore, scope: HistorySearchScope, query: str = ""):
+    return store.read_history_retrieval_candidates(
         chat_id=scope.chat_id, cutoff_memory_id=scope.cutoff_memory_id,
         cutoff_created_at=scope.cutoff_created_at, participant_id=scope.participant_id,
         after=scope.after, before=scope.before, authored_only=scope.authored_only,
         scan_limit=HISTORY_SCAN_LIMIT, query=query,
     )
+
+
+def _candidate_vector(store: MemoryStore, scope: HistorySearchScope, item, metadata):
+    """One shared validity contract for admission and final ranked evidence."""
+    if metadata["embedding_model"] is None:
+        return None
+    try:
+        canonical = store.searchable_text_for_item(item)
+        blob = metadata["embedding_blob"]
+        valid = (
+            metadata["embedding_chat_id"] == scope.chat_id
+            and metadata["embedding_model"] == HISTORY_EMBEDDING_MODEL
+            and metadata["embedding_dimensions"] == HISTORY_EMBEDDING_DIMENSIONS
+            and metadata["embedding_hash"] == store.content_hash(canonical)
+            and canonical and not item.is_bot
+            and _date(metadata["embedded_at"]) <= scope.cutoff_created_at
+            and isinstance(blob, bytes) and len(blob) == HISTORY_EMBEDDING_DIMENSIONS * 4
+            and (not scope.authored_only or canonical == " ".join(item.text.split()))
+        )
+        if valid:
+            return normalize_history_vector(struct.unpack(f"<{HISTORY_EMBEDDING_DIMENSIONS}f", blob))
+    except (TypeError, ValueError, struct.error, AttributeError):
+        pass
+    return None
+
+
+def history_query_embedding_available(store: MemoryStore, scope: HistorySearchScope) -> bool:
+    """Provider admission only: cap-check the whole scope, stop at a valid vector.
+
+    This is not an index-coverage count and does not authorize any source. Final
+    retrieval still re-reads and validates every candidate after the provider
+    await. The diagnostic preflight API below retains its complete counts.
+    """
+    rows, overflow, _, _ = _read_candidates(store, scope)
+    return not overflow and any(_candidate_vector(store, scope, item, metadata) is not None
+                                for item, metadata in rows)
+
+
+def _read_snapshot(store: MemoryStore, scope: HistorySearchScope, query: str = ""):
+    rows, overflow, fts_scores, fts_available = _read_candidates(store, scope, query)
     if overflow:
         return (), HistoryRetrievalCoverage("scope_too_large", HISTORY_SCAN_LIMIT + 1, 0, 0), {}, False
     candidates = []
     indexed = unusable = 0
     for item, metadata in rows:
-        canonical = store.searchable_text_for_item(item)
-        vector = None
+        vector = _candidate_vector(store, scope, item, metadata)
         if metadata["embedding_model"] is not None:
-            try:
-                blob = metadata["embedding_blob"]
-                valid = (
-                    metadata["embedding_chat_id"] == scope.chat_id
-                    and metadata["embedding_model"] == HISTORY_EMBEDDING_MODEL
-                    and metadata["embedding_dimensions"] == HISTORY_EMBEDDING_DIMENSIONS
-                    and metadata["embedding_hash"] == store.content_hash(canonical)
-                    and canonical and not item.is_bot
-                    and _date(metadata["embedded_at"]) <= scope.cutoff_created_at
-                    and isinstance(blob, bytes) and len(blob) == HISTORY_EMBEDDING_DIMENSIONS * 4
-                    and (not scope.authored_only or canonical == " ".join(item.text.split()))
-                )
-                if valid:
-                    vector = normalize_history_vector(struct.unpack(f"<{HISTORY_EMBEDDING_DIMENSIONS}f", blob))
-            except (TypeError, ValueError, struct.error, AttributeError):
-                pass
             if vector is None:
                 unusable += 1
         if vector is not None:

@@ -21,7 +21,7 @@ from typing import Awaitable, Callable, Sequence
 from memory import MemoryStore
 from history_retrieval import (
     HistorySearchScope, HistoryRetrievalResult, normalize_history_vector,
-    preflight_history_retrieval, retrieve_history,
+    history_query_embedding_available, retrieve_history,
 )
 
 
@@ -262,9 +262,9 @@ class ChatHistorySession:
                 spec = self._query_spec(mode=mode, query=query, anchor_id=anchor_id,
                     participant_id=participant_id, after=after, before=before, limit=limit)
                 scope = self._semantic_scope(spec)
-                coverage = await asyncio.to_thread(preflight_history_retrieval, self._store, scope)
+                can_embed = await asyncio.to_thread(history_query_embedding_available, self._store, scope)
                 vector, reason = (await self._query_vector(spec.semantic_query)
-                                  if coverage.can_embed else (None, ""))
+                                  if can_embed else (None, ""))
                 result = await asyncio.to_thread(retrieve_history, self._store, scope=scope,
                     query=spec.semantic_query, query_vector=vector, mode=mode, limit=spec.limit)
                 return self._publish_semantic(budget, spec, result, reason)
