@@ -86,6 +86,9 @@ from image_intent import (
 )
 from agent_capabilities import PrimaryCapabilities
 from chat_history import ChatHistorySession
+from character_evidence import (
+    CHARACTER_INSTRUCTIONS, CharacterEvidenceSession, CharacterReport, InvalidCharacterEvidence,
+)
 from image_capability import ImageCapabilityContext, ImageCapabilitySession, ImageContinuationEvidence
 from memory import (
     DeliveryReceipt, EmbeddingCandidate, MemoryFusionOutcome, MemoryItem,
@@ -388,6 +391,7 @@ class Config:
     memory_recall_policy_mode: str
     web_image_search_enabled: bool
     primary_capability_recovery_enabled: bool
+    character_evidence_enabled: bool
     web_image_candidate_max_bytes: int
     mcp_tool_timeout_seconds: float
     media_frame_extraction_enabled: bool
@@ -909,6 +913,7 @@ class Config:
             ),
             web_image_search_enabled=_env_bool("WEB_IMAGE_SEARCH_ENABLED", True),
             primary_capability_recovery_enabled=_env_bool("PRIMARY_CAPABILITY_RECOVERY_ENABLED", False),
+            character_evidence_enabled=_env_bool("CHARACTER_EVIDENCE_ENABLED", False),
             web_image_candidate_max_bytes=max(
                 100_000, min(3_000_000, int(os.getenv("WEB_IMAGE_CANDIDATE_MAX_BYTES", "2000000")))
             ),
@@ -11904,6 +11909,67 @@ async def maybe_send_chat_action(context: ContextTypes.DEFAULT_TYPE, chat_id: in
     await send_activity_action(context.bot, chat_id, action)
 
 
+async def run_character_evidence(session: CharacterEvidenceSession) -> CharacterReport:
+    """Same primary model, with only target-bound reads and a validated final schema."""
+    model_run_id = current_model_run_id()
+    hooks = AiganRunHooks(model_run_id, route_bucket="character",
+                         intended_model=CONFIG.openai_model, reasoning_effort=CONFIG.model_reasoning_effort)
+    settings = build_model_settings()
+    settings.max_tokens = min(CONFIG.max_output_tokens, 1800)
+    agent = Agent(name="Aigan character evidence", instructions=CHARACTER_INSTRUCTIONS,
+                  model=CONFIG.openai_model, model_settings=settings,
+                  tools=session.tools(), output_type=CharacterReport)
+    try:
+        result = await Runner.run(agent, session.initial_prompt(), max_turns=6, hooks=hooks,
+            run_config=build_agents_run_config(run_id=model_run_id, route_bucket="character"))
+        return session.validate(result.final_output)
+    except asyncio.CancelledError as exc:
+        hooks.finalize_pending("cancelled", exc)
+        raise
+    finally:
+        hooks.finalize_pending("failed", "character_run_ended_with_pending_turn")
+
+
+async def handle_grounded_character(message: Message, context: ContextTypes.DEFAULT_TYPE,
+                                    target: UserCommandTarget) -> None:
+    if MEMORY is None or not should_allow_chat(message) or not command_target_allowed(message, target):
+        return
+    target_id = target.user_id
+    if target_id is None and target.username:
+        # A reused or ambiguous username cannot silently broaden the identity
+        # filter to display-name aliases or select the most frequent claimant.
+        candidates = {item.user_id for item in MEMORY.user_stats(message.chat_id, username=target.username)
+                      if item.user_id is not None}
+        if len(candidates) == 1:
+            target_id = next(iter(candidates))
+    if target_id is None:
+        await send_reply(message, "Не можу однозначно пов'язати цей username з автором збережених повідомлень у цьому чаті.")
+        return
+    current = MEMORY.message_by_message_id(message.chat_id, message.message_id)
+    current_id = current.id if current is not None else save_memory_message(message)
+    if current_id is None:
+        await send_reply(message, "Не зміг зафіксувати межу історії для цього запиту.")
+        return
+    session = CharacterEvidenceSession(MEMORY, chat_id=message.chat_id, target_user_id=target_id,
+        cutoff_memory_id=current_id, cutoff_created_at=message_datetime(message).isoformat())
+    if len(session.examined_ids) < 3:
+        await send_reply(message, session.render(CharacterReport(facets=[], abstention="sparse")))
+        return
+    await maybe_send_chat_action(context, message.chat_id, ChatAction.TYPING)
+    try:
+        report = await asyncio.wait_for(run_character_evidence(session), timeout=120)
+        response = session.render(report)
+    except InvalidCharacterEvidence as exc:
+        system_event(component="character", event_type="evidence_rejected", message=str(exc),
+                     details={"examined_count": len(session.examined_ids), "available_count": session.available_count})
+        response = session.render(CharacterReport(facets=[], abstention="ambiguous"))
+    except Exception:
+        LOGGER.exception("Grounded character command failed")
+        await send_reply(message, "Не зміг зараз перевірити приклади для портрета. Спробуй пізніше.")
+        return
+    await send_reply(message, response)
+
+
 async def handle_character_command(message: Message, context: ContextTypes.DEFAULT_TYPE, args: str) -> None:
     if MEMORY is None:
         await message.reply_text("Пам'ять вимкнена, тому команда недоступна.")
@@ -11914,6 +11980,10 @@ async def handle_character_command(message: Message, context: ContextTypes.DEFAU
         return
     if not command_target_allowed(message, target):
         await message.reply_text("Характеристику іншого користувача може запитувати лише адмін.")
+        return
+
+    if CONFIG.character_evidence_enabled:
+        await handle_grounded_character(message, context, target)
         return
 
     selection = target_memory_selection(message, target)
