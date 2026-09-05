@@ -9,6 +9,7 @@ from agents import function_tool
 from agents.agent import ToolsToFinalOutputResult
 
 from chat_history import ChatHistorySession
+from history_citations import HistoryCitationSession
 from image_capability import ImageCapabilitySession, ImageContinuationEvidence, ImageDeliveryProposal
 
 
@@ -17,6 +18,7 @@ class PrimaryCapabilities:
     history: ChatHistorySession | None = None
     images: ImageCapabilitySession | None = None
     continuation: ImageContinuationEvidence | None = None
+    citations: HistoryCitationSession | None = None
 
     def guidance(self) -> str:
         lines = [
@@ -26,6 +28,13 @@ class PrimaryCapabilities:
             "Use recent, lexical search or a window around a returned evidence id; refine dates or participant when useful.",
             "Do not claim to have inspected all history when only a bounded window was returned.",
         ]
+        if self.citations is not None:
+            lines.extend([
+                "For statements about past chat, cite up to three original sources by copying their exact [[history:...]] reference after the statement. The application resolves and verifies them; never invent a Telegram URL.",
+                "If preloaded memory has the reference you need, reuse it without another history call. A missing reference can be obtained by inspecting original history.",
+                "Use the returned opaque cursor alone to continue the same search; do not combine it with new filters. Read only when more evidence is needed.",
+                "For funniest/wisest/best requests, say your choice among the found evidence. Returned dates and counts do not prove exhaustive reading. Forwarded content is not the sender's own writing.",
+            ])
         if self.images is not None:
             lines.extend([
                 "For a current request to find and deliver public-web images, use request_image_delivery if the initial route missed it.",
@@ -62,6 +71,7 @@ class PrimaryCapabilities:
                 after: str = "",
                 before: str = "",
                 limit: int = 10,
+                cursor: str = "",
             ) -> str:
                 """Inspect original retained history in this chat without embeddings.
 
@@ -73,9 +83,10 @@ class PrimaryCapabilities:
                     after: Optional inclusive ISO date/time lower bound.
                     before: Optional exclusive ISO date/time upper bound.
                     limit: Requested message count; the application enforces a hard maximum of 20.
+                    cursor: Opaque next_cursor from an earlier page; use it alone with default selectors.
                 """
                 return await history.aread(mode=mode, query=query, anchor_id=anchor_id,
-                    participant_id=participant_id, after=after, before=before, limit=limit)
+                    participant_id=participant_id, after=after, before=before, limit=limit, cursor=cursor)
 
             result.append(read_chat_history)
         if self.images is not None:

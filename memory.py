@@ -216,6 +216,11 @@ class MemoryStore:
         self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._conn.create_function("history_casefold", 1, lambda value: str(value or "").casefold(), deterministic=True)
+        self._conn.create_function(
+            "history_evidence_digest", -1,
+            lambda *values: hashlib.sha256(json.dumps(values, ensure_ascii=False, separators=(",", ":")).encode()).hexdigest(),
+            deterministic=True,
+        )
         with self._lock:
             self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.execute("PRAGMA foreign_keys=ON")
@@ -643,6 +648,7 @@ class MemoryStore:
         mode: str, limit: int, terms: tuple[str, ...] = (),
         anchor_id: int | None = None, participant_id: int | None = None,
         after: str = "", before: str = "", authored_only: bool = False,
+        before_key: tuple[float, int] | None = None,
     ) -> tuple[list[dict[str, object]], bool]:
         """Read a bounded original-message page without embeddings or FTS exclusions.
 
@@ -674,6 +680,11 @@ class MemoryStore:
             for term in terms[:8]:
                 conditions.append(f"instr(history_casefold({text_expression}), ?) > 0")
                 params.append(term.casefold())
+        if before_key is not None:
+            if mode not in {"recent", "search"}:
+                raise ValueError("Only chronological pages have a continuation key")
+            conditions.append("(julianday(m.created_at) < ? OR (julianday(m.created_at) = ? AND m.id < ?))")
+            params.extend((before_key[0], before_key[0], before_key[1]))
         summary = "''" if authored_only else "substr(m.vision_summary, 1, 1001)"
         source = "''" if authored_only else "substr(m.source_text, 1, 1001)"
         projection = f"""m.id, m.message_id, m.user_id, m.created_at,
@@ -682,7 +693,12 @@ class MemoryStore:
             {source} AS source_text,
             substr(m.attachment_type, 1, 49) AS attachment_type,
             {summary} AS attachment_summary, m.reply_to_message_id,
-            julianday(m.created_at) AS sort_time"""
+            (m.forward_origin != '') AS is_forwarded,
+            julianday(m.created_at) AS sort_time,
+            history_evidence_digest(m.id, m.message_id, m.user_id, m.created_at,
+                m.sender_label, m.text, m.source_text, m.attachment_type,
+                m.vision_summary, m.reply_to_message_id, m.is_bot, m.content_kind,
+                m.forward_origin) AS evidence_digest"""
         where = " AND ".join(conditions)
         with self._lock:
             if mode == "around":
@@ -717,7 +733,7 @@ class MemoryStore:
                 rows = list(reversed(rows[:limit]))
             else:
                 raise ValueError("Unknown history mode")
-        return [{key: row[key] for key in row.keys() if key != "sort_time"} for row in rows], more
+        return [dict(row) for row in rows], more
 
     def context_window_around_item(
         self,

@@ -190,7 +190,14 @@ class CharacterEvidenceSession:
             if "coverage" in payload:
                 payload["coverage"]["returned_start"] = rows[0]["created_at"] if rows else None
                 payload["coverage"]["returned_end"] = rows[-1]["created_at"] if rows else None
-            output = _json(payload)
+        if "coverage" in payload:
+            # The generic reader can include commands excluded by this command's
+            # fixed author snapshot; do not count those as displayed evidence.
+            payload["coverage"]["returned_count"] = len(rows)
+            payload["coverage"]["displayed_unique_count"] = len(
+                self.history.exposed_ids.intersection(self._eligible)
+            )
+        output = _json(payload)
         with self._lock:
             for row in rows:
                 old = self._examined.get(row["id"])

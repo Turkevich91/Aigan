@@ -86,6 +86,7 @@ from image_intent import (
 )
 from agent_capabilities import PrimaryCapabilities
 from chat_history import ChatHistorySession
+from history_citations import ACTIVE_HISTORY_CITATIONS, HistoryCitationSession
 from character_evidence import (
     CHARACTER_INSTRUCTIONS, CharacterEvidenceSession, CharacterReport, InvalidCharacterEvidence,
 )
@@ -7056,7 +7057,9 @@ def format_memory_item_line(item: MemoryItem) -> str:
             parts.append("[image/preview was referenced, but no image file was delivered]")
     elif item.attachment_type and item.content_kind != "text":
         parts.append(f"[attachment: {clip_text(item.attachment_type, 120)}]")
-    return prefix + ": " + (" | ".join(parts) if parts else "(no visible text)")
+    line = prefix + ": " + (" | ".join(parts) if parts else "(no visible text)")
+    citations = ACTIVE_HISTORY_CITATIONS.get()
+    return citations.decorate_context(item, line) if citations is not None else line
 
 
 def trim_memory_items_to_budget(
@@ -7397,7 +7400,14 @@ def primary_capabilities_for_message(message: Message, prompt: str) -> PrimaryCa
         reply_message_id=getattr(getattr(message, "reply_to_message", None), "message_id", None),
         continuation=continuation, enabled=True,
     )) if CONFIG.web_image_search_enabled else None)
-    return PrimaryCapabilities(history=history, images=images, continuation=continuation)
+    citations = (HistoryCitationSession(
+        MEMORY, chat_id=message.chat_id,
+        chat_type=str(getattr(message.chat, "type", "") or ""),
+        cutoff_memory_id=current.id, cutoff_created_at=cutoff.isoformat(), history=history,
+    ) if history is not None else None)
+    return PrimaryCapabilities(
+        history=history, images=images, continuation=continuation, citations=citations,
+    )
 
 
 async def run_agent(
@@ -8221,10 +8231,12 @@ def format_semantic_memory_results(results: list[SemanticMemoryResult]) -> str:
             parts.append(f"reply_to_message_id={item.reply_to_message_id}")
         if item.source_title:
             parts.append(f"source_title={clip_text(item.source_title, 160)}")
-        lines.append(
+        line = (
             f"- [{item.created_at}] {item.sender_label} score={result.score:.3f} source={result.source}: "
             + " | ".join(part for part in parts if part)
         )
+        citations = ACTIVE_HISTORY_CITATIONS.get()
+        lines.append(citations.decorate_context(item, line) if citations is not None else line)
     return "\n".join(lines)
 
 
@@ -13847,6 +13859,7 @@ async def _handle_prompt_generation(
     )
     emit_prompt_route_decision(tool_route_decision)
     recovery_claimed = False
+    citation_token = None
     presence = activity_presence_for_message(message, bot=context.bot, action=activity_action_for_route(route))
     await presence.start()
     try:
@@ -13861,6 +13874,8 @@ async def _handle_prompt_generation(
             outbound_provenance=outbound_provenance,
         )
         reminder_context = reminder_tool_context_for_message(message, prompt, tool_route_decision)
+        if capabilities is not None and capabilities.citations is not None:
+            citation_token = ACTIVE_HISTORY_CITATIONS.set(capabilities.citations)
         recalled_memory_context = None
         semantic_memory_context = None
         if route == "memory_recall":
@@ -13886,6 +13901,13 @@ async def _handle_prompt_generation(
                 route,
                 exclude_item_ids=memory_context_stats.selected_item_ids,
             )
+        if citation_token is not None:
+            ACTIVE_HISTORY_CITATIONS.reset(citation_token)
+            citation_token = None
+        if capabilities is not None and capabilities.citations is not None:
+            capabilities.citations.expose_contexts((
+                memory_context, expanded_memory_context, semantic_memory_context, recalled_memory_context,
+            ))
         agent_input = build_agent_input(
             message,
             prompt,
@@ -13992,8 +14014,18 @@ async def _handle_prompt_generation(
             await message.reply_text("Не вийшло відповісти. Спробуй ще раз.")
         return
     finally:
+        if citation_token is not None:
+            ACTIVE_HISTORY_CITATIONS.reset(citation_token)
         await presence.stop()
 
+    if capabilities is not None and capabilities.citations is not None:
+        response = capabilities.citations.render(
+            response,
+            fits=lambda text, footer: all(block in "\n\n".join(split_text_chunks(text))
+                                          for block in footer.strip().split("\n\n")),
+            max_chars=min(CONFIG.max_reply_chars,
+                          CONFIG.max_reply_chunks * max(1, CONFIG.telegram_text_chunk_chars - 40)),
+        )
     remember_observed_message(message, label=f"{user_label(message)} (current request)")
     delivery = await send_reply(
         message,
