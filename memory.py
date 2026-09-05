@@ -805,6 +805,26 @@ class MemoryStore:
                   "embedding_hash", "embedding_blob", "embedded_at")
         return [(self._row_to_item(row), {key: row[key] for key in fields}) for row in rows], False, scores, fts_available
 
+    def bounded_conversation_branch_rows(
+        self, *, chat_id: int, cutoff_memory_id: int, cutoff_created_at: str,
+        anchor_id: int, limit: int = 20, participant_id: int | None = None,
+        authored_only: bool = False, after: str = "", before: str = "",
+        include_neighbors: bool = False, max_depth: int = 6, max_chars: int = 12000,
+        expected_anchor_digest: str | None = None,
+    ) -> tuple[list[dict[str, object]], dict[str, object]]:
+        """Read bounded reply edges; the history session separately authorizes the anchor."""
+        from conversation_branches import select_conversation_branch
+
+        with self._lock:
+            return select_conversation_branch(
+                self._conn, chat_id=chat_id, cutoff_memory_id=cutoff_memory_id,
+                cutoff_created_at=cutoff_created_at, anchor_id=anchor_id, limit=limit,
+                participant_id=participant_id, authored_only=authored_only,
+                after=after, before=before, include_neighbors=include_neighbors,
+                max_depth=max_depth, max_chars=max_chars,
+                expected_anchor_digest=expected_anchor_digest,
+            )
+
     def context_window_around_item(
         self,
         chat_id: int,
