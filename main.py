@@ -84,6 +84,9 @@ from image_intent import (
     public_image_subject_is_sensitive,
     semantic_image_claim_requires_guard,
 )
+from agent_capabilities import PrimaryCapabilities
+from chat_history import ChatHistorySession
+from image_capability import ImageCapabilityContext, ImageCapabilitySession, ImageContinuationEvidence
 from memory import (
     DeliveryReceipt, EmbeddingCandidate, MemoryFusionOutcome, MemoryItem,
     MemorySearchBatch, MemoryStore, SemanticMemoryResult, fuse_memory_search_batches,
@@ -384,6 +387,7 @@ class Config:
     memory_recall_intent_ambiguous_threshold: float
     memory_recall_policy_mode: str
     web_image_search_enabled: bool
+    primary_capability_recovery_enabled: bool
     web_image_candidate_max_bytes: int
     mcp_tool_timeout_seconds: float
     media_frame_extraction_enabled: bool
@@ -904,6 +908,7 @@ class Config:
                 os.getenv("MEMORY_RECALL_INTENT_AMBIGUOUS_THRESHOLD", "0.48")
             ),
             web_image_search_enabled=_env_bool("WEB_IMAGE_SEARCH_ENABLED", True),
+            primary_capability_recovery_enabled=_env_bool("PRIMARY_CAPABILITY_RECOVERY_ENABLED", False),
             web_image_candidate_max_bytes=max(
                 100_000, min(3_000_000, int(os.getenv("WEB_IMAGE_CANDIDATE_MAX_BYTES", "2000000")))
             ),
@@ -4042,14 +4047,18 @@ def build_model_settings() -> ModelSettings:
     return ModelSettings(**kwargs)
 
 
-def make_agent(mcp_servers: list[MCPServerStdio]) -> Agent:
+def make_agent(
+    mcp_servers: list[MCPServerStdio], capabilities: PrimaryCapabilities | None = None,
+) -> Agent:
+    capability_kwargs = {"tool_use_behavior": capabilities.tool_use_behavior} if capabilities is not None else {}
     return Agent(
         name="Aigan",
         instructions=SYSTEM_PROMPT,
         model=CONFIG.openai_model,
         model_settings=build_model_settings(),
         mcp_servers=mcp_servers,
-        tools=reminder_agent_tools(),
+        tools=reminder_agent_tools() + (capabilities.tools() if capabilities is not None else []),
+        **capability_kwargs,
     )
 
 
@@ -7277,6 +7286,71 @@ def youtube_mcp_environment(*, run_id: str, route_bucket: str) -> dict[str, str]
     return child_env
 
 
+def verified_image_continuation(message: Message) -> ImageContinuationEvidence | None:
+    """Resolve bounded reply/provenance links, never model-selected evidence ids."""
+    if MEMORY is None:
+        return None
+    reply = getattr(message, "reply_to_message", None)
+    reply_id = getattr(reply, "message_id", None)
+    if reply_id is None or getattr(reply, "chat_id", None) != message.chat_id:
+        return None
+    next_reply_id, upper_id = reply_id, message.message_id
+    requests: list[str] = []
+    delivered_count = 0
+    for _ in range(4):
+        item = MEMORY.message_by_message_id(message.chat_id, next_reply_id)
+        if (item is None or not item.is_bot or item.attachment_type != "web_image"
+                or item.message_id is None or item.message_id >= upper_id):
+            break
+        provenance = MEMORY.provenance_for_output(item.id)
+        if provenance is None or provenance.route != "internet_image_send" or provenance.status != "delivered":
+            break
+        original = MEMORY.message_by_message_id(message.chat_id, provenance.trigger_message_id)
+        if (original is None or original.is_bot or original.forward_origin or not original.text.strip()
+                or original.message_id is None or original.message_id >= item.message_id):
+            break
+        if sum(len(part) + 1 for part in requests) + len(original.text) > IMAGE_INTENT_TRUSTED_TEXT_MAX_CHARS:
+            break
+        siblings = MEMORY.delivery_siblings(item.id)
+        count = sum(part.is_bot and part.attachment_type == "web_image" for part in siblings)
+        if not 1 <= count <= 5:
+            break
+        if not requests:
+            delivered_count = count
+        requests.append(original.text)
+        if original.reply_to_message_id is None:
+            break
+        next_reply_id, upper_id = original.reply_to_message_id, original.message_id
+    if not requests:
+        return None
+    return ImageContinuationEvidence(
+        chat_id=message.chat_id, replied_message_id=reply_id,
+        original_prompt="\n".join(reversed(requests)), delivered_count=delivered_count,
+        public_delivery_verified=True,
+    )
+
+
+def primary_capabilities_for_message(message: Message, prompt: str) -> PrimaryCapabilities | None:
+    if not CONFIG.primary_capability_recovery_enabled or not should_allow_chat(message):
+        return None
+    if message.from_user is None or message.from_user.is_bot:
+        return None
+    current = MEMORY.message_by_message_id(message.chat_id, message.message_id) if MEMORY is not None else None
+    cutoff = getattr(message, "date", None) or datetime.now(timezone.utc)
+    history = (ChatHistorySession(
+        MEMORY, chat_id=message.chat_id,
+        cutoff_memory_id=current.id if current is not None else None,
+        cutoff_created_at=cutoff.isoformat(),
+    ) if MEMORY is not None and current is not None else None)
+    continuation = verified_image_continuation(message) if CONFIG.web_image_search_enabled else None
+    images = (ImageCapabilitySession(ImageCapabilityContext(
+        trusted_prompt=prompt, chat_id=message.chat_id,
+        reply_message_id=getattr(getattr(message, "reply_to_message", None), "message_id", None),
+        continuation=continuation, enabled=True,
+    )) if CONFIG.web_image_search_enabled else None)
+    return PrimaryCapabilities(history=history, images=images, continuation=continuation)
+
+
 async def run_agent(
     prompt: str,
     reminder_tool_context: ReminderToolContext | None = None,
@@ -7284,6 +7358,7 @@ async def run_agent(
     guard_reminder_claims: bool = False,
     guard_specific_reminder_claims: bool = False,
     outbound_provenance: OutboundProvenance | None = None,
+    capability_context: PrimaryCapabilities | None = None,
 ) -> str:
     active_provenance = outbound_provenance or ACTIVE_OUTBOUND_PROVENANCE.get()
     model_run_id = current_model_run_id(active_provenance.run_id if active_provenance is not None else "")
@@ -7334,7 +7409,8 @@ async def run_agent(
     )
     try:
         async with web_server as web, youtube_server as youtube:
-            agent = make_agent([web, youtube])
+            agent = (make_agent([web, youtube], capability_context)
+                     if capability_context is not None else make_agent([web, youtube]))
             try:
                 result = await Runner.run(
                     agent,
@@ -7409,10 +7485,13 @@ async def run_agent_for_outbound(
     *,
     guard_reminder_claims: bool = False,
     guard_specific_reminder_claims: bool = False,
+    capability_context: PrimaryCapabilities | None = None,
 ) -> str:
     token = ACTIVE_OUTBOUND_PROVENANCE.set(outbound_provenance)
     try:
         kwargs: dict[str, Any] = {}
+        if capability_context is not None:
+            kwargs["capability_context"] = capability_context
         if reminder_tool_context is not None:
             kwargs["reminder_tool_context"] = reminder_tool_context
         if guard_reminder_claims:
@@ -13217,6 +13296,12 @@ async def _handle_prompt_generation(
     ACTIVE_MODEL_ROUTE_BUCKET.set(normalize_route_bucket(route, "other"))
     LOGGER.info("Prompt route=%s chat_id=%s", route, message.chat_id)
     outbound_provenance = provenance_for_message(message, route)
+    capabilities = (primary_capabilities_for_message(message, prompt)
+                    if route != "translate_reference" else None)
+    reconsider_image_route = bool(
+        capabilities is not None and capabilities.images is not None
+        and route in {"image_intent_clarify", "referenced_visual_unavailable", "image_source_unavailable"}
+    )
 
     def emit_prompt_route_decision(tool_route_decision: ToolRouteDecision) -> None:
         system_event(
@@ -13268,7 +13353,7 @@ async def _handle_prompt_generation(
         )
         return
 
-    if image_policy is not None and image_policy.response_text:
+    if image_policy is not None and image_policy.response_text and not reconsider_image_route:
         emit_prompt_route_decision(no_tool_route(route))
         delivery = await send_reply(
             message,
@@ -13345,6 +13430,7 @@ async def _handle_prompt_generation(
         tool_route_decision=tool_route_decision,
     )
     emit_prompt_route_decision(tool_route_decision)
+    recovery_claimed = False
     presence = activity_presence_for_message(message, bot=context.bot, action=activity_action_for_route(route))
     await presence.start()
     try:
@@ -13395,6 +13481,8 @@ async def _handle_prompt_generation(
             route=route,
             include_reminder_tool_guidance=reminder_context is not None,
         )
+        if capabilities is not None:
+            agent_input += "\n\n" + capabilities.guidance()
         guard_image_delivery_claims = bool(
             image_policy is not None and image_policy.guard_unconfirmed_delivery
         )
@@ -13424,7 +13512,15 @@ async def _handle_prompt_generation(
             tool_route_decision,
             reminder_context,
         )
-        if (
+        if capabilities is not None:
+            agent_coro = run_agent_for_outbound(
+                outbound_provenance, agent_input,
+                reminder_tool_context=reminder_context,
+                guard_reminder_claims=guard_reminder_claims,
+                guard_specific_reminder_claims=guard_specific_reminder_claims,
+                capability_context=capabilities,
+            )
+        elif (
             reminder_context is not None
             or guard_reminder_claims
             or guard_specific_reminder_claims
@@ -13439,6 +13535,22 @@ async def _handle_prompt_generation(
         else:
             agent_coro = run_agent_for_outbound(outbound_provenance, agent_input)
         response = await asyncio.wait_for(agent_coro, timeout=120)
+        recovery_plan = (capabilities.images.claim_plan()
+                         if capabilities is not None and capabilities.images is not None else None)
+        if recovery_plan is not None:
+            recovery_claimed = True
+            # Consume once before awaiting any external operation. A timeout or
+            # ambiguous send must not cause a second dispatch or a generic reply.
+            outbound_provenance.route = "internet_image_send"
+            ACTIVE_MODEL_ROUTE_BUCKET.set("internet_image_send")
+            system_event(component="routing", event_type="primary_capability_recovery",
+                         telegram_message=message, route="internet_image_send",
+                         message="public_web_delivery", details={"contextual": capabilities.continuation is not None})
+            outcome = await maybe_send_internet_image(
+                message, prompt, plan=recovery_plan, outbound_provenance=outbound_provenance)
+            if outcome.request_fulfilled:
+                record_chat_answer(message, prompt, "internet_image_send")
+            return
         if guard_image_delivery_claims:
             response = guard_unconfirmed_image_delivery_claims(
                 response,
@@ -13455,7 +13567,12 @@ async def _handle_prompt_generation(
             )
     except Exception:
         LOGGER.exception("Agent run failed")
-        await message.reply_text("Не вийшло відповісти. Спробуй ще раз.")
+        if recovery_claimed:
+            await message.reply_text(
+                "Під час доставки стався збій. Не можу підтвердити її завершення; перевір, чи з'явилися зображення."
+            )
+        else:
+            await message.reply_text("Не вийшло відповісти. Спробуй ще раз.")
         return
     finally:
         await presence.stop()
