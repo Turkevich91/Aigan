@@ -93,7 +93,8 @@ class HistoryCitationSession:
         blocks = tuple(block for block in blocks if isinstance(block, str))
         with self._lock:
             self._exposed = {key: evidence for key, evidence in self._candidates.items()
-                             if any(evidence.rendered_line in block for block in blocks)}
+                             if any("\n" + evidence.rendered_line + "\n" in "\n" + block + "\n"
+                                    for block in blocks)}
             self._candidates.clear()
 
     @property

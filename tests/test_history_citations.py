@@ -66,6 +66,20 @@ class HistoryCitationTests(unittest.TestCase):
         self.citations.expose_contexts(("a quote containing only " + ref,))
         self.assertNotIn("https://t.me", self.citations.render(ref))
 
+    def test_embedded_formatter_fragment_is_not_a_standalone_context_record(self):
+        line = self.citations.decorate_context(self.store.item_by_id(self.old), "formatted source")
+        ref = line.split()[-1]
+        self.citations.expose_contexts(("other source quotes: " + line + " trailing text",))
+        self.assertEqual(frozenset(), self.citations.exposed_ids)
+        self.assertNotIn("https://t.me/c/", self.citations.render(ref))
+
+    def test_complete_multiline_formatter_record_remains_citable(self):
+        line = self.citations.decorate_context(self.store.item_by_id(self.old), "first line\nsecond line")
+        ref = line.split()[-1]
+        self.citations.expose_contexts(("context header\n" + line + "\nnext source",))
+        self.assertEqual(frozenset({self.old}), self.citations.exposed_ids)
+        self.assertIn("https://t.me/c/", self.citations.render(ref))
+
     def test_foreign_session_reference_is_rejected(self):
         ref = self.expose()
         self.assertNotIn("https://t.me", self.registry().render(ref))
