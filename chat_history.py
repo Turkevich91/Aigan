@@ -1,7 +1,8 @@
 """Request-scoped access to bounded, untrusted original chat evidence.
 
 The host owns chat/cutoff/target identity. Model arguments only narrow that scope.
-No embeddings, provider calls, writes, media paths, or external source fetches.
+Optional query embeddings are injected by the host; retrieval never writes or
+fetches sources. Every mode shares one publication, citation and read budget.
 """
 from __future__ import annotations
 
@@ -10,12 +11,21 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
 import json
+import logging
 import secrets
 import re
 import sqlite3
 import threading
+from typing import Awaitable, Callable, Sequence
 
 from memory import MemoryStore
+from history_retrieval import (
+    HistorySearchScope, HistoryRetrievalResult, normalize_history_vector,
+    history_query_embedding_available, retrieve_history,
+)
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -26,12 +36,14 @@ class HistoryLimits:
     max_response_chars: int = 12000
     max_calls: int = 4
     max_total_chars: int = 30000
+    max_embedding_calls: int = 2
 
     def __post_init__(self) -> None:
         for name, floor, ceiling in (
             ("max_messages", 1, 20), ("max_row_chars", 384, 1000),
             ("max_response_chars", 1024, 12000), ("max_calls", 1, 4),
             ("max_total_chars", 1024, 30000),
+            ("max_embedding_calls", 0, 2),
         ):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or not floor <= value <= ceiling:
@@ -79,6 +91,7 @@ class _HistoryQuery:
     after: str
     before: str
     limit: int
+    semantic_query: str = ""
 
 
 @dataclass(frozen=True)
@@ -100,6 +113,8 @@ class ChatHistorySession:
         self, store: MemoryStore, *, chat_id: int, cutoff_memory_id: int,
         cutoff_created_at: str, limits: HistoryLimits | None = None,
         target_user_id: int | None = None,
+        query_embedder: Callable[[str], Awaitable[Sequence[float]]] | None = None,
+        embedding_timeout_seconds: float = 10.,
     ) -> None:
         if not isinstance(cutoff_memory_id, int) or isinstance(cutoff_memory_id, bool) or cutoff_memory_id <= 0:
             raise ValueError("A persisted request cutoff is required")
@@ -108,6 +123,12 @@ class ChatHistorySession:
         self._cutoff_id = cutoff_memory_id
         self._cutoff_at = _timestamp(cutoff_created_at)
         self._target_id = target_user_id
+        if not 0 < embedding_timeout_seconds <= 10:
+            raise ValueError("History embedding timeout must be at most ten seconds")
+        self._query_embedder = query_embedder
+        self._embedding_timeout_seconds = embedding_timeout_seconds
+        self._embedding_calls_used = 0
+        self._query_vectors: dict[str, tuple[float, ...]] = {}
         self.limits = limits or HistoryLimits()
         self._lock = threading.Lock()
         self._calls_used = 0
@@ -184,6 +205,11 @@ class ChatHistorySession:
             return self._chars_used
 
     @property
+    def embedding_calls_used(self) -> int:
+        with self._lock:
+            return self._embedding_calls_used
+
+    @property
     def available(self) -> bool:
         with self._lock:
             return self._calls_used < self.limits.max_calls and self._remaining() >= 512
@@ -230,6 +256,16 @@ class ChatHistorySession:
         if budget is None:
             return self._denied()
         try:
+            if mode in {"semantic", "hybrid"}:
+                if cursor:
+                    raise ValueError("Semantic results do not have a chronological cursor")
+                spec = self._query_spec(mode=mode, query=query, anchor_id=anchor_id,
+                    participant_id=participant_id, after=after, before=before, limit=limit)
+                scope = self._semantic_scope(spec)
+                vector, reason = await self._query_vector(spec.semantic_query, scope)
+                result = await asyncio.to_thread(retrieve_history, self._store, scope=scope,
+                    query=spec.semantic_query, query_vector=vector, mode=mode, limit=spec.limit)
+                return self._publish_semantic(budget, spec, result, reason)
             # A cancelled SDK call may leave a SQLite worker running, but that
             # worker can only select candidates. Exposure belongs to the live
             # awaiting coroutine after it has successfully received the result.
@@ -249,6 +285,13 @@ class ChatHistorySession:
 
     def _read_reserved(self, budget: int, **request: object) -> str:
         try:
+            if request.get("mode") in {"semantic", "hybrid"}:
+                if request.get("cursor"):
+                    raise ValueError("Semantic results do not have a chronological cursor")
+                spec = self._query_spec(**{key: value for key, value in request.items() if key != "cursor"})
+                result = retrieve_history(self._store, scope=self._semantic_scope(spec),
+                    query=spec.semantic_query, mode=spec.mode, limit=spec.limit)
+                return self._publish_semantic(budget, spec, result)
             return self._publish(budget, *self._select(**request))
         except (ValueError, TypeError, OverflowError):
             return self._failed_read(budget, "invalid_filter")
@@ -273,10 +316,80 @@ class ChatHistorySession:
         # Keep the claimed call: a cancelled SQLite worker can still finish its
         # bounded read and must not become a way around the four-call ceiling.
 
-    def _publish(self, budget: int, query: _HistoryQuery, raw_rows: list[dict], more: bool) -> str:
+    def _semantic_scope(self, query: _HistoryQuery) -> HistorySearchScope:
+        return HistorySearchScope(self._chat_id, self._cutoff_id, self._cutoff_at,
+            query.participant_id, query.after, query.before, self._target_id is not None)
+
+    async def _query_vector(self, query: str, scope: HistorySearchScope) -> tuple[tuple[float, ...] | None, str]:
+        key = " ".join(query.split())
+        with self._lock:
+            cached = self._query_vectors.get(key)
+            if cached is not None:
+                return cached, ""
+            if self._query_embedder is None:
+                return None, "query_embedding_unavailable"
+            if self._embedding_calls_used >= self.limits.max_embedding_calls:
+                return None, "embedding_budget_exhausted"
+        # Admission only avoids a needless provider call. Cached vectors and
+        # unavailable/exhausted providers still get the full fresh final read.
+        if not await asyncio.to_thread(history_query_embedding_available, self._store, scope):
+            return None, ""
+        with self._lock:
+            # Another tool call may finish or claim the last slot during the
+            # admission read. Recheck before reserving an actual provider call.
+            cached = self._query_vectors.get(key)
+            if cached is not None:
+                return cached, ""
+            if self._embedding_calls_used >= self.limits.max_embedding_calls:
+                return None, "embedding_budget_exhausted"
+            self._embedding_calls_used += 1
+        try:
+            result = await asyncio.wait_for(self._query_embedder(key), timeout=self._embedding_timeout_seconds)
+            vector = normalize_history_vector(result)
+            if vector is None:
+                return None, "invalid_query_embedding"
+        except TimeoutError:
+            return None, "query_embedding_timeout"
+        except Exception:
+            # No exception strings: provider errors may contain request content.
+            return None, "query_embedding_failed"
+        with self._lock:
+            self._query_vectors[key] = vector
+        return vector, ""
+
+    def _publish_semantic(self, budget: int, query: _HistoryQuery,
+                          result: HistoryRetrievalResult, reason: str = "") -> str:
+        fallback_reason = reason or result.fallback_reason
+        if result.coverage.status == "scope_too_large":
+            fallback_reason = "scope_too_large"
+        elif result.fallback_reason == "no_usable_index":
+            fallback_reason = "no_usable_index"
+        coverage = {
+            "selection": "nearest_retained_evidence" if result.embeddings_used else "newest_literal_matches",
+            "lexical_only": not result.embeddings_used, "semantic_status": result.coverage.status,
+            "scoped_rows": result.coverage.scoped_rows, "indexed_rows": result.coverage.indexed_rows,
+            "unusable_index_rows": result.coverage.unusable_index_rows,
+            "candidate_scan_limit": result.coverage.scan_limit,
+            "embeddings_used": result.embeddings_used, "embedding_calls_used": self.embedding_calls_used,
+            "applied_mode": result.applied_mode, "fusion_policy": result.fusion_policy,
+            "fallback_reason": fallback_reason,
+            "answerability": "nearest_neighbors_are_not_proof_of_an_answer",
+        }
+        LOGGER.info("History retrieval mode=%s status=%s scoped_rows=%d indexed_rows=%d candidate_rows=%d embeddings_used=%s",
+                    query.mode, result.status, result.coverage.scoped_rows, result.coverage.indexed_rows,
+                    len(result.rows), result.embeddings_used)
+        return self._publish(budget, query, list(result.rows), result.has_more_matching,
+            extra_coverage=coverage, drop_priority=tuple(reversed(result.relevance_order)),
+            selection_status=result.status)
+
+    def _publish(self, budget: int, query: _HistoryQuery, raw_rows: list[dict], more: bool, *,
+                 extra_coverage: dict | None = None, drop_priority: tuple[int, ...] = (),
+                 selection_status: str | None = None) -> str:
         """Count metadata, trim, and publish exposure atomically after selection."""
         rows = [self._bounded_row(row) for row in raw_rows]
         raw_by_id = {row["id"]: row for row in raw_rows}
+        if drop_priority:
+            rows.sort(key=lambda row: (raw_by_id[row["id"]]["sort_time"], row["id"]))
         pageable = query.mode in {"recent", "search"}
         candidate_cursor = secrets.token_urlsafe(18) if pageable and rows else None
         with self._lock:
@@ -305,6 +418,10 @@ class ChatHistorySession:
                         "pagination_supported": pageable,
                     },
                 }
+                if not raw_rows and selection_status:
+                    payload["status"] = selection_status
+                if extra_coverage:
+                    payload["coverage"].update(extra_coverage)
                 self._set_span(payload)
                 output = _json(payload)
                 if len(output) <= budget:
@@ -315,7 +432,10 @@ class ChatHistorySession:
                     payload["status"] = "response_budget_exhausted"
                     break
                 # Keep the around anchor; chronological pages keep newer rows.
-                index = len(rows) - 1 if query.mode == "around" and rows[0]["id"] == query.anchor_id else 0
+                discard = next((identity for identity in drop_priority
+                                if any(row["id"] == identity for row in rows)), None)
+                index = (next(i for i, row in enumerate(rows) if row["id"] == discard) if discard is not None
+                         else len(rows) - 1 if query.mode == "around" and rows[0]["id"] == query.anchor_id else 0)
                 rows.pop(index)
             if payload["next_cursor"] is not None:
                 oldest = raw_by_id[rows[0]["id"]]
@@ -354,7 +474,13 @@ class ChatHistorySession:
             if saved is None:
                 raise ValueError("Unknown session cursor")
             return self._retrieve(saved.query, before_key=saved.before_key)
-        if mode not in {"recent", "search", "around"}:
+        spec = self._query_spec(mode=mode, query=query, anchor_id=anchor_id,
+            participant_id=participant_id, after=after, before=before, limit=limit)
+        return self._retrieve(spec)
+
+    def _query_spec(self, *, mode: str, query: str, anchor_id: int | None,
+                    participant_id: int | None, after: str, before: str, limit: int | None) -> _HistoryQuery:
+        if mode not in {"recent", "search", "around", "semantic", "hybrid"}:
             raise ValueError("Unknown history mode")
         for value in (anchor_id, participant_id):
             if value is not None and (not isinstance(value, int) or isinstance(value, bool)):
@@ -377,8 +503,10 @@ class ChatHistorySession:
         terms = tuple(dict.fromkeys(re.findall(r"[^\W_]+", query.casefold(), flags=re.UNICODE)))
         if mode == "search" and (not terms or len(terms) > 8):
             raise ValueError("Use one to eight lexical terms")
-        spec = _HistoryQuery(mode, terms, anchor_id, participant_id, start, end, count)
-        return self._retrieve(spec)
+        if mode in {"semantic", "hybrid"} and not query.strip():
+            raise ValueError("Semantic history requires a query")
+        return _HistoryQuery(mode, terms, anchor_id, participant_id, start, end, count,
+                             query.strip() if mode in {"semantic", "hybrid"} else "")
 
     def _retrieve(self, query: _HistoryQuery, *, before_key: tuple[float, int] | None = None):
         rows, more = self._store.bounded_history_rows(
