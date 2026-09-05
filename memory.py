@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
 import sqlite3
 import struct
@@ -9,6 +10,7 @@ import threading
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Sequence
 
 
 @dataclass(frozen=True)
@@ -51,6 +53,100 @@ class SemanticMemoryResult:
     search_text: str
     score: float
     source: str
+
+
+@dataclass(frozen=True)
+class MemorySearchBatch:
+    """One filtered retriever invocation; query variants remain separate batches."""
+
+    channel: str
+    results: Sequence[SemanticMemoryResult]
+
+
+@dataclass(frozen=True)
+class MemoryFusionOutcome:
+    results: list[SemanticMemoryResult]
+    requested_policy: str
+    applied_policy: str
+    fallback_reason: str = ""
+
+
+def legacy_memory_result_merge(
+    results: Sequence[SemanticMemoryResult], limit: int,
+) -> list[SemanticMemoryResult]:
+    """Preserve the existing raw-score ordering and first-occurrence behavior."""
+    merged: dict[int, SemanticMemoryResult] = {}
+    for result in results:
+        existing = merged.get(result.item.id)
+        if existing is None:
+            merged[result.item.id] = result
+        else:
+            source = existing.source if result.source in existing.source.split("+") else f"{existing.source}+{result.source}"
+            merged[result.item.id] = SemanticMemoryResult(
+                item=existing.item, search_text=existing.search_text,
+                score=max(existing.score, result.score), source=source,
+            )
+    return sorted(merged.values(), key=lambda item: item.score, reverse=True)[:max(1, limit)]
+
+
+def fuse_memory_search_batches(
+    batches: Sequence[MemorySearchBatch], *, limit: int, policy: str = "legacy",
+    protect_numeric: bool = False,
+) -> MemoryFusionOutcome:
+    """Fuse incomparable retriever scales without multiplying query-variant votes.
+
+    Each row receives at most one contribution per channel. Invalid candidate
+    inputs and protected numeric retrieval retain the exact legacy merge.
+    """
+    requested = str(policy or "legacy").strip().casefold()
+    flat = [result for batch in batches for result in batch.results]
+
+    def legacy(reason=""):
+        return MemoryFusionOutcome(legacy_memory_result_merge(flat, limit), requested, "legacy", reason)
+
+    if requested == "legacy":
+        return legacy()
+    if requested not in {"rrf", "normalized"}:
+        return legacy("unknown_policy")
+    if protect_numeric and any(batch.channel == "keyword" and batch.results for batch in batches):
+        return legacy("numeric_protected")
+    if any(batch.channel not in {"keyword", "semantic", "fts"} for batch in batches):
+        return legacy("invalid_channel")
+    try:
+        if any(not math.isfinite(result.score) for result in flat):
+            return legacy("nonfinite_score")
+        canonical: dict[int, SemanticMemoryResult] = {}
+        sources: dict[int, set[str]] = {}
+        contributions: dict[tuple[int, str], float] = {}
+        best_rank: dict[int, int] = {}
+        for batch in batches:
+            unique: dict[int, SemanticMemoryResult] = {}
+            for result in batch.results:
+                key = result.item.id
+                canonical.setdefault(key, result)
+                unique.setdefault(key, result)
+                sources.setdefault(key, set()).update(result.source.split("+"))
+            values = list(unique.values())
+            low = min((result.score for result in values), default=0.)
+            high = max((result.score for result in values), default=0.)
+            for rank, result in enumerate(values, 1):
+                key = result.item.id
+                contribution = (1. / (60 + rank) if requested == "rrf" else
+                                (result.score - low) / (high - low) if high != low else 1.)
+                if not math.isfinite(contribution):
+                    return legacy("invalid_candidate_input")
+                channel_key = (key, batch.channel)
+                contributions[channel_key] = max(contribution, contributions.get(channel_key, 0.))
+                best_rank[key] = min(rank, best_rank.get(key, rank))
+        totals = {key: sum(contributions.get((key, channel), 0.)
+                           for channel in ("keyword", "semantic", "fts")) for key in canonical}
+        ordered = sorted(canonical, key=lambda key: (-totals[key], best_rank[key], key))
+        results = [SemanticMemoryResult(canonical[key].item, canonical[key].search_text,
+                                        totals[key], "+".join(sorted(sources[key])))
+                   for key in ordered[:max(1, limit)]]
+        return MemoryFusionOutcome(results, requested, requested)
+    except (TypeError, ValueError, OverflowError):
+        return legacy("invalid_candidate_input")
 
 
 @dataclass(frozen=True)
