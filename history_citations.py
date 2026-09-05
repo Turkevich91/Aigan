@@ -150,6 +150,8 @@ class HistoryCitationSession:
             upper = _instant(before).strftime("%d.%m.%Y %H:%M UTC") if before else "межа поточного запиту"
             exclusive = " (верхня межа не включена)" if before else ""
             line += f" Останній фільтр дат: від {lower} до {upper}{exclusive}."
+        if coverage.get("branch", {}).get("partial"):
+            line += " Остання гілка розмови часткова: деякі зв’язки відсутні або обмежені."
         if coverage.get("has_more_results"):
             line += " Є ще результати за останнім запитом."
         if coverage.get("text_truncated") or coverage.get("omitted_due_to_response_budget"):

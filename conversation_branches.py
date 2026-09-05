@@ -100,6 +100,7 @@ def select_conversation_branch(
         {source} AS source_text, substr(m.attachment_type, 1, 49) AS attachment_type,
         {summary} AS attachment_summary, m.reply_to_message_id,
         julianday(m.created_at) AS sort_time,
+        (m.forward_origin != '') AS is_forwarded,
         history_evidence_digest(m.id,m.message_id,m.user_id,m.created_at,m.sender_label,
             m.text,m.source_text,m.attachment_type,m.vision_summary,m.reply_to_message_id,
             m.is_bot,m.content_kind,m.forward_origin) AS evidence_digest"""

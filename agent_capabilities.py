@@ -29,6 +29,7 @@ class PrimaryCapabilities:
             "When wording, spelling or language differs, use semantic or hybrid search. These modes share the same bounded read budget; prefer available evidence and do not search for ordinary conversation.",
             "Semantic results are nearest retained candidates, not proof of an answer. Inspect the evidence, respect fallback/coverage, and refine the query only when useful.",
             "Do not claim to have inspected all history when only a bounded window was returned.",
+            "After finding an original message with read_chat_history, use read_conversation_branch when its reply context matters. It follows stored reply links; optional neighbors are labeled separately and do not prove a complete topic.",
         ]
         if self.citations is not None:
             lines.extend([
@@ -90,7 +91,29 @@ class PrimaryCapabilities:
                 return await history.aread(mode=mode, query=query, anchor_id=anchor_id,
                     participant_id=participant_id, after=after, before=before, limit=limit, cursor=cursor)
 
-            result.append(read_chat_history)
+            @function_tool
+            async def read_conversation_branch(
+                anchor_id: int,
+                participant_id: int | None = None,
+                after: str = "",
+                before: str = "",
+                limit: int = 10,
+                include_neighbors: bool = False,
+            ) -> str:
+                """Inspect bounded reply ancestors and replies to an already examined original.
+
+                Args:
+                    anchor_id: An unchanged memory evidence ID returned by read_chat_history in this run.
+                    participant_id: Optional participant filter; an existing host-fixed identity cannot change.
+                    after: Optional inclusive ISO date/time lower bound.
+                    before: Optional exclusive ISO date/time upper bound.
+                    limit: At most 20 messages, sharing the four-read and character budget with history search.
+                    include_neighbors: Add at most two chronological neighbors when space remains; they are not reply links.
+                """
+                return await history.aread_branch(anchor_id=anchor_id, participant_id=participant_id,
+                    after=after, before=before, limit=limit, include_neighbors=include_neighbors)
+
+            result.extend((read_chat_history, read_conversation_branch))
         if self.images is not None:
             images = self.images
 
