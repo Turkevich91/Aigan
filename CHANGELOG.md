@@ -2,7 +2,7 @@
 
 ## 2026-09-05 - Readable grounded character portraits
 
-- Present connected communication observations with short, dated original examples and one coverage note.
+- Present up to three distinctive communication observations in natural prose, with short, dated original examples and one coverage note.
 - Keep independently verified observations when another example fails validation, and preserve quoted text through Telegram delivery.
 - Retain the primary model, existing history limits, and generation budget.
 

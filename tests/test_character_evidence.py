@@ -14,6 +14,7 @@ from tests.support import FakeMessage, configure_test_environment
 configure_test_environment()
 import main
 from agents import Agent, Runner, RunConfig, Model, ModelResponse, Usage
+from agents.exceptions import ModelBehaviorError
 from openai.types.responses import ResponseFunctionToolCall, ResponseOutputMessage, ResponseOutputText
 from character_evidence import (
     CHARACTER_INSTRUCTIONS, CharacterEvidenceSession, CharacterReport,
@@ -228,7 +229,7 @@ class CharacterEvidenceTests(unittest.TestCase):
         ids = self.seed(5)
         session = self.session()
         facets = []
-        for index, category in enumerate(("argumentation", "uncertainty", "disagreement", "initiative", "interaction")):
+        for index, category in enumerate(("argumentation", "uncertainty", "interaction")):
             facet = self.report([ids[index]]).facets[0]
             facet.facet = category
             facet.observation = ("У цій розмові пропонує разом перевірити підстави рішення. " * 20)[:650]
@@ -240,7 +241,7 @@ class CharacterEvidenceTests(unittest.TestCase):
         rendered = session.render(report)
         self.assertGreater(len(facets[0].observation), 300)
         self.assertLess(len(rendered), 6000)
-        self.assertEqual(3, rendered.count("«"))
+        self.assertEqual(2, rendered.count("«"))
         self.assertEqual(1, rendered.count("«Перевірмо факти перед рішенням 0.»"))
         self.assertEqual(1, rendered.count("Переглянуто унікальних повідомлень:"))
         for label in ("Аргументація:", "Ініціатива:", "Межа висновку:", "Інший прояв"):
@@ -261,12 +262,12 @@ class CharacterEvidenceTests(unittest.TestCase):
         self.assertTrue(all("literal_text" not in call for call in message.reply_calls))
 
     def test_long_portrait_keeps_complete_sources_and_coverage_through_actual_chunker(self):
-        sources = [(f"Приклад {index}: " + "текст " * 30)[:160] for index in range(5)]
+        sources = [(f"Приклад {index}: " + "текст " * 30)[:160] for index in range(3)]
         ids = [self.save(source, day=index) for index, source in enumerate(sources)]
         counter = self.save("В іншій ситуації обирає інший підхід.", day=8)
         session = self.session()
         facets = []
-        for index, category in enumerate(("argumentation", "uncertainty", "disagreement", "initiative", "interaction")):
+        for index, category in enumerate(("argumentation", "uncertainty", "interaction")):
             facet = self.report([ids[index]], quote=sources[index],
                 counter=[EvidenceReference(id=counter, quote="обирає інший підхід")]).facets[0]
             facet.facet = category
@@ -274,19 +275,19 @@ class CharacterEvidenceTests(unittest.TestCase):
             facet.counter_observation = ("В іншій ситуації допускає інший підхід. " * 10)[:50]
             facets.append(facet)
         report = CharacterReport(facets=facets, abstention="none")
-        config = replace(main.CONFIG, telegram_text_chunk_chars=3500, max_reply_chars=12000, max_reply_chunks=4)
+        config = replace(main.CONFIG, telegram_text_chunk_chars=2000, max_reply_chars=12000, max_reply_chunks=4)
         with patch.object(main, "CONFIG", config):
             # A valid packed chunk at exactly the configured limit loses its
             # last characters when the existing splitter adds a chunk prefix.
             initial = session.render(report)
-            padding = 3500 - len("\n\n".join(initial.split("\n\n")[:4]))
-            wanted = len(facets[3].counter_observation) + padding
+            padding = 2000 - len("\n\n".join(initial.split("\n\n")[:2]))
+            wanted = len(facets[1].counter_observation) + padding
             self.assertGreater(wanted, 0)
             self.assertLessEqual(wanted, 300)
-            facets[3].counter_observation = ("В іншій ситуації допускає інший підхід. " * 10)[:wanted]
+            facets[1].counter_observation = ("В іншій ситуації допускає інший підхід. " * 10)[:wanted]
             unfitted = session.render(report)
             damaged = "\n\n".join(main.split_text_chunks(unfitted))
-            self.assertNotIn(unfitted.split("\n\n")[3], damaged)
+            self.assertNotIn(unfitted.split("\n\n")[1], damaged)
             fitted = session.render(report, fits=lambda text, blocks: all(
                 block in "\n\n".join(main.split_text_chunks(text)) for block in blocks))
             message = FakeMessage("/character me", message_id=9999)
@@ -295,8 +296,27 @@ class CharacterEvidenceTests(unittest.TestCase):
         self.assertTrue(all(block in delivered for block in fitted.split("\n\n")))
         self.assertIn("опущено через довжину", delivered)
         self.assertIn("Переглянуто унікальних повідомлень:", delivered)
-        for source in sources[:3]:
-            self.assertIn("«" + source + "»", delivered)
+        self.assertIn("«" + sources[0] + "»", delivered)
+        self.assertNotIn("«" + sources[2] + "»", delivered)
+
+    def test_sdk_rejects_an_overlong_report_instead_of_publishing_four_observations(self):
+        ids = self.seed()
+        session = self.session()
+        facets = []
+        for category in ("argumentation", "uncertainty", "disagreement", "interaction"):
+            facet = self.report([ids[0]]).facets[0]
+            facet.facet = category
+            facets.append(facet)
+        # Simulate an out-of-contract model response rather than allowing the
+        # fixture constructor to reject it before the real SDK sees the JSON.
+        oversized = CharacterReport.model_construct(facets=facets, abstention="none")
+        model = ScriptedCharacterModel([oversized])
+        agent = Agent(name="synthetic", model=model, instructions=CHARACTER_INSTRUCTIONS,
+                      tools=session.tools(), output_type=CharacterReport)
+        with self.assertRaises(ModelBehaviorError):
+            asyncio.run(Runner.run(agent, session.initial_prompt(), run_config=RunConfig(tracing_disabled=True)))
+        self.assertEqual(1, len(model.inputs))
+        self.assertEqual(0, session.history.calls_used)
 
     def test_multiline_quote_is_not_cropped_into_the_opposite_meaning(self):
         ids = self.seed()

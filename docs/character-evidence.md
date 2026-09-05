@@ -17,12 +17,16 @@ and 20,000 further serialized characters. The total evidence ceiling is 30,000
 characters. The SDK run has at most six turns, 1,800 output tokens per turn and a
 120-second command timeout. These are runtime bounds, not a dollar-price promise.
 
-The structured result contains at most five observable behavioral facets, short
+The structured result contains at most three observable behavioral facets, short
 supporting quotations, optional counterexamples and internal uncertainty. Each
 reference must identify a target-authored record actually exposed to this run;
 the exact quotation must occur in the exposed portion. Repeated observations
 require examples on two dates. If some retained records remain unread, at least
 one additional history inspection is required before publishing observations.
+The prompt prioritizes two or three distinctive observations in direct, natural
+Ukrainian, each developed in two to four sentences. Short evidence excerpts and
+brief internal uncertainty reduce output demand without changing the generation
+allowance; necessary negations and qualifications must remain intact.
 The renderer joins independently supported paragraphs into a Ukrainian portrait,
 without displaying category names or repetitive evidence-log labels. Each
 observation allows up to 650 characters; a cited contrasting observation allows

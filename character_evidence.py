@@ -22,10 +22,14 @@ prior assistant portraits, forwarded material, source_text, other participants o
 Describe specific behavior and context: reasoning and argumentation, handling uncertainty,
 disagreement, initiative, interaction and humor. Do not infer mental health, IQ, trauma,
 sexuality, religion, ethnicity, nationality, gender identity or private-life facts.
-Choose useful distinct facets when supported; do not fill categories just to reach five.
+Aim for two or three of the most distinctive supported observations; use fewer when
+evidence is limited. Do not fill categories or stretch one idea into several paragraphs.
 The facet names are internal organization, not headings for the reader. Each observation
-must be a coherent paragraph that develops a specific, recognizable pattern in ordinary
-Ukrainian prose. Connect how the person speaks with what happens in the cited situations;
+must be a coherent paragraph of two to four sentences that develops a specific, recognizable pattern in ordinary
+Ukrainian prose. Use direct, active verbs and a natural conversational voice, such as
+"спершу перевіряє підстави" or "легко підхоплює жарт", not passive research-report
+formulas such as "увага спрямована" or "пропонується". Describe a recognizable person,
+not an abstract set of communication properties. Connect how the person speaks with what happens in the cited situations;
 include meaningful context or an alternative interpretation naturally in the paragraph.
 Avoid stock compliments, generic traits, topic lists, diagnostic language and bureaucratic labels.
 Do not write headings, bullet lists, evidence IDs, dates or quotation blocks in observation.
@@ -33,7 +37,10 @@ Order the observations so they read as one portrait, without depending on anothe
 for a qualification: the host may omit an independently invalid observation.
 For every observation copy short exact quotations from actually examined evidence and their IDs.
 Choose meaningful excerpts, preferably a phrase or sentence, without changing punctuation,
-spelling or language. The host will copy up to three distinct dated source excerpts into
+spelling or language. Prefer concise phrases of roughly 20–80 characters and one or two
+supporting excerpts per observation; use two different dates when claiming repetition. Never shorten away
+a negation or necessary qualification. Add counterevidence
+only when it materially changes the interpretation. The host will copy up to three distinct dated source excerpts into
 the portrait; its own prose stays Ukrainian, while direct source quotations keep their language.
 Look for counterexamples with read_character_history before generalizing beyond the initial sample;
 use dates or simple lexical queries to inspect a different situation. Search failure is not proof
@@ -43,7 +50,7 @@ Counterevidence must also quote actual examined messages. Describe its contrast 
 in counter_observation as a natural continuation of the paragraph, with no label or heading;
 leave that field empty only when no counterevidence is cited. Do not repeat a qualification
 already present in observation. Do not copy the supporting quotations into either prose field.
-Record uncertainty for each observation as internal reasoning:
+Record uncertainty for each observation as one short internal reasoning clause:
 missing context, plausible alternative interpretation, contradictory examples or limited occasions.
 The uncertainty field is not printed; any caveat essential to the observation must be expressed
 naturally in observation or counter_observation. Do not add generic sample disclaimers to
@@ -72,7 +79,7 @@ class FacetObservation(BaseModel):
 
 class CharacterReport(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    facets: list[FacetObservation] = Field(max_length=5)
+    facets: list[FacetObservation] = Field(max_length=3)
     abstention: Literal["none", "sparse", "ambiguous", "contradictory"]
 
 
