@@ -92,6 +92,15 @@ Evidence SHA-256 fingerprints:
 | V2 measured source archive | `3cfae6a17baa272eda9b74ead2aff7d94455b178ec476ac9550c44684f7c3f31` |
 | V2 aggregate report | `a4bb34d004cfcf81abc20154b6c8b1cd9f910285a83304c0abf767798ae74df0` |
 
+An independent audit verified all labels, scheduled requests, model identities,
+usage and ledger links, 36 boundary results, stability, metrics and the archived
+39-file measured source map. The subsequent integration of #180 changed only
+its approved retrieval functions and imports; AST comparison proved all recall
+functions unchanged. The combined deployment image passed 1,036 tests with one
+skipped. A private synthetic smoke exercised actual invocation, recall admission
+and RRF retrieval in all rollout modes with mocked transport and zero Telegram
+sends; it is distinct from the actual-provider holdout and from field answers.
+
 ## Runtime contract
 
 `MEMORY_RECALL_POLICY_MODE=off` preserves the exact legacy path. `shadow` calls
