@@ -275,5 +275,251 @@ class ChatHistoryTests(unittest.TestCase):
         self.assertEqual(sum(map(len, outputs)), session.chars_used)
 
 
+    def test_cursor_pages_equal_timestamps_without_skips_and_preserves_chronological_output(self):
+        ids = [self.add("blue lantern", created_at="2026-01-01T01:00:00+01:00" if i % 2 else "2026-01-01T00:00:00Z") for i in range(6)]
+        session = self.session()
+        result = self.read(session, mode="search", query="BLUE lantern", limit=2)
+        retrieved = []
+        for page_number in range(3):
+            retrieved.extend(row["id"] for row in reversed(result["messages"]))
+            self.assertEqual(sorted(row["id"] for row in result["messages"]), [row["id"] for row in result["messages"]])
+            self.assertEqual((page_number + 1) * 2, result["coverage"]["displayed_unique_count"])
+            if result["next_cursor"]:
+                result = self.read(session, cursor=result["next_cursor"])
+        self.assertEqual(list(reversed(ids)), retrieved)
+        self.assertIsNone(result["next_cursor"])
+        self.assertFalse(result["coverage"]["has_more_results"])
+        self.assertEqual(3, session.calls_used)
+
+    def test_cursor_restores_filters_and_excludes_late_backfills(self):
+        self.add("wrong participant blue", user_id=9)
+        wanted = [self.add("blue lantern", user_id=2) for _ in range(3)]
+        self.add("red lantern", user_id=2)
+        session = self.session()
+        first = self.read(session, mode="search", query="blue", participant_id=2,
+                          after="2026-01-01T00:02:00Z", before="2026-01-01T00:05:00Z", limit=1)
+        self.add("blue late backfill", created_at=self.start + timedelta(minutes=3), user_id=2)
+        second = self.read(session, cursor=first["next_cursor"], limit=10)
+        third = self.read(session, cursor=second["next_cursor"])
+        self.assertEqual(list(reversed(wanted)), [page["messages"][0]["id"] for page in (first, second, third)])
+        for page in (first, second, third):
+            self.assertEqual("search", page["mode"])
+            self.assertEqual(2, page["coverage"]["participant_id"])
+            self.assertEqual("2026-01-01T00:02:00+00:00", page["coverage"]["scope_after"])
+            self.assertEqual("2026-01-01T00:05:00+00:00", page["coverage"]["scope_before"])
+
+    def test_cursor_is_session_bound_and_cannot_change_filters(self):
+        for _ in range(4):
+            self.add("blue evidence")
+        source = self.session()
+        cursor = self.read(source, limit=1)["next_cursor"]
+        for session in (self.session(), self.session(chat_id=200), self.session(target_user_id=1)):
+            with patch.object(self.store, "bounded_history_rows", wraps=self.store.bounded_history_rows) as reader:
+                self.assertEqual("invalid_filter", self.read(session, cursor=cursor)["status"])
+                reader.assert_not_called()
+        for changed in ({"mode": "search"}, {"query": "blue"}, {"after": "2026-01-01"},
+                        {"before": "2026-02-01"}, {"participant_id": 1}, {"anchor_id": 1},
+                        {"limit": 1}, {"limit": True}, {"limit": 10.0}):
+            session = self.session()
+            cursor = self.read(session, limit=1)["next_cursor"]
+            with patch.object(self.store, "bounded_history_rows", wraps=self.store.bounded_history_rows) as reader:
+                self.assertEqual("invalid_filter", self.read(session, cursor=cursor, **changed)["status"])
+                reader.assert_not_called()
+        for invalid in ("invented", "x" * 97, None, True):
+            self.assertEqual("invalid_filter", self.read(cursor=invalid)["status"])
+
+    def test_budget_omitted_matches_continue_from_oldest_actually_emitted_row(self):
+        ids = [self.add("blue " * 300) for _ in range(5)]
+        session = self.session(limits=HistoryLimits(max_response_chars=3500))
+        # An irrelevant anchor selector must not reverse page trimming.
+        page = self.read(session, mode="search", query="blue", limit=20, anchor_id=ids[0])
+        self.assertFalse(page["coverage"]["more_matching_in_database"])
+        self.assertGreater(page["coverage"]["omitted_due_to_response_budget"], 0)
+        self.assertTrue(page["coverage"]["has_more_results"])
+        retrieved = []
+        while True:
+            retrieved.extend(row["id"] for row in reversed(page["messages"]))
+            self.assertEqual(len(set(retrieved)), page["coverage"]["displayed_unique_count"])
+            if page["next_cursor"] is None:
+                break
+            page = self.read(session, cursor=page["next_cursor"])
+        self.assertEqual(list(reversed(ids)), retrieved)
+        self.assertEqual(set(ids), session.exposed_ids)
+        self.assertLessEqual(session.calls_used, 4)
+
+    def test_around_is_nonpageable_and_coverage_counts_unique_overlapping_rows(self):
+        ids = [self.add(str(i)) for i in range(8)]
+        session = self.session()
+        first = self.read(session, limit=4)
+        second = self.read(session, mode="around", anchor_id=ids[4], limit=5)
+        expected = {row["id"] for page in (first, second) for row in page["messages"]}
+        self.assertEqual(len(expected), second["coverage"]["displayed_unique_count"])
+        self.assertFalse(second["coverage"]["pagination_supported"])
+        self.assertIsNone(second["next_cursor"])
+        self.assertTrue(second["coverage"]["has_more_results"])
+
+    def test_last_coverage_is_defensive_and_cleared_on_failure_or_denial(self):
+        self.add("blue evidence")
+        session = self.session()
+        self.assertIsNone(session.last_coverage)
+        page = self.read(session)
+        coverage = session.last_coverage
+        self.assertEqual(page["coverage"], coverage)
+        coverage["displayed_unique_count"] = 9999
+        self.assertEqual(1, session.last_coverage["displayed_unique_count"])
+        self.read(session, cursor="foreign")
+        self.assertIsNone(session.last_coverage)
+        self.read(session, mode="search", query="unknown")
+        self.assertEqual(0, session.last_coverage["returned_count"])
+        self.read(session)
+        self.assertIsNotNone(session.last_coverage)
+        self.read(session)
+        self.assertIsNone(session.last_coverage)
+
+    def test_evidence_snapshots_and_markers_cover_only_emitted_rows_and_are_immutable(self):
+        from dataclasses import FrozenInstanceError
+        import hashlib
+        ids = [self.add("blue " * 300) for _ in range(8)]
+        session = self.session(limits=HistoryLimits(max_response_chars=2500))
+        page = self.read(session, limit=8)
+        exposed = session.exposed_items
+        self.assertEqual({row["id"] for row in page["messages"]}, {row.id for row in exposed})
+        self.assertLess(len(exposed), len(ids))
+        for item in exposed:
+            self.assertEqual(hashlib.sha256(item.serialized_row.encode()).hexdigest(), item.sha256)
+            self.assertEqual(item.citation_ref, item.to_dict()["citation_ref"])
+            self.assertEqual(item, session.validated_exposed_item(item.id))
+            self.assertEqual(item, session.resolve_citation_ref(item.citation_ref))
+            modified = item.to_dict()
+            modified["text"] = "modified caller copy"
+            self.assertNotEqual(modified, item.to_dict())
+            with self.assertRaises(FrozenInstanceError):
+                item.message_id = 999
+        for item_id in set(ids) - session.exposed_ids:
+            self.assertIsNone(session.validated_exposed_item(item_id))
+        self.assertIsNone(session.validated_exposed_item(True))
+        self.assertIsNone(session.resolve_citation_ref(exposed[0].citation_ref + "extra"))
+        self.assertIsNone(self.session().resolve_citation_ref(exposed[0].citation_ref))
+        self.assertNotIn("canonical_sha256", session.read())
+        self.assertNotIn("evidence_digest", session.read())
+
+    def test_evidence_validation_rejects_edits_beyond_truncation_and_deletion(self):
+        expected = self.add("x" * 2500)
+        session = self.session()
+        self.read(session)
+        original = session.exposed_items[0]
+        self.assertTrue(original.to_dict()["truncated"])
+        self.assertEqual(original, session.validated_exposed_item(expected))
+        # Preserve the exposed prefix but change the unseen tail.
+        with self.store._lock:
+            self.store._conn.execute("UPDATE messages SET text = ? WHERE id = ?", ("x" * 2499 + "y", expected))
+            self.store._conn.commit()
+        self.assertIsNone(session.validated_exposed_item(expected))
+        self.assertIsNone(session.resolve_citation_ref(original.citation_ref))
+        with self.store._lock:
+            self.store._conn.execute("DELETE FROM messages WHERE id = ?", (expected,))
+            self.store._conn.commit()
+        self.assertIsNone(session.validated_exposed_item(expected))
+
+    def test_parallel_publication_reports_union_and_counts_all_marker_metadata(self):
+        for i in range(20):
+            self.add("blue " * 100, user_id=1 + i % 2)
+        session = self.session(limits=HistoryLimits(max_response_chars=4000, max_total_chars=8000))
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            outputs = list(pool.map(lambda user: session.read(participant_id=user, limit=20), (1, 2, 1, 2)))
+        pages = [json.loads(output) for output in outputs if output]
+        union = {row["id"] for page in pages for row in page["messages"]}
+        self.assertEqual(union, session.exposed_ids)
+        self.assertEqual(len(union), max(page.get("coverage", {}).get("displayed_unique_count", 0) for page in pages))
+        self.assertEqual(sum(map(len, outputs)), session.chars_used)
+        self.assertLessEqual(session.chars_used, 8000)
+        self.assertTrue(all(len(output) <= 4000 for output in outputs))
+
+    def test_unemitted_no_match_coverage_is_not_retained_under_small_remaining_budget(self):
+        session = self.session(limits=HistoryLimits(max_response_chars=1024, max_total_chars=1536))
+        for _ in range(4):
+            text = session.read(mode="search", query="absent", after="2026-01-01T00:00:00+00:00", before="2026-01-02T00:00:00+00:00")
+            payload = json.loads(text) if text else {}
+            self.assertEqual(payload.get("coverage"), session.last_coverage)
+        self.assertLessEqual(session.chars_used, 1536)
+
+    def test_minimum_response_budget_cannot_publish_unseen_evidence_or_cursor(self):
+        self.add("blue " * 400)
+        session = self.session(limits=HistoryLimits(max_response_chars=1024, max_total_chars=1024))
+        output = session.read()
+        self.assertLessEqual(len(output), 1024)
+        self.assertEqual([], json.loads(output)["messages"])
+        self.assertEqual((), session.exposed_items)
+        self.assertEqual(frozenset(), session.exposed_ids)
+        self.assertIsNone(json.loads(output).get("next_cursor"))
+        self.assertIsNone(session.last_coverage)
+
+
+    def test_cancelled_async_selection_cannot_publish_unseen_rows_or_references(self):
+        expected = self.add("synthetic evidence")
+        session = self.session()
+        entered, release, finished = threading.Event(), threading.Event(), threading.Event()
+        original = self.store.bounded_history_rows
+
+        def blocked(**kwargs):
+            entered.set()
+            release.wait(timeout=3)
+            try:
+                return original(**kwargs)
+            finally:
+                finished.set()
+
+        async def run():
+            task = asyncio.create_task(session.aread())
+            try:
+                self.assertTrue(await asyncio.to_thread(entered.wait, 1))
+                task.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await task
+                self.assertEqual(1, session.calls_used)
+                self.assertEqual(0, session._reserved_chars)
+            finally:
+                release.set()
+                await asyncio.gather(task, return_exceptions=True)
+                self.assertTrue(await asyncio.to_thread(finished.wait, 1))
+            await asyncio.sleep(0)
+            self.assertEqual(frozenset(), session.exposed_ids)
+            self.assertEqual((), session.exposed_items)
+            self.assertEqual(0, session.chars_used)
+            self.assertIsNone(session.last_coverage)
+            self.assertIsNone(session.validated_exposed_item(expected))
+
+        with patch.object(self.store, "bounded_history_rows", side_effect=blocked):
+            asyncio.run(run())
+        self.assertEqual([expected], [row["id"] for row in self.read(session)["messages"]])
+        self.assertEqual(2, session.calls_used)
+
+    def test_rereading_edited_row_cannot_reauthorize_old_reference(self):
+        expected = self.add("old synthetic version")
+        session = self.session()
+        first = self.read(session)["messages"][0]
+        self.assertIsNotNone(session.resolve_citation_ref(first["citation_ref"]))
+        with self.store._lock:
+            self.store._conn.execute("UPDATE messages SET text = ? WHERE id = ?", ("new synthetic version", expected))
+            self.store._conn.commit()
+        self.assertIsNone(session.resolve_citation_ref(first["citation_ref"]))
+        second = self.read(session)["messages"][0]
+        self.assertEqual(first["id"], second["id"])
+        self.assertNotEqual(first["citation_ref"], second["citation_ref"])
+        self.assertIsNone(session.resolve_citation_ref(first["citation_ref"]))
+        self.assertEqual("new synthetic version", session.resolve_citation_ref(second["citation_ref"]).to_dict()["text"])
+        self.assertEqual(1, session.last_coverage["displayed_unique_count"])
+
+    def test_forward_origin_without_source_text_keeps_safe_attribution(self):
+        expected = self.add("forwarded body in a legacy text field", source_text="", forward_origin="PRIVATE_ORIGIN")
+        session = self.session()
+        output = session.read()
+        row = json.loads(output)["messages"][0]
+        self.assertEqual(expected, row["id"])
+        self.assertTrue(row["is_forwarded"])
+        self.assertNotIn("PRIVATE_ORIGIN", output)
+        self.assertTrue(session.validated_exposed_item(expected).to_dict()["is_forwarded"])
+
+
 if __name__ == "__main__":
     unittest.main()
