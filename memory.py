@@ -735,6 +735,72 @@ class MemoryStore:
                 raise ValueError("Unknown history mode")
         return [dict(row) for row in rows], more
 
+    def read_history_retrieval_candidates(
+        self, *, chat_id: int, cutoff_memory_id: int, cutoff_created_at: str,
+        participant_id: int | None = None, after: str = "", before: str = "",
+        authored_only: bool = False, scan_limit: int = 8192, query: str = "",
+    ) -> tuple[list[tuple[MemoryItem, dict[str, object]]], bool, dict[int, float], bool]:
+        """Private bounded snapshot for history_retrieval, never a model payload.
+
+        Scope filters precede both the cap probe and every retrieval channel.
+        Probe IDs first: an oversized archive is refused without loading bodies
+        or silently narrowing it to recent rows. The caller projects safe fields.
+        """
+        scan_limit = max(1, min(8192, int(scan_limit)))
+        conditions = ["m.chat_id = ?", "m.id < ?", "julianday(m.created_at) <= julianday(?)"]
+        params: list[object] = [chat_id, cutoff_memory_id, cutoff_created_at]
+        if participant_id is not None:
+            conditions.append("m.user_id = ?")
+            params.append(participant_id)
+        if after:
+            conditions.append("julianday(m.created_at) >= julianday(?)")
+            params.append(after)
+        if before:
+            conditions.append("julianday(m.created_at) < julianday(?)")
+            params.append(before)
+        if authored_only:
+            conditions.extend([
+                "m.is_bot = 0", "m.text != ''", "m.text NOT LIKE '[message has %'",
+                "m.forward_origin = ''", "m.content_kind = 'text'",
+            ])
+        where = " AND ".join(conditions)
+        with self._lock:
+            ids = self._conn.execute(
+                f"SELECT m.id FROM messages m WHERE {where} LIMIT ?", (*params, scan_limit + 1),
+            ).fetchall()
+            if len(ids) > scan_limit:
+                return [], True, {}, False
+            rows = self._conn.execute(
+                f"""SELECT m.*, julianday(m.created_at) AS sort_time,
+                    e.chat_id AS embedding_chat_id, e.model AS embedding_model,
+                    e.dimensions AS embedding_dimensions, e.content_hash AS embedding_hash,
+                    e.embedding_blob, e.embedded_at
+                    FROM messages m LEFT JOIN message_embeddings e ON e.message_id = m.id
+                    WHERE {where} ORDER BY m.id LIMIT ?""", (*params, scan_limit + 1),
+            ).fetchall()
+            if len(rows) > scan_limit:
+                return [], True, {}, False
+            scores: dict[int, float] = {}
+            fts_available = True
+            # The existing FTS index mixes authored/source fields. Do not use
+            # that channel for an authored-only scope.
+            fts_query = self._fts_query(query) if not authored_only else ""
+            if fts_query:
+                try:
+                    matches = self._conn.execute(
+                        f"""SELECT m.id, bm25(message_fts) AS rank FROM message_fts
+                            JOIN messages m ON m.id = message_fts.rowid
+                            WHERE message_fts MATCH ? AND {where}
+                            ORDER BY rank ASC, m.id ASC LIMIT ?""",
+                        (fts_query, *params, scan_limit),
+                    ).fetchall()
+                    scores = {row["id"]: -float(row["rank"] or 0.) for row in matches}
+                except sqlite3.OperationalError:
+                    fts_available = False
+        fields = ("sort_time", "embedding_chat_id", "embedding_model", "embedding_dimensions",
+                  "embedding_hash", "embedding_blob", "embedded_at")
+        return [(self._row_to_item(row), {key: row[key] for key in fields}) for row in rows], False, scores, fts_available
+
     def context_window_around_item(
         self,
         chat_id: int,
