@@ -49,8 +49,12 @@ their existing transport policy.
 Provider admission checks the complete scope cap and stops vector validation at
 the first fully valid vector. This boolean check authorizes no source and claims
 no complete index counts. The separate aggregate preflight API remains available
-for diagnostics. After a provider await, retrieval
+for diagnostics. Admission is skipped when the query vector is already cached,
+no provider is configured, or the embedding budget is exhausted. Every path
+still performs fresh final retrieval. After a provider await, retrieval
 reads a fresh snapshot rather than caching source content across that await.
+Fresh scope refusal or an unusable index takes precedence over a provider-budget
+fallback; exhausted embedding calls remain reported in the usage count.
 Cancellation cannot publish candidates from a continuing SQLite worker. Failed
 or timed-out embeddings retain literal search with a specific fallback reason;
 they do not expose provider exception text. Aggregate diagnostics contain no

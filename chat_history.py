@@ -262,9 +262,7 @@ class ChatHistorySession:
                 spec = self._query_spec(mode=mode, query=query, anchor_id=anchor_id,
                     participant_id=participant_id, after=after, before=before, limit=limit)
                 scope = self._semantic_scope(spec)
-                can_embed = await asyncio.to_thread(history_query_embedding_available, self._store, scope)
-                vector, reason = (await self._query_vector(spec.semantic_query)
-                                  if can_embed else (None, ""))
+                vector, reason = await self._query_vector(spec.semantic_query, scope)
                 result = await asyncio.to_thread(retrieve_history, self._store, scope=scope,
                     query=spec.semantic_query, query_vector=vector, mode=mode, limit=spec.limit)
                 return self._publish_semantic(budget, spec, result, reason)
@@ -322,7 +320,7 @@ class ChatHistorySession:
         return HistorySearchScope(self._chat_id, self._cutoff_id, self._cutoff_at,
             query.participant_id, query.after, query.before, self._target_id is not None)
 
-    async def _query_vector(self, query: str) -> tuple[tuple[float, ...] | None, str]:
+    async def _query_vector(self, query: str, scope: HistorySearchScope) -> tuple[tuple[float, ...] | None, str]:
         key = " ".join(query.split())
         with self._lock:
             cached = self._query_vectors.get(key)
@@ -330,6 +328,18 @@ class ChatHistorySession:
                 return cached, ""
             if self._query_embedder is None:
                 return None, "query_embedding_unavailable"
+            if self._embedding_calls_used >= self.limits.max_embedding_calls:
+                return None, "embedding_budget_exhausted"
+        # Admission only avoids a needless provider call. Cached vectors and
+        # unavailable/exhausted providers still get the full fresh final read.
+        if not await asyncio.to_thread(history_query_embedding_available, self._store, scope):
+            return None, ""
+        with self._lock:
+            # Another tool call may finish or claim the last slot during the
+            # admission read. Recheck before reserving an actual provider call.
+            cached = self._query_vectors.get(key)
+            if cached is not None:
+                return cached, ""
             if self._embedding_calls_used >= self.limits.max_embedding_calls:
                 return None, "embedding_budget_exhausted"
             self._embedding_calls_used += 1
@@ -349,6 +359,11 @@ class ChatHistorySession:
 
     def _publish_semantic(self, budget: int, query: _HistoryQuery,
                           result: HistoryRetrievalResult, reason: str = "") -> str:
+        fallback_reason = reason or result.fallback_reason
+        if result.coverage.status == "scope_too_large":
+            fallback_reason = "scope_too_large"
+        elif result.fallback_reason == "no_usable_index":
+            fallback_reason = "no_usable_index"
         coverage = {
             "selection": "nearest_retained_evidence" if result.embeddings_used else "newest_literal_matches",
             "lexical_only": not result.embeddings_used, "semantic_status": result.coverage.status,
@@ -357,7 +372,7 @@ class ChatHistorySession:
             "candidate_scan_limit": result.coverage.scan_limit,
             "embeddings_used": result.embeddings_used, "embedding_calls_used": self.embedding_calls_used,
             "applied_mode": result.applied_mode, "fusion_policy": result.fusion_policy,
-            "fallback_reason": reason or result.fallback_reason,
+            "fallback_reason": fallback_reason,
             "answerability": "nearest_neighbors_are_not_proof_of_an_answer",
         }
         LOGGER.info("History retrieval mode=%s status=%s scoped_rows=%d indexed_rows=%d candidate_rows=%d embeddings_used=%s",

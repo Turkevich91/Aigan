@@ -89,6 +89,91 @@ class HistorySemanticSessionTests(retrieval_fixtures.HistoryRetrievalTests):
             self.run_read(session, mode="hybrid", query="blue lantern")
         self.assertEqual(1, embedder.await_count)
 
+    def test_cached_vector_skips_admission_but_rechecks_stale_source_index(self):
+        target = self.add(embedding=vector())
+        embedder = AsyncMock(return_value=vector())
+        session = self.session(embedder)
+        first = self.run_read(session, mode="semantic", query="meaning")
+        self.assertTrue(first["coverage"]["embeddings_used"])
+        self.change_embedding(target, content_hash="changed-after-first-read")
+        with patch("chat_history.history_query_embedding_available") as admission, \
+             patch.object(self.store, "read_history_retrieval_candidates", wraps=self.store.read_history_retrieval_candidates) as read:
+            result = self.run_read(session, mode="semantic", query="meaning")
+        admission.assert_not_called()
+        self.assertEqual(1, read.call_count)
+        self.assertEqual(1, embedder.await_count)
+        self.assertEqual([], result["messages"])
+        self.assertFalse(result["coverage"]["embeddings_used"])
+        self.assertEqual("no_usable_index", result["coverage"]["fallback_reason"])
+
+    def test_unavailable_provider_skips_admission_and_still_reads_literal_sources(self):
+        target = self.add(embedding=vector())
+        session = self.session()
+        with patch("chat_history.history_query_embedding_available") as admission, \
+             patch.object(self.store, "read_history_retrieval_candidates", wraps=self.store.read_history_retrieval_candidates) as read:
+            result = self.run_read(session, mode="hybrid", query="blue lantern")
+        admission.assert_not_called()
+        self.assertEqual(1, read.call_count)
+        self.assertEqual([target], [row["id"] for row in result["messages"]])
+        self.assertEqual("query_embedding_unavailable", result["coverage"]["fallback_reason"])
+        self.assertEqual(0, session.embedding_calls_used)
+
+    def test_exhausted_provider_skips_admission_and_reports_actual_budget(self):
+        target = self.add("blue lantern one two", embedding=vector())
+        embedder = AsyncMock(return_value=vector())
+        session = self.session(embedder)
+        for query in ("one", "two"):
+            self.run_read(session, mode="semantic", query=query)
+        with patch("chat_history.history_query_embedding_available") as admission, \
+             patch.object(self.store, "read_history_retrieval_candidates", wraps=self.store.read_history_retrieval_candidates) as read:
+            result = self.run_read(session, mode="hybrid", query="blue lantern")
+        admission.assert_not_called()
+        self.assertEqual(1, read.call_count)
+        self.assertEqual(2, embedder.await_count)
+        self.assertEqual([target], [row["id"] for row in result["messages"]])
+        self.assertEqual("embedding_budget_exhausted", result["coverage"]["fallback_reason"])
+        self.assertEqual(2, result["coverage"]["embedding_calls_used"])
+
+    def test_exhausted_provider_reports_fresh_missing_index_before_budget(self):
+        for invalidation in ("stale", "deleted"):
+            with self.subTest(invalidation=invalidation):
+                target = self.add("blue lantern one two", embedding=vector())
+                embedder = AsyncMock(return_value=vector())
+                session = self.session(embedder)
+                for query in ("one", "two"):
+                    self.run_read(session, mode="semantic", query=query)
+                if invalidation == "stale":
+                    self.change_embedding(target, content_hash="changed-after-budget-used")
+                else:
+                    self.store._conn.execute("DELETE FROM message_embeddings")
+                    self.store._conn.commit()
+                with patch("chat_history.history_query_embedding_available") as admission, \
+                     patch.object(self.store, "read_history_retrieval_candidates", wraps=self.store.read_history_retrieval_candidates) as read:
+                    result = self.run_read(session, mode="hybrid", query="blue lantern")
+                admission.assert_not_called()
+                self.assertEqual(1, read.call_count)
+                self.assertEqual(2, embedder.await_count)
+                self.assertIn(target, [row["id"] for row in result["messages"]])
+                self.assertEqual("no_usable_index", result["coverage"]["fallback_reason"])
+                self.assertEqual(2, result["coverage"]["embedding_calls_used"])
+
+    def test_exhausted_provider_reports_fresh_scope_refusal_before_budget(self):
+        self.add("blue lantern one two", embedding=vector())
+        self.add("second retained statement", embedding=vector())
+        embedder = AsyncMock(return_value=vector())
+        session = self.session(embedder)
+        for query in ("one", "two"):
+            self.run_read(session, mode="semantic", query=query)
+        with patch("chat_history.history_query_embedding_available") as admission, \
+             patch("history_retrieval.HISTORY_SCAN_LIMIT", 1):
+            result = self.run_read(session, mode="hybrid", query="blue lantern")
+        admission.assert_not_called()
+        self.assertEqual(2, embedder.await_count)
+        self.assertEqual([], result["messages"])
+        self.assertEqual("scope_too_large", result["status"])
+        self.assertEqual("scope_too_large", result["coverage"]["fallback_reason"])
+        self.assertEqual(2, result["coverage"]["embedding_calls_used"])
+
     def test_parallel_queries_respect_provider_and_shared_reservations(self):
         self.add("blue lantern one two three", embedding=vector())
         embedder = AsyncMock(return_value=vector())
