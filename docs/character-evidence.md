@@ -115,7 +115,12 @@ Its exact literal chunks are recoverable for 24 hours, separately from searchabl
 chat messages, embeddings and personal profiles. Expired rows are purged on the
 next character request; there is no separate cleanup timer. Storage is capped at
 128 responses and 2,048 command records. A response has at most eight chunks and
-16,000 characters; pending responses are not evicted to admit another model run. Each part is
+16,000 characters, with at most 4,096 UTF-16 units per chunk. The grounded
+command clamps configurable reply limits to these final bounds, including
+numbering and truncation markers. Rendering and preparation share that calculation
+so whole observations and literal sources are retained together. A configuration
+that cannot fit even the coverage-only response is rejected before a model call.
+Pending responses are not evicted to admit another model run. Each part is
 marked before the network attempt and confirmed only after Telegram returns a
 real message identifier. A timeout, cancellation or interrupted acknowledgement
 remains uncertain rather than being treated as a safe automatic retry.

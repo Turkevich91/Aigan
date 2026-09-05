@@ -335,6 +335,46 @@ class DeliveryStoreTests(unittest.IsolatedAsyncioTestCase):
         sent.assert_not_awaited()
 
 
+class GroundedCharacterChunkTests(unittest.TestCase):
+    def test_final_chunks_fit_store_with_elevated_tiny_and_unicode_config(self):
+        cases = (
+            ("long_bmp", "Ж" * 60000, 4096, 60000, 99, True),
+            ("unicode", "**literal** <b>original</b> & " + "😀" * 5000, 4096, 60000, 99, False),
+            ("tiny_chunks", "Original prose " * 400, 20, 60000, 99, True),
+            ("prefix_overhead", "Ж" * 16000, 3500, 16000, 99, True),
+            ("lower_config", "Short paragraphs. " * 100, 250, 400, 2, True),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            store = cd.CharacterDeliveryStore(Path(directory) / "chunks.sqlite3")
+            try:
+                for index, (label, text, per_chunk, total, parts, shortened) in enumerate(cases, 1):
+                    config = replace(main.CONFIG, telegram_text_chunk_chars=per_chunk,
+                                     max_reply_chars=total, max_reply_chunks=parts)
+                    with self.subTest(case=label), patch.object(main, "CONFIG", config):
+                        chunks = main.grounded_character_chunks(text)
+                        self.assertLessEqual(len(chunks), min(parts, cd.MAX_CHUNKS))
+                        self.assertLessEqual(sum(map(len, chunks)), min(total, cd.MAX_TEXT_CHARS))
+                        self.assertTrue(all(len(chunk) <= per_chunk for chunk in chunks))
+                        self.assertTrue(all(len(chunk.encode("utf-16-le")) // 2 <= cd.MAX_CHUNK_UTF16_UNITS for chunk in chunks))
+                        if shortened:
+                            self.assertIn("[...] скорочено", chunks[-1])
+                        if label == "unicode":
+                            self.assertIn("**literal** <b>original</b> &", chunks[0])
+                        claim = store.admit(cd.CharacterDeliveryScope(-1001, 0, index, index), index,
+                                            command_time=store.clock())
+                        prepared = store.prepare(claim, tuple(chunks))
+                        self.assertEqual(tuple(chunks), prepared.chunks)
+                        store.release(claim)
+            finally:
+                store.close()
+
+    def test_already_valid_default_chunking_is_unchanged(self):
+        config = replace(main.CONFIG, telegram_text_chunk_chars=3500, max_reply_chars=12000, max_reply_chunks=4)
+        for text in ("Literal **text** <b>example</b> & data.", "A" * 3000 + "\n\n" + "B" * 1000):
+            with self.subTest(length=len(text)), patch.object(main, "CONFIG", config):
+                self.assertEqual(main.split_text_chunks(text), main.grounded_character_chunks(text))
+
+
 class DeliveryCommandTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.tmp=tempfile.TemporaryDirectory()
@@ -538,6 +578,75 @@ class DeliveryCommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(3, len(sent))
         self.assertIn('Термін збереження', sent[-1])
         self.assertNotIn('надішлю збережений текст', sent[-1])
+
+    async def test_impossible_tiny_coverage_budget_is_rejected_before_model(self):
+        config = replace(self.config, telegram_text_chunk_chars=20, max_reply_chunks=99, max_reply_chars=60000)
+        for requester in (101, 202):
+            with self.subTest(has_history=requester == 101), patch.object(main, "CONFIG", config):
+                message = self.message(1000 + requester, user_id=requester)
+                await self.run_command(message)
+                self.assertEqual(1, len(message.reply_calls))
+                self.assertIn("Ліміт довжини", message.reply_calls[0]["text"])
+        self.model.assert_not_awaited()
+        with sqlite3.connect(self.memory.db_path) as connection:
+            self.assertEqual(0, connection.execute("SELECT count(*) FROM character_delivery_responses").fetchone()[0])
+
+    async def test_unicode_portrait_and_whole_facet_fit_use_prepared_chunk_adapter(self):
+        from character_evidence import EvidenceReference, FacetObservation
+        observations = []
+        def report(session):
+            ids = sorted(session.examined_ids)
+            facets = []
+            for index, kind in enumerate(("argumentation", "initiative", "interaction")):
+                observation = f"Прояв {index}: " + "😀" * 640 + "."
+                observations.append(observation)
+                facets.append(FacetObservation(facet=kind, observation=observation,
+                    evidence=[EvidenceReference(id=ids[index], quote="Перевірмо факти")],
+                    counterevidence=[], counter_observation="", scope="isolated", uncertainty="Один приклад."))
+            result = CharacterReport(facets=facets, abstention="none")
+            original = session.render(result)
+            self.assertGreater(max(len(c.encode("utf-16-le")) // 2 for c in main.split_text_chunks(original)), 4096)
+            return result
+        self.model.side_effect = report
+        config = replace(self.config, telegram_text_chunk_chars=3500, max_reply_chunks=99, max_reply_chars=60000)
+        with patch.object(main, "CONFIG", config):
+            message = self.message()
+            await self.run_command(message)
+        self.model.assert_awaited_once()
+        visible = "\n\n".join(row["text"] for row in message.reply_calls)
+        self.assertTrue(all(observation in visible for observation in observations))
+        self.assertIn("Переглянуто унікальних", visible)
+        self.assertTrue(all(len(row["text"].encode("utf-16-le")) // 2 <= 4096 for row in message.reply_calls))
+        with sqlite3.connect(self.memory.db_path) as connection:
+            row = connection.execute("SELECT chunks_json,complete FROM character_delivery_responses").fetchone()
+        self.assertEqual(1, row[1])
+        self.assertEqual(json.loads(row[0]), [r["text"] for r in message.reply_calls])
+
+    async def test_reduced_config_omits_whole_last_facets_and_keeps_coverage(self):
+        from character_evidence import EvidenceReference, FacetObservation
+        observations = []
+        def report(session):
+            ids = sorted(session.examined_ids)
+            facets = []
+            for index, kind in enumerate(("argumentation", "initiative", "interaction")):
+                observation = f"WHOLE_FACET_{index} " + "контекст " * 60 + "END."
+                observations.append(observation)
+                facets.append(FacetObservation(facet=kind, observation=observation,
+                    evidence=[EvidenceReference(id=ids[index], quote="Перевірмо факти")],
+                    counterevidence=[], counter_observation="", scope="isolated", uncertainty="Один приклад."))
+            return CharacterReport(facets=facets, abstention="none")
+        self.model.side_effect = report
+        config = replace(self.config, telegram_text_chunk_chars=900, max_reply_chunks=99, max_reply_chars=1300)
+        with patch.object(main, "CONFIG", config):
+            message = self.message()
+            await self.run_command(message)
+        visible = "\n\n".join(row["text"] for row in message.reply_calls)
+        self.assertIn(observations[0], visible)
+        self.assertNotIn("WHOLE_FACET_2", visible)
+        self.assertIn("Частину перевірених спостережень опущено", visible)
+        self.assertIn("Переглянуто унікальних", visible)
+        self.assertNotIn("[...] скорочено", visible)
+        self.assertLessEqual(sum(len(row["text"]) for row in message.reply_calls), 1300)
 
     async def test_expired_telegram_update_does_not_start_model(self):
         message=self.message();message.date=self.now-timedelta(days=2)

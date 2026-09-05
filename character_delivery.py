@@ -16,6 +16,7 @@ MAX_RESPONSES = 128
 MAX_COMMANDS = 2048
 MAX_CHUNKS = 8
 MAX_TEXT_CHARS = 16000
+MAX_CHUNK_UTF16_UNITS = 4096
 SEND_TIMEOUT_SECONDS = 30
 RECOVERY_NOTICE = "Відновлюю готову відповідь; попередня спроба могла дійти."
 CONFIRMED_FAILURE_RECOVERY_NOTICE = "Відновлюю готову відповідь."
@@ -181,7 +182,7 @@ class CharacterDeliveryStore:
     def prepare(self, claim: CharacterDeliveryClaim, chunks: tuple[str, ...]) -> PreparedCharacterResponse:
         if not isinstance(chunks, tuple) or not 1 <= len(chunks) <= MAX_CHUNKS:
             raise CharacterDeliveryError("prepared_chunk_limit")
-        if any(not isinstance(c, str) or not c or len(c) > 4096 or len(c.encode("utf-16-le")) // 2 > 4096 for c in chunks):
+        if any(not isinstance(c, str) or not c or len(c) > MAX_CHUNK_UTF16_UNITS or len(c.encode("utf-16-le")) // 2 > MAX_CHUNK_UTF16_UNITS for c in chunks):
             raise CharacterDeliveryError("prepared_chunk_invalid")
         if sum(map(len, chunks)) > MAX_TEXT_CHARS:
             raise CharacterDeliveryError("prepared_text_limit")

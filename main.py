@@ -91,6 +91,9 @@ from history_citations import ACTIVE_HISTORY_CITATIONS, HistoryCitationSession
 from character_delivery import (
     CharacterDeliveryStore, CharacterDeliveryScope, CharacterDeliveryError,
     deliver_prepared_character,
+    MAX_CHUNKS as CHARACTER_DELIVERY_MAX_CHUNKS,
+    MAX_TEXT_CHARS as CHARACTER_DELIVERY_MAX_TEXT_CHARS,
+    MAX_CHUNK_UTF16_UNITS as CHARACTER_DELIVERY_MAX_CHUNK_UTF16_UNITS,
 )
 from character_evidence import (
     CHARACTER_INSTRUCTIONS, CharacterEvidenceSession, CharacterReport, InvalidCharacterEvidence,
@@ -12015,6 +12018,39 @@ async def run_character_evidence(session: CharacterEvidenceSession) -> Character
         hooks.finalize_pending("failed", "character_run_ended_with_pending_turn")
 
 
+def grounded_character_chunks(text: str) -> list[str]:
+    """Fit the final numbered/marked transport into config and prepared-store caps."""
+    chunk_chars = max(20, min(CONFIG.telegram_text_chunk_chars, CHARACTER_DELIVERY_MAX_CHUNK_UTF16_UNITS))
+    max_chunks = max(1, min(CONFIG.max_reply_chunks, CHARACTER_DELIVERY_MAX_CHUNKS))
+    total_chars = max(1, min(CONFIG.max_reply_chars, CHARACTER_DELIVERY_MAX_TEXT_CHARS))
+    input_chars = total_chars
+
+    def split() -> list[str]:
+        return split_text_chunks(text, chunk_chars=chunk_chars, max_chunks=max_chunks,
+                                 max_total_chars=input_chars)
+
+    chunks = split()
+    if any(len(chunk.encode("utf-16-le")) // 2 > CHARACTER_DELIVERY_MAX_CHUNK_UTF16_UNITS for chunk in chunks):
+        # Preserve existing chunking when already safe. Only oversized Unicode
+        # chunks need the conservative two-units-per-code-point local limit.
+        chunk_chars = min(chunk_chars, CHARACTER_DELIVERY_MAX_CHUNK_UTF16_UNITS // 2)
+        chunks = split()
+    if sum(map(len, chunks)) > total_chars:
+        # The generic splitter caps its input, then adds numbering and a marker.
+        # Reserve their worst-case final size before splitting again locally.
+        numbering = len(f"{max_chunks}/{max_chunks}\n") * max_chunks if max_chunks > 1 else 0
+        input_chars = total_chars - numbering - len("\n\n[...] скорочено")
+        if input_chars <= 0:
+            raise CharacterDeliveryError("character_reply_budget_too_small")
+        chunks = split()
+    if (len(chunks) > max_chunks or sum(map(len, chunks)) > total_chars or
+            any(len(chunk) > chunk_chars or
+                len(chunk.encode("utf-16-le")) // 2 > CHARACTER_DELIVERY_MAX_CHUNK_UTF16_UNITS
+                for chunk in chunks)):
+        raise CharacterDeliveryError("character_reply_budget_too_small")
+    return chunks
+
+
 def grounded_character_target_id(message: Message, target: UserCommandTarget) -> int | None:
     if MEMORY is None or not should_allow_chat(message) or not command_target_allowed(message, target):
         return None
@@ -12088,8 +12124,15 @@ async def handle_grounded_character(message: Message, context: ContextTypes.DEFA
                 return
             session = CharacterEvidenceSession(memory, chat_id=message.chat_id, target_user_id=target_id,
                 cutoff_memory_id=current_id, cutoff_created_at=message_datetime(message).isoformat())
+            def fits(text: str, blocks: tuple[str, ...]) -> bool:
+                delivered = "\n\n".join(grounded_character_chunks(text))
+                return all(block in delivered for block in blocks)
+            # Reject a configuration that cannot even retain the coverage note
+            # before spending on a model response. The actual render uses this
+            # same final transport contract and omits whole observations to fit.
+            minimum_response = session.render(CharacterReport(facets=[], abstention="sparse"), fits=fits)
             if len(session.examined_ids) < 3:
-                response = session.render(CharacterReport(facets=[], abstention="sparse"))
+                response = minimum_response
             else:
                 try:
                     await asyncio.wait_for(maybe_send_chat_action(context, message.chat_id, ChatAction.TYPING), timeout=5)
@@ -12097,9 +12140,7 @@ async def handle_grounded_character(message: Message, context: ContextTypes.DEFA
                     pass
                 try:
                     report = await asyncio.wait_for(run_character_evidence(session), timeout=120)
-                    response = session.render(report, fits=lambda text, blocks: all(
-                        block in "\n\n".join(split_text_chunks(text)) for block in blocks
-                    ))
+                    response = session.render(report, fits=fits)
                     if session.rejected_facet_count:
                         system_event(component="character", event_type="evidence_partially_rejected",
                             message="retained_valid_observations",
@@ -12109,10 +12150,10 @@ async def handle_grounded_character(message: Message, context: ContextTypes.DEFA
                 except InvalidCharacterEvidence as exc:
                     system_event(component="character", event_type="evidence_rejected", message=str(exc),
                         details={"examined_count": len(session.examined_ids), "available_count": session.available_count})
-                    response = session.render(CharacterReport(facets=[], abstention="ambiguous"))
+                    response = session.render(CharacterReport(facets=[], abstention="ambiguous"), fits=fits)
             # Store the exact final chunks once. Recovery never splits them again
             # or inserts a banner into the paid response's text budget.
-            prepared = delivery.prepare(claim, tuple(split_text_chunks(response)))
+            prepared = delivery.prepare(claim, tuple(grounded_character_chunks(response)))
             event("prepared")
         await deliver_prepared_character(delivery, claim, prepared,
             lambda chunk: message.reply_text(chunk, parse_mode=None), permitted,
@@ -12131,6 +12172,8 @@ async def handle_grounded_character(message: Message, context: ContextTypes.DEFA
         )
         if expired:
             await notice("Термін збереження цієї відповіді минув. Нова команда підготує нову відповідь.")
+        elif isinstance(exc, (CharacterDeliveryError, ValueError)) and str(exc) == "character_reply_budget_too_small":
+            await notice("Ліміт довжини відповіді замалий для портрета з поясненням охоплення.")
         elif prepared is not None:
             await notice("Відповідь готова. Якщо вона не з’явилася, повтори цю команду — надішлю збережений текст.")
         else:
