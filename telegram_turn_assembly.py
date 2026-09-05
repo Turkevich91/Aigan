@@ -92,6 +92,12 @@ class TurnAssembler:
         identity = (cohort, part.message_id)
         if identity in self._seen:
             return TurnAdmission("duplicate")
+        # Rejection is still an observed update. Replays must not repeat notices
+        # or become newly admitted when queue capacity or invocation changes.
+        self._seen.add(identity)
+        self._seen_order.append(identity)
+        if len(self._seen_order) > 2048:
+            self._seen.discard(self._seen_order.popleft())
         if not self._fits((part,), max_instruction_chars):
             return TurnAdmission("oversized")
         current = self._turns.get(self._open.get(cohort, -1))
@@ -129,10 +135,6 @@ class TurnAssembler:
         else:
             current = replace(current, parts=(*current.parts, part))
         self._turns[current.token] = current
-        self._seen.add(identity)
-        self._seen_order.append(identity)
-        if len(self._seen_order) > 2048:
-            self._seen.discard(self._seen_order.popleft())
         return TurnAdmission("accepted", current, created)
 
     def get(self, token: int) -> AssembledTurn | None:

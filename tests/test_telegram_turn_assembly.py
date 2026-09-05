@@ -54,19 +54,23 @@ class TurnAssemblyPolicyTests(unittest.TestCase):
 
     def test_group_admission_and_reply_topic_user_isolation(self):
         self.assertEqual("not_invoked", self.offer(1, 0, can_start=False).status)
-        first = self.offer(1, 0)
-        self.assertEqual(first.turn.token, self.offer(2, 1, can_start=False).turn.token)
+        self.assertEqual("duplicate", self.offer(1, 0, can_start=True).status)
+        first = self.offer(2, 0)
+        self.assertEqual(first.turn.token, self.offer(3, 1, can_start=False).turn.token)
         for cohort in (TurnCohort(1, 3), TurnCohort(2, 2), TurnCohort(1, 2, 4), TurnCohort(1, 2, None, 8)):
-            self.assertEqual("not_invoked", self.offer(3, 1, cohort=cohort, can_start=False).status)
-            self.assertNotEqual(first.turn.token, self.offer(3, 1, cohort=cohort).turn.token)
+            self.assertEqual("not_invoked", self.offer(4, 1, cohort=cohort, can_start=False).status)
+            self.assertEqual("duplicate", self.offer(4, 1, cohort=cohort).status)
+            self.assertNotEqual(first.turn.token, self.offer(5, 1, cohort=cohort).turn.token)
 
     def test_message_id_replay_and_out_of_order_are_not_new_turns(self):
         first = self.offer(10, 0)
         self.assertEqual("duplicate", self.offer(10, 0.1).status)
         self.assertEqual("out_of_order", self.offer(9, 0.2).status)
+        self.assertEqual("duplicate", self.offer(9, 0.3).status)
         self.assembler.claim(first.turn.token, now=2)
         self.assembler.finish(first.turn.token)
         self.assertEqual("duplicate", self.offer(10, 3).status)
+        self.assertEqual("duplicate", self.offer(9, 3).status)
 
     def test_fragment_cap_overflow_has_separate_fixed_window(self):
         first = self.offer(1, 0)
@@ -80,8 +84,10 @@ class TurnAssemblyPolicyTests(unittest.TestCase):
 
     def test_source_media_and_instruction_caps_are_enforced(self):
         self.assertEqual("oversized", self.offer(1, 0, instruction="x" * 1001).status)
-        self.assertEqual("oversized", self.offer(1, 0, source_characters=12001).status)
-        self.assertEqual("oversized", self.offer(1, 0, media_count=11).status)
+        self.assertEqual("oversized", self.offer(2, 0, source_characters=12001).status)
+        self.assertEqual("oversized", self.offer(3, 0, media_count=11).status)
+        for message_id in (1, 2, 3):
+            self.assertEqual("duplicate", self.offer(message_id, 1).status)
         self.assertEqual(0, self.assembler.outstanding_count)
 
     def test_outstanding_cap_counts_sealed_and_open_turns(self):
@@ -90,7 +96,15 @@ class TurnAssemblyPolicyTests(unittest.TestCase):
             self.assembler.claim(turn.token, now=index * 3 + 2)
         self.assertEqual("busy", self.offer(20, 20).status)
         self.assembler.finish(1)
-        self.assertEqual("accepted", self.offer(20, 20).status)
+        self.assertEqual("duplicate", self.offer(20, 20).status)
+        self.assertEqual("accepted", self.offer(21, 20).status)
+
+    def test_rejected_update_replay_cache_remains_bounded(self):
+        for message_id in range(1, 2050):
+            self.assertEqual("not_invoked", self.offer(message_id, 0, can_start=False).status)
+        self.assertEqual("duplicate", self.offer(2049, 1, can_start=False).status)
+        self.assertEqual("not_invoked", self.offer(1, 1, can_start=False).status)
+        self.assertEqual(0, self.assembler.outstanding_count)
 
     def test_old_updates_delivered_together_do_not_become_one_burst(self):
         first = self.offer(1, 0, sent_at=100)
@@ -439,6 +453,46 @@ class TurnAssemblyIngressTests(unittest.IsolatedAsyncioTestCase):
         await self.ingest(message)
         self.persistence.assert_awaited_once()
         self.prompt.assert_awaited_once()
+
+    async def test_oversized_update_replay_does_not_repeat_notice_or_observation(self):
+        message = self.message("x" * 31, 50)
+        with patch.object(main, "CONFIG", replace(main.CONFIG, max_input_chars=30)):
+            await self.ingest(message)
+            await self.ingest(message)
+        self.assertEqual(1, len(message.reply_calls))
+        self.assertIn("коротшу", message.reply_calls[0]["text"])
+        self.persistence.assert_awaited_once_with(message)
+        self.assertEqual(1, self.complaint.call_count)
+        self.prompt.assert_not_awaited()
+
+    async def test_busy_update_replay_stays_rejected_after_queue_capacity_recovers(self):
+        release = asyncio.Event()
+        async def blocked_generation(*_args, **_kwargs):
+            await release.wait()
+        self.prompt.side_effect = blocked_generation
+        for index in range(MAX_COHORT_TURNS):
+            await self.ingest(self.message(f"Independent request {index}", index + 1))
+            await self.advance((index + 1) * 2.1)
+        self.assertEqual(MAX_COHORT_TURNS, main.telegram_turn_assembler.outstanding_count)
+        rejected = self.message("New request while busy", 99)
+        await self.ingest(rejected)
+        await self.ingest(rejected)
+        self.assertEqual(1, len(rejected.reply_calls))
+        self.assertIn("заповнена", rejected.reply_calls[0]["text"])
+        self.assertEqual(MAX_COHORT_TURNS + 1, self.persistence.await_count)
+        self.assertEqual(MAX_COHORT_TURNS + 1, self.complaint.call_count)
+        release.set()
+        await self.settle()
+        self.assertEqual(0, main.telegram_turn_assembler.outstanding_count)
+        self.assertEqual(MAX_COHORT_TURNS, self.prompt.await_count)
+        await self.ingest(rejected)
+        await self.advance(self.clock.now + 2.1)
+        self.assertEqual(MAX_COHORT_TURNS, self.prompt.await_count)
+        self.assertEqual(MAX_COHORT_TURNS + 1, self.persistence.await_count)
+        self.assertEqual(1, len(rejected.reply_calls))
+        await self.ingest(self.message("Fresh request after recovery", 100))
+        await self.advance(self.clock.now + 2.1)
+        self.assertEqual(MAX_COHORT_TURNS + 1, self.prompt.await_count)
 
     async def test_multiple_forwarded_sources_stay_separate_from_authored_text(self):
         first = self.message("Compare these reports", 1)
