@@ -84,7 +84,11 @@ from image_intent import (
     public_image_subject_is_sensitive,
     semantic_image_claim_requires_guard,
 )
-from memory import DeliveryReceipt, EmbeddingCandidate, MemoryItem, MemoryStore, SemanticMemoryResult
+from memory import (
+    DeliveryReceipt, EmbeddingCandidate, MemoryFusionOutcome, MemoryItem,
+    MemorySearchBatch, MemoryStore, SemanticMemoryResult, fuse_memory_search_batches,
+    legacy_memory_result_merge,
+)
 from recall_intent_model import MODEL as RECALL_INTENT_MODEL, classify_recall_intent, recall_model_metadata
 from memory_recall import (
     normalize_recall_policy_mode,
@@ -368,6 +372,7 @@ class Config:
     memory_embedding_dimensions: int
     memory_semantic_lookback_days: int
     memory_semantic_top_k: int
+    memory_search_fusion_policy: str
     memory_recall_top_k: int
     memory_recall_context_before: int
     memory_recall_context_after: int
@@ -885,6 +890,7 @@ class Config:
             memory_embedding_dimensions=int(os.getenv("MEMORY_EMBEDDING_DIMENSIONS", "512")),
             memory_semantic_lookback_days=int(os.getenv("MEMORY_SEMANTIC_LOOKBACK_DAYS", "30")),
             memory_semantic_top_k=int(os.getenv("MEMORY_SEMANTIC_TOP_K", "6")),
+            memory_search_fusion_policy=os.getenv("MEMORY_SEARCH_FUSION_POLICY", "legacy").strip().casefold() or "legacy",
             memory_recall_top_k=max(1, int(os.getenv("MEMORY_RECALL_TOP_K", "12"))),
             memory_recall_context_before=max(0, int(os.getenv("MEMORY_RECALL_CONTEXT_BEFORE", "2"))),
             memory_recall_context_after=max(0, int(os.getenv("MEMORY_RECALL_CONTEXT_AFTER", "2"))),
@@ -2127,6 +2133,8 @@ class MemorySearchOutcome:
     returned: int = 0
     embedding_error: str = ""
     topic_terms: tuple[str, ...] = ()
+    fusion_policy: str = "legacy"
+    fusion_fallback_reason: str = ""
 
 
 @dataclass
@@ -8071,20 +8079,7 @@ def filter_memory_search_results(
 
 
 def merge_semantic_results(results: list[SemanticMemoryResult], limit: int) -> list[SemanticMemoryResult]:
-    merged: dict[int, SemanticMemoryResult] = {}
-    for result in results:
-        existing = merged.get(result.item.id)
-        if existing is None:
-            merged[result.item.id] = result
-        else:
-            source = existing.source if result.source in existing.source.split("+") else f"{existing.source}+{result.source}"
-            merged[result.item.id] = SemanticMemoryResult(
-                item=existing.item,
-                search_text=existing.search_text,
-                score=max(existing.score, result.score),
-                source=source,
-            )
-    return sorted(merged.values(), key=lambda item: item.score, reverse=True)[: max(1, limit)]
+    return legacy_memory_result_merge(results, limit)
 
 
 def format_semantic_memory_results(results: list[SemanticMemoryResult]) -> str:
@@ -8318,39 +8313,48 @@ async def semantic_memory_search_outcome(
     if route == "memory_recall":
         topic_terms_list.extend(search_queries)
     topic_terms = tuple(dict.fromkeys(term for term in topic_terms_list if term))
-    keyword_results: list[SemanticMemoryResult] = []
+    keyword_batches: list[MemorySearchBatch] = []
     for term in topic_terms:
-        keyword_results.extend(
+        batch = filter_memory_search_results(
             MEMORY.keyword_search(
                 chat_id=message.chat_id,
                 query=term,
                 lookback_days=CONFIG.memory_semantic_lookback_days,
                 limit=source_limit,
-            )
+            ),
+            exclude_message_id=exclude_message_id,
+            exclude_bot_invocations=route == "memory_recall",
         )
-    keyword_results = filter_memory_search_results(
-        keyword_results,
-        exclude_message_id=exclude_message_id,
-        exclude_bot_invocations=route == "memory_recall",
-    )
+        keyword_batches.append(MemorySearchBatch("keyword", batch))
+    keyword_results = [result for batch in keyword_batches for result in batch.results]
 
-    fts_results: list[SemanticMemoryResult] = []
+    fts_batches: list[MemorySearchBatch] = []
     for search_query in search_queries:
-        fts_results.extend(
+        batch = filter_memory_search_results(
             MEMORY.fts_search(
                 chat_id=message.chat_id,
                 query=search_query,
                 lookback_days=CONFIG.memory_semantic_lookback_days,
                 limit=source_limit,
-            )
+            ),
+            exclude_message_id=exclude_message_id,
+            exclude_bot_invocations=route == "memory_recall",
         )
-    fts_results = filter_memory_search_results(
-        fts_results,
-        exclude_message_id=exclude_message_id,
-        exclude_bot_invocations=route == "memory_recall",
-    )
+        fts_batches.append(MemorySearchBatch("fts", batch))
+    fts_results = [result for batch in fts_batches for result in batch.results]
     return_limit = CONFIG.memory_recall_top_k if route == "memory_recall" else CONFIG.memory_semantic_top_k
-    results = merge_semantic_results(keyword_results + semantic_results + fts_results, return_limit)
+    batches = keyword_batches + [MemorySearchBatch("semantic", semantic_results)] + fts_batches
+    try:
+        fusion = fuse_memory_search_batches(
+            batches, limit=return_limit, policy=CONFIG.memory_search_fusion_policy,
+            protect_numeric=any(re.search(r"(?<!\w)\d+(?!\w)", value) for value in search_queries),
+        )
+    except Exception:
+        fusion = MemoryFusionOutcome(
+            merge_semantic_results(keyword_results + semantic_results + fts_results, return_limit),
+            CONFIG.memory_search_fusion_policy, "legacy", "candidate_exception",
+        )
+    results = fusion.results
     system_event(
         component="memory_vector",
         event_type="semantic_search",
@@ -8363,6 +8367,8 @@ async def semantic_memory_search_outcome(
             "fts_results": len(fts_results),
             "keyword_results": len(keyword_results),
             "returned": len(results),
+            "fusion_policy": fusion.applied_policy,
+            "fusion_fallback_reason": fusion.fallback_reason,
             "embedding_indexed": embedding_indexed,
             "embeddings_used": embeddings_used,
             "topic_term_count": len(topic_terms),
@@ -8374,6 +8380,8 @@ async def semantic_memory_search_outcome(
     )
     return MemorySearchOutcome(
         results=results,
+        fusion_policy=fusion.applied_policy,
+        fusion_fallback_reason=fusion.fallback_reason,
         embedding_indexed=embedding_indexed,
         embeddings_used=embeddings_used,
         semantic_results=len(semantic_results),
