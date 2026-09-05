@@ -13,6 +13,28 @@ from pathlib import Path
 from typing import Sequence
 
 
+AUTHORED_TURN_NOTE_PREFIX = "[aigan.authored_turn.v1]"
+AUTHORED_TURN_MAX_PARTS = 10
+AUTHORED_TURN_MAX_CHARS = 12000
+
+
+def _without_authored_turn_marker(note: str) -> str:
+    if not any(line.startswith(AUTHORED_TURN_NOTE_PREFIX) for line in note.splitlines()):
+        return note
+    return "\n".join(line for line in note.splitlines() if not line.startswith(AUTHORED_TURN_NOTE_PREFIX))
+
+
+def _merge_authored_turn_note(previous: str, replacement: str) -> str:
+    """Keep host-only turn metadata when a later cache/import updates its note."""
+    markers = [line for line in previous.splitlines() if line.startswith(AUTHORED_TURN_NOTE_PREFIX)]
+    note = _without_authored_turn_marker(replacement)
+    if not markers:
+        return note
+    if not note:
+        note = "\n".join(line for line in previous.splitlines() if not line.startswith(AUTHORED_TURN_NOTE_PREFIX))
+    return "\n".join(part for part in (note, *markers) if part)
+
+
 @dataclass(frozen=True)
 class MemoryItem:
     id: int
@@ -355,17 +377,19 @@ class MemoryStore:
             "source_title": source_title or "",
             "reply_to_message_id": reply_to_message_id,
             "forward_origin": forward_origin or "",
-            "raw_note": raw_note or "",
+            "raw_note": _without_authored_turn_marker(raw_note or ""),
         }
 
         with self._lock:
             existing_id = None
             if message_id is not None:
                 row = self._conn.execute(
-                    "SELECT id FROM messages WHERE chat_id = ? AND message_id = ?",
+                    "SELECT id, raw_note FROM messages WHERE chat_id = ? AND message_id = ?",
                     (chat_id, message_id),
                 ).fetchone()
                 existing_id = int(row["id"]) if row else None
+                if row is not None:
+                    values["raw_note"] = _merge_authored_turn_note(str(row["raw_note"] or ""), values["raw_note"])
 
             if existing_id is None:
                 cursor = self._conn.execute(
@@ -435,6 +459,9 @@ class MemoryStore:
         raw_note: str = "",
     ) -> None:
         with self._lock:
+            previous = self._conn.execute("SELECT raw_note FROM messages WHERE id = ?", (item_id,)).fetchone()
+            if previous is not None:
+                raw_note = _merge_authored_turn_note(str(previous["raw_note"] or ""), raw_note)
             self._conn.execute(
                 """
                 UPDATE messages SET
@@ -459,6 +486,123 @@ class MemoryStore:
             )
             self._conn.commit()
             self._sync_search_index_for_id(item_id)
+
+    def remember_authored_turn(
+        self, *, chat_id: int, trigger_message_id: int,
+        authored_parts: Sequence[tuple[int, str]], turn_end_message_id: int,
+    ) -> bool:
+        """Persist host-admitted authored relations without replacing messages.
+
+        The ingress owner supplies its already isolated cohort and original
+        text snapshots. Canonical IDs and digests are resolved under one lock;
+        source material never becomes an authored continuation request.
+        """
+        if not 1 <= len(authored_parts) <= AUTHORED_TURN_MAX_PARTS:
+            return False
+        message_ids = [part[0] for part in authored_parts]
+        if message_ids != sorted(set(message_ids)) or message_ids[-1] > turn_end_message_id:
+            return False
+        if sum(len(part[1]) for part in authored_parts) + len(authored_parts) - 1 > AUTHORED_TURN_MAX_CHARS:
+            return False
+        with self._lock:
+            trigger = self._conn.execute(
+                "SELECT * FROM messages WHERE chat_id = ? AND message_id = ?", (chat_id, trigger_message_id),
+            ).fetchone()
+            end = self._conn.execute(
+                "SELECT * FROM messages WHERE chat_id = ? AND message_id = ?", (chat_id, turn_end_message_id),
+            ).fetchone()
+            if trigger is None or end is None or trigger["is_bot"] or trigger["user_id"] is None:
+                return False
+            if trigger_message_id > turn_end_message_id or end["user_id"] != trigger["user_id"]:
+                return False
+            records = []
+            valid = True
+            for message_id, expected_text in authored_parts:
+                row = self._conn.execute(
+                    "SELECT * FROM messages WHERE chat_id = ? AND message_id = ?", (chat_id, message_id),
+                ).fetchone()
+                if (
+                    row is None or row["is_bot"] or row["forward_origin"] or row["source_text"]
+                    or row["content_kind"] != "text" or str(row["text"]).casefold().startswith("[message has ")
+                    or row["user_id"] != trigger["user_id"] or not str(row["text"]).strip()
+                    or row["text"] != expected_text or row["created_at"] > end["created_at"]
+                    or row["reply_to_message_id"] != trigger["reply_to_message_id"]
+                ):
+                    # A captured turn whose canonical rows changed must not
+                    # silently become a legacy first-fragment continuation.
+                    valid = False
+                    records = []
+                    break
+                records.append([int(row["id"]), hashlib.sha256(expected_text.encode("utf-8")).hexdigest()])
+            metadata = {
+                "actor": int(trigger["user_id"]), "end": int(turn_end_message_id),
+                "cutoff": str(end["created_at"]), "parts": records,
+            }
+            note = "\n".join(
+                line for line in str(trigger["raw_note"] or "").splitlines()
+                if not line.startswith(AUTHORED_TURN_NOTE_PREFIX)
+            )
+            note = "\n".join(part for part in (note, AUTHORED_TURN_NOTE_PREFIX + json.dumps(metadata, separators=(",", ":"))) if part)
+            self._conn.execute("UPDATE messages SET raw_note = ? WHERE id = ?", (note, trigger["id"]))
+            self._conn.commit()
+            return valid
+
+    def authored_turn_items(
+        self, *, chat_id: int, trigger_message_id: int, before_message_id: int,
+    ) -> list[MemoryItem] | None:
+        """Return validated authored rows; None means absent, [] invalid evidence.
+
+        Callers must not fall back to a fragment after invalidation. This
+        metadata is host-owned provenance and must never be rendered to models.
+        """
+        with self._lock:
+            trigger = self._conn.execute(
+                "SELECT * FROM messages WHERE chat_id = ? AND message_id = ?", (chat_id, trigger_message_id),
+            ).fetchone()
+            if trigger is None:
+                return []
+            markers = [line for line in str(trigger["raw_note"] or "").splitlines() if line.startswith(AUTHORED_TURN_NOTE_PREFIX)]
+            if not markers:
+                return None
+            if len(markers) != 1 or len(markers[0]) > 4096:
+                return []
+            try:
+                metadata = json.loads(markers[0][len(AUTHORED_TURN_NOTE_PREFIX):])
+                actor, end, cutoff, parts = (metadata[key] for key in ("actor", "end", "cutoff", "parts"))
+                if (
+                    type(actor) is not int or type(end) is not int or not isinstance(cutoff, str)
+                    or not isinstance(parts, list) or not 1 <= len(parts) <= AUTHORED_TURN_MAX_PARTS
+                    or trigger["is_bot"] or trigger["user_id"] != actor
+                    or not trigger_message_id <= end < before_message_id
+                ):
+                    return []
+                end_row = self._conn.execute(
+                    "SELECT user_id, created_at FROM messages WHERE chat_id = ? AND message_id = ?", (chat_id, end),
+                ).fetchone()
+                if end_row is None or end_row["user_id"] != actor or end_row["created_at"] != cutoff:
+                    return []
+                items = []
+                previous_message_id = -1
+                for record in parts:
+                    if not isinstance(record, list) or len(record) != 2 or type(record[0]) is not int:
+                        return []
+                    row = self._conn.execute("SELECT * FROM messages WHERE id = ? AND chat_id = ?", (record[0], chat_id)).fetchone()
+                    if (
+                        row is None or row["is_bot"] or row["forward_origin"] or row["source_text"]
+                        or row["content_kind"] != "text" or str(row["text"]).casefold().startswith("[message has ")
+                        or row["user_id"] != actor or not str(row["text"]).strip()
+                        or row["message_id"] is None or not previous_message_id < row["message_id"] <= end
+                        or row["created_at"] > cutoff or row["reply_to_message_id"] != trigger["reply_to_message_id"]
+                        or hashlib.sha256(str(row["text"]).encode("utf-8")).hexdigest() != record[1]
+                    ):
+                        return []
+                    items.append(self._row_to_item(row))
+                    previous_message_id = row["message_id"]
+                if sum(len(item.text) for item in items) + len(items) - 1 > AUTHORED_TURN_MAX_CHARS:
+                    return []
+                return items
+            except (KeyError, TypeError, ValueError):
+                return []
 
     def update_vision_summary(self, item_id: int, summary: str) -> None:
         with self._lock:
