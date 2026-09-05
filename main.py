@@ -39,7 +39,7 @@ from openai import AsyncOpenAI, OpenAI
 from PIL import Image, UnidentifiedImageError
 from telegram import Bot, InputMediaPhoto, Message, MessageEntity, Update
 from telegram.constants import ChatAction, ChatType, ParseMode
-from telegram.error import BadRequest, NetworkError
+from telegram.error import RetryAfter, Forbidden, BadRequest, NetworkError
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, MessageReactionHandler, filters
 
 from mcp_servers.web import (
@@ -88,6 +88,13 @@ from agent_capabilities import PrimaryCapabilities
 from chat_history import ChatHistorySession
 from history_retrieval import HISTORY_EMBEDDING_MODEL, HISTORY_EMBEDDING_DIMENSIONS
 from history_citations import ACTIVE_HISTORY_CITATIONS, HistoryCitationSession
+from character_delivery import (
+    CharacterDeliveryStore, CharacterDeliveryScope, CharacterDeliveryError,
+    deliver_prepared_character,
+    MAX_CHUNKS as CHARACTER_DELIVERY_MAX_CHUNKS,
+    MAX_TEXT_CHARS as CHARACTER_DELIVERY_MAX_TEXT_CHARS,
+    MAX_CHUNK_UTF16_UNITS as CHARACTER_DELIVERY_MAX_CHUNK_UTF16_UNITS,
+)
 from character_evidence import (
     CHARACTER_INSTRUCTIONS, CharacterEvidenceSession, CharacterReport, InvalidCharacterEvidence,
 )
@@ -12011,52 +12018,180 @@ async def run_character_evidence(session: CharacterEvidenceSession) -> Character
         hooks.finalize_pending("failed", "character_run_ended_with_pending_turn")
 
 
-async def handle_grounded_character(message: Message, context: ContextTypes.DEFAULT_TYPE,
-                                    target: UserCommandTarget) -> None:
+def grounded_character_chunks(text: str) -> list[str]:
+    """Fit the final numbered/marked transport into config and prepared-store caps."""
+    chunk_chars = max(20, min(CONFIG.telegram_text_chunk_chars, CHARACTER_DELIVERY_MAX_CHUNK_UTF16_UNITS))
+    max_chunks = max(1, min(CONFIG.max_reply_chunks, CHARACTER_DELIVERY_MAX_CHUNKS))
+    total_chars = max(1, min(CONFIG.max_reply_chars, CHARACTER_DELIVERY_MAX_TEXT_CHARS))
+    input_chars = total_chars
+
+    def split() -> list[str]:
+        return split_text_chunks(text, chunk_chars=chunk_chars, max_chunks=max_chunks,
+                                 max_total_chars=input_chars)
+
+    chunks = split()
+    if any(len(chunk.encode("utf-16-le")) // 2 > CHARACTER_DELIVERY_MAX_CHUNK_UTF16_UNITS for chunk in chunks):
+        # Preserve existing chunking when already safe. Only oversized Unicode
+        # chunks need the conservative two-units-per-code-point local limit.
+        chunk_chars = min(chunk_chars, CHARACTER_DELIVERY_MAX_CHUNK_UTF16_UNITS // 2)
+        chunks = split()
+    if sum(map(len, chunks)) > total_chars:
+        # The generic splitter caps its input, then adds numbering and a marker.
+        # Reserve their worst-case final size before splitting again locally.
+        numbering = len(f"{max_chunks}/{max_chunks}\n") * max_chunks if max_chunks > 1 else 0
+        input_chars = total_chars - numbering - len("\n\n[...] скорочено")
+        if input_chars <= 0:
+            raise CharacterDeliveryError("character_reply_budget_too_small")
+        chunks = split()
+    if (len(chunks) > max_chunks or sum(map(len, chunks)) > total_chars or
+            any(len(chunk) > chunk_chars or
+                len(chunk.encode("utf-16-le")) // 2 > CHARACTER_DELIVERY_MAX_CHUNK_UTF16_UNITS
+                for chunk in chunks)):
+        raise CharacterDeliveryError("character_reply_budget_too_small")
+    return chunks
+
+
+def grounded_character_target_id(message: Message, target: UserCommandTarget) -> int | None:
     if MEMORY is None or not should_allow_chat(message) or not command_target_allowed(message, target):
-        return
+        return None
     target_id = target.user_id
     if target_id is None and target.username:
-        # A reused or ambiguous username cannot silently broaden the identity
-        # filter to display-name aliases or select the most frequent claimant.
         candidates = {item.user_id for item in MEMORY.user_stats(message.chat_id, username=target.username)
                       if item.user_id is not None}
         if len(candidates) == 1:
             target_id = next(iter(candidates))
+    requester = getattr(getattr(message, "from_user", None), "id", None)
+    if isinstance(target_id, bool) or not isinstance(target_id, int) or target_id <= 0:
+        return None
+    if target_id != requester and not is_admin_user(message):
+        return None
+    return target_id
+
+
+async def handle_grounded_character(message: Message, context: ContextTypes.DEFAULT_TYPE,
+                                    target: UserCommandTarget) -> None:
+    if MEMORY is None or not should_allow_chat(message) or not command_target_allowed(message, target):
+        return
+    target_id = grounded_character_target_id(message, target)
     if target_id is None:
         await send_reply(message, "Не можу однозначно пов'язати цей username з автором збережених повідомлень у цьому чаті.")
         return
-    current = MEMORY.message_by_message_id(message.chat_id, message.message_id)
-    current_id = current.id if current is not None else save_memory_message(message)
-    if current_id is None:
-        await send_reply(message, "Не зміг зафіксувати межу історії для цього запиту.")
-        return
-    session = CharacterEvidenceSession(MEMORY, chat_id=message.chat_id, target_user_id=target_id,
-        cutoff_memory_id=current_id, cutoff_created_at=message_datetime(message).isoformat())
-    if len(session.examined_ids) < 3:
-        await send_reply(message, session.render(CharacterReport(facets=[], abstention="sparse")), literal_text=True)
-        return
-    await maybe_send_chat_action(context, message.chat_id, ChatAction.TYPING)
+    memory = MEMORY
+    permitted = lambda: MEMORY is memory and grounded_character_target_id(message, target) == target_id
+
+    async def notice(text: str) -> None:
+        if permitted():
+            try:
+                await asyncio.wait_for(message.reply_text(text, parse_mode=None), timeout=2)
+            except Exception:
+                pass
+
+    delivery = None
+    claim = None
+    prepared = None
+    model_run_id = ""
+    run_token = None
+
+    def event(kind: str) -> None:
+        try:
+            system_event(component="character_delivery", event_type=kind,
+                message=kind, details={"prepared_id": prepared.id if prepared else "",
+                                       "run_id": model_run_id})
+        except Exception as exc:
+            LOGGER.warning("Character delivery event failed error=%s", type(exc).__name__)
+
     try:
-        report = await asyncio.wait_for(run_character_evidence(session), timeout=120)
-        response = session.render(report, fits=lambda text, blocks: all(
-            block in "\n\n".join(split_text_chunks(text)) for block in blocks
-        ))
-        if session.rejected_facet_count:
-            system_event(component="character", event_type="evidence_partially_rejected",
-                message="retained_valid_observations",
-                details={"accepted_facets": len(report.facets),
-                         "rejected_facets": session.rejected_facet_count,
-                         "rejection_reasons": session.rejected_facet_reasons})
-    except InvalidCharacterEvidence as exc:
-        system_event(component="character", event_type="evidence_rejected", message=str(exc),
-                     details={"examined_count": len(session.examined_ids), "available_count": session.available_count})
-        response = session.render(CharacterReport(facets=[], abstention="ambiguous"))
-    except Exception:
-        LOGGER.exception("Grounded character command failed")
-        await send_reply(message, "Не зміг зараз перевірити приклади для портрета. Спробуй пізніше.")
-        return
-    await send_reply(message, response, literal_text=True)
+        scope = CharacterDeliveryScope(message.chat_id, message_thread_id(message) or 0,
+            message.from_user.id, target_id)
+        delivery = CharacterDeliveryStore(memory.db_path)
+        claim = delivery.admit(scope, message.message_id, command_time=message_datetime(message).timestamp())
+        if claim.status in {"duplicate", "expired_command"}:
+            return
+        if claim.status == "busy":
+            await notice("Портрет уже готую або надсилаю. Спробуй повторити команду трохи пізніше.")
+            return
+        if claim.status == "capacity":
+            await notice("Не можу зараз безпечно зберегти ще одну відповідь. Повтори команду пізніше новим повідомленням.")
+            return
+        model_run_id = current_model_run_id()
+        run_token = ACTIVE_MODEL_RUN_ID.set(model_run_id)
+        prepared = claim.prepared
+        if prepared is None:
+            current = memory.message_by_message_id(message.chat_id, message.message_id)
+            current_id = current.id if current is not None else save_memory_message(message)
+            if current_id is None:
+                await notice("Не зміг зафіксувати межу історії для цього запиту.")
+                return
+            session = CharacterEvidenceSession(memory, chat_id=message.chat_id, target_user_id=target_id,
+                cutoff_memory_id=current_id, cutoff_created_at=message_datetime(message).isoformat())
+            def fits(text: str, blocks: tuple[str, ...]) -> bool:
+                delivered = "\n\n".join(grounded_character_chunks(text))
+                return all(block in delivered for block in blocks)
+            # Reject a configuration that cannot even retain the coverage note
+            # before spending on a model response. The actual render uses this
+            # same final transport contract and omits whole observations to fit.
+            minimum_response = session.render(CharacterReport(facets=[], abstention="sparse"), fits=fits)
+            if len(session.examined_ids) < 3:
+                response = minimum_response
+            else:
+                try:
+                    await asyncio.wait_for(maybe_send_chat_action(context, message.chat_id, ChatAction.TYPING), timeout=5)
+                except Exception:
+                    pass
+                try:
+                    report = await asyncio.wait_for(run_character_evidence(session), timeout=120)
+                    response = session.render(report, fits=fits)
+                    if session.rejected_facet_count:
+                        system_event(component="character", event_type="evidence_partially_rejected",
+                            message="retained_valid_observations",
+                            details={"accepted_facets": len(report.facets),
+                                     "rejected_facets": session.rejected_facet_count,
+                                     "rejection_reasons": session.rejected_facet_reasons})
+                except InvalidCharacterEvidence as exc:
+                    system_event(component="character", event_type="evidence_rejected", message=str(exc),
+                        details={"examined_count": len(session.examined_ids), "available_count": session.available_count})
+                    response = session.render(CharacterReport(facets=[], abstention="ambiguous"), fits=fits)
+            # Store the exact final chunks once. Recovery never splits them again
+            # or inserts a banner into the paid response's text budget.
+            prepared = delivery.prepare(claim, tuple(grounded_character_chunks(response)))
+            event("prepared")
+        await deliver_prepared_character(delivery, claim, prepared,
+            lambda chunk: message.reply_text(chunk, parse_mode=None), permitted,
+            definite_rejections=(BadRequest, Forbidden, RetryAfter))
+        event("delivery_recovered" if claim.status == "recovery" else "delivery_complete")
+    except asyncio.CancelledError:
+        # The write-ahead marker is already durable if Telegram was attempted.
+        # Cancellation never launches a retry or spends on a new model response.
+        event("delivery_cancelled")
+        raise
+    except Exception as exc:
+        LOGGER.warning("Grounded character request failed error=%s", type(exc).__name__)
+        event("delivery_failed")
+        expired = (isinstance(exc, CharacterDeliveryError) and str(exc) == "prepared_response_expired") or (
+            prepared is not None and delivery is not None and prepared.expires_at <= delivery.clock()
+        )
+        if expired:
+            await notice("Термін збереження цієї відповіді минув. Нова команда підготує нову відповідь.")
+        elif isinstance(exc, (CharacterDeliveryError, ValueError)) and str(exc) == "character_reply_budget_too_small":
+            await notice("Ліміт довжини відповіді замалий для портрета з поясненням охоплення.")
+        elif prepared is not None:
+            await notice("Відповідь готова. Якщо вона не з’явилася, повтори цю команду — надішлю збережений текст.")
+        else:
+            await notice("Не зміг зараз підготувати й зберегти відповідь. Повтори команду новим повідомленням пізніше.")
+    finally:
+        if delivery is not None:
+            try:
+                if claim is not None and claim.token:
+                    delivery.release(claim)
+            except Exception as exc:
+                LOGGER.warning("Grounded character lease release failed error=%s", type(exc).__name__)
+            finally:
+                try:
+                    delivery.close()
+                except Exception as exc:
+                    LOGGER.warning("Grounded character store close failed error=%s", type(exc).__name__)
+        if run_token is not None:
+            ACTIVE_MODEL_RUN_ID.reset(run_token)
 
 
 async def handle_character_command(message: Message, context: ContextTypes.DEFAULT_TYPE, args: str) -> None:

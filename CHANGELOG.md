@@ -1,5 +1,11 @@
 # Aigan Changelog
 
+## 2026-09-05 - Recoverable character delivery
+
+- Retain prepared grounded-character replies privately so an authorized repeat command can recover after a delivery failure without another model run.
+- Keep confirmed parts, make uncertain delivery explicit, and preserve literal response text during recovery.
+- Bound recovery storage and keep it separate from searchable conversation memory and personal profiles.
+
 ## 2026-09-05 - Readable grounded character portraits
 
 - Present up to three distinctive communication observations in natural prose, with short, dated original examples and one coverage note.
