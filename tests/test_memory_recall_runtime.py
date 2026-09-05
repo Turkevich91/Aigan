@@ -145,6 +145,8 @@ class RecallRuntimeTests(unittest.TestCase):
         for mode in ('off', 'shadow', 'enforce'):
             with self.subTest(mode=mode), \
                  patch.object(main, 'CONFIG', replace(self.config, memory_recall_policy_mode=mode)), \
+                 patch.object(main, 'BOT_ID', main.BOT_ID), \
+                 patch.object(main, 'BOT_USERNAME', main.BOT_USERNAME), \
                  patch.object(main, 'remember_message_persistently', AsyncMock()), \
                  patch.object(main, 'handle_pending_or_observe', AsyncMock(return_value=False)), \
                  patch.object(main, 'handle_prompt', AsyncMock()) as handle, \
