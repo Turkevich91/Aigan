@@ -25,9 +25,12 @@ require examples on two dates. If some retained records remain unread, at least
 one additional history inspection is required before publishing observations.
 The renderer provides dates and the unique examined/available record count.
 It does not print internal row identifiers or claim complete-history coverage.
-Exact quotations remain internal validation evidence. The user receives Ukrainian
-observations and counter-observations with dated references, without raw quotes
-that could conflict with the existing response-language policy.
+The renderer does not append the internal supporting quotations to the dated
+observations and counter-observations. Their free-text wording and uncertainty
+remain model-generated: Ukrainian paraphrasing is a prompt requirement, as in
+the existing character path, rather than a hard language or substring validator.
+Reference validation does not guarantee that these fields never repeat words
+from the examined evidence.
 
 Sparse or invalid evidence produces a qualified abstention. No free-form generic
 profile is published after a reference-validation failure. Reference validation

@@ -254,6 +254,45 @@ class CharacterEvidenceTests(unittest.TestCase):
             with self.assertRaises(InvalidCharacterEvidence):
                 session.validate(wrong_report)
 
+    def test_cancelled_primary_adapter_records_one_cancelled_pending_stage_and_propagates(self):
+        self.seed()
+        session = self.session()
+        telemetry = main.ModelTelemetryStore(Path(self.tmp.name) / "telemetry.sqlite3", retention_days=7)
+        self.addCleanup(telemetry.close)
+
+        class WaitingModel(ScriptedCharacterModel):
+            async def get_response(self, *args, **kwargs):
+                self.started.set()
+                await self.release.wait()
+                raise AssertionError("Cancelled model must not complete")
+
+        async def cancel_during_model_turn():
+            model = WaitingModel([])
+            model.started, model.release = asyncio.Event(), asyncio.Event()
+            def scripted_agent(**kwargs):
+                return Agent(**{**kwargs, "model": model})
+            with patch.object(main, "MODEL_TELEMETRY", telemetry), \
+                    patch.object(main, "Agent", side_effect=scripted_agent), \
+                    patch.object(main, "build_agents_run_config", return_value=RunConfig(tracing_disabled=True)), \
+                    patch.object(main, "system_event"):
+                task = asyncio.create_task(main.run_character_evidence(session))
+                try:
+                    await asyncio.wait_for(model.started.wait(), timeout=1)
+                    task.cancel()
+                    with self.assertRaises(asyncio.CancelledError):
+                        await task
+                finally:
+                    task.cancel()
+                    await asyncio.gather(task, return_exceptions=True)
+
+        asyncio.run(cancel_during_model_turn())
+        stages = telemetry.latest_stages(10)
+        self.assertEqual(1, len(stages))
+        self.assertEqual("cancelled", stages[0].status)
+        self.assertEqual("cancellederror", stages[0].failure_class)
+        self.assertEqual("agent_turn", stages[0].stage_kind)
+        self.assertEqual("character", stages[0].route_bucket)
+
 
 class CharacterCommandTests(unittest.TestCase):
     def setUp(self):

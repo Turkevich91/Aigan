@@ -11923,6 +11923,9 @@ async def run_character_evidence(session: CharacterEvidenceSession) -> Character
         result = await Runner.run(agent, session.initial_prompt(), max_turns=6, hooks=hooks,
             run_config=build_agents_run_config(run_id=model_run_id, route_bucket="character"))
         return session.validate(result.final_output)
+    except asyncio.CancelledError as exc:
+        hooks.finalize_pending("cancelled", exc)
+        raise
     finally:
         hooks.finalize_pending("failed", "character_run_ended_with_pending_turn")
 
