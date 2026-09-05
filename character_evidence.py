@@ -4,7 +4,6 @@ from __future__ import annotations
 from collections import defaultdict, deque
 from datetime import datetime, timezone
 import json
-import re
 import threading
 from typing import Literal
 
