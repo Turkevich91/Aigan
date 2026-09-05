@@ -1,5 +1,11 @@
 # Aigan Changelog
 
+## 2026-09-05 - Readable grounded character portraits
+
+- Present up to three distinctive communication observations in natural prose, with short, dated original examples and one coverage note.
+- Keep independently verified observations when another example fails validation, and preserve quoted text through Telegram delivery.
+- Retain the primary model, existing history limits, and generation budget.
+
 ## 2026-09-04 - Astra model integration
 
 - Use GPT-6 Astra with low reasoning for the former Sol primary, premium, and interactive-vision roles; preserve specialized auxiliary models and shadow-only routing.

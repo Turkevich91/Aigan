@@ -3,6 +3,7 @@ import asyncio
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 import json
+import html
 from pathlib import Path
 import tempfile
 from types import SimpleNamespace
@@ -13,6 +14,7 @@ from tests.support import FakeMessage, configure_test_environment
 configure_test_environment()
 import main
 from agents import Agent, Runner, RunConfig, Model, ModelResponse, Usage
+from agents.exceptions import ModelBehaviorError
 from openai.types.responses import ResponseFunctionToolCall, ResponseOutputMessage, ResponseOutputText
 from character_evidence import (
     CHARACTER_INSTRUCTIONS, CharacterEvidenceSession, CharacterReport,
@@ -170,22 +172,188 @@ class CharacterEvidenceTests(unittest.TestCase):
         self.assertEqual(4, len(session.examined_ids))
         self.assertIn("Переглянуто унікальних повідомлень: 4 із 4", rendered)
         self.assertIn("2026-08-09", rendered)
-        self.assertIn("Межа висновку:", rendered)
+        self.assertNotIn("Межа висновку:", rendered)
         self.assertNotIn("user_id", rendered)
         self.assertNotIn("evidence_id", rendered)
-        self.assertNotIn("дію без перевірки", rendered)
+        self.assertIn("«дію без перевірки»", rendered)
+        self.assertNotIn(report.facets[0].uncertainty, rendered)
+        self.assertEqual(1, rendered.count("обмеженою вибіркою"))
 
-    def test_counter_observation_requires_cited_evidence_and_quotes_stay_internal(self):
+    def test_counter_observation_keeps_natural_context_and_original_quote_language(self):
         ids = self.seed()
         counter = self.save("Сейчас отправлю без проверки.", day=4)
         session = self.session()
         report = self.report([ids[0]], counter=[EvidenceReference(id=counter, quote="Сейчас отправлю")])
         rendered = session.render(report)
-        self.assertNotIn("Сейчас", rendered)
-        self.assertIn("Інший прояв", rendered)
+        self.assertIn("«Сейчас отправлю»", rendered)
+        self.assertIn(report.facets[0].counter_observation, rendered)
+        self.assertNotIn("Інший прояв", rendered)
         report.facets[0].counterevidence = []
         with self.assertRaises(InvalidCharacterEvidence):
             session.validate(report)
+
+    def test_invalid_facet_does_not_discard_independently_grounded_paragraph(self):
+        ids = self.seed()
+        session = self.session()
+        valid = self.report([ids[0]]).facets[0]
+        for invalid in (
+            self.report([99999]).facets[0],
+            self.report([ids[1]], quote="Invented statement").facets[0],
+            self.report([ids[1]], counter=[EvidenceReference(id=99999, quote="Unknown counterexample")]).facets[0],
+        ):
+            invalid.facet = "initiative"
+            invalid.observation = "UNVERIFIED PARAGRAPH MUST NOT APPEAR."
+            report = CharacterReport(facets=[invalid, valid], abstention="none")
+            with self.subTest(invalid=invalid.evidence):
+                accepted = session.validate(report)
+                self.assertEqual([valid], accepted.facets)
+                rendered = session.render(report)
+                self.assertIn(valid.observation, rendered)
+                self.assertNotIn("UNVERIFIED", rendered)
+                self.assertEqual(2, len(report.facets))
+                self.assertEqual(1, session.rejected_facet_count)
+                self.assertEqual({"unexamined_or_mismatched_reference": 1}, session.rejected_facet_reasons)
+
+    def test_all_invalid_and_report_global_invalidity_still_reject(self):
+        ids = self.seed()
+        session = self.session()
+        invalid = self.report([99999]).facets[0]
+        other = self.report([ids[0]], quote="Unexamined quote").facets[0]
+        other.facet = "interaction"
+        for report in (CharacterReport(facets=[invalid, other], abstention="none"),
+                       CharacterReport(facets=[self.report([ids[0]]).facets[0]], abstention="ambiguous")):
+            with self.assertRaises(InvalidCharacterEvidence):
+                session.render(report)
+
+    def test_long_narrative_stays_bounded_without_repeating_examples_or_labels(self):
+        ids = self.seed(5)
+        session = self.session()
+        facets = []
+        for index, category in enumerate(("argumentation", "uncertainty", "interaction")):
+            facet = self.report([ids[index]]).facets[0]
+            facet.facet = category
+            facet.observation = ("У цій розмові пропонує разом перевірити підстави рішення. " * 20)[:650]
+            facet.evidence[0].quote = f"Перевірмо факти перед рішенням {index}."
+            facets.append(facet)
+        # A reference repeated in another facet cannot fill the source allowance.
+        facets[1].evidence = [facets[0].evidence[0]]
+        report = CharacterReport(facets=facets, abstention="none")
+        rendered = session.render(report)
+        self.assertGreater(len(facets[0].observation), 300)
+        self.assertLess(len(rendered), 6000)
+        self.assertEqual(2, rendered.count("«"))
+        self.assertEqual(1, rendered.count("«Перевірмо факти перед рішенням 0.»"))
+        self.assertEqual(1, rendered.count("Переглянуто унікальних повідомлень:"))
+        for label in ("Аргументація:", "Ініціатива:", "Межа висновку:", "Інший прояв"):
+            self.assertNotIn(label, rendered)
+
+    def test_exact_source_markup_is_literal_through_real_reply_delivery(self):
+        self.seed()
+        source = "Перевірмо **підстави** <b>разом</b> & не поспішаймо."
+        identity = self.save(source, day=5)
+        session = self.session()
+        rendered = session.render(self.report([identity], quote=source))
+        message = FakeMessage("/character me", message_id=9999)
+        asyncio.run(main.send_reply(message, rendered, literal_text=True))
+        sent = "\n\n".join(call["text"] for call in message.reply_calls)
+        self.assertIn(html.escape(source, quote=False), sent)
+        self.assertNotIn("<b>разом</b>", sent)
+        self.assertIn(source, html.unescape(sent))
+        self.assertTrue(all("literal_text" not in call for call in message.reply_calls))
+
+    def test_long_portrait_keeps_complete_sources_and_coverage_through_actual_chunker(self):
+        sources = [(f"Приклад {index}: " + "текст " * 30)[:160] for index in range(3)]
+        ids = [self.save(source, day=index) for index, source in enumerate(sources)]
+        counter = self.save("В іншій ситуації обирає інший підхід.", day=8)
+        session = self.session()
+        facets = []
+        for index, category in enumerate(("argumentation", "uncertainty", "interaction")):
+            facet = self.report([ids[index]], quote=sources[index],
+                counter=[EvidenceReference(id=counter, quote="обирає інший підхід")]).facets[0]
+            facet.facet = category
+            facet.observation = ("Розглядає приклад у його конкретному контексті. " * 20)[:650]
+            facet.counter_observation = ("В іншій ситуації допускає інший підхід. " * 10)[:50]
+            facets.append(facet)
+        report = CharacterReport(facets=facets, abstention="none")
+        config = replace(main.CONFIG, telegram_text_chunk_chars=2000, max_reply_chars=12000, max_reply_chunks=4)
+        with patch.object(main, "CONFIG", config):
+            # A valid packed chunk at exactly the configured limit loses its
+            # last characters when the existing splitter adds a chunk prefix.
+            initial = session.render(report)
+            padding = 2000 - len("\n\n".join(initial.split("\n\n")[:2]))
+            wanted = len(facets[1].counter_observation) + padding
+            self.assertGreater(wanted, 0)
+            self.assertLessEqual(wanted, 300)
+            facets[1].counter_observation = ("В іншій ситуації допускає інший підхід. " * 10)[:wanted]
+            unfitted = session.render(report)
+            damaged = "\n\n".join(main.split_text_chunks(unfitted))
+            self.assertNotIn(unfitted.split("\n\n")[1], damaged)
+            fitted = session.render(report, fits=lambda text, blocks: all(
+                block in "\n\n".join(main.split_text_chunks(text)) for block in blocks))
+            message = FakeMessage("/character me", message_id=9999)
+            asyncio.run(main.send_reply(message, fitted, literal_text=True))
+        delivered = html.unescape("\n\n".join(call["text"] for call in message.reply_calls))
+        self.assertTrue(all(block in delivered for block in fitted.split("\n\n")))
+        self.assertIn("опущено через довжину", delivered)
+        self.assertIn("Переглянуто унікальних повідомлень:", delivered)
+        self.assertIn("«" + sources[0] + "»", delivered)
+        self.assertNotIn("«" + sources[2] + "»", delivered)
+
+    def test_sdk_rejects_an_overlong_report_instead_of_publishing_four_observations(self):
+        ids = self.seed()
+        session = self.session()
+        facets = []
+        for category in ("argumentation", "uncertainty", "disagreement", "interaction"):
+            facet = self.report([ids[0]]).facets[0]
+            facet.facet = category
+            facets.append(facet)
+        # Simulate an out-of-contract model response rather than allowing the
+        # fixture constructor to reject it before the real SDK sees the JSON.
+        oversized = CharacterReport.model_construct(facets=facets, abstention="none")
+        model = ScriptedCharacterModel([oversized])
+        agent = Agent(name="synthetic", model=model, instructions=CHARACTER_INSTRUCTIONS,
+                      tools=session.tools(), output_type=CharacterReport)
+        with self.assertRaises(ModelBehaviorError):
+            asyncio.run(Runner.run(agent, session.initial_prompt(), run_config=RunConfig(tracing_disabled=True)))
+        self.assertEqual(1, len(model.inputs))
+        self.assertEqual(0, session.history.calls_used)
+
+    def test_multiline_quote_is_not_cropped_into_the_opposite_meaning(self):
+        ids = self.seed()
+        source = "Не варто\nпочинати без перевірки."
+        identity = self.save(source, day=5)
+        session = self.session()
+        report = self.report([identity], quote=source)
+        report.facets[0].evidence.append(EvidenceReference(id=ids[0], quote="Перевірмо факти"))
+        rendered = session.render(report)
+        self.assertIn("«Перевірмо факти»", rendered)
+        self.assertNotIn("«починати без перевірки.", rendered)
+        self.assertNotIn("«Не варто", rendered)
+
+    def test_single_line_quote_cannot_hide_another_line_of_examined_source(self):
+        ids = self.seed()
+        identity = self.save("Не роби цього:\nПочинай без перевірки.", day=5)
+        session = self.session()
+        report = self.report([identity], quote="Починай без перевірки.")
+        report.facets[0].observation = "Наголошує, що починати без перевірки не варто."
+        report.facets[0].evidence.append(EvidenceReference(id=ids[0], quote="Перевірмо факти"))
+        self.assertIs(report, session.validate(report))
+        rendered = session.render(report)
+        self.assertIn(report.facets[0].observation, rendered)
+        self.assertIn("«Перевірмо факти»", rendered)
+        self.assertNotIn("«Починай без перевірки.", rendered)
+        self.assertEqual(0, session.rejected_facet_count)
+
+    def test_literal_delivery_fallback_preserves_source_and_default_formatting(self):
+        source = "**Приклад** <b>дослівно</b> & дані"
+        sender = AsyncMock(side_effect=[main.BadRequest("synthetic rejection"), SimpleNamespace(message_id=1)])
+        with patch.object(main, "system_event"):
+            asyncio.run(main.send_formatted_text(sender, source, literal_text=True))
+        self.assertEqual(source, sender.call_args.kwargs["text"])
+        self.assertNotIn("parse_mode", sender.call_args.kwargs)
+        default_sender = AsyncMock()
+        asyncio.run(main.send_formatted_text(default_sender, "**Звичайне форматування**"))
+        self.assertEqual("<b>Звичайне форматування</b>", default_sender.call_args.kwargs["text"])
 
     def test_read_budget_and_model_schema_prevent_target_override(self):
         self.seed(30)
@@ -258,6 +426,24 @@ class CharacterEvidenceTests(unittest.TestCase):
         for session, wrong_report in ((first, second_report), (second, first_report)):
             with self.assertRaises(InvalidCharacterEvidence):
                 session.validate(wrong_report)
+
+    def test_primary_adapter_salvages_valid_evidence_without_an_extra_model_turn(self):
+        ids = self.seed()
+        session = self.session()
+        valid = self.report([ids[0]]).facets[0]
+        invalid = self.report([99999]).facets[0]
+        invalid.facet = "initiative"
+        model = ScriptedCharacterModel([CharacterReport(facets=[invalid, valid], abstention="none")])
+        with patch.object(main, "CONFIG", replace(main.CONFIG, openai_model=model)), \
+                patch.object(main, "build_agents_run_config", return_value=RunConfig(tracing_disabled=True)), \
+                patch.object(main, "AiganRunHooks") as hook_cls:
+            from agents import RunHooks
+            hook_cls.return_value = RunHooks()
+            hook_cls.return_value.finalize_pending = lambda *_args: None
+            result = asyncio.run(main.run_character_evidence(session))
+        self.assertEqual([valid], result.facets)
+        self.assertEqual(1, len(model.inputs))
+        self.assertEqual(0, session.history.calls_used)
 
     def test_cancelled_primary_adapter_records_one_cancelled_pending_stage_and_propagates(self):
         self.seed()
@@ -369,6 +555,61 @@ class CharacterCommandTests(unittest.TestCase):
         self.run_command(message, "me", model).assert_awaited_once()
         self.assertIn("недостатньо", message.reply_calls[-1]["text"])
         self.assertNotIn("unexamined", message.reply_calls[-1]["text"])
+
+    def test_sparse_character_response_uses_literal_delivery(self):
+        message = self.message()
+        with patch.object(main, "send_reply", wraps=main.send_reply) as reply:
+            self.run_command(message, "me").assert_not_awaited()
+        reply.assert_awaited_once()
+        self.assertTrue(reply.call_args.kwargs["literal_text"])
+        self.assertEqual(1, len(message.reply_calls))
+
+    def test_command_delivers_only_verified_parts_once_as_literal_text(self):
+        self.seed()
+        message = self.message()
+        def report_for(session):
+            identity = min(session.examined_ids)
+            facet = FacetObservation(facet="argumentation",
+                observation="Пропонує **разом** перевірити <b>підстави</b> рішення.",
+                evidence=[EvidenceReference(id=identity, quote="Перевірмо факти")],
+                counterevidence=[], counter_observation="", scope="isolated",
+                uncertainty="Опис стосується лише наведеного епізоду.")
+            invalid = facet.model_copy(deep=True)
+            invalid.facet = "initiative"
+            invalid.observation = "UNVERIFIED CLAIM MUST NOT APPEAR."
+            invalid.evidence[0].id = 999999
+            # The actual run_character_evidence adapter returns a validated
+            # report; preserve that boundary while testing command delivery.
+            return session.validate(CharacterReport(facets=[invalid, facet], abstention="none"))
+        model = AsyncMock(side_effect=report_for)
+        with patch.object(main, "system_event") as event:
+            self.run_command(message, "me", model)
+        model.assert_awaited_once()
+        event.assert_called_once_with(component="character", event_type="evidence_partially_rejected",
+            message="retained_valid_observations",
+            details={"accepted_facets": 1, "rejected_facets": 1,
+                     "rejection_reasons": {"unexamined_or_mismatched_reference": 1}})
+        self.assertEqual(1, len(message.reply_calls))
+        sent = message.reply_calls[0]["text"]
+        self.assertIn("**разом**", sent)
+        self.assertIn("&lt;b&gt;підстави&lt;/b&gt;", sent)
+        self.assertIn("«Перевірмо факти»", sent)
+        self.assertNotIn("UNVERIFIED", sent)
+        self.assertNotIn("Межа висновку", sent)
+
+    def test_all_invalid_command_abstains_without_retry_or_model_prose(self):
+        self.seed()
+        message = self.message()
+        facet = FacetObservation(facet="initiative", observation="UNVERIFIED CLAIM MUST NOT APPEAR.",
+            evidence=[EvidenceReference(id=999999, quote="Unexamined words")],
+            counterevidence=[], counter_observation="", scope="isolated",
+            uncertainty="No valid sources were actually provided.")
+        model = AsyncMock(return_value=CharacterReport(facets=[facet], abstention="none"))
+        self.run_command(message, "me", model)
+        model.assert_awaited_once()
+        self.assertEqual(1, len(message.reply_calls))
+        self.assertIn("недостатньо", message.reply_calls[0]["text"])
+        self.assertNotIn("UNVERIFIED", message.reply_calls[0]["text"])
 
     def test_feature_flag_off_keeps_legacy_path(self):
         message = self.message()
