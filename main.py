@@ -11188,8 +11188,8 @@ def split_text_chunks(
     return chunks
 
 
-async def send_formatted_text(send_func: Any, text: str, **kwargs: Any) -> Any:
-    html_text = render_telegram_html(text)
+async def send_formatted_text(send_func: Any, text: str, *, literal_text: bool = False, **kwargs: Any) -> Any:
+    html_text = html.escape(text, quote=False) if literal_text else render_telegram_html(text)
     try:
         return await send_func(text=html_text, parse_mode=ParseMode.HTML, **kwargs)
     except BadRequest as exc:
@@ -11201,7 +11201,7 @@ async def send_formatted_text(send_func: Any, text: str, **kwargs: Any) -> Any:
             message="bad_request",
             details={"text_chars": len(text)},
         )
-        return await send_func(text=render_plain_fallback(text), **kwargs)
+        return await send_func(text=text if literal_text else render_plain_fallback(text), **kwargs)
 
 
 def delivered_message_id(message: Any) -> int | None:
@@ -11393,6 +11393,7 @@ async def send_reply(
     memory_label: str | None = None,
     route: str = "outbound_reply",
     outbound_provenance: OutboundProvenance | None = None,
+    literal_text: bool = False,
 ) -> TextDeliveryResult:
     provenance = outbound_provenance
     if memory_label is not None and provenance is None:
@@ -11413,6 +11414,7 @@ async def send_reply(
         text,
         on_delivered_chunk=callback,
         delivery_run_id=provenance.run_id if provenance is not None else "",
+        **({"literal_text": True} if literal_text else {}),
     )
 
 
@@ -12037,7 +12039,16 @@ async def handle_grounded_character(message: Message, context: ContextTypes.DEFA
     await maybe_send_chat_action(context, message.chat_id, ChatAction.TYPING)
     try:
         report = await asyncio.wait_for(run_character_evidence(session), timeout=120)
-        response = session.render(report)
+        report = session.validate(report)
+        response = session.render(report, fits=lambda text, blocks: all(
+            block in "\n\n".join(split_text_chunks(text)) for block in blocks
+        ))
+        if session.rejected_facet_count:
+            system_event(component="character", event_type="evidence_partially_rejected",
+                message="retained_valid_observations",
+                details={"accepted_facets": len(report.facets),
+                         "rejected_facets": session.rejected_facet_count,
+                         "rejection_reasons": session.rejected_facet_reasons})
     except InvalidCharacterEvidence as exc:
         system_event(component="character", event_type="evidence_rejected", message=str(exc),
                      details={"examined_count": len(session.examined_ids), "available_count": session.available_count})
@@ -12046,7 +12057,7 @@ async def handle_grounded_character(message: Message, context: ContextTypes.DEFA
         LOGGER.exception("Grounded character command failed")
         await send_reply(message, "Не зміг зараз перевірити приклади для портрета. Спробуй пізніше.")
         return
-    await send_reply(message, response)
+    await send_reply(message, response, literal_text=True)
 
 
 async def handle_character_command(message: Message, context: ContextTypes.DEFAULT_TYPE, args: str) -> None:

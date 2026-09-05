@@ -18,25 +18,47 @@ characters. The SDK run has at most six turns, 1,800 output tokens per turn and 
 120-second command timeout. These are runtime bounds, not a dollar-price promise.
 
 The structured result contains at most five observable behavioral facets, short
-supporting quotations, optional counterexamples and explicit uncertainty. Each
+supporting quotations, optional counterexamples and internal uncertainty. Each
 reference must identify a target-authored record actually exposed to this run;
 the exact quotation must occur in the exposed portion. Repeated observations
 require examples on two dates. If some retained records remain unread, at least
 one additional history inspection is required before publishing observations.
-The renderer provides dates and the unique examined/available record count.
-It does not print internal row identifiers or claim complete-history coverage.
-The renderer does not append the internal supporting quotations to the dated
-observations and counter-observations. Their free-text wording and uncertainty
-remain model-generated: Ukrainian paraphrasing is a prompt requirement, as in
-the existing character path, rather than a hard language or substring validator.
-Reference validation does not guarantee that these fields never repeat words
-from the examined evidence.
+The renderer joins independently supported paragraphs into a Ukrainian portrait,
+without displaying category names or repetitive evidence-log labels. Each
+observation allows up to 650 characters; a cited contrasting observation allows
+300. The prompt asks for meaningful context and qualifications within the prose.
+Internal uncertainty is not mechanically appended to every paragraph.
 
-Sparse or invalid evidence produces a qualified abstention. No free-form generic
-profile is published after a reference-validation failure. Reference validation
+Up to three distinct source excerpts are copied by the host from validated,
+actually examined text, with their dates. Multiline quotations remain valid
+internal evidence but are skipped as visible examples: cropping a line could
+remove its qualifying context, and paragraph packing could change it. Repeated
+references do not fill the example allowance. Sources retain their original
+language; the surrounding model-written portrait is requested in Ukrainian.
+The entire grounded-character reply uses literal delivery: HTML and Markdown
+inside either a source or generated prose cannot become Telegram formatting.
+Other reply paths keep their existing formatting behavior. Before delivery the
+host checks that complete paragraphs, examples and the coverage note survive the
+actual reply chunker. If needed, it omits whole final observations and reports
+that length limitation rather than cutting a quotation or losing the note.
+
+One final note gives the unique examined/available count, the examined period and
+the sample limitation. Internal row IDs are not printed. The prose remains
+model-generated: contextual interpretation and Ukrainian paraphrasing are prompt
+requirements, not hard language or semantic-entailment validators.
+
+An invalid source, quotation, repetition claim or counterexample discards that
+entire observation while retaining independently valid observations. No text or
+examples from a discarded observation enter the renderer. Report-wide invalid
+structure, missing required additional inspection, sparse evidence or no valid
+observations still produces a qualified abstention. There is no automatic repair
+model call and no unvalidated free-form narrative fallback. Reference validation
 does not prove semantic entailment: the primary model still owns interpretation,
 counterexample selection and uncertainty. Clinical diagnoses and psychometric
 scoring are outside the prompt contract.
+The session retains aggregate rejected-observation counts and fixed validation
+reason codes through rendering. Partial rejection is recorded without rejected
+prose, quotations or source identifiers.
 
 Validation uses synthetic temporary stores and scripted SDK model responses with
 network access disabled. It covers identity/permission isolation, date diversity,
@@ -44,11 +66,11 @@ deduplication, actual-exposure references and quotations, unread tails,
 counterexamples, concurrency/budgets, structured output and command rollback.
 Scripted contrasting profiles test evidence isolation, not measured model quality.
 Actual-adapter provider probes and release review are separate activation gates;
-provider probes share the existing combined evaluation ceiling with #183.
+each evaluation freezes its own cases and provider budget before dispatch.
 
-## Initial actual-adapter screen
+## Initial actual-adapter screen (previous presentation)
 
-Three fresh synthetic development cases ran once through the actual primary
+Before the narrative renderer change, three fresh synthetic development cases ran once through the actual primary
 adapter with Astra, low reasoning and the configured medium verbosity. The
 1,800-token output limit and application evidence/history limits were retained.
 Provider storage, tracing and retries were disabled for these private probes.
