@@ -2,8 +2,8 @@
 
 `CHARACTER_EVIDENCE_ENABLED=false` retains the existing `/character` implementation.
 When enabled, the self-or-administrator command uses the same primary model with
-one bounded, read-only history tool. The flag is an immediate rollback; there are
-no schema, embedding or model-role changes.
+one bounded, read-only history tool. The flag retains the legacy command as a rollback. Grounding does not change
+embeddings or model roles; delivery recovery adds its own private tables.
 
 The host fixes the current chat, resolved target author and persisted command
 cutoff before the model runs. Ambiguous or unresolved usernames abstain; display
@@ -107,3 +107,31 @@ probe documentation, leaving the character adapter and its dependencies intact.
 After the screen, the coverage label received a grammar-only change to a
 count-neutral form; source selection, prompts, report validation and model
 settings are unchanged. Original measured reports were preserved.
+
+## Delivery recovery
+
+A finished grounded-character response is saved privately before Telegram delivery.
+Its exact literal chunks are recoverable for 24 hours, separately from searchable
+chat messages, embeddings and personal profiles. Expired rows are purged on the
+next character request; there is no separate cleanup timer. Storage is capped at
+128 responses and 2,048 command records. A response has at most eight chunks and
+16,000 characters; pending responses are not evicted to admit another model run. Each part is
+marked before the network attempt and confirmed only after Telegram returns a
+real message identifier. A timeout, cancellation or interrupted acknowledgement
+remains uncertain rather than being treated as a safe automatic retry.
+
+Repeating the same character command can recover the pending response without
+another model call. Recovery reapplies current authorization and requires the
+same chat, topic, requester and resolved numeric subject. It skips confirmed
+parts and makes possible prior delivery explicit. Duplicate command updates and
+simultaneous recovery requests cannot claim the same send. A new request after
+successful completion can generate a fresh portrait normally. After a hard
+process crash, an existing ownership lease can delay recovery by up to eight
+minutes. Ordinary failure and cancellation release ownership promptly. Network
+operations have an outer 30-second deadline; existing Telegram transport
+timeouts may still fail earlier.
+
+Recovery cannot reconstruct responses lost before this feature was installed.
+It does not promise exactly-once Telegram delivery after an acknowledgement is
+lost. Fault validation uses temporary stores and synthetic transports; it needs
+no provider requests or Telegram test messages.

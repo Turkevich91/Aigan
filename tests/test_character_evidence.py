@@ -526,6 +526,7 @@ class CharacterCommandTests(unittest.TestCase):
         self.assertIsNotNone(cutoff)
         self.assertNotIn(cutoff.id, session.examined_ids)
         admin = self.message("/character @target", user_id=next(iter(self.config.admin_user_ids)))
+        admin.message_id = 10000
         self.run_command(admin, "@target").assert_awaited_once()
 
     def test_other_member_and_foreign_chat_cannot_start_analysis(self):
@@ -558,11 +559,9 @@ class CharacterCommandTests(unittest.TestCase):
 
     def test_sparse_character_response_uses_literal_delivery(self):
         message = self.message()
-        with patch.object(main, "send_reply", wraps=main.send_reply) as reply:
-            self.run_command(message, "me").assert_not_awaited()
-        reply.assert_awaited_once()
-        self.assertTrue(reply.call_args.kwargs["literal_text"])
+        self.run_command(message, "me").assert_not_awaited()
         self.assertEqual(1, len(message.reply_calls))
+        self.assertIsNone(message.reply_calls[0]["parse_mode"])
 
     def test_command_delivers_only_verified_parts_once_as_literal_text(self):
         self.seed()
@@ -585,14 +584,15 @@ class CharacterCommandTests(unittest.TestCase):
         with patch.object(main, "system_event") as event:
             self.run_command(message, "me", model)
         model.assert_awaited_once()
-        event.assert_called_once_with(component="character", event_type="evidence_partially_rejected",
+        event.assert_any_call(component="character", event_type="evidence_partially_rejected",
             message="retained_valid_observations",
             details={"accepted_facets": 1, "rejected_facets": 1,
                      "rejection_reasons": {"unexamined_or_mismatched_reference": 1}})
         self.assertEqual(1, len(message.reply_calls))
         sent = message.reply_calls[0]["text"]
         self.assertIn("**разом**", sent)
-        self.assertIn("&lt;b&gt;підстави&lt;/b&gt;", sent)
+        self.assertIn("<b>підстави</b>", sent)
+        self.assertIsNone(message.reply_calls[0]["parse_mode"])
         self.assertIn("«Перевірмо факти»", sent)
         self.assertNotIn("UNVERIFIED", sent)
         self.assertNotIn("Межа висновку", sent)
