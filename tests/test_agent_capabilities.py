@@ -207,6 +207,7 @@ class AgentCapabilityTests(unittest.TestCase):
         main.pending_requests.clear()
         context = SimpleNamespace(bot=SimpleNamespace(id=123456, username="test_bot", send_chat_action=AsyncMock()))
         with patch.object(main, "CONFIG", self.config), patch.object(main, "MEMORY", self.store), \
+             patch.object(main, "BOT_USERNAME", main.BOT_USERNAME), patch.object(main, "BOT_ID", main.BOT_ID), \
              patch.object(main, "run_agent", AsyncMock()) as run, \
              patch.object(main, "maybe_auto_react", AsyncMock()), \
              patch.object(main, "primary_capabilities_for_message") as capabilities:
