@@ -108,6 +108,11 @@ class CharacterEvidenceTests(unittest.TestCase):
         self.assertNotIn("Prior assistant portrait", output)
         self.assertNotIn("INJECTED SOURCE BODY", output)
         self.assertEqual(4, session.available_count)
+        payload = json.loads(output)
+        self.assertEqual(4, len(payload["messages"]))
+        self.assertEqual(4, payload["coverage"]["returned_count"])
+        self.assertEqual(4, payload["coverage"]["displayed_unique_count"])
+        self.assertTrue(all(not row["text"].startswith("/") for row in payload["messages"]))
 
     def test_refuses_missing_or_cross_chat_cutoff_and_unresolved_target(self):
         cutoff = self.save("request", chat_id=-2002)
