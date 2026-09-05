@@ -82,7 +82,7 @@ class CharacterDeliveryStore:
     def __init__(self, path: Path | str, *, clock: Callable[[], float] = time.time) -> None:
         self.path = Path(path)
         self.clock = clock
-        self._conn = sqlite3.connect(self.path, timeout=1)
+        self._conn = sqlite3.connect(self.path, timeout=5)
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA foreign_keys=ON")
         self._conn.executescript("""

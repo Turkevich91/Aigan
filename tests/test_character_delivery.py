@@ -265,6 +265,40 @@ class DeliveryStoreTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual('new',first.status)
             self.assertEqual('capacity',second.status)
 
+    def test_prepare_survives_brief_external_writer_contention(self):
+        import threading
+        claim = self.admit()
+        locked, release = threading.Event(), threading.Event()
+        failures = []
+        def hold_writer():
+            try:
+                with sqlite3.connect(self.path) as connection:
+                    connection.execute('BEGIN IMMEDIATE')
+                    locked.set()
+                    release.wait(5)
+            except Exception as exc:
+                failures.append(type(exc).__name__)
+                locked.set()
+        worker = threading.Thread(target=hold_writer)
+        worker.start()
+        timer = None
+        try:
+            self.assertTrue(locked.wait(5))
+            self.assertEqual([], failures)
+            timer = threading.Timer(1.2, release.set)
+            timer.start()
+            prepared = self.store.prepare(claim, ('already generated literal text',))
+            self.assertEqual(['already generated literal text'], json.loads(self.snapshot(prepared.id)['chunks_json']))
+            self.assertEqual(1, self.store._conn.execute('SELECT count(*) FROM character_delivery_responses').fetchone()[0])
+        finally:
+            release.set()
+            if timer is not None:
+                timer.cancel()
+                timer.join(5)
+            worker.join(5)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual([], failures)
+
     def test_chunk_caps_validate_before_persisting(self):
         claim=self.admit()
         for chunks in ((), ('a',)*9, ('x'*4097,), ('😀'*2049,), ('x'*4001,)*4):
