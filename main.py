@@ -86,6 +86,7 @@ from image_intent import (
 )
 from agent_capabilities import PrimaryCapabilities
 from chat_history import ChatHistorySession
+from history_retrieval import HISTORY_EMBEDDING_MODEL, HISTORY_EMBEDDING_DIMENSIONS
 from history_citations import ACTIVE_HISTORY_CITATIONS, HistoryCitationSession
 from character_evidence import (
     CHARACTER_INSTRUCTIONS, CharacterEvidenceSession, CharacterReport, InvalidCharacterEvidence,
@@ -7393,6 +7394,9 @@ def primary_capabilities_for_message(message: Message, prompt: str) -> PrimaryCa
         MEMORY, chat_id=message.chat_id,
         cutoff_memory_id=current.id if current is not None else None,
         cutoff_created_at=cutoff.isoformat(),
+        query_embedder=(create_history_query_embedding
+            if memory_vector_available() and CONFIG.memory_embedding_model == HISTORY_EMBEDDING_MODEL
+            and CONFIG.memory_embedding_dimensions == HISTORY_EMBEDDING_DIMENSIONS else None),
     ) if MEMORY is not None and current is not None else None)
     continuation = verified_image_continuation(message) if CONFIG.web_image_search_enabled else None
     images = (ImageCapabilitySession(ImageCapabilityContext(
@@ -7921,6 +7925,7 @@ def create_embeddings_sync(
     *,
     route_bucket: str = "",
     task_class_bucket: str = "",
+    timeout_seconds: float | None = None,
 ) -> list[list[float]]:
     if not texts:
         return []
@@ -7941,7 +7946,13 @@ def create_embeddings_sync(
     try:
         if CONFIG.openai_api_key == "sk-test":
             raise RuntimeError("test OpenAI API key cannot create embeddings")
-        response = OpenAI().embeddings.create(**kwargs)
+        if timeout_seconds is None:
+            response = OpenAI().embeddings.create(**kwargs)
+        else:
+            # Explicit history-tool queries have a bounded transport; automatic
+            # context and indexing keep their existing timeout/retry policy.
+            with OpenAI(timeout=timeout_seconds, max_retries=0) as client:
+                response = client.embeddings.create(**kwargs)
     except Exception as exc:
         finish_model_stage(stage, status="failed", failure_class=exc)
         raise
@@ -7962,6 +7973,7 @@ async def create_embeddings(
     stage_kind: str = "embedding_query",
     route_bucket: str = "",
     task_class_bucket: str = "",
+    timeout_seconds: float | None = None,
 ) -> list[list[float]]:
     clipped = [clip_text(text, 4000) for text in texts if text.strip()]
     if not clipped:
@@ -7972,7 +7984,18 @@ async def create_embeddings(
         stage_kind,
         route_bucket=route_bucket,
         task_class_bucket=task_class_bucket,
+        **({"timeout_seconds": timeout_seconds} if timeout_seconds is not None else {}),
     )
+
+
+async def create_history_query_embedding(query: str) -> list[float]:
+    """Explicit history-tool query with existing small/512 telemetry and pricing."""
+    if (not memory_vector_available() or CONFIG.memory_embedding_model != HISTORY_EMBEDDING_MODEL
+            or CONFIG.memory_embedding_dimensions != HISTORY_EMBEDDING_DIMENSIONS):
+        return []
+    vectors = await create_embeddings([query], stage_kind="embedding_query",
+        route_bucket="memory_recall", timeout_seconds=8.)
+    return vectors[0] if len(vectors) == 1 else []
 
 
 async def process_embedding_candidates(candidates: list[EmbeddingCandidate], source: str) -> int:

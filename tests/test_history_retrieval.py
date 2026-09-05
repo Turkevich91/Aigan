@@ -176,7 +176,8 @@ class HistoryRetrievalTests(unittest.TestCase):
         self.assertNotIn("FORBIDDEN", json.dumps(asdict(result)))
         self.assertEqual("visible quoted source", result.rows[0]["source_text"])
         self.assertEqual({"id", "message_id", "user_id", "created_at", "sender_label", "text", "source_text",
-                          "attachment_type", "attachment_summary", "reply_to_message_id", "sort_time"}, set(result.rows[0]))
+                          "attachment_type", "attachment_summary", "reply_to_message_id", "sort_time",
+                          "is_forwarded", "evidence_digest"}, set(result.rows[0]))
 
     def test_authored_scope_excludes_forwarded_bot_and_source_influenced_vectors(self):
         self.add("blue lantern", embedding=vector(), is_bot=True)

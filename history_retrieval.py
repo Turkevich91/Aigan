@@ -86,7 +86,7 @@ class HistoryRetrievalResult:
     relevance_order: tuple[int, ...] = ()
 
 
-def _unit_vector(values: Sequence[float] | None) -> tuple[float, ...] | None:
+def normalize_history_vector(values: Sequence[float] | None) -> tuple[float, ...] | None:
     if values is None or len(values) != HISTORY_EMBEDDING_DIMENSIONS:
         return None
     try:
@@ -129,7 +129,7 @@ def _read_snapshot(store: MemoryStore, scope: HistorySearchScope, query: str = "
                     and (not scope.authored_only or canonical == " ".join(item.text.split()))
                 )
                 if valid:
-                    vector = _unit_vector(struct.unpack(f"<{HISTORY_EMBEDDING_DIMENSIONS}f", blob))
+                    vector = normalize_history_vector(struct.unpack(f"<{HISTORY_EMBEDDING_DIMENSIONS}f", blob))
             except (TypeError, ValueError, struct.error, AttributeError):
                 pass
             if vector is None:
@@ -138,7 +138,7 @@ def _read_snapshot(store: MemoryStore, scope: HistorySearchScope, query: str = "
             indexed += 1
         # Lexical evidence is restricted to fields the model can actually inspect.
         lexical = item.text if scope.authored_only else " ".join((item.text, item.source_text, item.vision_summary))
-        candidates.append((item, lexical, vector, metadata["sort_time"]))
+        candidates.append((item, lexical, vector, metadata["sort_time"], metadata["evidence_digest"]))
     status = "ready" if indexed else "no_usable_index" if rows else "empty_scope"
     return tuple(candidates), HistoryRetrievalCoverage(status, len(rows), indexed, unusable), fts_scores, fts_available
 
@@ -148,7 +148,7 @@ def preflight_history_retrieval(store: MemoryStore, scope: HistorySearchScope) -
     return _read_snapshot(store, scope)[1]
 
 
-def _project(item, *, authored_only: bool, sort_time: float) -> dict[str, object]:
+def _project(item, *, authored_only: bool, sort_time: float, evidence_digest: str) -> dict[str, object]:
     return {
         "id": item.id, "message_id": item.message_id, "user_id": item.user_id,
         "created_at": item.created_at, "sender_label": item.sender_label[:97],
@@ -156,6 +156,7 @@ def _project(item, *, authored_only: bool, sort_time: float) -> dict[str, object
         "attachment_type": item.attachment_type[:49],
         "attachment_summary": "" if authored_only else item.vision_summary[:1001],
         "reply_to_message_id": item.reply_to_message_id, "sort_time": sort_time,
+        "is_forwarded": bool(item.forward_origin), "evidence_digest": evidence_digest,
     }
 
 
@@ -179,15 +180,17 @@ def retrieve_history(
     candidates, coverage, fts_scores, fts_available = _read_snapshot(store, scope, query)
     if coverage.status == "scope_too_large":
         return HistoryRetrievalResult((), coverage, "scope_too_large", mode, False)
-    vector = _unit_vector(query_vector)
+    vector = normalize_history_vector(query_vector)
     use_vectors = vector is not None and coverage.indexed_rows > 0
     terms = tuple(dict.fromkeys(re.findall(r"[^\W_]+", query.casefold(), flags=re.UNICODE)))[:8]
     keyword = []
     semantic = []
     fts = []
     times = {}
-    for item, lexical, candidate_vector, sort_time in candidates:
+    digests = {}
+    for item, lexical, candidate_vector, sort_time, digest in candidates:
         times[item.id] = sort_time
+        digests[item.id] = digest
         if terms and all(term in lexical.casefold() for term in terms):
             keyword.append(SemanticMemoryResult(item, lexical, 100., "keyword"))
         if use_vectors and candidate_vector is not None:
@@ -220,7 +223,8 @@ def retrieve_history(
             reason = "fts_unavailable"
         applied_mode = "hybrid"
     selected = ranked[:limit]
-    rows = tuple(_project(result.item, authored_only=scope.authored_only, sort_time=times[result.item.id])
+    rows = tuple(_project(result.item, authored_only=scope.authored_only, sort_time=times[result.item.id],
+                          evidence_digest=digests[result.item.id])
                  for result in selected)
     return HistoryRetrievalResult(rows, coverage, "ok" if rows else "no_match", applied_mode,
                                   use_vectors, policy, reason, len(ranked) > limit,

@@ -772,6 +772,10 @@ class MemoryStore:
                 return [], True, {}, False
             rows = self._conn.execute(
                 f"""SELECT m.*, julianday(m.created_at) AS sort_time,
+                    history_evidence_digest(m.id, m.message_id, m.user_id, m.created_at,
+                        m.sender_label, m.text, m.source_text, m.attachment_type,
+                        m.vision_summary, m.reply_to_message_id, m.is_bot, m.content_kind,
+                        m.forward_origin) AS evidence_digest,
                     e.chat_id AS embedding_chat_id, e.model AS embedding_model,
                     e.dimensions AS embedding_dimensions, e.content_hash AS embedding_hash,
                     e.embedding_blob, e.embedded_at
@@ -797,7 +801,7 @@ class MemoryStore:
                     scores = {row["id"]: -float(row["rank"] or 0.) for row in matches}
                 except sqlite3.OperationalError:
                     fts_available = False
-        fields = ("sort_time", "embedding_chat_id", "embedding_model", "embedding_dimensions",
+        fields = ("sort_time", "evidence_digest", "embedding_chat_id", "embedding_model", "embedding_dimensions",
                   "embedding_hash", "embedding_blob", "embedded_at")
         return [(self._row_to_item(row), {key: row[key] for key in fields}) for row in rows], False, scores, fts_available
 
