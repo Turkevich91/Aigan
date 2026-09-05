@@ -522,6 +522,14 @@ class CharacterCommandTests(unittest.TestCase):
         self.assertIn("недостатньо", message.reply_calls[-1]["text"])
         self.assertNotIn("unexamined", message.reply_calls[-1]["text"])
 
+    def test_sparse_character_response_uses_literal_delivery(self):
+        message = self.message()
+        with patch.object(main, "send_reply", wraps=main.send_reply) as reply:
+            self.run_command(message, "me").assert_not_awaited()
+        reply.assert_awaited_once()
+        self.assertTrue(reply.call_args.kwargs["literal_text"])
+        self.assertEqual(1, len(message.reply_calls))
+
     def test_command_delivers_only_verified_parts_once_as_literal_text(self):
         self.seed()
         message = self.message()
@@ -536,10 +544,17 @@ class CharacterCommandTests(unittest.TestCase):
             invalid.facet = "initiative"
             invalid.observation = "UNVERIFIED CLAIM MUST NOT APPEAR."
             invalid.evidence[0].id = 999999
-            return CharacterReport(facets=[invalid, facet], abstention="none")
+            # The actual run_character_evidence adapter returns a validated
+            # report; preserve that boundary while testing command delivery.
+            return session.validate(CharacterReport(facets=[invalid, facet], abstention="none"))
         model = AsyncMock(side_effect=report_for)
-        self.run_command(message, "me", model)
+        with patch.object(main, "system_event") as event:
+            self.run_command(message, "me", model)
         model.assert_awaited_once()
+        event.assert_called_once_with(component="character", event_type="evidence_partially_rejected",
+            message="retained_valid_observations",
+            details={"accepted_facets": 1, "rejected_facets": 1,
+                     "rejection_reasons": {"unexamined_or_mismatched_reference": 1}})
         self.assertEqual(1, len(message.reply_calls))
         sent = message.reply_calls[0]["text"]
         self.assertIn("**разом**", sent)

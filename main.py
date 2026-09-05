@@ -12034,12 +12034,11 @@ async def handle_grounded_character(message: Message, context: ContextTypes.DEFA
     session = CharacterEvidenceSession(MEMORY, chat_id=message.chat_id, target_user_id=target_id,
         cutoff_memory_id=current_id, cutoff_created_at=message_datetime(message).isoformat())
     if len(session.examined_ids) < 3:
-        await send_reply(message, session.render(CharacterReport(facets=[], abstention="sparse")))
+        await send_reply(message, session.render(CharacterReport(facets=[], abstention="sparse")), literal_text=True)
         return
     await maybe_send_chat_action(context, message.chat_id, ChatAction.TYPING)
     try:
         report = await asyncio.wait_for(run_character_evidence(session), timeout=120)
-        report = session.validate(report)
         response = session.render(report, fits=lambda text, blocks: all(
             block in "\n\n".join(split_text_chunks(text)) for block in blocks
         ))
