@@ -1,0 +1,192 @@
+{
+  "authorization": {
+    "claim_retained_after_failure": true,
+    "exclusive_claim_before_payload_parse": true,
+    "required_fields": [
+      "authorized",
+      "fixture_sha256",
+      "fixture_manifest_sha256",
+      "protocol_sha256",
+      "evaluator_source_sha256",
+      "candidate_source_sha256",
+      "candidate_config_sha256",
+      "development_report_sha256",
+      "development_cache_manifest_sha256",
+      "state_directory_sha256",
+      "state_ledger_uuid",
+      "experiment_schedule_sha256",
+      "nonce",
+      "scope"
+    ],
+    "schema_version": "recall179-holdout-authorization-v2",
+    "scope": "one_three_repetition_holdout_experiment_no_tuning"
+  },
+  "baseline_policy": {
+    "ambiguous_threshold": 0.48,
+    "archetype_count": 10,
+    "archetypes_canonical_json_sha256": "2c902785f6949d19568ca6f7369c9ab96247d96eb8dae798a08851a983d985fa",
+    "function_sha256": {
+      "detect_memory_recall_intent": "dd02597de46f91417fe49c2304f73f429e692c085095cbd294910b5a0484f27c",
+      "has_explicit_memory_context_hint": "c24579bac39b5fa260005b5684f29db36f6fd73a4bf98773736394cd1f46575e",
+      "memory_recall_embedding_confidence": "8d0ed1e9a5a1de5f0d7a48f360082a8212ce67eeadf20943f6e28aab54123f6c",
+      "memory_recall_fallback_intent": "aca4b78b91428f48c2157f48fb1ab418fab17185556e5410f607c2b14e992779"
+    },
+    "main_sha256": "8117c14b80df560a8df00acc4e4289945e1e17889738e764cb2ba8ff7a7c652a",
+    "strong_threshold": 0.62
+  },
+  "baseline_sha": "a0d5028bab91ba64daff379375b1f52a46c9dd0b",
+  "cache": {
+    "additive_issue_180_entries_allowed": true,
+    "dimensions": 512,
+    "frozen_entries_must_remain_unchanged": true,
+    "key_inputs": [
+      "exact_provider_input_sha256",
+      "model",
+      "dimensions",
+      "normalization_version"
+    ],
+    "ledger_identity_required": true,
+    "model": "text-embedding-3-small",
+    "paired_query_vectors": true
+  },
+  "candidate_prompt_or_code_read_by_custodian": false,
+  "experiment": {
+    "actual_main_adapter_required": true,
+    "baseline_cache_reuse_allowed": true,
+    "baseline_pairs_same_case": true,
+    "boundary_decisions": 36,
+    "candidate_repetitions": 3,
+    "complete_repetitions_required": 3,
+    "decision_stability_denominator": 72,
+    "efficacy_decisions": 216,
+    "fresh_classifier_requests_each_repetition": true,
+    "majority_vote_rescue_allowed": false,
+    "runtime_promotion": false,
+    "stable_all_three_min_cases": 69
+  },
+  "fixture_schema_version": "recall-admission-fixture-v1",
+  "frozen_before_candidate_comparison": true,
+  "gates": {
+    "all_repetitions_must_pass": true,
+    "per_repetition": {
+      "administrative_aborts_max": 0,
+      "classifier_p95_ms_max": 3000,
+      "critical_false_positives_max": 0,
+      "degraded_outcomes_max": 0,
+      "false_positives_max": 1,
+      "incomplete_or_unexplained_cases_max": 0,
+      "invocation_boundary_violations_max": 0,
+      "net_true_positive_gain_min": 8,
+      "provider_invalid_or_error_max": 0,
+      "true_positives_min": 33
+    },
+    "separate_failure_precedence_scope_and_rollout_checks_required": true,
+    "stable_all_three_min_cases": 69,
+    "uninvoked_group_classifier_calls_max": 0,
+    "uninvoked_group_provider_calls_max": 0
+  },
+  "holdout": {
+    "boundary_cases": 12,
+    "boundary_families": 4,
+    "boundary_uninvoked_cases": 6,
+    "bytes": 63961,
+    "critical_negative": 15,
+    "cross_v1_exact_prompt_duplicates": 0,
+    "efficacy_cases": 72,
+    "exposure_at_freeze": "independent_custodian_only",
+    "families": 24,
+    "fixture_id": "recall-admission-179-holdout-v2",
+    "language_variants_per_family": 3,
+    "negative": 36,
+    "payload_in_git": false,
+    "per_language_negative": 12,
+    "per_language_positive": 12,
+    "positive": 36,
+    "sha256": "d0711ee79acdb95d89680b94939bef7493164ab074cae09f9136a24e3e90af13"
+  },
+  "human_gold": false,
+  "issue": 179,
+  "label_authority": "independent_agent_synthetic",
+  "latency": {
+    "automatic_retries": 0,
+    "empty_population_passes": false,
+    "failed_or_slow_observations_excluded": false,
+    "p95_definition": "nearest_rank",
+    "population": "actual_attempted_classifier_calls_per_repetition",
+    "report_total_adapter_latency_separately": true,
+    "timeout_seconds": 8
+  },
+  "metrics": {
+    "bootstrap": {
+      "confidence": 0.95,
+      "keep_all_language_variants": true,
+      "method": "paired_family_percentile",
+      "precision": "positive_and_negative_families_resampled_separately",
+      "recall": "positive_families",
+      "replicates": 10000,
+      "seed": 179
+    },
+    "confusion_counts": true,
+    "decision_stability": "same_final_decision_in_all_three",
+    "language_breakdown": [
+      "ua",
+      "ru",
+      "en"
+    ],
+    "paired_win_loss_counts": true,
+    "per_arm_and_delta_intervals": true,
+    "primary": [
+      "precision",
+      "recall",
+      "specificity",
+      "false_positive_rate"
+    ],
+    "repetitions_are_independent_queries": false,
+    "report_each_repetition": true,
+    "undefined_precision": "null"
+  },
+  "prior_iteration": {
+    "authorization_reusable": false,
+    "development_sha256": "2109575596776ead7ec5e29abe05f8fd1dd11c8345b7209c52ccee809358991d",
+    "failed_candidate": {
+      "critical_fp": 2,
+      "fn": 16,
+      "fp": 2,
+      "tn": 34,
+      "tp": 20
+    },
+    "holdout_sha256": "c77bf08c8e08a25f39c1fb65a3b3d2d35d3a66f71f324c89a432c95adf470888",
+    "holdout_status": "consumed_failed_observed_development",
+    "manifest_path": "tests/fixtures/memory_recall_179_manifest.json",
+    "manifest_sha256": "34f038e9afb71f77caa275bae6273fb2b4b43f134d0e269c8369fb450140b58a",
+    "originals_immutable": true,
+    "paired_baseline": {
+      "fn": 31,
+      "fp": 4,
+      "tn": 32,
+      "tp": 5
+    },
+    "protocol_sha256": "dfc95a2341736ee3f05249b56a61caddb654599ae605e9993c048e2b31de0bea"
+  },
+  "protocol": {
+    "path": "docs/recall-admission-179-v2-eval.md",
+    "sha256": "a3de01c489c72cdfa9193434c8b315cd5850d1008e264b899ccfb28b626a1a9b"
+  },
+  "provider_calls_by_custodian": 0,
+  "schema_version": "recall-admission-eval-manifest-v2",
+  "shared_provider_budget": {
+    "frozen_luna_rates_usd_per_million": {
+      "input": 0.2,
+      "output": 1.2
+    },
+    "historical_model_pricing_is_not_trial_rate_source": true,
+    "issues": [
+      179,
+      180
+    ],
+    "rate_card_must_be_bound": true,
+    "reserve_before_dispatch": true,
+    "unknown_usage_is_not_free": true,
+    "usd": 5
+  }
+}
