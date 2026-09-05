@@ -85,9 +85,9 @@ class HistorySemanticSessionTests(retrieval_fixtures.HistoryRetrievalTests):
         self.add(embedding=vector())
         embedder = AsyncMock(return_value=vector())
         session = self.session(embedder)
-        for _ in range(2):
-            self.run_read(session, mode="hybrid", query="blue lantern")
-        self.assertEqual(1, embedder.await_count)
+        for query in ("  blue\t lantern  ", "blue lantern"):
+            self.run_read(session, mode="hybrid", query=query)
+        embedder.assert_awaited_once_with("blue lantern")
 
     def test_cached_vector_skips_admission_but_rechecks_stale_source_index(self):
         target = self.add(embedding=vector())

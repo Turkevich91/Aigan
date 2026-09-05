@@ -344,7 +344,7 @@ class ChatHistorySession:
                 return None, "embedding_budget_exhausted"
             self._embedding_calls_used += 1
         try:
-            result = await asyncio.wait_for(self._query_embedder(query), timeout=self._embedding_timeout_seconds)
+            result = await asyncio.wait_for(self._query_embedder(key), timeout=self._embedding_timeout_seconds)
             vector = normalize_history_vector(result)
             if vector is None:
                 return None, "invalid_query_embedding"
