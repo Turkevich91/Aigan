@@ -193,6 +193,7 @@ class MemoryStore:
         self._lock = threading.RLock()
         self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
+        self._conn.create_function("history_casefold", 1, lambda value: str(value or "").casefold(), deterministic=True)
         with self._lock:
             self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.execute("PRAGMA foreign_keys=ON")
@@ -492,6 +493,87 @@ class MemoryStore:
                 (chat_id,),
             ).fetchone()
         return int(row["count"] or 0) if row is not None else 0
+
+    def bounded_history_rows(
+        self, *, chat_id: int, cutoff_memory_id: int, cutoff_created_at: str,
+        mode: str, limit: int, terms: tuple[str, ...] = (),
+        anchor_id: int | None = None, participant_id: int | None = None,
+        after: str = "", before: str = "", authored_only: bool = False,
+    ) -> tuple[list[dict[str, object]], bool]:
+        """Read a bounded original-message page without embeddings or FTS exclusions.
+
+        This low-level API receives a trusted scope from ChatHistorySession. SQL
+        projects only safe, size-limited fields; no complete MemoryItem leaves it.
+        The lexical path includes bot replies, which the ordinary FTS omits.
+        """
+        limit = max(1, min(20, int(limit)))
+        conditions = ["m.chat_id = ?", "m.id < ?", "julianday(m.created_at) <= julianday(?)"]
+        params: list[object] = [chat_id, cutoff_memory_id, cutoff_created_at]
+        if participant_id is not None:
+            conditions.append("m.user_id = ?")
+            params.append(participant_id)
+        if after:
+            conditions.append("julianday(m.created_at) >= julianday(?)")
+            params.append(after)
+        if before:
+            conditions.append("julianday(m.created_at) < julianday(?)")
+            params.append(before)
+        if authored_only:
+            conditions.extend([
+                "m.is_bot = 0", "m.text != ''", "m.text NOT LIKE '[message has %'",
+                "m.forward_origin = ''", "m.content_kind = 'text'",
+            ])
+        if mode == "search":
+            if not terms:
+                return [], False
+            text_expression = "m.text" if authored_only else "m.text || ' ' || m.vision_summary || ' ' || m.source_text"
+            for term in terms[:8]:
+                conditions.append(f"instr(history_casefold({text_expression}), ?) > 0")
+                params.append(term.casefold())
+        summary = "''" if authored_only else "substr(m.vision_summary, 1, 1001)"
+        source = "''" if authored_only else "substr(m.source_text, 1, 1001)"
+        projection = f"""m.id, m.message_id, m.user_id, m.created_at,
+            substr(m.sender_label, 1, 97) AS sender_label,
+            substr(m.text, 1, 1001) AS text,
+            {source} AS source_text,
+            substr(m.attachment_type, 1, 49) AS attachment_type,
+            {summary} AS attachment_summary, m.reply_to_message_id,
+            julianday(m.created_at) AS sort_time"""
+        where = " AND ".join(conditions)
+        with self._lock:
+            if mode == "around":
+                anchor = self._conn.execute(
+                    f"SELECT {projection} FROM messages m WHERE {where} AND m.id = ? LIMIT 1",
+                    (*params, anchor_id),
+                ).fetchone()
+                if anchor is None:
+                    return [], False
+                sides = []
+                for comparison, direction in (("<", "DESC"), (">", "ASC")):
+                    sides.append(self._conn.execute(
+                        f"""SELECT {projection} FROM messages m WHERE {where}
+                            AND (julianday(m.created_at) {comparison} ? OR
+                                (julianday(m.created_at) = ? AND m.id {comparison} ?))
+                            ORDER BY julianday(m.created_at) {direction}, m.id {direction} LIMIT ?""",
+                        (*params, anchor["sort_time"], anchor["sort_time"], anchor_id, limit),
+                    ).fetchall())
+                earlier, later = sides
+                earlier_count = min(len(earlier), (limit - 1) // 2)
+                later_count = min(len(later), limit - 1 - earlier_count)
+                earlier_count = min(len(earlier), limit - 1 - later_count)
+                rows = list(reversed(earlier[:earlier_count])) + [anchor] + later[:later_count]
+                more = len(earlier) > earlier_count or len(later) > later_count
+            elif mode in {"recent", "search"}:
+                rows = self._conn.execute(
+                    f"""SELECT {projection} FROM messages m WHERE {where}
+                        ORDER BY julianday(m.created_at) DESC, m.id DESC LIMIT ?""",
+                    (*params, limit + 1),
+                ).fetchall()
+                more = len(rows) > limit
+                rows = list(reversed(rows[:limit]))
+            else:
+                raise ValueError("Unknown history mode")
+        return [{key: row[key] for key in row.keys() if key != "sort_time"} for row in rows], more
 
     def context_window_around_item(
         self,
