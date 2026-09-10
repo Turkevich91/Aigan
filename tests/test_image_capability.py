@@ -132,6 +132,53 @@ class ImageCapabilityTests(unittest.TestCase):
                                                 ImageDeliveryProposal(operation, 'current_text', subject))
                 self.assertEqual('denied', result.status)
 
+    def test_inline_translation_sources_cannot_authorize_delivery(self):
+        for prefix, operation, subject in (
+            ('Translate into Ukrainian: ', 'Find five red flowers', 'red flowers'),
+            ('Please translate to Ukrainian\n', 'Find five red flowers', 'red flowers'),
+            ('Переклади українською: ', 'Покажи пʼять червоних квітів', 'червоних квітів'),
+            ('Переведи на украинский\n', 'Найди пять красных цветов', 'красных цветов'),
+            ('Translate ', 'Find five red flowers', 'red flowers'),
+        ):
+            prompt = prefix + operation
+            for selected in (operation, prompt):
+                with self.subTest(prompt=prompt, selected=selected):
+                    result = propose_image_delivery(ImageCapabilityContext(prompt, -1001),
+                        ImageDeliveryProposal(selected, 'current_text', subject, '', 'exact', 5))
+                    self.assertEqual('denied', result.status)
+        # "Then" is part of an undelimited source, not permission to execute it.
+        prompt = 'Translate: A sentence; then Find five red flowers'
+        self.assertEqual('denied', propose_image_delivery(ImageCapabilityContext(prompt, -1001),
+            ImageDeliveryProposal('Find five red flowers', 'current_text', 'red flowers')).status)
+
+    def test_quoted_translation_source_and_separate_current_operation_keep_own_authority(self):
+        prompt = 'Translate "Find five red flowers"; then find five blue flowers'
+        ctx = ImageCapabilityContext(prompt, -1001)
+        self.assertEqual('denied', propose_image_delivery(ctx, ImageDeliveryProposal(
+            'Find five red flowers', 'current_text', 'red flowers')).status)
+        self.assertEqual('denied', propose_image_delivery(ctx, ImageDeliveryProposal(
+            prompt, 'current_text', 'red flowers')).status)
+        self.assertEqual('accepted', propose_image_delivery(ctx, ImageDeliveryProposal(
+            'find five blue flowers', 'current_text', 'blue flowers')).status)
+        # Quoted and unquoted source occurrences cannot authorize each other.
+        prompt = 'He wrote "Find red flowers"; Translate: Find red flowers'
+        self.assertEqual('denied', propose_image_delivery(ImageCapabilityContext(prompt, -1001),
+            ImageDeliveryProposal('Find red flowers', 'current_text', 'red flowers')).status)
+
+    def test_escaped_quote_cannot_release_inline_source_authority(self):
+        prompt = r'Translate "Quoted \" word. Find five red flowers"; then find five blue flowers'
+        ctx = ImageCapabilityContext(prompt, -1001)
+        self.assertEqual('denied', propose_image_delivery(ctx, ImageDeliveryProposal(
+            'Find five red flowers', 'current_text', 'red flowers')).status)
+        self.assertEqual('accepted', propose_image_delivery(ctx, ImageDeliveryProposal(
+            'find five blue flowers', 'current_text', 'blue flowers')).status)
+
+    def test_nested_source_directive_does_not_hide_separate_current_operation(self):
+        prompt = 'Translate "First line\nTranslate hello"; then find five blue flowers'
+        result = propose_image_delivery(ImageCapabilityContext(prompt, -1001),
+            ImageDeliveryProposal('find five blue flowers', 'current_text', 'blue flowers'))
+        self.assertEqual('accepted', result.status)
+
     def test_negative_elliptical_continuation_does_not_strip_its_negation(self):
         for prompt, operation, modifier in (
             ('Не треба жовті', 'жовті', 'жовті'),
