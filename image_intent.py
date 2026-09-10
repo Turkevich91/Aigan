@@ -441,19 +441,36 @@ def _inline_translation_source_ranges(text: str) -> list[tuple[int, int]]:
     grant execution authority. A closed quotation has an explicit source end,
     leaving separately authored instructions outside that quotation available.
     """
-    directive = re.compile(
-        r"(?:^|[;\n])\s*(?:(?:please|будь\s+ласка|пожалуйста)[, ]+)?"
-        r"(?:translate|translation|переведи|перевести|переклади|перекласти|переклад|перевод)\b"
-        r"(?:\s+(?:(?:into|to|in|на)\s+\w+|українською|англійською))?"
-        r"[ \t]*[:—-]?[ \t\r\n]*",
+    # A delimited source header may use an interrogative, gerund or noun. Match
+    # the translation term within its clause, not a whitelist of polite prefixes.
+    delimited = re.compile(
+        r"\b(?:translat\w*|перекла\w*|перевод\w*|перевед\w*|перевест\w*|перев[её]л\w*)\b"
+        r'[^\r\n:;.!?"«“„‘]{0,160}'
+        r'(?:(?P<quoted>["«“„‘])|(?::(?!//)|\r?\n)[ \t\r\n]*)',
         re.IGNORECASE,
     )
+    # Without an explicit source delimiter, retain the narrow imperative form.
+    # A verb used inside an ordinary subject ("Google Translate app") is not a
+    # source introduction and must not hide the requested image capability.
+    bare = re.compile(
+        r"(?:^|[;\n])\s*(?:(?:please|будь\s+ласка|пожалуйста)[, ]+)?"
+        r"(?:translate|переведи|перевести|переклади|перекласти)\b"
+        r"(?:\s+(?:(?:into|to|in|на)\s+\w+|українською|англійською))?"
+        r"[ \t]*[—-]?[ \t\r\n]*",
+        re.IGNORECASE,
+    )
+    headers = list(delimited.finditer(text))
+    candidates = [(match.start(), match.start("quoted") if match.group("quoted") else match.end())
+                  for match in headers]
+    for match in bare.finditer(text):
+        if not any(match.start() <= header.start() < match.end() for header in headers):
+            candidates.append((match.start(), match.end()))
     quote_pairs = {'"': '"', '«': '»', '“': '”', '„': '“', '‘': '’'}
     ranges = []
-    for match in directive.finditer(text):
-        if any(source_start <= match.start() < source_end for source_start, source_end in ranges):
+    for directive_start, start in sorted(candidates):
+        if any(source_start <= directive_start < source_end for source_start, source_end in ranges):
             continue
-        start, end = match.end(), len(text)
+        end = len(text)
         if start < end and text[start] in quote_pairs:
             closer = quote_pairs[text[start]]
             closing = text.find(closer, start + 1)
