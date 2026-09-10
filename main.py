@@ -1695,6 +1695,8 @@ chat_generation_locks: dict[int, asyncio.Lock] = {}
 recent_chat_answers: dict[int, deque[Any]] = defaultdict(lambda: deque(maxlen=12))
 last_context_diagnostics: dict[int, "MemoryContextDiagnostics"] = {}
 embedding_queue: asyncio.Queue[int] | None = None
+embedding_worker_task: asyncio.Task[None] | None = None
+embedding_backfill_task: asyncio.Task[None] | None = None
 last_embedding_error = ""
 last_embedding_at = ""
 last_embedding_backlog = 0
@@ -7997,6 +7999,56 @@ def create_embeddings_sync(
     return [normalize_embedding(list(item.embedding)) for item in response.data]
 
 
+async def create_index_embeddings(
+    texts: list[str],
+    *,
+    route_bucket: str,
+    task_class_bucket: str,
+    timeout_seconds: float | None = None,
+) -> list[list[float]]:
+    """Keep background HTTP cancellable instead of leaving a running thread."""
+    stage = begin_model_stage(
+        stage_kind="embedding_index",
+        intended_model=CONFIG.memory_embedding_model,
+        endpoint="embeddings",
+        route_bucket=route_bucket,
+        task_class_bucket=task_class_bucket or "embedding_index",
+    )
+    kwargs: dict[str, Any] = {
+        "model": CONFIG.memory_embedding_model,
+        "input": texts,
+        "encoding_format": "float",
+    }
+    if CONFIG.memory_embedding_dimensions > 0:
+        kwargs["dimensions"] = CONFIG.memory_embedding_dimensions
+    try:
+        if CONFIG.openai_api_key == "sk-test":
+            raise RuntimeError("test OpenAI API key cannot create embeddings")
+        # Preserve the SDK's normal timeout/retry defaults. Cancellation reaches
+        # the HTTP request and closes the client before the worker exits.
+        client_options = (
+            {"timeout": timeout_seconds, "max_retries": 0}
+            if timeout_seconds is not None else {}
+        )
+        async with AsyncOpenAI(**client_options) as client:
+            response = await client.embeddings.create(**kwargs)
+    except asyncio.CancelledError as exc:
+        finish_model_stage(stage, status="cancelled", failure_class=exc)
+        raise
+    except Exception as exc:
+        finish_model_stage(stage, status="failed", failure_class=exc)
+        raise
+    actual_model, actual_model_source = response_actual_model(response)
+    finish_model_stage(
+        stage,
+        status="succeeded",
+        usage=response_usage(response),
+        actual_model=actual_model,
+        actual_model_source=actual_model_source,
+    )
+    return [normalize_embedding(list(item.embedding)) for item in response.data]
+
+
 async def create_embeddings(
     texts: list[str],
     *,
@@ -8008,6 +8060,11 @@ async def create_embeddings(
     clipped = [clip_text(text, 4000) for text in texts if text.strip()]
     if not clipped:
         return []
+    if stage_kind == "embedding_index":
+        return await create_index_embeddings(
+            clipped, route_bucket=route_bucket, task_class_bucket=task_class_bucket,
+            timeout_seconds=timeout_seconds,
+        )
     return await asyncio.to_thread(
         create_embeddings_sync,
         clipped,
@@ -8090,39 +8147,99 @@ async def process_embedding_candidates(candidates: list[EmbeddingCandidate], sou
     return stored
 
 
+async def start_memory_embedding_tasks() -> None:
+    global embedding_queue, embedding_worker_task, embedding_backfill_task
+
+    # A new application incarnation must not inherit a queue from another loop.
+    await stop_memory_embedding_tasks()
+    if not memory_vector_available():
+        return
+    embedding_queue = asyncio.Queue()
+    embedding_worker_task = asyncio.create_task(
+        memory_embedding_worker(), name="memory-embedding-worker",
+    )
+    if CONFIG.memory_vector_backfill_on_start:
+        embedding_backfill_task = asyncio.create_task(
+            memory_vector_backfill_loop(), name="memory-embedding-backfill",
+        )
+
+
+async def stop_memory_embedding_tasks() -> None:
+    global embedding_queue, embedding_worker_task, embedding_backfill_task
+
+    queue = embedding_queue
+    # Already-dispatched Telegram operations can still persist messages while
+    # PTB drains. Their durable embedding backlog survives without queuing work.
+    embedding_queue = None
+    worker, backfill = embedding_worker_task, embedding_backfill_task
+    tasks = tuple(task for task in (worker, backfill) if task is not None)
+    for task in tasks:
+        if not task.done() and not task.cancelling():
+            task.cancel()
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+    if queue is not None:
+        while True:
+            try:
+                queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            queue.task_done()
+    if embedding_worker_task is worker:
+        embedding_worker_task = None
+    if embedding_backfill_task is backfill:
+        embedding_backfill_task = None
+
+
 async def memory_embedding_worker() -> None:
-    if not memory_vector_available() or embedding_queue is None:
+    queue = embedding_queue
+    if not memory_vector_available() or queue is None:
         return
 
     batch_size = max(1, CONFIG.memory_embedding_batch_size)
     while True:
         item_ids: list[int] = []
+        failed = False
         try:
-            first = await embedding_queue.get()
-            item_ids.append(first)
-            while len(item_ids) < batch_size:
-                try:
-                    item_ids.append(embedding_queue.get_nowait())
-                except asyncio.QueueEmpty:
-                    break
-            candidates = MEMORY.embedding_candidates_by_ids(
-                item_ids,
-                model=CONFIG.memory_embedding_model,
-                dimensions=CONFIG.memory_embedding_dimensions,
-                limit=batch_size,
-            ) if MEMORY is not None else []
-            await process_embedding_candidates(candidates, "queue")
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            LOGGER.exception("Memory embedding worker failed")
-            system_event(level="error", component="memory_vector", event_type="worker_failed")
+            try:
+                item_ids.append(await queue.get())
+                while len(item_ids) < batch_size:
+                    try:
+                        item_ids.append(queue.get_nowait())
+                    except asyncio.QueueEmpty:
+                        break
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                # A broken queue/loop cannot recover by immediately retrying it.
+                LOGGER.error("Memory embedding queue unavailable error=%s", type(exc).__name__)
+                system_event(
+                    level="error", component="memory_vector", event_type="worker_failed",
+                    message="queue_unavailable", details={"error_type": type(exc).__name__},
+                )
+                return
+            try:
+                candidates = MEMORY.embedding_candidates_by_ids(
+                    item_ids,
+                    model=CONFIG.memory_embedding_model,
+                    dimensions=CONFIG.memory_embedding_dimensions,
+                    limit=batch_size,
+                ) if MEMORY is not None else []
+                await process_embedding_candidates(candidates, "queue")
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                LOGGER.error("Memory embedding worker failed error=%s", type(exc).__name__)
+                system_event(
+                    level="error", component="memory_vector", event_type="worker_failed",
+                    details={"error_type": type(exc).__name__},
+                )
+                failed = True
         finally:
             for _ in item_ids:
-                try:
-                    embedding_queue.task_done()
-                except ValueError:
-                    break
+                queue.task_done()
+        # Also yield when an empty or failed batch completed synchronously.
+        await asyncio.sleep(1.0 if failed else 0)
 
 
 async def memory_vector_backfill_loop() -> None:
@@ -13481,8 +13598,15 @@ class AiganApplication(Application):
     async def stop(self) -> None:
         # PTB awaits create_task work inside stop, before either post_stop or
         # post_shutdown. Cancel queued timers before entering that drain.
+        await stop_memory_embedding_tasks()
         await stop_pending_telegram_turns()
         await super().stop()
+
+    async def shutdown(self) -> None:
+        # post_init can create workers before a later startup step fails, in
+        # which case PTB skips stop() and proceeds directly to shutdown().
+        await stop_memory_embedding_tasks()
+        await super().shutdown()
 
 
 async def handle_pending_or_observe(message: Message, context: ContextTypes.DEFAULT_TYPE) -> bool:
@@ -15722,7 +15846,7 @@ async def health_report_loop(application: Application) -> None:
 
 
 async def post_init(application: Application) -> None:
-    global BOT_ID, BOT_USERNAME, embedding_queue, telegram_turn_stopping
+    global BOT_ID, BOT_USERNAME, telegram_turn_stopping
 
     telegram_turn_stopping = False
 
@@ -15760,11 +15884,7 @@ async def post_init(application: Application) -> None:
             CONFIG.memory_embedding_model,
             CONFIG.memory_embedding_dimensions,
         )
-        if memory_vector_available():
-            embedding_queue = asyncio.Queue()
-            asyncio.create_task(memory_embedding_worker())
-            if CONFIG.memory_vector_backfill_on_start:
-                asyncio.create_task(memory_vector_backfill_loop())
+        await start_memory_embedding_tasks()
     if SYSTEM_LOG is not None:
         deleted = SYSTEM_LOG.cleanup()
         LOGGER.info(
