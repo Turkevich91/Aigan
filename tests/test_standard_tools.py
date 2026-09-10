@@ -60,7 +60,7 @@ class StandardToolsTests(unittest.TestCase):
         delivery = stack.enter_context(patch.object(main, "send_reply", AsyncMock()))
         return delivery
 
-    def test_actual_sdk_image_can_search_and_fetch_with_configured_role(self):
+    def _run_actual_sdk_image_search_and_fetch(self):
         calls = []
         @function_tool
         async def search_web(query: str) -> str:
@@ -111,12 +111,15 @@ class StandardToolsTests(unittest.TestCase):
         self.assertTrue(any(item.tool_kind == "search_web" for item in provenance.tools))
         self.assertTrue(any(item.tool_kind == "fetch_url" for item in provenance.tools))
 
+    def test_actual_sdk_image_can_search_and_fetch_with_configured_role(self):
+        self._run_actual_sdk_image_search_and_fetch()
+
     def test_combined_image_agent_preserves_source_caption_and_search(self):
         # Integration contract with the separately reviewed media ownership fix.
         item = self.store.message_by_message_id(self.message.chat_id, self.message.message_id)
         neutral = "Cobalt banner above an empty stage."
         self.store.update_vision_summary(item.id, neutral)
-        self.test_actual_sdk_image_can_search_and_fetch_with_configured_role()
+        self._run_actual_sdk_image_search_and_fetch()
         self.assertEqual(neutral, self.store.item_by_id(item.id).vision_summary)
         hits = self.store.fts_search(chat_id=self.message.chat_id, query="Cobalt",
                                      lookback_days=1, limit=10)
