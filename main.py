@@ -4808,18 +4808,41 @@ async def remember_message_persistently(message: Message, label: str | None = No
     if REACTION_MEMORY is not None:
         REACTION_MEMORY.link_pending_targets(MEMORY, message.chat_id)
 
+    new_source_item_id: int | None = None
     if has_supported_image(message):
         await cache_image_for_memory(message, item_id, message.chat_id, "current message")
     else:
         replied = getattr(message, "reply_to_message", None)
-        external_reply = getattr(message, "external_reply", None)
-        if replied is not None and image_file_ref_from(replied) is not None:
-            await cache_image_for_memory(replied, item_id, message.chat_id, "reply_to_message image")
-        elif external_reply is not None and image_file_ref_from(external_reply) is not None:
-            await cache_image_for_memory(external_reply, item_id, message.chat_id, "external_reply image")
+        source_message_id = getattr(replied, "message_id", None)
+        # Referenced media belongs to its source message, never to the reply.
+        # ExternalReplyInfo lacks full Message identity and stays context-only.
+        if (
+            replied is not None
+            and getattr(replied, "chat_id", None) == message.chat_id
+            and type(source_message_id) is int
+            and source_message_id > 0
+            and source_message_id != getattr(message, "message_id", None)
+            and image_file_ref_from(replied) is not None
+        ):
+            source_item = MEMORY.message_by_message_id(message.chat_id, source_message_id)
+            source_item_id = source_item.id if source_item is not None else save_memory_message(
+                replied,
+                is_bot=bool(getattr(getattr(replied, "from_user", None), "is_bot", False)),
+            )
+            if source_item_id is not None:
+                await cache_image_for_memory(
+                    replied, source_item_id, message.chat_id, "reply_to_message image",
+                )
+                if source_item is None:
+                    new_source_item_id = source_item_id
 
     if CONFIG.memory_eager_image_summary:
         await ensure_recent_image_summaries(message.chat_id, force=True)
+    if new_source_item_id is not None:
+        new_source = MEMORY.item_by_id(new_source_item_id)
+        # Successful eager summaries already enqueue their updated source.
+        if new_source is not None and not new_source.vision_summary:
+            enqueue_memory_embedding(new_source_item_id)
     remember_social_observations(item_id)
     item = MEMORY.item_by_id(item_id)
     await run_reaction_ingestion_hook(message, item, phase="pre_embedding")
@@ -14322,14 +14345,12 @@ async def handle_image_prompt_generation(
 
     try:
         image_data_urls: list[str] = []
-        successful_image_messages: list[Message] = []
         failed_image_parts = 0
         for part_index, part in enumerate(image_messages):
             try:
                 part_data_urls = await extract_image_data_urls(part)
                 if part_data_urls:
                     image_data_urls.extend(part_data_urls)
-                    successful_image_messages.append(part)
             except Exception as exc:
                 failed_image_parts += 1
                 LOGGER.warning(
@@ -14411,15 +14432,8 @@ Explain the image(s) according to the current request. Ukrainian by default; Eng
         await presence.stop()
 
     histories[message.chat_id].append(f"{user_label(message)}: {prompt[:500]}")
-    if MEMORY is not None:
-        for part in successful_image_messages:
-            item = MEMORY.message_by_message_id(message.chat_id, getattr(part, "message_id", None))
-            item_id = item.id if item is not None else save_memory_message(
-                part,
-                label=f"{user_label(part)} (image request)",
-            )
-            if item_id is not None:
-                MEMORY.update_vision_summary(item_id, response)
+    # Interactive answers belong to the bot output. Neutral source descriptions
+    # are owned by ensure_recent_image_summaries, independent of this request.
     delivery = await send_reply(
         message,
         response,
