@@ -3300,7 +3300,7 @@ class TelegramTurnCoalescingTests(unittest.TestCase):
         self.assertEqual(1, len(bad.reply_calls))
         self.assertEqual("partial album success", bad.reply_calls[0]["text"])
         self.assertEqual([], good.reply_calls)
-        self.assertEqual([(good.message_id, "partial album success")], vision_updates)
+        self.assertEqual([], vision_updates)
 
     def test_all_album_parts_failing_produces_one_safe_fallback(self) -> None:
         private_exception_marker = "PRIVATE_IMAGE_EXCEPTION_MARKER_52"
@@ -10896,10 +10896,15 @@ class PersistentMemoryTests(unittest.TestCase):
         asyncio.run(main.remember_message_persistently(message))
 
         items = main.MEMORY.latest(-1001, 10)
-        self.assertEqual(1, len(items))
-        self.assertEqual("image", items[0].content_kind)
-        self.assertTrue(items[0].local_media_path)
-        self.assertIn("reply_to_message", items[0].raw_note)
+        self.assertEqual(2, len(items))
+        reply_item = main.MEMORY.message_by_message_id(-1001, message.message_id)
+        source_item = main.MEMORY.message_by_message_id(-1001, replied.message_id)
+        self.assertEqual("text", reply_item.content_kind)
+        self.assertEqual("", reply_item.local_media_path)
+        self.assertEqual(replied.message_id, reply_item.reply_to_message_id)
+        self.assertEqual("image", source_item.content_kind)
+        self.assertTrue(source_item.local_media_path)
+        self.assertIn("reply_to_message", source_item.raw_note)
 
     def test_link_preview_without_delivered_image_keeps_text_context_only(self) -> None:
         message = FakeMessage("https://example.com/page", message_id=30)

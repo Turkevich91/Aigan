@@ -434,8 +434,61 @@ def public_image_subject_is_sensitive(subject_text: str | None) -> bool:
     )
 
 
+def _inline_translation_source_ranges(text: str) -> list[tuple[int, int]]:
+    """Locate inline translation data without relying on a route classification.
+
+    Unquoted source extends to the end: punctuation or "then" inside it cannot
+    grant execution authority. A closed quotation has an explicit source end,
+    leaving separately authored instructions outside that quotation available.
+    """
+    # A delimited source header may use an interrogative, gerund or noun. Match
+    # the translation term within its clause, not a whitelist of polite prefixes.
+    delimited = re.compile(
+        r"\b(?:translat\w*|перекла\w*|перевод\w*|перевед\w*|перевест\w*|перев[её]л\w*)\b"
+        r'[^\r\n:;.!?"«“„‘]{0,160}'
+        r'(?:(?P<quoted>["«“„‘])|(?::(?!//)|\r?\n)[ \t\r\n]*)',
+        re.IGNORECASE,
+    )
+    # Without an explicit source delimiter, retain the narrow imperative form.
+    # A verb used inside an ordinary subject ("Google Translate app") is not a
+    # source introduction and must not hide the requested image capability.
+    bare = re.compile(
+        r"(?:^|[;\n])\s*(?:(?:please|будь\s+ласка|пожалуйста)[, ]+)?"
+        r"(?:translate|переведи|перевести|переклади|перекласти)\b"
+        r"(?:\s+(?:(?:into|to|in|на)\s+\w+|українською|англійською))?"
+        r"[ \t]*[—-]?[ \t\r\n]*",
+        re.IGNORECASE,
+    )
+    headers = list(delimited.finditer(text))
+    candidates = [(match.start(), match.start("quoted") if match.group("quoted") else match.end())
+                  for match in headers]
+    for match in bare.finditer(text):
+        if not any(match.start() <= header.start() < match.end() for header in headers):
+            candidates.append((match.start(), match.end()))
+    quote_pairs = {'"': '"', '«': '»', '“': '”', '„': '“', '‘': '’'}
+    ranges = []
+    for directive_start, start in sorted(candidates):
+        if any(source_start <= directive_start < source_end for source_start, source_end in ranges):
+            continue
+        end = len(text)
+        if start < end and text[start] in quote_pairs:
+            closer = quote_pairs[text[start]]
+            closing = text.find(closer, start + 1)
+            while closing >= 0:
+                escape_index = closing - 1
+                while escape_index > start and text[escape_index] == "\\":
+                    escape_index -= 1
+                if (closing - 1 - escape_index) % 2 == 0:
+                    end = closing + 1
+                    break
+                closing = text.find(closer, closing + 1)
+        if start < end:
+            ranges.append((start, end))
+    return ranges
+
+
 def _selected_operation_is_quoted(prompt: str, operation_text: str) -> bool:
-    """Deny only when every selected span is quoted or reported, never current."""
+    """Deny only when every selected span is source evidence, never current."""
     trusted_text = str(prompt or "")
     selected = str(operation_text or "").strip()
     if not trusted_text or not selected:
@@ -472,6 +525,7 @@ def _selected_operation_is_quoted(prompt: str, operation_text: str) -> bool:
         flags=re.IGNORECASE,
     )
     comma_pattern = re.compile(",")
+    translation_sources = _inline_translation_source_ranges(trusted_text)
     unsafe_occurrences = 0
     for start in starts:
         end = start + len(selected)
@@ -505,7 +559,9 @@ def _selected_operation_is_quoted(prompt: str, operation_text: str) -> bool:
         reported = bool(
             reported_subject_pattern.search(trusted_text[clause_start:end])
         )
-        if quoted or reported:
+        translation_source = any(start < source_end and end > source_start
+                                 for source_start, source_end in translation_sources)
+        if quoted or reported or translation_source:
             unsafe_occurrences += 1
             continue
         return False

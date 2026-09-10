@@ -1,6 +1,16 @@
 # Primary-agent capabilities
 
-The primary model can inspect original retained conversation evidence and propose a public-web image delivery when initial classification misses the user's request. `PRIMARY_CAPABILITY_RECOVERY_ENABLED` defaults to `false`. Disabling it restores the previous routing and agent-tool set; it does not change existing media settings or model assignments.
+The primary model can use the same bounded capability catalog for admitted text, translation and interactive-image requests, including when initial classification misses the user's request. `PRIMARY_CAPABILITY_RECOVERY_ENABLED` defaults to `false`. Disabling it restores the previous routing and agent-tool set; it does not change existing media settings or model assignments.
+
+## Standard tools on admitted turns
+
+The catalog includes `search_web`, `fetch_url`, `get_youtube_transcript`, bounded `read_chat_history` and `read_conversation_branch`, and `request_image_delivery` when public-image delivery is enabled. Scope, retained-history cutoff and feature availability still determine which capabilities can be constructed. Classifier labels do not grant permission, and a soft classifier refusal can be reconsidered by the primary model even when image delivery is disabled.
+
+Interactive images enter the existing Agents SDK loop as image input alongside the current request. They retain the configured interactive-vision model and reasoning effort, the six-turn limit, and the 120-second agent timeout. Attaching tools does not require a separate preliminary model call. Simple descriptions can finish directly. Background neutral descriptions keep their existing direct vision path. Disabling capability recovery retains the legacy interactive-vision fallback.
+
+Translation sources and referenced/forwarded content remain untrusted evidence. They do not authorize image delivery or change the current recipient. Image proposals still require current-request grounding and a single claimed host dispatch, and success claims still require confirmed outcomes. Reminder mutations retain their separate current routing and authorization checks; this change does not expose unrestricted write tools.
+
+Tool availability is a tested application property; it is not a guarantee that every model chooses the right tool. Automated regressions exercise the real SDK loop with synthetic provider/tool responses and isolated memory, including one-response delivery, source descriptions, denied operations and passive group chatter.
 
 ## Ownership and scope
 
@@ -60,7 +70,7 @@ The current store has no forum-topic field. Retrieval is chat-scoped, not a clai
 
 ## Image continuation contract
 
-An admitted primary run receives the typed image request tool when public-image search is enabled. Soft classifier clarification/unavailable responses can reach that run. Supported direct image routes retain their existing fast path; referenced visual analysis retains its existing pipeline.
+An admitted primary run receives the typed image request tool when public-image search is enabled. Soft classifier clarification/unavailable responses can reach that run. Supported direct image-delivery routes retain their existing fast path; interactive referenced visual analysis uses the tool-enabled primary loop when capability recovery is enabled.
 
 For a contextual continuation, the application resolves the actual same-chat replied message through successful public-image delivery provenance to authored source requests. It follows at most four ordered delivery/request links and exposes at most 2,500 source-request characters. The model selects unchanged subject words from that evidence and a replacement modifier from the current request. For the synthetic sequence `red flowers` then `yellow ones`, the query uses `flowers yellow`. Unspecified plural inherits the latest confirmed album count; explicit counts and the existing five-image delivery ceiling remain.
 

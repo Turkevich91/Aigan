@@ -1,5 +1,13 @@
 # Aigan Changelog
 
+## 2026-09-10 - Consistent tools and source-memory ownership
+
+- Give admitted interactive image and translation requests the same bounded primary-agent capabilities as ordinary text, so a missing routing label does not hide available search or history tools.
+- Preserve the configured interactive-image model and reasoning settings in the SDK run; keep background image descriptions separate.
+- Keep conversational answers separate from neutral image descriptions, and retain referenced attachments on their verified source messages.
+- Own and cancel background embedding work during application shutdown, including its HTTP request, without changing embedding models or dimensions.
+
+
 ## 2026-09-05 - Recoverable character delivery
 
 - Retain prepared grounded-character replies privately so an authorized repeat command can recover after a delivery failure without another model run.
