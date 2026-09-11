@@ -35,10 +35,12 @@ def _instant(value: str) -> datetime:
 
 def _fingerprint(item) -> str:
     # Hash complete evidence and attribution, including text beyond the preview.
-    # Never retain operational paths, tokens or raw_note in this registry.
+    # Media identity is hashed too; the registry retains no raw paths or transport IDs.
+    # raw_note is operational commentary, not source identity.
     names = ("id", "chat_id", "message_id", "created_at", "user_id", "sender_label", "username",
              "is_bot", "text", "source_text", "content_kind", "attachment_type", "vision_summary",
-             "source_title", "source_url", "forward_origin", "reply_to_message_id")
+             "source_title", "source_url", "forward_origin", "reply_to_message_id",
+             "mime_type", "local_media_path", "telegram_file_id", "telegram_unique_id")
     values = {name: getattr(item, name, None) for name in names}
     return hashlib.sha256(json.dumps(values, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
 
@@ -104,6 +106,20 @@ class HistoryCitationSession:
         if self._history is not None:
             own.update(self._history.exposed_ids)
         return frozenset(own)
+
+    def validated_exposed_item(self, item_id: int):
+        """Resolve an already exposed original for another host-owned read capability."""
+        if isinstance(item_id, bool) or not isinstance(item_id, int):
+            return None
+        with self._lock:
+            evidence = self._exposed.get(item_id)
+        if evidence is not None:
+            item = self._store.item_by_id(item_id)
+            return item if self._eligible(item) and _fingerprint(item) == evidence.fingerprint else None
+        if self._history is not None:
+            item = self._history.validated_exposed_source(item_id)
+            return item if self._eligible(item) else None
+        return None
 
     def _resolve(self, ref: str) -> dict | None:
         match = _REF.fullmatch(ref)

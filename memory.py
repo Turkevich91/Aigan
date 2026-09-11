@@ -62,6 +62,21 @@ class MemoryItem:
     raw_note: str
 
 
+def _history_evidence_digest_values(*values) -> str:
+    return hashlib.sha256(json.dumps(values, ensure_ascii=False, separators=(",", ":")).encode()).hexdigest()
+
+
+def history_item_evidence_digest(item: MemoryItem) -> str:
+    """Digest this exact private snapshot using the bounded-history SQL contract."""
+    return _history_evidence_digest_values(
+        item.id, item.message_id, item.user_id, item.created_at,
+        item.sender_label, item.text, item.source_text, item.attachment_type,
+        item.vision_summary, item.reply_to_message_id, int(item.is_bot), item.content_kind,
+        item.forward_origin, item.mime_type, item.local_media_path,
+        item.telegram_file_id, item.telegram_unique_id,
+    )
+
+
 @dataclass(frozen=True)
 class EmbeddingCandidate:
     item: MemoryItem
@@ -218,7 +233,7 @@ class MemoryStore:
         self._conn.create_function("history_casefold", 1, lambda value: str(value or "").casefold(), deterministic=True)
         self._conn.create_function(
             "history_evidence_digest", -1,
-            lambda *values: hashlib.sha256(json.dumps(values, ensure_ascii=False, separators=(",", ":")).encode()).hexdigest(),
+            _history_evidence_digest_values,
             deterministic=True,
         )
         with self._lock:
@@ -698,7 +713,8 @@ class MemoryStore:
             history_evidence_digest(m.id, m.message_id, m.user_id, m.created_at,
                 m.sender_label, m.text, m.source_text, m.attachment_type,
                 m.vision_summary, m.reply_to_message_id, m.is_bot, m.content_kind,
-                m.forward_origin) AS evidence_digest"""
+                m.forward_origin, m.mime_type, m.local_media_path,
+                m.telegram_file_id, m.telegram_unique_id) AS evidence_digest"""
         where = " AND ".join(conditions)
         with self._lock:
             if mode == "around":
@@ -775,7 +791,8 @@ class MemoryStore:
                     history_evidence_digest(m.id, m.message_id, m.user_id, m.created_at,
                         m.sender_label, m.text, m.source_text, m.attachment_type,
                         m.vision_summary, m.reply_to_message_id, m.is_bot, m.content_kind,
-                        m.forward_origin) AS evidence_digest,
+                        m.forward_origin, m.mime_type, m.local_media_path,
+                        m.telegram_file_id, m.telegram_unique_id) AS evidence_digest,
                     e.chat_id AS embedding_chat_id, e.model AS embedding_model,
                     e.dimensions AS embedding_dimensions, e.content_hash AS embedding_hash,
                     e.embedding_blob, e.embedded_at

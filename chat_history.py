@@ -18,7 +18,7 @@ import sqlite3
 import threading
 from typing import Awaitable, Callable, Sequence
 
-from memory import MemoryStore
+from memory import MemoryItem, MemoryStore, history_item_evidence_digest
 from history_retrieval import (
     HistorySearchScope, HistoryRetrievalResult, normalize_history_vector,
     history_query_embedding_available, retrieve_history,
@@ -161,8 +161,8 @@ class ChatHistorySession:
         """Resolve exposed evidence only while its canonical content is unchanged.
 
         The internal digest covers full evidence/attribution fields, including
-        text beyond a displayed truncation boundary. It never includes notes,
-        transport tokens or media paths and is not sent to the model.
+        text beyond a displayed truncation boundary and retained media identity.
+        Only the digest is retained; raw media paths/transport IDs are never exposed.
         """
         if isinstance(item_id, bool) or not isinstance(item_id, int):
             return None
@@ -185,6 +185,24 @@ class ChatHistorySession:
             return None
         with self._lock:
             return evidence if self._exposed_items.get(item_id) == evidence else None
+
+    def validated_exposed_source(self, item_id: int) -> MemoryItem | None:
+        """Return the exact private source snapshot matching exposed history evidence."""
+        evidence = self.validated_exposed_item(item_id)
+        if evidence is None:
+            return None
+        item = self._store.item_by_id(item_id)
+        if item is None:
+            return None
+        try:
+            if (item.chat_id != self._chat_id or not 0 < item.id < self._cutoff_id
+                    or _timestamp(item.created_at) > self._cutoff_at
+                    or history_item_evidence_digest(item) != evidence.canonical_sha256):
+                return None
+        except (ValueError, TypeError):
+            return None
+        with self._lock:
+            return item if self._exposed_items.get(item_id) == evidence else None
 
     def resolve_citation_ref(self, reference: str) -> HistoryEvidence | None:
         if not isinstance(reference, str) or len(reference) > 96:
