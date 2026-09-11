@@ -85,6 +85,7 @@ from image_intent import (
     semantic_image_claim_requires_guard,
 )
 from agent_capabilities import PrimaryCapabilities
+from retained_images import RetainedImageSession
 from chat_history import ChatHistorySession
 from history_retrieval import HISTORY_EMBEDDING_MODEL, HISTORY_EMBEDDING_DIMENSIONS
 from history_citations import ACTIVE_HISTORY_CITATIONS, HistoryCitationSession
@@ -145,7 +146,10 @@ from operator_alerts import (
     OperatorAlertSettings,
 )
 from outbound_reactions import NullReactionAdapter, OutboundReactionAdapter, OutboundReactionConfig, ReactionAdapter
-from provenance import ToolProvenance, extract_tool_provenance, make_tool_provenance, renumber_tool_provenance
+from provenance import (
+    ToolProvenance, extract_tool_provenance, make_tool_provenance, renumber_tool_provenance,
+    tool_result_text_for_observation,
+)
 from reaction_memory import ReactionAsset, ReactionMemoryStore, ReactionPreference, ReactionSpec
 from reminders import ClaimedReminderFire, Reminder, ReminderStore, parse_datetime as parse_reminder_datetime
 from github_reporting import GitHubReporter
@@ -1380,6 +1384,7 @@ def response_requests_tools(response: Any) -> bool:
 
 def build_agents_run_config(
     *, run_id: str = "", route_bucket: str = "", model_name: str | None = None,
+    retained_image_reads: bool = False,
 ) -> RunConfig:
     mode = normalize_tracing_mode(CONFIG.agents_tracing_mode)
     resolved_run_id = current_model_run_id(run_id)
@@ -1387,7 +1392,7 @@ def build_agents_run_config(
     return RunConfig(
         model=(configured_agents_model(model_name) if model_name is not None else configured_agents_model()),
         tracing_disabled=mode == "disabled",
-        trace_include_sensitive_data=mode == "sensitive",
+        trace_include_sensitive_data=mode == "sensitive" and not retained_image_reads,
         workflow_name="Aigan Telegram",
         group_id=resolved_run_id,
         trace_metadata={
@@ -3967,8 +3972,8 @@ class AiganRunHooks(RunHooks[Any]):
             details=details,
         )
 
-    async def on_tool_end(self, context: Any, agent: Agent, tool: Any, result: str) -> None:
-        result_text = str(result)
+    async def on_tool_end(self, context: Any, agent: Agent, tool: Any, result: Any) -> None:
+        result_text = tool_result_text_for_observation(getattr(tool, "name", ""), result)
         failure_category = classify_tool_result_failure(result_text)
         details: dict[str, Any] = {"result_chars": len(result_text)}
         if self.run_id:
@@ -7457,8 +7462,17 @@ def primary_capabilities_for_message(message: Message, prompt: str) -> PrimaryCa
         chat_type=str(getattr(message.chat, "type", "") or ""),
         cutoff_memory_id=current.id, cutoff_created_at=cutoff.isoformat(), history=history,
     ) if history is not None else None)
+    reply = getattr(message, "reply_to_message", None)
+    reply_id = (getattr(reply, "message_id", None)
+                if getattr(reply, "chat_id", None) == message.chat_id else None)
+    retained_images = (RetainedImageSession(
+        MEMORY, chat_id=message.chat_id, cutoff_memory_id=current.id,
+        cutoff_created_at=cutoff.isoformat(), reply_message_id=reply_id,
+        history=history, citations=citations, max_bytes=CONFIG.image_max_bytes,
+    ) if history is not None and CONFIG.image_analysis_enabled else None)
     return PrimaryCapabilities(
         history=history, images=images, continuation=continuation, citations=citations,
+        retained_images=retained_images,
     )
 
 
@@ -7570,6 +7584,8 @@ async def run_agent(
                     hooks=run_hooks,
                     run_config=build_agents_run_config(
                         run_id=model_run_id, route_bucket=model_route,
+                        retained_image_reads=(capability_context is not None
+                                              and capability_context.retained_images is not None),
                         **({"model_name": model} if image_data_urls is not None else {}),
                     ),
                 )
@@ -14099,7 +14115,9 @@ async def _handle_prompt_generation(
     capabilities = primary_capabilities_for_message(message, prompt)
     reconsider_image_route = bool(
         capabilities is not None
-        and route in {"image_intent_clarify", "referenced_visual_unavailable", "image_source_unavailable"}
+        and (route in {"image_intent_clarify", "referenced_visual_unavailable", "image_source_unavailable"}
+             or (route == "referenced_visual_analysis" and capabilities.retained_images is not None
+                 and not referenced_image_messages(message)))
     )
 
     def emit_prompt_route_decision(tool_route_decision: ToolRouteDecision) -> None:
@@ -14129,7 +14147,9 @@ async def _handle_prompt_generation(
             },
         )
 
-    if route == "referenced_visual_analysis":
+    if (route == "referenced_visual_analysis"
+            and (referenced_image_messages(message) or capabilities is None
+                 or capabilities.retained_images is None)):
         emit_prompt_route_decision(no_tool_route("referenced_visual_analysis"))
         image_messages = referenced_image_messages(message)
         if not image_messages:

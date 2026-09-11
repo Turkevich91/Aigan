@@ -103,7 +103,8 @@ def select_conversation_branch(
         (m.forward_origin != '') AS is_forwarded,
         history_evidence_digest(m.id,m.message_id,m.user_id,m.created_at,m.sender_label,
             m.text,m.source_text,m.attachment_type,m.vision_summary,m.reply_to_message_id,
-            m.is_bot,m.content_kind,m.forward_origin) AS evidence_digest"""
+            m.is_bot,m.content_kind,m.forward_origin,m.mime_type,m.local_media_path,
+            m.telegram_file_id,m.telegram_unique_id) AS evidence_digest"""
     flags = dict(missing_parent=False, filtered_nodes=False, cycle_detected=False,
                  depth_cap=False, node_cap=False, character_cap=False)
     metadata: dict[str, object] = {

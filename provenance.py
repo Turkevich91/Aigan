@@ -124,8 +124,15 @@ def _size_bucket(size: int) -> str:
     return "large"
 
 
+def tool_result_text_for_observation(tool_kind: str, output: Any) -> str:
+    """Never stringify retained pixels for hooks, failure classification or provenance."""
+    if canonical_tool_kind(tool_kind) == "inspect_chat_image" and isinstance(output, (list, tuple)):
+        return "Retained image inspected; multimodal payload omitted."
+    return "" if output is None else str(output)
+
+
 def bounded_result_digest(tool_kind: str, output: Any, status: str) -> str:
-    text = "" if output is None else str(output)
+    text = tool_result_text_for_observation(tool_kind, output)
     normalized = text.casefold()
     digest: dict[str, Any] = {
         "chars": _size_bucket(len(text)),
@@ -157,7 +164,7 @@ def make_tool_provenance(
     failure_classifier: Callable[[str], str | None] | None = None,
 ) -> ToolProvenance:
     kind = canonical_tool_kind(tool_kind)
-    output_text = "" if output is None else str(output)
+    output_text = tool_result_text_for_observation(tool_kind, output)
     intrinsic_status = None
     normalized_output = " ".join(output_text.casefold().split())
     if kind == "get_youtube_transcript":

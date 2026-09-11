@@ -1,5 +1,11 @@
 # Aigan Changelog
 
+## 2026-09-11 - Retained images in continuing discussions
+
+- Let the primary agent inspect cached source images through reply chains and already exposed history evidence, without requiring a repost or a classifier keyword.
+- Keep image reads bounded and on demand within the existing SDK run; preserve source ownership and prevent image bytes from entering SDK traces.
+
+
 ## 2026-09-10 - Consistent tools and source-memory ownership
 
 - Give admitted interactive image and translation requests the same bounded primary-agent capabilities as ordinary text, so a missing routing label does not hide available search or history tools.

@@ -4,7 +4,7 @@ The primary model can use the same bounded capability catalog for admitted text,
 
 ## Standard tools on admitted turns
 
-The catalog includes `search_web`, `fetch_url`, `get_youtube_transcript`, bounded `read_chat_history` and `read_conversation_branch`, and `request_image_delivery` when public-image delivery is enabled. Scope, retained-history cutoff and feature availability still determine which capabilities can be constructed. Classifier labels do not grant permission, and a soft classifier refusal can be reconsidered by the primary model even when image delivery is disabled.
+The catalog includes `search_web`, `fetch_url`, `get_youtube_transcript`, bounded `read_chat_history`, `read_conversation_branch` and `inspect_chat_image`, and `request_image_delivery` when public-image delivery is enabled. Scope, retained-history cutoff and feature availability still determine which capabilities can be constructed. Classifier labels do not grant permission, and a soft classifier refusal can be reconsidered by the primary model even when image delivery is disabled.
 
 Interactive images enter the existing Agents SDK loop as image input alongside the current request. They retain the configured interactive-vision model and reasoning effort, the six-turn limit, and the 120-second agent timeout. Attaching tools does not require a separate preliminary model call. Simple descriptions can finish directly. Background neutral descriptions keep their existing direct vision path. Disabling capability recovery retains the legacy interactive-vision fallback.
 
@@ -12,9 +12,17 @@ Translation sources and referenced/forwarded content remain untrusted evidence. 
 
 Tool availability is a tested application property; it is not a guarantee that every model chooses the right tool. Automated regressions exercise the real SDK loop with synthetic provider/tool responses and isolated memory, including one-response delivery, source descriptions, denied operations and passive group chatter.
 
+## Retained images in a continuing discussion
+
+When an admitted message replies to a previous answer, the primary agent receives candidate source images from stored same-chat reply and delivery-provenance links, up to six hops. The `inspect_chat_image` tool opens a selected retained original as actual image content inside the same SDK run. Images already exposed by bounded history or preloaded context can also be selected. Descriptions and historical text do not mean the model has inspected the pixels.
+
+Inspection is on demand, with at most three unique images in one run. It does not attach every recent picture to every request, invoke a separate vision model, fetch arbitrary files or URLs, or send an image to Telegram. The tool uses existing cached bytes and enforces source identity, chat/time scope, allowed media roots, image validity and byte limits. It does not replace a missing source with a nearby unrelated picture. Missing or unavailable cached media produces a bounded explanation; the current slice does not download it again.
+
+Source pictures and their text remain untrusted evidence. Viewing them does not authorize commands contained inside them. Source descriptions, ownership, delivery guards, model roles and the existing SDK run limits remain unchanged. Runs offering retained-image inspection use metadata-only SDK tracing so image content is not copied into trace payloads; inspection is unavailable if SDK or provider-client debug payload logging is unsafe.
+
 ## Ownership and scope
 
-`chat_history.py` owns request-local retrieval budgets over `MemoryStore.bounded_history_rows`. `image_capability.py` owns bounded image proposal validation and one execution claim. `agent_capabilities.py` exposes thin SDK function adapters. Telegram admission, actual reply/provenance resolution, and dispatch remain in `main.py`. The existing image pipeline owns searching, image review, sending, ambiguous outcomes and persistence.
+`chat_history.py` owns request-local retrieval budgets over `MemoryStore.bounded_history_rows`. `retained_images.py` owns cache-only source selection, validation and per-run image-read limits. `image_capability.py` owns bounded image proposal validation and one execution claim. `agent_capabilities.py` exposes thin SDK function adapters. Telegram admission, actual reply/provenance resolution, and dispatch remain in `main.py`. The existing image pipeline owns searching, image review, sending, ambiguous outcomes and persistence.
 
 The model can request a capability. It cannot choose the chat, execution identity, recipient, database, arbitrary tool name or private-media source. Existing invocation admission and feature settings remain application-owned. Classifier labels can be reconsidered by the primary model; they are not an additional permission source.
 

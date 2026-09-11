@@ -161,8 +161,8 @@ class ChatHistorySession:
         """Resolve exposed evidence only while its canonical content is unchanged.
 
         The internal digest covers full evidence/attribution fields, including
-        text beyond a displayed truncation boundary. It never includes notes,
-        transport tokens or media paths and is not sent to the model.
+        text beyond a displayed truncation boundary and retained media identity.
+        Only the digest is retained; raw media paths/transport IDs are never exposed.
         """
         if isinstance(item_id, bool) or not isinstance(item_id, int):
             return None
