@@ -62,6 +62,21 @@ class MemoryItem:
     raw_note: str
 
 
+def _history_evidence_digest_values(*values) -> str:
+    return hashlib.sha256(json.dumps(values, ensure_ascii=False, separators=(",", ":")).encode()).hexdigest()
+
+
+def history_item_evidence_digest(item: MemoryItem) -> str:
+    """Digest this exact private snapshot using the bounded-history SQL contract."""
+    return _history_evidence_digest_values(
+        item.id, item.message_id, item.user_id, item.created_at,
+        item.sender_label, item.text, item.source_text, item.attachment_type,
+        item.vision_summary, item.reply_to_message_id, int(item.is_bot), item.content_kind,
+        item.forward_origin, item.mime_type, item.local_media_path,
+        item.telegram_file_id, item.telegram_unique_id,
+    )
+
+
 @dataclass(frozen=True)
 class EmbeddingCandidate:
     item: MemoryItem
@@ -218,7 +233,7 @@ class MemoryStore:
         self._conn.create_function("history_casefold", 1, lambda value: str(value or "").casefold(), deterministic=True)
         self._conn.create_function(
             "history_evidence_digest", -1,
-            lambda *values: hashlib.sha256(json.dumps(values, ensure_ascii=False, separators=(",", ":")).encode()).hexdigest(),
+            _history_evidence_digest_values,
             deterministic=True,
         )
         with self._lock:

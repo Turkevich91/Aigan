@@ -113,16 +113,18 @@ class RetainedImageSession:
     def _authorized(self, evidence_id: int):
         if not _positive(evidence_id):
             return None
-        item = self._store.item_by_id(evidence_id)
-        if not self._eligible(item):
-            return None
         candidate = self._candidates.get(evidence_id)
         if candidate is not None:
-            return item if _fingerprint(item) == candidate[0] else None
-        if self._citations is not None and self._citations.validated_exposed_item(evidence_id) is not None:
-            return item
-        if self._history is not None and self._history.validated_exposed_item(evidence_id) is not None:
-            return item
+            item = self._store.item_by_id(evidence_id)
+            return item if self._eligible(item) and _fingerprint(item) == candidate[0] else None
+        if self._citations is not None:
+            item = self._citations.validated_exposed_item(evidence_id)
+            if self._eligible(item):
+                return item
+        if self._history is not None:
+            item = self._history.validated_exposed_source(evidence_id)
+            if self._eligible(item):
+                return item
         return None
 
     def _read_cache(self, item) -> bytes:

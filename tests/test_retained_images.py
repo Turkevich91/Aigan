@@ -159,6 +159,64 @@ class RetainedImageTests(unittest.TestCase):
                 self.store._conn.execute(f"UPDATE messages SET {column}=? WHERE id=?", (before, self.source))
                 self.store._conn.commit()
 
+    def test_citation_reader_uses_exact_validated_snapshot(self):
+        citations = HistoryCitationSession(self.store, chat_id=-1001, chat_type="supergroup",
+            cutoff_memory_id=self.current, cutoff_created_at=self.now.isoformat())
+        line = citations.decorate_context(self.store.item_by_id(self.source), "Synthetic image source")
+        citations.expose_contexts([line])
+        session = self.session(reply_message_id=None, citations=citations)
+        original = citations.validated_exposed_item
+        validated = []
+        def validate_after_update(item_id):
+            # This operational update is outside source identity; the resolver still
+            # must return its actual validated object rather than an earlier fetch.
+            self.store._conn.execute("UPDATE messages SET raw_note=? WHERE id=?", ("updated note", item_id))
+            self.store._conn.commit()
+            item = original(item_id)
+            validated.append(item)
+            return item
+        with patch.object(citations, "validated_exposed_item", side_effect=validate_after_update), \
+                patch.object(session, "_read_cache", wraps=session._read_cache) as reader:
+            self.assert_pixels(session.inspect(self.source))
+        self.assertIs(reader.call_args.args[0], validated[0])
+        self.assertEqual("updated note", reader.call_args.args[0].raw_note)
+
+    def test_history_source_swap_after_validation_is_rejected_before_cache_read(self):
+        for through_citations in (False, True):
+            with self.subTest(through_citations=through_citations):
+                history = ChatHistorySession(self.store, chat_id=-1001, cutoff_memory_id=self.current,
+                                            cutoff_created_at=self.now.isoformat())
+                asyncio.run(history.aread(mode="around", anchor_id=self.source))
+                citations = (HistoryCitationSession(self.store, chat_id=-1001, chat_type="supergroup",
+                    cutoff_memory_id=self.current, cutoff_created_at=self.now.isoformat(), history=history)
+                    if through_citations else None)
+                session = self.session(reply_message_id=None, citations=citations,
+                                       history=None if through_citations else history)
+                original = history.validated_exposed_item
+                def validate_then_replace(item_id):
+                    evidence = original(item_id)
+                    self.store._conn.execute("UPDATE messages SET telegram_unique_id=? WHERE id=?",
+                                             (f"replacement-{through_citations}", item_id))
+                    self.store._conn.commit()
+                    return evidence
+                with patch.object(history, "validated_exposed_item", side_effect=validate_then_replace), \
+                        patch.object(session, "_read_cache") as reader:
+                    self.assertIn("image_evidence_unavailable", session.inspect(self.source))
+                reader.assert_not_called()
+
+    def test_validated_history_source_rechecks_chat_after_registry_validation(self):
+        history = ChatHistorySession(self.store, chat_id=-1001, cutoff_memory_id=self.current,
+                                    cutoff_created_at=self.now.isoformat())
+        asyncio.run(history.aread(mode="around", anchor_id=self.source))
+        original = history.validated_exposed_item
+        def validate_then_move(item_id):
+            evidence = original(item_id)
+            self.store._conn.execute("UPDATE messages SET chat_id=-2002 WHERE id=?", (item_id,))
+            self.store._conn.commit()
+            return evidence
+        with patch.object(history, "validated_exposed_item", side_effect=validate_then_move):
+            self.assertIsNone(history.validated_exposed_source(self.source))
+
     def test_missing_oversized_invalid_mime_and_truncated_cache_fail_truthfully(self):
         self.assertIn("image_cache_unavailable", self.session(max_bytes=10).inspect(self.source))
         self.path.write_bytes(b"not an image")

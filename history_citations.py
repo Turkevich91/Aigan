@@ -116,8 +116,8 @@ class HistoryCitationSession:
         if evidence is not None:
             item = self._store.item_by_id(item_id)
             return item if self._eligible(item) and _fingerprint(item) == evidence.fingerprint else None
-        if self._history is not None and self._history.validated_exposed_item(item_id) is not None:
-            item = self._store.item_by_id(item_id)
+        if self._history is not None:
+            item = self._history.validated_exposed_source(item_id)
             return item if self._eligible(item) else None
         return None
 
