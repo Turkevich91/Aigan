@@ -12,6 +12,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Sequence
 
+from sticker_cache import StickerCache
+
 
 AUTHORED_TURN_NOTE_PREFIX = "[aigan.authored_turn.v1]"
 AUTHORED_TURN_MAX_PARTS = 10
@@ -60,6 +62,7 @@ class MemoryItem:
     reply_to_message_id: int | None
     forward_origin: str
     raw_note: str
+    sticker_metadata: str = ""
 
 
 def _history_evidence_digest_values(*values) -> str:
@@ -240,6 +243,7 @@ class MemoryStore:
             self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.execute("PRAGMA foreign_keys=ON")
             self._migrate()
+        self.stickers = StickerCache(self.db_path)
 
     def _migrate(self) -> None:
         self._conn.executescript(
@@ -338,6 +342,7 @@ class MemoryStore:
                 ON provenance_runs(subject_kind, subject_id, subject_key)
             """
         )
+        self._ensure_column("messages", "sticker_metadata", "TEXT NOT NULL DEFAULT ''")
         self._conn.commit()
 
     def _ensure_column(self, table: str, column: str, definition: str) -> None:
@@ -506,6 +511,22 @@ class MemoryStore:
             )
             self._conn.commit()
             self._sync_search_index_for_id(item_id)
+
+    def update_sticker_metadata(self, item_id: int, *, file_id: str,
+                                file_unique_id: str, metadata: dict) -> bool:
+        """Bind transport metadata to its own source, without loading pixels."""
+        encoded = json.dumps(metadata, ensure_ascii=False, sort_keys=True)
+        if len(encoded) > 4000:
+            return False
+        with self._lock:
+            cursor = self._conn.execute(
+                """UPDATE messages SET telegram_file_id=?, telegram_unique_id=?,
+                       sticker_metadata=? WHERE id=? AND attachment_type='sticker'
+                       AND (telegram_unique_id='' OR telegram_unique_id=?)""",
+                (file_id, file_unique_id, encoded, item_id, file_unique_id),
+            )
+            self._conn.commit()
+            return cursor.rowcount == 1
 
     def remember_authored_turn(
         self, *, chat_id: int, trigger_message_id: int,
@@ -1556,6 +1577,7 @@ class MemoryStore:
                   AND content_kind = 'image'
                   AND local_media_path != ''
                   AND vision_summary = ''
+                  AND attachment_type != 'sticker'
                 ORDER BY created_at DESC, id DESC
                 LIMIT ?
                 """,
@@ -1901,6 +1923,7 @@ class MemoryStore:
             self._conn.commit()
 
     def close(self) -> None:
+        self.stickers.close()
         with self._lock:
             self._conn.close()
 
@@ -2035,4 +2058,5 @@ class MemoryStore:
             reply_to_message_id=row["reply_to_message_id"],
             forward_origin=row["forward_origin"],
             raw_note=row["raw_note"],
+            sticker_metadata=row["sticker_metadata"],
         )
