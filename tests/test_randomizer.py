@@ -68,6 +68,7 @@ class RandomizerTests(unittest.TestCase):
         self.assertEqual(original, items)
 
     def test_valid_limits(self):
+        self.assertEqual((7,), randomize("integers", minimum=7, maximum=7, items=None).values)
         self.assertEqual(100, len(randomize("integers", count=100).values))
         self.assertEqual(100, len(randomize("choose", items=["x"] * 200, count=100).values))
         self.assertEqual(100, len(randomize("shuffle", items=["x"] * 100).values))
@@ -88,6 +89,7 @@ class RandomizerTests(unittest.TestCase):
             {"operation": "integers", "minimum": 5, "maximum": 4},
             {"operation": "integers", "minimum": 1, "maximum": 2, "count": 3, "replacement": False},
             {"operation": "integers", "replacement": 1},
+            {"operation": "integers", "items": []},
             {"operation": "integers", "items": ["not an integer input"]},
             {"operation": "choose"},
             {"operation": "choose", "items": []},
@@ -107,13 +109,22 @@ class RandomizerTests(unittest.TestCase):
                     randomize(**kwargs)
                 constructor.assert_not_called()
 
-    def test_expanded_result_limit_fails_without_reroll(self):
+    def test_replacement_output_bound_rejects_before_random_source(self):
+        for items in (["x" * 200], ["short", "x" * 200]):
+            with self.subTest(item_count=len(items)), patch("randomizer.random.SystemRandom") as source:
+                with self.assertRaises(RandomizerValidationError) as error:
+                    randomize("choose", items=items, count=51, replacement=True)
+                self.assertEqual("result_too_large", error.exception.code)
+                source.assert_not_called()
+
+    def test_replacement_output_bound_accepts_exact_limit(self):
         source = Mock(spec=random.SystemRandom)
         source.choice.return_value = "x" * 200
-        with self.assertRaises(RandomizerValidationError) as error:
-            randomize("choose", items=["x" * 200], count=51, replacement=True, rng=source)
-        self.assertEqual("result_too_large", error.exception.code)
-        self.assertEqual(51, source.choice.call_count)
+        result = randomize("choose", items=["short", "x" * 200],
+                           count=50, replacement=True, rng=source)
+        self.assertEqual(("x" * 200,) * 50, result.values)
+        self.assertEqual(10000, sum(map(len, result.values)))
+        self.assertEqual(50, source.choice.call_count)
 
     def test_source_failure_is_not_replaced_with_a_success(self):
         source = Mock(spec=random.SystemRandom)

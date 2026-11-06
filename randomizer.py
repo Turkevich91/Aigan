@@ -81,6 +81,7 @@ def randomize(
     Integers allow replacement by default;
     item selection defaults to distinct positions (equal strings may recur).
     Shuffle returns every item, so count is unused and input is capped at 100.
+    Replacement choices reserve the output budget using the longest input item.
     No seed, previous response, persistence, or rejection reroll is involved.
     """
     if operation not in ("integers", "choose", "shuffle"):
@@ -95,7 +96,7 @@ def randomize(
         maximum = _integer("maximum", maximum, -MAX_INTEGER, MAX_INTEGER)
         if minimum > maximum:
             raise RandomizerValidationError("invalid_range", "minimum must not exceed maximum.")
-        if items:
+        if items is not None:
             raise RandomizerValidationError("unexpected_items", "Integer sampling does not accept items.")
         replace = True if replacement is None else replacement
         if not replace and count > (maximum - minimum) // step + 1:
@@ -120,13 +121,13 @@ def randomize(
             replace = False if replacement is None else replacement
             if not replace and count > len(population):
                 raise RandomizerValidationError("insufficient_population", "The list has too few positions.")
+            if replace and count * max(map(len, population)) > MAX_TOTAL_CHARACTERS:
+                raise RandomizerValidationError(
+                    "result_too_large", f"Worst-case selected items exceed {MAX_TOTAL_CHARACTERS} characters."
+                )
             source = rng if rng is not None else random.SystemRandom()
             values = (
                 [source.choice(population) for _ in range(count)]
                 if replace else source.sample(population, count)
-            )
-        if sum(map(len, values)) > MAX_TOTAL_CHARACTERS:
-            raise RandomizerValidationError(
-                "result_too_large", f"Selected items total more than {MAX_TOTAL_CHARACTERS} characters."
             )
     return RandomizerResult(operation=operation, values=tuple(values))

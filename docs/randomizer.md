@@ -46,8 +46,11 @@ and in-flight duplicate protection still applies.
 Maximum 100 outputs, 200 input entries (100 for shuffle), 200 characters per
 entry and 10,000 aggregate input/output characters. Integer endpoints are
 bounded to the exact JSON integer range `[-(2**53-1), 2**53-1]`. Source lists
-are not mutated. Arbitrary word generation and built-in dictionaries are not
-part of this capability. Stepped ranges include only values on the progression:
+are not mutated. For selection with replacement, the output limit is checked
+before sampling as `count * longest entry length <= 10000`; acceptance therefore
+does not depend on which entries happen to be selected. Arbitrary word generation
+and built-in dictionaries are not part of this capability. Stepped ranges include
+only values on the progression:
 for example, a step that does not reach the upper bound stops below it. Multiple
 dice are independent integer draws with replacement and retain each roll.
 
