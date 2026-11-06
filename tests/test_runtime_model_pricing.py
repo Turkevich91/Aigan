@@ -6,6 +6,43 @@ from model_telemetry import normalize_policy_version
 
 
 class RuntimeModelPricingTests(unittest.TestCase):
+    def test_terra_61_cached_and_write_tokens_are_charged_once(self) -> None:
+        estimate = runtime_pricing.estimate_token_cost(
+            "gpt-6.1-terra",
+            [runtime_pricing.TokenUsage(
+                input_tokens=1000, cached_input_tokens=100,
+                cache_write_tokens=100, output_tokens=50,
+            )],
+        )
+
+        self.assertEqual(1_180_000, estimate.nano_usd)
+        self.assertEqual("estimated", estimate.status)
+        self.assertTrue(estimate.complete)
+        self.assertEqual("gpt-6.1-terra", estimate.basis_model)
+        self.assertEqual(1_000, estimate.input_rate_nano_usd)
+        self.assertEqual(50, estimate.cached_input_rate_nano_usd)
+        self.assertEqual(1_250, estimate.cache_write_rate_nano_usd)
+        self.assertEqual(5_000, estimate.output_rate_nano_usd)
+
+    def test_terra_61_long_context_threshold_and_cached_write_tiers(self) -> None:
+        boundary = runtime_pricing.TokenUsage(
+            input_tokens=272_000, cached_input_tokens=2_000,
+            cache_write_tokens=4_000, output_tokens=20,
+        )
+        above = runtime_pricing.TokenUsage(
+            input_tokens=272_001, cached_input_tokens=2_000,
+            cache_write_tokens=4_000, output_tokens=20,
+        )
+
+        at_limit = runtime_pricing.estimate_token_cost("gpt-6.1-terra", [boundary])
+        over_limit = runtime_pricing.estimate_token_cost("gpt-6.1-terra", [above])
+        combined = runtime_pricing.estimate_token_cost("gpt-6.1-terra", [boundary, above])
+
+        self.assertEqual(271_200_000, at_limit.nano_usd)
+        self.assertEqual(542_352_000, over_limit.nano_usd)
+        self.assertEqual(813_552_000, combined.nano_usd)
+        self.assertTrue(combined.complete)
+
     def test_astra_cached_and_write_tokens_are_charged_once(self) -> None:
         estimate = runtime_pricing.estimate_token_cost(
             "gpt-6-astra",
@@ -78,7 +115,11 @@ class RuntimeModelPricingTests(unittest.TestCase):
             "gpt-6-astra", [runtime_pricing.TokenUsage(100, output_tokens=10)]
         )
 
-        self.assertEqual("openai-standard-2026-09-04", estimate.snapshot_version)
+        self.assertEqual("openai-standard-2026-10-29-terra61-addendum", estimate.snapshot_version)
+        self.assertIn(
+            "https://developers.openai.com/api/docs/models/gpt-6.1-terra",
+            runtime_pricing.PRICE_SOURCE_URLS,
+        )
         self.assertIn(
             "https://developers.openai.com/api/docs/models/gpt-6-astra",
             runtime_pricing.PRICE_SOURCE_URLS,
@@ -150,6 +191,7 @@ class RuntimeModelPricingTests(unittest.TestCase):
         self.assertEqual(6_175_000, after.nano_usd)
         self.assertEqual(4_740_000, current.nano_usd)
         self.assertIsNone(historical_pricing.token_price_for_model("gpt-6-astra"))
+        self.assertIsNone(historical_pricing.token_price_for_model("gpt-6.1-terra"))
         self.assertIsNot(
             historical_pricing.MODEL_TOKEN_PRICES,
             runtime_pricing.MODEL_TOKEN_PRICES,
