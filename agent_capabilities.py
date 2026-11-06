@@ -1,4 +1,7 @@
-"""Request-local SDK adapters for application-owned conversational capabilities."""
+"""Request-local SDK adapters for application-owned conversational capabilities.
+
+Owner: conversational capability adapters.
+"""
 from __future__ import annotations
 
 import json
@@ -14,6 +17,60 @@ from chat_history import ChatHistorySession
 from history_citations import HistoryCitationSession
 from retained_images import RetainedImageSession
 from image_capability import ImageCapabilitySession, ImageContinuationEvidence, ImageDeliveryProposal
+from randomizer_capability import RandomizerSession
+
+
+def randomizer_tools(session: RandomizerSession):
+    """Expose the application-owned sampler, without model-owned result prose."""
+    @function_tool
+    def randomize(
+        operation: Literal["integers", "choose", "shuffle", "clarify"],
+        minimum: int | None = None,
+        maximum: int | None = None,
+        step: int = 1,
+        count: int = 1,
+        items: list[str] | None = None,
+        replacement: bool | None = None,
+    ) -> str:
+        """Draw random integers, choose supplied words/items, or shuffle a list.
+
+        Use for a requested random outcome, never invent the outcome yourself.
+        The application replies with the result; do not announce tool use.
+        Do not call for explanations, quotations or negated requests.
+
+        Args:
+            operation: integers, choose, shuffle, or clarify when required parameters are missing.
+            minimum: Inclusive integer lower bound from the request; do not invent a missing range.
+            maximum: Inclusive integer upper bound from the request.
+            step: Positive integer spacing from minimum; only progression members at or below maximum are eligible.
+            count: Number of integer draws or choices, at most 100. Shuffle returns the whole list.
+            items: Exact supplied entries, preserving spelling and duplicates. Never invent a word list.
+            replacement: Whether entries may be drawn again; default true for integers, false for choices.
+        """
+        result = session.execute(operation, minimum=minimum, maximum=maximum, step=step, count=count,
+                                 items=items, replacement=replacement)
+        return result if session.literal_output else "Tool failed: randomizer_unfulfilled. " + result
+
+    return [randomize]
+
+
+def conversational_tool_behavior(session: RandomizerSession, capabilities=None):
+    """Compose existing image dispatch with terminal, literal random outcomes."""
+    async def behavior(context, results):
+        if capabilities is not None:
+            outcome = await capabilities.tool_use_behavior(context, results)
+            if outcome.is_final_output:
+                return outcome
+        if not session.completed and any(
+            getattr(getattr(item, "tool", None), "name", "") == "randomize" for item in results
+        ):
+            # SDK argument/schema failures may happen before execute(). They
+            # must also end in a clarification, never model-invented success.
+            session.execute("clarify")
+        if session.completed:
+            return ToolsToFinalOutputResult(is_final_output=True, final_output=session.final_output(""))
+        return ToolsToFinalOutputResult(is_final_output=False, final_output=None)
+    return behavior
 
 
 @dataclass
