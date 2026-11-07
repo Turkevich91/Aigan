@@ -245,7 +245,7 @@ class ChatModelUI:
             for index, capability in enumerate(MODEL_CATALOG):
                 label = capability.aliases[0] if capability.aliases else capability.model
                 if capability.model == SPARK_MODEL:
-                    label = "Spark / Qwen · локальний текст" if self.spark_available() else "Spark / Qwen · недоступний"
+                    label = "Spark / Qwen · локально, безплатно" if self.spark_available() else "Spark / Qwen · недоступний"
                 rows.append([button(("✓ " if capability.model == panel.model else "") + label, "m", index)])
         elif panel.stage == "effort":
             capability = get_model_capability(panel.model)

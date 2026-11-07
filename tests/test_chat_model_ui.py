@@ -204,9 +204,9 @@ class ChatModelUITests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(query.answer.await_args.kwargs["show_alert"])
         self.ui.spark_available = lambda: True
         await self.command()
-        await self.click("Spark / Qwen · локальний текст")
+        await self.click("Spark / Qwen · локально, безплатно")
         await self.click("Назад")
-        await self.click("Spark / Qwen · локальний текст")
+        await self.click("Spark / Qwen · локально, безплатно")
         await self.click("15 хв")
         await self.click("Застосувати")
         self.assertEqual(("spark-qwen", "auto"), (self.profile().model, self.profile().reasoning_effort))
