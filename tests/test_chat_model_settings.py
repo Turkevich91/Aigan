@@ -1,5 +1,6 @@
 """Deterministic settings persistence, expiry, and competing-operator checks."""
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing
 from dataclasses import FrozenInstanceError
 from pathlib import Path
 import sqlite3
@@ -48,6 +49,9 @@ class ModelSelectionTests(unittest.TestCase):
         self.assertEqual("low", parse_model_selection("sol 7d").reasoning_effort)
         self.assertIsNone(parse_model_selection("astra-max persistent").duration_seconds)
         self.assertIsNone(parse_model_selection("terra none until-reset").duration_seconds)
+        canonical = parse_model_selection("sol-medium persistent")
+        self.assertEqual(canonical, parse_model_selection("sol-mid persistent"))
+        self.assertEqual(canonical, parse_model_selection("sol MID persistent"))
 
     def test_cli_rejects_unknown_unbounded_or_ambiguous_inputs(self):
         for value in ("", "astra low 1m extra", "astra ultra", "astra-none", "0m", "astra 8d",
@@ -75,7 +79,7 @@ class ChatSettingsStoreTests(unittest.TestCase):
         self.assertEqual(("legacy-current-default", "low", False, None, 0),
                          (profile.model, profile.reasoning_effort, profile.overridden,
                           profile.expires_at, profile.revision))
-        with sqlite3.connect(self.path) as conn:
+        with closing(sqlite3.connect(self.path)) as conn, conn:
             self.assertEqual(0, conn.execute("SELECT COUNT(*) FROM chat_model_settings").fetchone()[0])
 
     def test_request_snapshot_is_immutable_and_chat_isolated(self):
@@ -160,7 +164,7 @@ class ChatSettingsStoreTests(unittest.TestCase):
         )):
             chat = -1001 - index
             self.store.apply(chat, "astra", "low", 60)
-            with sqlite3.connect(self.path) as conn:
+            with closing(sqlite3.connect(self.path)) as conn, conn:
                 conn.execute("UPDATE chat_model_settings SET model=?, reasoning_effort=?, expires_at=? WHERE chat_id=?",
                              (*changes, chat))
             profile = self.resolve(chat)
@@ -168,6 +172,93 @@ class ChatSettingsStoreTests(unittest.TestCase):
             self.assertEqual("legacy-current-default", profile.model)
             self.assertEqual(2, profile.revision)
             self.assertEqual(2, self.resolve(chat).revision)
+
+    def test_member_persistent_range_uses_higher_anchor_including_its_end(self):
+        for owner, allowed in ((("luna", "low"), ("sol", "medium")),
+                               (("astra", "high"), ("astra", "high"))):
+            with self.subTest(owner=owner):
+                self.store.apply(-1001, *owner, role="owner")
+                self.store.apply(-1001, "spark", "auto", role="member")
+                result = self.store.apply(-1001, *allowed, role="member")
+                self.assertIsNone(result.expires_at)
+                self.assertEqual(validate_selection(*allowed), (result.model, result.reasoning_effort))
+        self.store.apply(-1001, "astra", "medium", role="member")
+        self.assertEqual(validate_selection("astra", "high"), self.store.member_ceiling(-1001))
+        self.assertEqual(validate_selection("sol", "medium"), self.store.member_ceiling(-1002))
+
+    def test_member_boost_duration_cap_replay_and_persistent_return_after_restart(self):
+        self.store.apply(-1001, "qwen", "auto", role="owner")
+        self.store.apply(-1001, "sol", "medium", role="member")
+        for model, effort, duration in (("astra", "low", None), ("sol", "high", 901),
+                                        ("astra", "medium", 1)):
+            with self.subTest(model=model, effort=effort, duration=duration):
+                with self.assertRaisesRegex(InvalidModelSelection, "member_profile_limit"):
+                    self.store.apply(-1001, model, effort, duration, role="member")
+        self.assertEqual(2, self.resolve().revision)
+        boosted = self.store.apply(-1001, "astra", "low", 900, role="member")
+        self.assertEqual(1900, boosted.expires_at)
+        self.now += 30
+        replay = self.store.apply(-1001, "astra", "low", 900, role="member")
+        self.assertEqual(boosted, replay)
+        switched = self.store.apply(-1001, "sol", "high", 900, role="member")
+        self.assertEqual(boosted.expires_at, switched.expires_at)
+        restarted = ChatModelSettingsStore(self.path)
+        self.assertEqual(switched, restarted.resolve(-1001, "default", "high", now=1899))
+        restored = restarted.resolve(-1001, "default", "high", now=1900)
+        self.assertEqual(("gpt-6.1-sol", "medium", None, 5),
+                         (restored.model, restored.reasoning_effort, restored.expires_at, restored.revision))
+        self.assertEqual(1930, restarted.apply(-1001, "sol", "high", 30, now=1900, role="member").expires_at)
+
+    def test_member_mutations_follow_latest_owner_policy_and_privileged_timers_never_raise_it(self):
+        self.store.apply(-1001, "astra", "high", role="owner")
+        self.store.apply(-1001, "astra", "medium", role="member")
+        self.store.reset(-1001, role="member")
+        self.assertEqual("high", self.resolve().reasoning_effort)
+        current = self.store.apply(-1001, "luna", "low", role="owner")
+        self.store.apply(-1001, "astra", "max", 300, role="admin")
+        with self.assertRaises(StaleSettingsRevision):
+            self.store.apply(-1001, "astra", "high", expected_revision=current.revision, role="member")
+        with self.assertRaises(InvalidModelSelection):
+            self.store.apply(-1001, "astra", "high", role="member")
+        self.store.reset(-1001, role="admin")
+        self.assertEqual("gpt-6-luna", self.resolve().model)
+        self.store.reset(-1001, role="owner")
+        self.assertFalse(self.resolve().overridden)
+
+    def test_only_single_trusted_owner_inherits_legacy_persistent_ceiling(self):
+        for trusted in (False, True):
+            with self.subTest(trusted=trusted):
+                path = Path(self.tmp.name) / f"legacy-{trusted}.sqlite3"
+                with closing(sqlite3.connect(path)) as conn, conn:
+                    conn.execute("""CREATE TABLE chat_model_settings (
+                        chat_id INTEGER PRIMARY KEY, model TEXT, reasoning_effort TEXT, expires_at REAL,
+                        revision INTEGER NOT NULL, updated_at REAL NOT NULL)""")
+                    conn.executemany("INSERT INTO chat_model_settings VALUES (?, ?, ?, ?, ?, ?)", [
+                        (-1001, "gpt-6-astra", "high", None, 6, 900),
+                        (-1002, "gpt-6-astra", "max", 1020, 9, 900),
+                    ])
+                store = ChatModelSettingsStore(path, clock=lambda: self.now, legacy_owner_settings=trusted)
+                self.assertEqual(("gpt-6-astra", "high") if trusted else ("gpt-6.1-sol", "medium"),
+                                 store.member_ceiling(-1001))
+                active = store.resolve(-1001, "default", "low")
+                self.assertEqual(("gpt-6-astra", "high", 6), (active.model, active.reasoning_effort, active.revision))
+                self.assertEqual(("gpt-6.1-sol", "medium"), store.member_ceiling(-1002))
+                self.assertFalse(store.resolve(-1002, "default", "low", now=1020).overridden)
+                again = ChatModelSettingsStore(path, clock=lambda: self.now, legacy_owner_settings=not trusted)
+                self.assertEqual(store.member_ceiling(-1001), again.member_ceiling(-1001))
+
+    def test_member_reset_cannot_select_an_unapproved_or_unranked_runtime_default(self):
+        for default, expected in (
+            (("gpt-6-astra", "high"), ("gpt-6.1-sol", "medium")),
+            (("unranked-default", "low"), ("gpt-6.1-sol", "medium")),
+            (("gpt-6-luna", "low"), ("gpt-6-luna", "low")),
+        ):
+            with self.subTest(default=default):
+                self.store.apply(-1001, "qwen", "auto", role="member")
+                self.store.reset(-1001, role="member", default_profile=default)
+                profile = self.store.resolve(-1001, *default)
+                self.assertEqual(expected, (profile.model, profile.reasoning_effort))
+                self.assertEqual(default != expected, profile.overridden)
 
     def test_competing_instances_cannot_both_apply_same_revision(self):
         self.store.apply(-1001, "astra", "low", 60)
@@ -203,7 +294,7 @@ class ChatSettingsStoreTests(unittest.TestCase):
         for index, revision in enumerate((0, -1, "corrupt", 1.5)):
             chat = -2001 - index
             self.store.apply(chat, "astra", "low", 60)
-            with sqlite3.connect(self.path) as conn:
+            with closing(sqlite3.connect(self.path)) as conn, conn:
                 conn.execute("UPDATE chat_model_settings SET revision=? WHERE chat_id=?", (revision, chat))
             profile = self.resolve(chat)
             self.assertFalse(profile.overridden)
@@ -215,19 +306,19 @@ class ChatSettingsStoreTests(unittest.TestCase):
             ):
                 with self.assertRaisesRegex(InvalidModelSelection, "malformed_settings_revision"):
                     operation()
-            with sqlite3.connect(self.path) as conn:
+            with closing(sqlite3.connect(self.path)) as conn, conn:
                 self.assertEqual(revision, conn.execute(
                     "SELECT revision FROM chat_model_settings WHERE chat_id=?", (chat,),
                 ).fetchone()[0])
 
     def test_existing_database_tables_and_rows_are_preserved(self):
-        with sqlite3.connect(self.path) as conn:
+        with closing(sqlite3.connect(self.path)) as conn, conn:
             conn.execute("CREATE TABLE unrelated_records (id INTEGER PRIMARY KEY, value TEXT)")
             conn.execute("INSERT INTO unrelated_records VALUES (1, 'synthetic retained record')")
         other = ChatModelSettingsStore(self.path)
         other.apply(-1001, "astra", "low", 60)
         other.reset(-1001)
-        with sqlite3.connect(self.path) as conn:
+        with closing(sqlite3.connect(self.path)) as conn, conn:
             self.assertEqual([(1, "synthetic retained record")],
                              conn.execute("SELECT * FROM unrelated_records").fetchall())
             self.assertEqual("ok", conn.execute("PRAGMA quick_check").fetchone()[0])

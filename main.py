@@ -322,6 +322,7 @@ class Config:
     prompt_privacy_guard_enabled: bool
     allowed_chat_ids: set[int]
     admin_user_ids: set[int]
+    owner_user_id: int | None
     user_cooldown_seconds: int
     chat_cooldown_seconds: int
     chat_inflight_guard_enabled: bool
@@ -706,6 +707,9 @@ class Config:
         )
         operator_alerts_enabled = _env_bool("OPERATOR_ALERTS_ENABLED", False)
         admin_user_ids = _csv_ints(os.getenv("ADMIN_USER_IDS", ""))
+        owner_user_id = optional_int(os.getenv("AIGAN_OWNER_USER_ID"))
+        if owner_user_id is not None and (owner_user_id <= 0 or owner_user_id not in admin_user_ids):
+            raise RuntimeError("AIGAN_OWNER_USER_ID must identify a positive user in ADMIN_USER_IDS")
         if operator_alerts_enabled:
             if operator_alert_chat_id is None or operator_alert_chat_id <= 0:
                 raise RuntimeError(
@@ -757,6 +761,7 @@ class Config:
             prompt_privacy_guard_enabled=_env_bool("PROMPT_PRIVACY_GUARD_ENABLED", True),
             allowed_chat_ids=_csv_ints(os.getenv("ALLOWED_CHAT_IDS", "")),
             admin_user_ids=admin_user_ids,
+            owner_user_id=owner_user_id,
             user_cooldown_seconds=int(os.getenv("USER_COOLDOWN_SECONDS", "20")),
             chat_cooldown_seconds=int(os.getenv("CHAT_COOLDOWN_SECONDS", "5")),
             chat_inflight_guard_enabled=_env_bool("CHAT_INFLIGHT_GUARD_ENABLED", True),
@@ -1111,7 +1116,10 @@ async def send_activity_action(
 
 # Chat controls are durable independently of conversational memory being enabled.
 try:
-    CHAT_MODEL_SETTINGS: ChatModelSettingsStore | None = ChatModelSettingsStore(CONFIG.memory_db_path)
+    CHAT_MODEL_SETTINGS: ChatModelSettingsStore | None = ChatModelSettingsStore(
+        CONFIG.memory_db_path,
+        legacy_owner_settings=CONFIG.owner_user_id is not None and CONFIG.admin_user_ids == {CONFIG.owner_user_id},
+    )
 except Exception as exc:
     LOGGER.error("Chat model settings unavailable error=%s", type(exc).__name__)
     CHAT_MODEL_SETTINGS = None
@@ -1244,6 +1252,10 @@ def is_admin_actor(actor_id: int | None) -> bool:
     return actor_id in CONFIG.admin_user_ids
 
 
+def is_owner_actor(actor_id: int | None) -> bool:
+    return is_admin_actor(actor_id) and actor_id == CONFIG.owner_user_id
+
+
 def chat_actor_allowed(chat_id: int, chat_type: str, actor_id: int | None) -> bool:
     return (not CONFIG.allowed_chat_ids or chat_id in CONFIG.allowed_chat_ids
             or (chat_type == ChatType.PRIVATE and is_admin_actor(actor_id)))
@@ -1260,6 +1272,7 @@ CHAT_MODEL_UI = ChatModelUI(
     CHAT_MODEL_SETTINGS,
     defaults=lambda: (CONFIG.openai_model, CONFIG.model_reasoning_effort),
     is_admin=is_admin_actor,
+    is_owner=is_owner_actor,
     chat_allowed=chat_actor_allowed,
     spark_available=lambda: SPARK_ANSWER is not None,
 )
@@ -12879,10 +12892,11 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if not allow_command(message, "help"):
         return
     model_help = (
-        "\nДля адміна: /model відкриває панель моделі цього чату; "
-        "/select_model astra-low 15m — тимчасовий вибір; /select_model reset — типові налаштування."
-        if is_admin_user(message) else ""
+        "\n/model відкриває панель цього чату. /select_model sol-medium persistent зберігає модель. "
+        "/select_model astra-low 15m вмикає її на 15 хвилин."
     )
+    if is_admin_user(message):
+        model_help += " У панелі також можна змінити дозволи інструментів."
     await message.reply_text(
         f"У групі клич мене так: {CONFIG.bot_trigger} питання, /ai, /питай, /п, /а, згадка або reply. Сервісні: /ids (/айді), /context (/контекст), /version (/версія), /stat (/стат), /character (/характер), /interests (/інтереси), /health (/самопочуття), /tools (/тулзи), /tool_health (/стан_тулзів), /logs (/логи), /selfcheck (/самоаналіз), /complaints (/скарги), /memory_search (/память, /памʼять, /пошук_памяті), /proactive_now (/проактив), /remind, /reminders." + model_help
     )

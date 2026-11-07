@@ -24,6 +24,7 @@ _TEST_ENV = {
     "LOG_LEVEL": "CRITICAL",
     "ALLOWED_CHAT_IDS": "-1001",
     "ADMIN_USER_IDS": "42424242",
+    "AIGAN_OWNER_USER_ID": "",
     "AUTO_REACT_ENABLED": "false",
     "BOT_TIMEZONE": "America/New_York",
     "MAX_REPLY_CHARS": "12000",
