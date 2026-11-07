@@ -196,6 +196,21 @@ class ChatModelUITests(unittest.IsolatedAsyncioTestCase):
         await self.click(effort)
         await self.click(duration)
 
+    async def test_spark_requires_configuration_and_skips_effort_step(self):
+        await self.command("/select_model qwen 15m")
+        self.assertFalse(self.profile().overridden)
+        await self.command()
+        query = await self.click("Spark / Qwen · недоступний")
+        self.assertTrue(query.answer.await_args.kwargs["show_alert"])
+        self.ui.spark_available = lambda: True
+        await self.command()
+        await self.click("Spark / Qwen · локальний текст")
+        await self.click("Назад")
+        await self.click("Spark / Qwen · локальний текст")
+        await self.click("15 хв")
+        await self.click("Застосувати")
+        self.assertEqual(("spark-qwen", "auto"), (self.profile().model, self.profile().reasoning_effort))
+
     async def test_select_command_defaults_to_fifteen_minutes_and_deletes_after_success(self):
         msg = await self.command("/select_model astra-low")
         current = self.profile()

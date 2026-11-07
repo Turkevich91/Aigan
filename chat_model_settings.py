@@ -37,12 +37,14 @@ class ModelCapability:
     supports_images: bool = True
 
 
+SPARK_MODEL = "spark-qwen"
 _REASONING = ("low", "medium", "high", "xhigh", "max")
 MODEL_CATALOG = (
     ModelCapability("gpt-6-astra", ("astra",), _REASONING),
-    ModelCapability("gpt-6.1-terra", ("terra",), ("none", *_REASONING)),
     ModelCapability("gpt-6.1-sol", ("sol",), _REASONING),
+    ModelCapability("gpt-6.1-terra", ("terra",), ("none", *_REASONING)),
     ModelCapability("gpt-6-luna", ("luna",), ("none", *_REASONING)),
+    ModelCapability(SPARK_MODEL, ("spark", "qwen"), ("auto",), supports_images=False),
 )
 
 
@@ -99,7 +101,7 @@ def parse_duration(value: str) -> int | None:
 def parse_model_selection(arguments: str | Sequence[str]) -> ParsedModelSelection:
     """Parse ``astra-low 15m`` or ``gpt-6-astra low 15m`` arguments.
 
-    Missing reasoning defaults to low and missing duration to fifteen minutes.
+    Missing reasoning uses the preset default. Missing duration is fifteen minutes.
     Reset/default is a separate operation handled by the Telegram adapter.
     """
     if isinstance(arguments, str):
@@ -118,7 +120,8 @@ def parse_model_selection(arguments: str | Sequence[str]) -> ParsedModelSelectio
             raise InvalidModelSelection("unsupported_model") from None
         capability = get_model_capability(model_token)
     else:
-        if parts and parts[0].casefold() in {"none", *_REASONING}:
+        effort = "low" if "low" in capability.reasoning_efforts else capability.reasoning_efforts[0]
+        if parts and parts[0].casefold() in {"auto", "none", *_REASONING}:
             effort = parts.pop(0).casefold()
     if len(parts) > 1:
         raise InvalidModelSelection("invalid_selection_arguments")

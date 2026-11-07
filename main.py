@@ -39,6 +39,7 @@ from agents import (
     set_tracing_disabled,
 )
 from agents.mcp import MCPServerStdio
+from agents.models.openai_chatcompletions import OpenAIChatCompletionsModel
 from agents.models.openai_responses import OpenAIResponsesModel
 from openai import AsyncOpenAI, OpenAI
 from PIL import Image, UnidentifiedImageError
@@ -90,7 +91,8 @@ from image_intent import (
     semantic_image_claim_requires_guard,
 )
 from agent_capabilities import PrimaryCapabilities, randomizer_tools, conversational_tool_behavior
-from chat_model_settings import AnswerProfile, ChatModelSettingsStore
+from chat_model_settings import AnswerProfile, ChatModelSettingsStore, SPARK_MODEL, get_model_capability
+from spark_answer import SparkAnswerProvider
 from chat_model_ui import ChatModelUI, PANEL_TITLE, is_settings_control_message, is_settings_panel_message
 from randomizer_capability import RandomizerSession, is_randomization_request, is_randomization_repeat
 
@@ -1217,9 +1219,17 @@ def chat_model_scope(chat_id: int, *, inherit: bool = True):
         ACTIVE_CHAT_MODEL.reset(token)
 
 
+def primary_supports_images() -> bool:
+    active = ACTIVE_CHAT_MODEL.get()
+    return (active is None or not active[1].overridden
+            or get_model_capability(active[1].model).supports_images)
+
+
 def primary_answer_settings(*, images: bool = False) -> tuple[str, str]:
     active = ACTIVE_CHAT_MODEL.get()
     if active is not None and (active[1].overridden or not images):
+        if images and not primary_supports_images():
+            raise ValueError("spark_visual_input_unsupported")
         return active[1].model, active[1].reasoning_effort
     if images:
         return CONFIG.vision_interactive_model, CONFIG.vision_interactive_reasoning_effort
@@ -1241,11 +1251,13 @@ def model_control_content(message: Message | None) -> bool:
     )
 
 
+SPARK_ANSWER = SparkAnswerProvider.from_environment()
 CHAT_MODEL_UI = ChatModelUI(
     CHAT_MODEL_SETTINGS,
     defaults=lambda: (CONFIG.openai_model, CONFIG.model_reasoning_effort),
     is_admin=is_admin_actor,
     chat_allowed=chat_actor_allowed,
+    spark_available=lambda: SPARK_ANSWER is not None,
 )
 
 
@@ -1315,8 +1327,12 @@ _AGENTS_OPENAI_CLIENT: AsyncOpenAI | None = None
 _AGENTS_RESPONSE_MODEL: TelemetryOpenAIResponsesModel | None = None
 
 
-def configured_agents_model(model_name: str | None = None) -> TelemetryOpenAIResponsesModel:
+def configured_agents_model(model_name: str | None = None) -> TelemetryOpenAIResponsesModel | OpenAIChatCompletionsModel:
     global _AGENTS_OPENAI_CLIENT, _AGENTS_RESPONSE_MODEL
+    if model_name == SPARK_MODEL:
+        if SPARK_ANSWER is None:
+            raise RuntimeError("spark_answer_unconfigured")
+        return SPARK_ANSWER.agents_model()
     if _AGENTS_RESPONSE_MODEL is None:
         _AGENTS_OPENAI_CLIENT = AsyncOpenAI(api_key=CONFIG.openai_api_key)
         _AGENTS_RESPONSE_MODEL = TelemetryOpenAIResponsesModel(
@@ -1330,6 +1346,8 @@ def configured_agents_model(model_name: str | None = None) -> TelemetryOpenAIRes
 
 async def close_configured_agents_model() -> None:
     global _AGENTS_OPENAI_CLIENT, _AGENTS_RESPONSE_MODEL
+    if SPARK_ANSWER is not None:
+        await SPARK_ANSWER.close()
     client = _AGENTS_OPENAI_CLIENT
     _AGENTS_OPENAI_CLIENT = None
     _AGENTS_RESPONSE_MODEL = None
@@ -1495,8 +1513,8 @@ def build_agents_run_config(
     resolved_route = current_model_route_bucket(route_bucket)
     return RunConfig(
         model=(configured_agents_model(model_name) if model_name is not None else configured_agents_model()),
-        tracing_disabled=mode == "disabled",
-        trace_include_sensitive_data=mode == "sensitive" and not retained_image_reads,
+        tracing_disabled=mode == "disabled" or model_name == SPARK_MODEL,
+        trace_include_sensitive_data=mode == "sensitive" and not retained_image_reads and model_name != SPARK_MODEL,
         workflow_name="Aigan Telegram",
         group_id=resolved_run_id,
         trace_metadata={
@@ -4194,7 +4212,8 @@ def make_agent(
     *, model: str | None = None, reasoning_effort: str | None = None,
 ) -> Agent:
     randomizer = ACTIVE_RANDOMIZER.get() or RandomizerSession()
-    settings = build_model_settings(reasoning_effort=reasoning_effort)
+    settings = (ModelSettings(max_tokens=CONFIG.max_output_tokens) if model == SPARK_MODEL
+                else build_model_settings(reasoning_effort=reasoning_effort))
     if randomizer.required:
         settings.tool_choice = "randomize"
         settings.parallel_tool_calls = False
@@ -7630,12 +7649,13 @@ def primary_capabilities_for_message(message: Message, prompt: str) -> PrimaryCa
             if memory_vector_available() and CONFIG.memory_embedding_model == HISTORY_EMBEDDING_MODEL
             and CONFIG.memory_embedding_dimensions == HISTORY_EMBEDDING_DIMENSIONS else None),
     ) if MEMORY is not None and current is not None else None)
-    continuation = verified_image_continuation(message) if CONFIG.web_image_search_enabled else None
+    can_deliver_images = CONFIG.web_image_search_enabled and primary_supports_images()
+    continuation = verified_image_continuation(message) if can_deliver_images else None
     images = (ImageCapabilitySession(ImageCapabilityContext(
         trusted_prompt=prompt, chat_id=message.chat_id,
         reply_message_id=getattr(getattr(message, "reply_to_message", None), "message_id", None),
         continuation=continuation, enabled=True,
-    )) if CONFIG.web_image_search_enabled else None)
+    )) if can_deliver_images else None)
     citations = (HistoryCitationSession(
         MEMORY, chat_id=message.chat_id,
         chat_type=str(getattr(message.chat, "type", "") or ""),
@@ -7649,7 +7669,7 @@ def primary_capabilities_for_message(message: Message, prompt: str) -> PrimaryCa
         cutoff_created_at=cutoff.isoformat(), reply_message_id=reply_id,
         history=history, citations=citations, max_bytes=CONFIG.image_max_bytes,
         sticker_inspector=inspect_retained_sticker,
-    ) if history is not None and CONFIG.image_analysis_enabled else None)
+    ) if history is not None and CONFIG.image_analysis_enabled and primary_supports_images() else None)
     return PrimaryCapabilities(
         history=history, images=images, continuation=continuation, citations=citations,
         retained_images=retained_images,
@@ -7888,12 +7908,25 @@ def run_plain_model_sync(
         stage_kind="plain",
         intended_model=model,
         reasoning_effort=effort,
-        endpoint="responses",
+        endpoint="chat_completions" if model == SPARK_MODEL else "responses",
         route_bucket=route_bucket,
         task_class_bucket=task_class_bucket,
     )
-    client = OpenAI()
     try:
+        if model == SPARK_MODEL:
+            if SPARK_ANSWER is None:
+                raise RuntimeError("spark_answer_unconfigured")
+            response = SPARK_ANSWER.plain_completion(with_current_time_metadata(prompt), CONFIG.max_output_tokens)
+            choice = response.choices[0]
+            if choice.finish_reason != "stop" or not choice.message.content:
+                raise RuntimeError("spark_answer_incomplete")
+            # Keep private serving identifiers out of durable telemetry.
+            matched = response.model == SPARK_ANSWER.model
+            finish_model_stage(stage, status="succeeded", usage=response.usage,
+                               actual_model=model if matched else "",
+                               actual_model_source="provider_response" if matched else "not_reported")
+            return choice.message.content.strip()
+        client = OpenAI()
         response = client.responses.create(
             model=model,
             input=[
@@ -11326,6 +11359,10 @@ async def maybe_send_internet_image(
             requested_count=count,
             quantity_kind="exact" if count > 1 else "singular",
         )
+    if not primary_supports_images():
+        await send_reply(message, "Для пошуку з перевіркою фото обери модель із зором у /model.",
+                         memory_label="Aigan", route="internet_image_send", outbound_provenance=outbound_provenance)
+        return WebImageSendOutcome(True)
     if not CONFIG.web_image_search_enabled:
         await send_reply(
             message,
@@ -12512,7 +12549,7 @@ async def run_character_evidence(session: CharacterEvidenceSession) -> Character
     model_run_id = current_model_run_id()
     hooks = AiganRunHooks(model_run_id, route_bucket="character",
                          intended_model=model, reasoning_effort=effort)
-    settings = build_model_settings(reasoning_effort=effort)
+    settings = (ModelSettings() if model == SPARK_MODEL else build_model_settings(reasoning_effort=effort))
     settings.max_tokens = min(CONFIG.max_output_tokens, 1800)
     agent = Agent(name="Aigan character evidence", instructions=CHARACTER_INSTRUCTIONS,
                   model=model, model_settings=settings,
@@ -14912,6 +14949,9 @@ async def _handle_image_prompt_generation(
     skip_cooldown: bool = False,
     admitted_parts: Sequence[Message] = (),
 ) -> None:
+    if not primary_supports_images():
+        await message.reply_text("Spark / Qwen працює з текстом. Для зображень обери модель із зором у /model.")
+        return
     left = cooldown_left(message)
     if left > 0 and not skip_cooldown:
         await message.reply_text(f"Зачекай {left}s перед наступним запитом.")

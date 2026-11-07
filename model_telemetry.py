@@ -95,8 +95,8 @@ TASK_CLASS_BUCKETS = {
     "youtube_transcript",
 }
 POLICY_VERSIONS = {"primary_astra_low_v1", "primary_sol_low_v1", "shadow_tier_router_v1"}
-ENDPOINTS = {"agents", "audio_transcriptions", "embeddings", "responses"}
-REASONING_EFFORTS = {"none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"}
+ENDPOINTS = {"agents", "chat_completions", "audio_transcriptions", "embeddings", "responses"}
+REASONING_EFFORTS = {"auto", "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"}
 ACTUAL_MODEL_SOURCES = {"not_reported", "provider_response", "unavailable_sdk"}
 FALLBACK_REASONS = {"captions_unavailable"}
 RUN_ID_RE = re.compile(r"[0-9a-f]{32}")

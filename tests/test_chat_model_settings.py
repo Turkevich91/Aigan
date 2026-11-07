@@ -23,8 +23,11 @@ from chat_model_settings import (
 
 class ModelSelectionTests(unittest.TestCase):
     def test_catalog_and_reasoning_are_explicit(self):
-        self.assertEqual(4, len(MODEL_CATALOG))
-        self.assertTrue(all(entry.supports_images for entry in MODEL_CATALOG))
+        self.assertEqual(["astra", "sol", "terra", "luna", "spark"], [entry.aliases[0] for entry in MODEL_CATALOG])
+        self.assertTrue(all(entry.supports_images for entry in MODEL_CATALOG[:-1]))
+        self.assertFalse(MODEL_CATALOG[-1].supports_images)
+        self.assertEqual(parse_model_selection("spark 15m"), parse_model_selection("qwen-auto 15m"))
+        self.assertEqual(("spark-qwen", "auto"), validate_selection("qwen", "auto"))
         self.assertEqual(("gpt-6-astra", "max"), validate_selection("ASTRA", "MAX"))
         self.assertEqual(("gpt-6.1-terra", "none"), validate_selection("terra", "none"))
         self.assertEqual(("gpt-6-luna", "none"), validate_selection("luna", "none"))

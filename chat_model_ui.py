@@ -19,6 +19,7 @@ from telegram.error import TelegramError
 
 from chat_model_settings import (
     MODEL_CATALOG,
+    SPARK_MODEL,
     ChatModelSettingsStore,
     InvalidModelSelection,
     StaleSettingsRevision,
@@ -120,6 +121,7 @@ class ChatModelUI:
         defaults: Callable[[], tuple[str, str]],
         is_admin: Callable[[int], bool],
         chat_allowed: Callable[[int, str, int], bool],
+        spark_available: Callable[[], bool] = lambda: False,
         clock: Callable[[], float] = time.time,
         delete_commands: bool = True,
         panel_ttl_seconds: int = 900,
@@ -129,6 +131,7 @@ class ChatModelUI:
         self.defaults = defaults
         self.is_admin = is_admin
         self.chat_allowed = chat_allowed
+        self.spark_available = spark_available
         self.clock = clock
         self.delete_commands = delete_commands
         self.panel_ttl_seconds = max(1, min(int(panel_ttl_seconds), 3600))
@@ -216,6 +219,9 @@ class ChatModelUI:
              "duration": "3/3 · Обери термін.",
              "confirm": "Перевір вибір і натисни «Застосувати»."}[panel.stage],
         ])
+        if SPARK_MODEL in {panel.model, profile.model}:
+            lines.append("Spark / Qwen генерує текст локально без оплати за токени відповіді. "
+                         "Допоміжні запити, зокрема для пам’яті, можуть тарифікуватися окремо.")
         if notice:
             lines.extend(["", html.escape(notice)])
         return "\n".join(lines)
@@ -238,6 +244,8 @@ class ChatModelUI:
         if panel.stage == "model":
             for index, capability in enumerate(MODEL_CATALOG):
                 label = capability.aliases[0] if capability.aliases else capability.model
+                if capability.model == SPARK_MODEL:
+                    label = "Spark / Qwen · локальний текст" if self.spark_available() else "Spark / Qwen · недоступний"
                 rows.append([button(("✓ " if capability.model == panel.model else "") + label, "m", index)])
         elif panel.stage == "effort":
             capability = get_model_capability(panel.model)
@@ -320,6 +328,9 @@ class ChatModelUI:
                 await self._notice(message, "Відновлено типову модель для всього поточного чату.")
             elif control.name == "select_model" and control.arguments:
                 selection = parse_model_selection(control.arguments)
+                if selection.model == SPARK_MODEL and not self.spark_available():
+                    await self._notice(message, "Spark / Qwen не налаштований. Обери іншу модель у /model.")
+                    return True
                 previous = self._profile(chat_id)
                 profile = self.store.apply(chat_id, selection.model, selection.reasoning_effort,
                                            selection.duration_seconds, expected_revision=previous.revision)
@@ -430,10 +441,13 @@ class ChatModelUI:
                 panel.model, panel.effort = self._draft(profile)
             elif action == "m" and panel.stage == "model" and int(option) < len(MODEL_CATALOG):
                 capability = MODEL_CATALOG[int(option)]
+                if capability.model == SPARK_MODEL and not self.spark_available():
+                    await self._answer(query, "Spark / Qwen не налаштований.", alert=True)
+                    return
                 panel.model = capability.model
                 if panel.effort not in capability.reasoning_efforts:
                     panel.effort = "low" if "low" in capability.reasoning_efforts else capability.reasoning_efforts[0]
-                panel.stage = "effort"
+                panel.stage = "duration" if len(capability.reasoning_efforts) == 1 else "effort"
             elif action == "e" and panel.stage == "effort":
                 efforts = get_model_capability(panel.model).reasoning_efforts
                 if int(option) >= len(efforts):
@@ -444,6 +458,9 @@ class ChatModelUI:
                 panel.duration_seconds = DURATIONS[int(option)][0]
                 panel.stage = "confirm"
             elif action == "a" and panel.stage == "confirm":
+                if panel.model == SPARK_MODEL and not self.spark_available():
+                    await self._answer(query, "Spark / Qwen не налаштований.", alert=True)
+                    return
                 profile = self.store.apply(chat_id, panel.model, panel.effort, panel.duration_seconds,
                                            expected_revision=panel.settings_revision)
                 panel.settings_revision = profile.revision
@@ -463,7 +480,8 @@ class ChatModelUI:
                 panel.duration_seconds = 900
                 panel.stage = "model"
             elif action == "b" and panel.stage != "model":
-                panel.stage = {"effort": "model", "duration": "effort", "confirm": "duration"}[panel.stage]
+                previous_to_duration = "model" if panel.model == SPARK_MODEL else "effort"
+                panel.stage = {"effort": "model", "duration": previous_to_duration, "confirm": "duration"}[panel.stage]
             else:
                 raise InvalidModelSelection("invalid_panel_action")
         except InvalidModelSelection:
