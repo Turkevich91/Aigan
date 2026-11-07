@@ -203,6 +203,7 @@ class ChatModelUITests(unittest.IsolatedAsyncioTestCase):
                          (current.model, current.reasoning_effort, current.expires_at))
         msg.delete.assert_awaited_once()
         self.assertIn("Застосовано", self.sent[-1][0])
+        self.assertFalse(msg.reply_text.await_args.kwargs["do_quote"])
         self.assertFalse(self.profile(-1002).overridden)
 
     async def test_persistent_and_both_reset_aliases(self):
@@ -217,6 +218,32 @@ class ChatModelUITests(unittest.IsolatedAsyncioTestCase):
         await self.command("/select_model secret-unknown-model low 15m")
         self.assertFalse(self.profile().overridden)
         self.assertNotIn("secret-unknown-model", self.sent[-1][0])
+
+    async def test_close_deletes_panel_without_a_confirmation_or_reply_quote(self):
+        msg = await self.command()
+        self.assertFalse(msg.reply_text.await_args.kwargs["do_quote"])
+        msg.delete.assert_awaited_once()
+        token = self.button("Закрити")
+        await self.click(data=token, actor=43)
+        self.panel.delete.assert_not_awaited()
+        query = await self.click(data=token)
+        self.panel.delete.assert_awaited_once()
+        query.edit_message_text.assert_not_awaited()
+        query.answer.assert_awaited_once()
+        stale = await self.click(data=token)
+        self.assertTrue(stale.answer.await_args.kwargs["show_alert"])
+        self.panel.delete.assert_awaited_once()
+        self.assertEqual(1, len(self.sent))
+
+    async def test_failed_close_can_be_retried_without_posting_a_message(self):
+        await self.command()
+        self.panel.delete.side_effect = [TelegramError("synthetic_failure"), True]
+        query = await self.click("Закрити")
+        self.assertTrue(query.answer.await_args.kwargs["show_alert"])
+        query.edit_message_text.assert_not_awaited()
+        await self.click("Закрити")
+        self.assertEqual(2, self.panel.delete.await_count)
+        self.assertEqual(1, len(self.sent))
 
     async def test_panel_draft_does_not_apply_until_confirmation(self):
         await self.command()

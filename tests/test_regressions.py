@@ -4326,6 +4326,60 @@ class TelegramFormattingTests(unittest.TestCase):
 
         self.assertEqual("2 &lt; 3 &amp; <b>ok</b>", rendered)
 
+    def test_source_anchor_preserves_url_and_renders_label_in_telegram_html(self) -> None:
+        raw = """See <A HREF='https://example.org/Mixed?X=One&amp;y=2&not=3'>A &amp; <b>B</b></A>."""
+        expected_url = "https://example.org/Mixed?X=One&amp;y=2&amp;not=3"
+        message = FakeMessage()
+        asyncio.run(main.send_reply(message, raw))
+        self.assertEqual(f'See <a href="{expected_url}">A &amp; <b>B</b></a>.',
+                         message.reply_calls[0]["text"])
+        self.assertEqual(ParseMode.HTML, message.reply_calls[0]["parse_mode"])
+        self.assertEqual("See A & B (https://example.org/Mixed?X=One&y=2&not=3).",
+                         main.render_plain_fallback(raw))
+
+    def test_plain_fallback_for_a_long_hidden_destination_fits_one_message(self) -> None:
+        href = "https://example.org/" + "a" * 4090
+        self.assertEqual("title", main.render_plain_fallback(f'<a href="{href}">title</a>'))
+
+    def test_emphasis_spanning_link_preserves_literal_stars_in_the_url(self) -> None:
+        source = '**See <a href="https://example.org/A**B">title</a> here**'
+        self.assertEqual('<b>See <a href="https://example.org/A**B">title</a> here</b>',
+                         main.render_telegram_html(source))
+
+    def test_invalid_link_targets_and_attributes_never_become_active_markup(self) -> None:
+        sources = (
+            '<a href="javascript:alert(1)">title</a>',
+            '<a href="https://">title</a>',
+            '<a href="https://example.org/&#10;bad">title</a>',
+            '<a href="https://example.org/" onclick="surprise()">title</a>',
+        )
+        for source in sources:
+            with self.subTest(source=source):
+                self.assertNotIn("<a ", main.render_telegram_html(source))
+                self.assertIn("title", main.render_telegram_html(source))
+        self.assertEqual('@@AIGAN_TG_HTML_0@@ <b>ok</b>',
+                         main.render_telegram_html('@@AIGAN_TG_HTML_0@@ <b>ok</b>'))
+
+    def test_link_across_chunk_boundary_remains_clickable_in_every_piece(self) -> None:
+        href = "https://example.org/" + "long-path/" * 8
+        source = f'intro <a href="{href}">' + 'fragment ' * 11 + '</a> done'
+        chunks = main.split_text_chunks(source, chunk_chars=45, max_chunks=5,
+                                        max_total_chars=500, preserve_links=True)
+        self.assertGreater(len(chunks), 1)
+        for chunk in chunks:
+            rendered = main.render_telegram_html(chunk)
+            self.assertEqual(1, rendered.count(f'<a href="{href}">'))
+            self.assertEqual(1, rendered.count("</a>"))
+            self.assertNotIn("&lt;a", rendered)
+        self.assertEqual(11, "".join(chunks).count("fragment"))
+
+    def test_truncation_closes_the_link_before_the_shortening_notice(self) -> None:
+        source = '<a href="https://example.org">' + "word " * 40 + "</a>"
+        chunks = main.split_text_chunks(source, chunk_chars=50, max_chunks=2,
+                                        max_total_chars=500, preserve_links=True)
+        self.assertEqual(2, len(chunks))
+        self.assertTrue(chunks[-1].endswith("</a>\n\n[...] скорочено"))
+
     def test_send_reply_uses_telegram_html_parse_mode(self) -> None:
         message = FakeMessage()
 

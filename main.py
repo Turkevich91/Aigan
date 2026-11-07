@@ -100,6 +100,7 @@ from sticker_media import (resolve_sticker, normalize_sticker_image,
 from sticker_recognition import recognize_sticker, StickerUnavailable
 from chat_history import ChatHistorySession
 from history_retrieval import HISTORY_EMBEDDING_MODEL, HISTORY_EMBEDDING_DIMENSIONS
+from telegram_formatting import render_plain_fallback, render_telegram_html, split_linked_reply
 from history_citations import ACTIVE_HISTORY_CITATIONS, HistoryCitationSession
 from character_delivery import (
     CharacterDeliveryStore, CharacterDeliveryScope, CharacterDeliveryError,
@@ -1896,17 +1897,12 @@ Telegram formatting:
 - Telegram supports native formatting through parse_mode=HTML.
 - Do not use Markdown/CommonMark markers in replies: no **bold**, __underline__, ### headings, or markdown tables.
 - If emphasis is genuinely helpful, use only sparse Telegram HTML: <b>, <i>, <u>, <s>, <code>, <pre>, or <blockquote>.
+- For cited web sources, use <a href="https://...">source title</a>.
 - Prefer short plain paragraphs and simple '-' bullets over decorative formatting.
 - Never output raw '<', '>', or '&' for decoration; only use them as part of the allowed Telegram HTML tags.
 """
 
 
-TELEGRAM_HTML_TAG_RE = re.compile(
-    r"</?(?:b|strong|i|em|u|ins|s|strike|del|code|pre|blockquote)>",
-    re.IGNORECASE,
-)
-MARKDOWN_BOLD_RE = re.compile(r"\*\*(.+?)\*\*", re.DOTALL)
-MARKDOWN_HEADING_RE = re.compile(r"(?m)^\s{0,3}#{1,6}\s+(.+)$")
 CHANGELOG_PATH = APP_DIR / "CHANGELOG.md"
 MAX_VERSION_ENTRIES = 5
 PROFILE_SAMPLE_LIMIT = 60
@@ -11588,32 +11584,6 @@ async def maybe_send_internet_image(
     return WebImageSendOutcome(True)
 
 
-def normalize_outgoing_markup(text: str) -> str:
-    text = MARKDOWN_HEADING_RE.sub(lambda match: f"<b>{match.group(1).strip()}</b>", text)
-    text = MARKDOWN_BOLD_RE.sub(lambda match: f"<b>{match.group(1)}</b>", text)
-    return text.replace("**", "")
-
-
-def render_telegram_html(text: str) -> str:
-    normalized = normalize_outgoing_markup(text)
-    tags: list[str] = []
-
-    def stash_tag(match: re.Match[str]) -> str:
-        tags.append(match.group(0).lower())
-        return f"@@AIGAN_TG_HTML_{len(tags) - 1}@@"
-
-    escaped = html.escape(TELEGRAM_HTML_TAG_RE.sub(stash_tag, normalized), quote=False)
-    for index, tag in enumerate(tags):
-        escaped = escaped.replace(f"@@AIGAN_TG_HTML_{index}@@", tag)
-    return escaped
-
-
-def render_plain_fallback(text: str) -> str:
-    normalized = normalize_outgoing_markup(text)
-    without_tags = TELEGRAM_HTML_TAG_RE.sub("", normalized)
-    return html.unescape(without_tags)
-
-
 def hard_wrap_text(text: str, limit: int) -> list[str]:
     pieces: list[str] = []
     remaining = text.strip()
@@ -11686,11 +11656,16 @@ def split_text_chunks(
     chunk_chars: int | None = None,
     max_chunks: int | None = None,
     max_total_chars: int | None = None,
+    preserve_links: bool = False,
 ) -> list[str]:
     limit = max(20, min(chunk_chars or CONFIG.telegram_text_chunk_chars, 4096))
     chunk_limit = max(1, max_chunks or CONFIG.max_reply_chunks)
     total_limit = max_total_chars if max_total_chars is not None else CONFIG.max_reply_chars
     total_limit = max(1, total_limit)
+    if preserve_links:
+        linked = split_linked_reply(text, limit=limit, max_chunks=chunk_limit, max_total_chars=total_limit)
+        if linked is not None:
+            return linked
 
     text = text.strip() or "Не маю корисної відповіді на це."
     shortened = False
@@ -11805,7 +11780,7 @@ async def send_text_chunks(
     delivery_run_id: str = "",
     **kwargs: Any,
 ) -> TextDeliveryResult:
-    chunks = split_text_chunks(text)
+    chunks = split_text_chunks(text, preserve_links=not kwargs.get("literal_text", False))
     intended_count = len(chunks)
     message_ids: list[int] = []
     delivered_chunks: list[str] = []

@@ -273,7 +273,7 @@ class ChatModelUI:
     async def _notice(self, message: Any, text: str) -> None:
         await message.reply_text(
             f"<b>{PANEL_TITLE}</b>\n{html.escape(text)}",
-            parse_mode="HTML",
+            parse_mode="HTML", do_quote=False,
         )
 
     async def _open(self, message: Any, owner_id: int, chat_id: int) -> None:
@@ -281,7 +281,9 @@ class ChatModelUI:
         model, effort = self._draft(profile)
         panel = _Panel(secrets.token_urlsafe(12), owner_id, chat_id, 0, profile.revision,
                        0, self.clock() + self.panel_ttl_seconds, model, effort)
-        sent = await message.reply_text(self._text(panel, profile), reply_markup=self._markup(panel), parse_mode="HTML")
+        sent = await message.reply_text(
+            self._text(panel, profile), reply_markup=self._markup(panel), parse_mode="HTML", do_quote=False,
+        )
         panel.message_id = int(sent.message_id)
         self._prune()
         self._panels[panel.nonce] = panel
@@ -385,15 +387,27 @@ class ChatModelUI:
                 or (not indexed and (option != "-" or action not in {"a", "r", "f", "b", "x", "t", "z"}))):
             await self._answer(query, "Невідома дія.", alert=True)
             return
+        if action == "x":
+            # An in-flight deletion must exclude duplicate clicks and concurrent apply.
+            panel.panel_revision = -1
+            try:
+                await message.delete()
+            except (TelegramError, OSError):
+                panel.panel_revision = int(revision_text)
+                await self._answer(query, "Не вдалося закрити панель. Спробуй ще раз.", alert=True)
+            else:
+                self._panels.pop(nonce, None)
+                await self._answer(query)
+            return
         try:
             profile = self._profile(chat_id)
         except (OSError, sqlite3.Error, InvalidModelSelection):
             await self._answer(query, "Налаштування зараз недоступні. Відкрий /model пізніше.", alert=True)
             return
-        if panel.stage == "tools" and action not in {"v", "z", "b", "f", "x"}:
+        if panel.stage == "tools" and action not in {"v", "z", "b", "f"}:
             await self._answer(query, "Недоступна дія.", alert=True)
             return
-        if panel.stage != "tools" and action not in {"f", "x", "t"} and profile.revision != panel.settings_revision:
+        if panel.stage != "tools" and action not in {"f", "t"} and profile.revision != panel.settings_revision:
             await self._answer(query, "Налаштування вже змінилися. Натисни «Оновити» або відкрий /model.", alert=True)
             return
         notice = ""
@@ -450,11 +464,6 @@ class ChatModelUI:
                 panel.stage = "model"
             elif action == "b" and panel.stage != "model":
                 panel.stage = {"effort": "model", "duration": "effort", "confirm": "duration"}[panel.stage]
-            elif action == "x":
-                self._panels.pop(nonce, None)
-                await self._answer(query)
-                await query.edit_message_text(f"<b>{PANEL_TITLE}</b>\nПанель закрито.", parse_mode="HTML")
-                return
             else:
                 raise InvalidModelSelection("invalid_panel_action")
         except InvalidModelSelection:
