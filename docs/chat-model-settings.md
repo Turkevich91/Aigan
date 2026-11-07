@@ -13,6 +13,7 @@ answer can use a paid cloud model or a configured local text model.
 
 - `/settings` or `/model` opens the model panel.
 - `/select_model astra-low 15m` selects Astra with low reasoning for 15 minutes.
+- `/select_model qwen 15m` selects local text generation (`spark` is an alias).
 - `/select_model default` removes the override and restores current defaults.
 - The panel provides model, supported reasoning, duration, Apply and Reset.
 - **Інструменти** opens the independent tool permissions for this chat.
