@@ -7,7 +7,7 @@ a provider, changes global configuration, or touches conversation records.
 from __future__ import annotations
 
 from contextlib import closing
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import math
 from pathlib import Path
 import re
@@ -84,6 +84,21 @@ def validate_selection(model: str, effort: str) -> tuple[str, str]:
     return capability.model, normalized
 
 
+def _profile_rank(profile: tuple[str, str]) -> tuple[int, int]:
+    capability = get_model_capability(profile[0])
+    return -MODEL_CATALOG.index(capability), capability.reasoning_efforts.index(profile[1])
+
+
+def member_duration_limit(model: str, effort: str, ceiling: tuple[str, str]) -> int | None:
+    """Return None for persistent access, the boost limit in seconds, or zero for no access."""
+    requested = _profile_rank(validate_selection(model, effort))
+    if requested <= _profile_rank(ceiling):
+        return None
+    if requested <= _profile_rank(("astra", "low")):
+        return DEFAULT_DURATION_SECONDS
+    return 0
+
+
 def parse_duration(value: str) -> int | None:
     """Parse a bounded CLI duration; indefinite selection must be explicit."""
     if not isinstance(value, str):
@@ -123,11 +138,11 @@ def parse_model_selection(arguments: str | Sequence[str]) -> ParsedModelSelectio
         capability = get_model_capability(model_token)
     else:
         effort = "low" if "low" in capability.reasoning_efforts else capability.reasoning_efforts[0]
-        if parts and parts[0].casefold() in {"auto", "none", *_REASONING}:
+        if parts and parts[0].casefold() in {"auto", "none", "mid", *_REASONING}:
             effort = parts.pop(0).casefold()
     if len(parts) > 1:
         raise InvalidModelSelection("invalid_selection_arguments")
-    model, effort = validate_selection(capability.model, effort)
+    model, effort = validate_selection(capability.model, "medium" if effort == "mid" else effort)
     duration = parse_duration(parts[0]) if parts else DEFAULT_DURATION_SECONDS
     return ParsedModelSelection(model, effort, duration)
 
@@ -239,20 +254,47 @@ class ChatToolSettingsStore:
             return self._state(connection, chat_id)
 
 
+@dataclass(frozen=True)
+class _ChatSettings:
+    revision: int | None = 0
+    owner: tuple[str, str] | None = None
+    persistent: tuple[str, str] | None = None
+    temporary: tuple[str, str] | None = None
+    expires_at: float | None = None
+
+    def columns(self) -> tuple:
+        # Keep the effective profile in the original columns for older readers.
+        active = self.temporary or self.persistent or (None, None)
+        previous = self.persistent if self.temporary else None
+        return (*active, self.expires_at, *(self.owner or (None, None)), *(previous or (None, None)))
+
+    def answer(self, default: tuple[str, str]) -> AnswerProfile:
+        selected = self.temporary or self.persistent
+        return AnswerProfile(*(selected or default), selected is not None, self.expires_at, self.revision or 0)
+
+
+def _stored_profile(model, effort) -> tuple[str, str] | None:
+    try:
+        canonical = validate_selection(model, effort)
+    except InvalidModelSelection:
+        return None
+    return canonical if canonical == (model, effort) else None
+
+
 class ChatModelSettingsStore:
-    """Own one table in the configured database, independently of memory being on.
+    """Serialize settings, revisions and permission checks across processes."""
 
-    Each operation opens a short transaction. BEGIN IMMEDIATE serializes changes
-    across instances/processes, and tombstones preserve revisions after reset or
-    expiry. No timer or previous-default snapshot can restore obsolete settings.
-    """
-
-    def __init__(self, db_path: str | Path, *, clock: Callable[[], float] = time.time) -> None:
+    def __init__(
+        self, db_path: str | Path, *, clock: Callable[[], float] = time.time,
+        member_default: tuple[str, str] = ("sol", "medium"), legacy_owner_settings: bool = False,
+    ) -> None:
         self.path = Path(db_path)
         self.clock = clock
+        self.member_default = validate_selection(*member_default)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.tools = ChatToolSettingsStore(self._connect)
         with closing(self._connect()) as connection, connection:
+            connection.execute("BEGIN IMMEDIATE")
             connection.execute("""
                 CREATE TABLE IF NOT EXISTS chat_model_settings (
                     chat_id INTEGER PRIMARY KEY,
@@ -263,6 +305,17 @@ class ChatModelSettingsStore:
                     updated_at REAL NOT NULL
                 )
             """)
+            columns = {row["name"] for row in connection.execute("PRAGMA table_info(chat_model_settings)")}
+            if "owner_model" not in columns:
+                for column in ("owner_model", "owner_effort", "persistent_model", "persistent_effort"):
+                    connection.execute(f"ALTER TABLE chat_model_settings ADD COLUMN {column} TEXT")
+                # Legacy settings have no author. Only an explicitly trusted
+                # single-owner deployment can attribute its old choices.
+                if legacy_owner_settings:
+                    connection.execute("""
+                        UPDATE chat_model_settings SET owner_model=model, owner_effort=reasoning_effort
+                        WHERE expires_at IS NULL AND model IS NOT NULL
+                    """)
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.path, timeout=5)
@@ -276,109 +329,134 @@ class ChatModelSettingsStore:
         return _timestamp(self.clock() if now is None else now)
 
     @staticmethod
-    def _write(
-        connection: sqlite3.Connection,
-        chat_id: int,
-        model: str | None,
-        effort: str | None,
-        expires_at: float | None,
-        revision: int,
-        now: float,
-    ) -> None:
+    def _write(connection: sqlite3.Connection, chat_id: int, state: _ChatSettings, now: float) -> None:
         connection.execute("""
             INSERT INTO chat_model_settings
-                (chat_id, model, reasoning_effort, expires_at, revision, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?)
+                (chat_id, model, reasoning_effort, expires_at, owner_model, owner_effort,
+                 persistent_model, persistent_effort, revision, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(chat_id) DO UPDATE SET
-                model=excluded.model, reasoning_effort=excluded.reasoning_effort,
-                expires_at=excluded.expires_at, revision=excluded.revision,
-                updated_at=excluded.updated_at
-        """, (chat_id, model, effort, expires_at, revision, now))
+                model=excluded.model, reasoning_effort=excluded.reasoning_effort, expires_at=excluded.expires_at,
+                owner_model=excluded.owner_model, owner_effort=excluded.owner_effort,
+                persistent_model=excluded.persistent_model, persistent_effort=excluded.persistent_effort,
+                revision=excluded.revision, updated_at=excluded.updated_at
+        """, (chat_id, *state.columns(), state.revision, now))
 
-    def _state(
-        self, connection: sqlite3.Connection, chat_id: int, now: float,
-    ) -> tuple[int | None, tuple[str, str, float | None] | None]:
-        row = connection.execute(
-            "SELECT model, reasoning_effort, expires_at, revision FROM chat_model_settings WHERE chat_id=?",
-            (chat_id,),
-        ).fetchone()
+    def _state(self, connection: sqlite3.Connection, chat_id: int, now: float) -> _ChatSettings:
+        row = connection.execute("""
+            SELECT model, reasoning_effort, expires_at, owner_model, owner_effort,
+                   persistent_model, persistent_effort, revision FROM chat_model_settings WHERE chat_id=?
+        """, (chat_id,)).fetchone()
         if row is None:
-            return 0, None
+            return _ChatSettings()
         revision = row["revision"]
-        valid_revision = type(revision) is int and 0 < revision <= _MAX_INTEGER
-        if not valid_revision:
-            # Never invent/reuse a revision that might match an old panel. Reads
-            # fall back to defaults; mutations require explicit database repair.
-            return None, None
-        expires_at = row["expires_at"]
-        if valid_revision and all(row[key] is None for key in ("model", "reasoning_effort", "expires_at")):
-            return revision, None
-        try:
-            model, effort = validate_selection(row["model"], row["reasoning_effort"])
-            if not valid_revision or model != row["model"] or effort != row["reasoning_effort"]:
-                raise InvalidModelSelection("malformed_persisted_settings")
-            if expires_at is not None:
-                expires_at = _timestamp(expires_at)
-            if expires_at is None or now < expires_at:
-                return revision, (model, effort, expires_at)
-        except InvalidModelSelection:
-            pass
-        revision = _next_revision(revision)
-        self._write(connection, chat_id, None, None, None, revision, now)
-        return revision, None
+        if type(revision) is not int or not 0 < revision <= _MAX_INTEGER:
+            # Reads fall back to defaults; never reuse a potentially stale revision.
+            return _ChatSettings(revision=None)
+        active = _stored_profile(row["model"], row["reasoning_effort"])
+        owner = _stored_profile(row["owner_model"], row["owner_effort"])
+        if row["expires_at"] is None:
+            state = _ChatSettings(revision, owner, persistent=active)
+        else:
+            previous = _stored_profile(row["persistent_model"], row["persistent_effort"])
+            state = _ChatSettings(revision, owner, persistent=previous)
+            try:
+                expires_at = _timestamp(row["expires_at"])
+            except InvalidModelSelection:
+                expires_at = None
+            if active and expires_at is not None and now < expires_at:
+                state = replace(state, temporary=active, expires_at=expires_at)
+        if state.columns() != tuple(row)[:-1]:
+            state = replace(state, revision=_next_revision(revision))
+            self._write(connection, chat_id, state, now)
+        return state
+
+    def _member_ceiling(self, state: _ChatSettings) -> tuple[str, str]:
+        return max(self.member_default, state.owner or self.member_default, key=_profile_rank)
+
+    def member_ceiling(self, chat_id: int) -> tuple[str, str]:
+        with closing(self._connect()) as connection, connection:
+            connection.execute("BEGIN IMMEDIATE")
+            state = self._state(connection, _chat_id(chat_id), self._now(None))
+            return self._member_ceiling(state)
 
     def resolve(
         self, chat_id: int, default_model: str, default_effort: str, *, now: float | None = None,
     ) -> AnswerProfile:
-        chat_id, timestamp = _chat_id(chat_id), self._now(now)
         with closing(self._connect()) as connection, connection:
             connection.execute("BEGIN IMMEDIATE")
-            revision, selection = self._state(connection, chat_id, timestamp)
-        if selection is None:
-            return AnswerProfile(default_model, default_effort, False, None, revision or 0)
-        return AnswerProfile(selection[0], selection[1], True, selection[2], revision)
+            state = self._state(connection, _chat_id(chat_id), self._now(now))
+            return state.answer((default_model, default_effort))
+
+    @staticmethod
+    def _check_mutation(
+        connection: sqlite3.Connection, state: _ChatSettings, expected_revision: int | None, role: str,
+    ) -> None:
+        if role not in ("owner", "admin", "member"):
+            raise InvalidModelSelection("invalid_settings_role")
+        if state.revision is None:
+            raise InvalidModelSelection("malformed_settings_revision")
+        if expected_revision is not None and state.revision != expected_revision:
+            # _state may have restored an expired timer before detecting the stale card.
+            connection.commit()
+            raise StaleSettingsRevision("settings_changed")
 
     def apply(
         self, chat_id: int, model: str, effort: str,
         duration_seconds: int | None = None, *, expected_revision: int | None = None,
-        now: float | None = None,
+        role: str = "admin", now: float | None = None,
     ) -> AnswerProfile:
-        chat_id, timestamp = _chat_id(chat_id), self._now(now)
-        model, effort = validate_selection(model, effort)
+        chat_id = _chat_id(chat_id)
+        requested = validate_selection(model, effort)
         _expected_revision(expected_revision)
         if duration_seconds is not None and (
             type(duration_seconds) is not int or not 1 <= duration_seconds <= MAX_DURATION_SECONDS
         ):
             raise InvalidModelSelection("invalid_duration")
-        expires_at = timestamp + duration_seconds if duration_seconds is not None else None
         with closing(self._connect()) as connection, connection:
             connection.execute("BEGIN IMMEDIATE")
-            revision, _ = self._state(connection, chat_id, timestamp)
-            if revision is None:
-                raise InvalidModelSelection("malformed_settings_revision")
-            stale = expected_revision is not None and revision != expected_revision
-            if not stale:
-                revision = _next_revision(revision)
-                self._write(connection, chat_id, model, effort, expires_at, revision, timestamp)
-        # Commit expiry/repair even if the caller's previously viewed card is stale.
-        if stale:
-            raise StaleSettingsRevision("settings_changed")
-        return AnswerProfile(model, effort, True, expires_at, revision)
+            timestamp = self._now(now)
+            state = self._state(connection, chat_id, timestamp)
+            self._check_mutation(connection, state, expected_revision, role)
+            expires_at = timestamp + duration_seconds if duration_seconds is not None else None
+            if role == "member":
+                ceiling = self._member_ceiling(state)
+                limit = member_duration_limit(*requested, ceiling)
+                if limit == 0 or (limit is not None and (duration_seconds is None or duration_seconds > limit)):
+                    raise InvalidModelSelection("member_profile_limit")
+                if expires_at is not None and state.expires_at is not None:
+                    continuing_boost = limit is not None and _profile_rank(state.temporary) > _profile_rank(ceiling)
+                    if requested == state.temporary or continuing_boost:
+                        expires_at = min(expires_at, state.expires_at)
+            if duration_seconds is None:
+                owner = requested if role == "owner" else state.owner
+                changed = _ChatSettings(state.revision, owner, persistent=requested)
+            else:
+                changed = replace(state, temporary=requested, expires_at=expires_at)
+            if changed != state:
+                changed = replace(changed, revision=_next_revision(state.revision))
+                self._write(connection, chat_id, changed, timestamp)
+            return changed.answer(requested)
 
     def reset(
-        self, chat_id: int, *, expected_revision: int | None = None, now: float | None = None,
+        self, chat_id: int, *, expected_revision: int | None = None,
+        role: str = "admin", default_profile: tuple[str, str] | None = None, now: float | None = None,
     ) -> int:
-        chat_id, timestamp = _chat_id(chat_id), self._now(now)
+        chat_id = _chat_id(chat_id)
         _expected_revision(expected_revision)
         with closing(self._connect()) as connection, connection:
             connection.execute("BEGIN IMMEDIATE")
-            revision, _ = self._state(connection, chat_id, timestamp)
-            if revision is None:
-                raise InvalidModelSelection("malformed_settings_revision")
-            stale = expected_revision is not None and revision != expected_revision
-            if not stale:
-                revision = _next_revision(revision)
-                self._write(connection, chat_id, None, None, None, revision, timestamp)
-        if stale:
-            raise StaleSettingsRevision("settings_changed")
-        return revision
+            timestamp = self._now(now)
+            state = self._state(connection, chat_id, timestamp)
+            self._check_mutation(connection, state, expected_revision, role)
+            owner = None if role == "owner" else state.owner
+            persistent = owner
+            if role == "member" and owner is None:
+                # Clearing to the global runtime default must not select a profile
+                # that the member could not have made persistent directly.
+                default = _stored_profile(*default_profile) if default_profile else None
+                if default is None or member_duration_limit(*default, self.member_default) is not None:
+                    persistent = self.member_default
+            revision = _next_revision(state.revision)
+            self._write(connection, chat_id, _ChatSettings(revision, owner, persistent=persistent), timestamp)
+            return revision

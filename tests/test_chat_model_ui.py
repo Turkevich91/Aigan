@@ -87,10 +87,13 @@ class ChatModelUITests(unittest.IsolatedAsyncioTestCase):
         self.ui = ChatModelUI(
             self.store, defaults=lambda: ("gpt-6.1-terra", "low"),
             is_admin=lambda actor: actor in self.admins,
+            is_owner=lambda actor: actor == 42 and actor in self.admins,
             chat_allowed=lambda chat, kind, actor: chat in self.allowed,
             clock=lambda: self.now[0], max_panels=2,
         )
-        self.context = SimpleNamespace(bot=SimpleNamespace(username="test_bot"))
+        self.context = SimpleNamespace(bot=SimpleNamespace(username="test_bot", get_chat_member=AsyncMock(
+            return_value=SimpleNamespace(status="member"),
+        )))
         self.next_id = 100
         self.sent = []
         self.panel = None
@@ -284,21 +287,120 @@ class ChatModelUITests(unittest.IsolatedAsyncioTestCase):
 
     async def test_panel_can_choose_until_reset_and_reset(self):
         await self.command()
-        await self.choose(duration="До скидання")
+        await self.choose(duration="Постійно")
         await self.click("Застосувати")
         self.assertTrue(self.profile().overridden)
         self.assertIsNone(self.profile().expires_at)
         await self.click("Скинути до типових")
         self.assertFalse(self.profile().overridden)
 
-    async def test_nonadmin_and_disallowed_command_cannot_open_or_read_store(self):
+    async def test_disallowed_command_cannot_open_or_read_store(self):
         with patch.object(self.store, "resolve", side_effect=AssertionError("must not read")):
-            await self.command(user_id=77)
-            self.assertIsNone(self.panel)
-            self.assertNotIn("gpt", self.sent[-1][0])
-            count = len(self.sent)
-            await self.command(chat_id=-999)
-            self.assertEqual(count, len(self.sent))
+            for actor in (42, 77):
+                await self.command(chat_id=-999, user_id=actor)
+            self.assertFalse(self.sent)
+
+    async def test_member_persistent_choice_survives_boost_and_other_chats_are_unchanged(self):
+        await self.command("/select_model luna-low persistent")
+        await self.command(user_id=77)
+        for item in ("sol", "medium", "Постійно", "Застосувати"):
+            await self.click(item, actor=77)
+        self.assertEqual(("gpt-6.1-sol", "medium", None),
+                         (self.profile().model, self.profile().reasoning_effort, self.profile().expires_at))
+        await self.click("Astra/low · 15 хв", actor=77)
+        await self.click("Застосувати", actor=77)
+        self.assertEqual(("gpt-6-astra", self.now[0] + 900), (self.profile().model, self.profile().expires_at))
+        self.now[0] += 900
+        self.assertEqual(("gpt-6.1-sol", "medium", None),
+                         (self.profile().model, self.profile().reasoning_effort, self.profile().expires_at))
+        self.assertFalse(self.profile(-1002).overridden)
+        await self.command("/select_model reset", user_id=77)
+        self.assertEqual("gpt-6-luna", self.profile().model)
+
+    async def test_member_duplicate_command_reports_actual_unchanged_deadline(self):
+        await self.command("/select_model astra-low 15m", user_id=77)
+        first = self.sent[-1][0]
+        self.now[0] += 60
+        await self.command("/select_model astra-low 15m", user_id=77)
+        self.assertIn("00:31:40 UTC", first)
+        self.assertEqual(first, self.sent[-1][0])
+
+    async def test_owner_ceiling_survives_member_downgrade_and_rejects_higher_effort(self):
+        await self.command("/select_model astra-high persistent")
+        for effort in ("medium", "low", "high"):
+            await self.command(f"/select_model astra-{effort} persistent", user_id=77)
+            self.assertEqual((effort, None), (self.profile().reasoning_effort, self.profile().expires_at))
+        revision = self.profile().revision
+        await self.command("/select_model astra-xhigh 1m", user_id=77)
+        self.assertEqual(revision, self.profile().revision)
+
+    async def test_member_cannot_view_toggle_or_reset_tools_through_callbacks(self):
+        disabled = self.store.tools.set_enabled(-1001, "web", False, expected_revision=0)
+        await self.command("/settings", user_id=77)
+        buttons = [b for row in self.panel.reply_markup.inline_keyboard for b in row]
+        self.assertNotIn("Інструменти", [b.text for b in buttons])
+        prefix = self.button("astra").rsplit(":", 2)[0]
+        for ending in ("t:-", "v:0", "z:-"):
+            query = await self.click(data=f"{prefix}:{ending}", actor=77)
+            self.assertTrue(query.answer.await_args.kwargs["show_alert"])
+            query.edit_message_text.assert_not_awaited()
+        await self.click("Повернути базовий профіль", actor=77)
+        self.assertEqual(disabled, self.store.tools.resolve(-1001))
+
+    async def test_member_cannot_forge_reasoning_or_duration_or_promote_timed_profile(self):
+        await self.command(user_id=77)
+        await self.click("astra", actor=77)
+        low = self.button("low")
+        self.assertFalse(any(b.text == "medium" for row in self.panel.reply_markup.inline_keyboard for b in row))
+        rejected = await self.click(data=low.rsplit(":", 1)[0] + ":1", actor=77)
+        rejected.edit_message_text.assert_not_awaited()
+        await self.click(data=low, actor=77)
+        duration = self.button("15 хв")
+        for forged in (1, 2, 3):
+            rejected = await self.click(data=duration.rsplit(":", 1)[0] + f":{forged}", actor=77)
+            rejected.edit_message_text.assert_not_awaited()
+        for command in ("astra-low persistent", "astra-low 16m", "astra-medium 1m"):
+            await self.command("/select_model " + command, user_id=77)
+        self.assertFalse(self.profile().overridden)
+
+    async def test_group_callback_checks_current_membership_and_fails_closed(self):
+        await self.command(user_id=77)
+        action = self.button("sol")
+        lookup = self.context.bot.get_chat_member
+        for result in (SimpleNamespace(status="left"), SimpleNamespace(status="kicked"),
+                       SimpleNamespace(status="restricted", is_member=False), TelegramError("unavailable")):
+            lookup.side_effect = [result]
+            query = await self.click(data=action, actor=77)
+            self.assertTrue(query.answer.await_args.kwargs["show_alert"])
+            query.edit_message_text.assert_not_awaited()
+        lookup.side_effect = [SimpleNamespace(status="restricted", is_member=True)]
+        query = await self.click(data=action, actor=77)
+        query.edit_message_text.assert_awaited_once()
+        lookup.assert_awaited_with(-1001, 77)
+
+    async def test_queued_group_commands_cannot_mutate_after_member_leaves(self):
+        lookup = self.context.bot.get_chat_member
+        await self.command(user_id=77)
+        lookup.assert_not_awaited()
+        await self.command("/select_model luna-high persistent", user_id=77)
+        saved = self.profile()
+        lookup.return_value = SimpleNamespace(status="left")
+        for change in ("sol-medium persistent", "astra-low 15m", "reset"):
+            await self.command("/select_model " + change, user_id=77)
+            self.assertEqual(saved, self.profile())
+        lookup.side_effect = TelegramError("temporarily unavailable")
+        await self.command("/select_model reset", user_id=77)
+        self.assertEqual(saved, self.profile())
+
+    async def test_group_selection_rechecks_role_and_chat_after_membership_lookup(self):
+        for revoke in (lambda: self.allowed.remove(-1001), lambda: self.admins.add(77)):
+            async def lookup(chat_id, user_id):
+                revoke()
+                return SimpleNamespace(status="member")
+            self.context.bot.get_chat_member.side_effect = lookup
+            await self.command("/select_model sol-medium persistent", user_id=77)
+            self.assertFalse(self.profile().overridden)
+            self.allowed.add(-1001)
 
     async def test_forwarded_edited_anonymous_and_otherbot_controls_are_silent(self):
         for extra in ({"forward_origin": object()}, {"edit_date": object()},

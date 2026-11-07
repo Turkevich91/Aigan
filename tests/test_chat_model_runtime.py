@@ -3,6 +3,7 @@
 Owner: Aigan application orchestration.
 """
 import asyncio
+import os
 from contextlib import ExitStack
 from dataclasses import replace
 from datetime import datetime, timezone
@@ -270,7 +271,7 @@ class ChatModelRuntimeTests(unittest.IsolatedAsyncioTestCase):
                 message = FakeMessage("/select_model astra-high 15m")
                 if kind == "forwarded": message.forward_origin = SimpleNamespace(type="user")
                 if kind == "edited": message.edit_date = datetime.now(timezone.utc)
-                if kind == "caption": message.caption, message.text = message.text, ""
+                if kind == "caption": message.caption, message.text = "/select_model sol-low 15m", ""
                 if kind == "other_bot": message.text = "/select_model@AnotherBot astra-high 15m"
                 before = self.store.resolve(-1001, "default", "low").revision
                 with patch.object(main, "CHAT_MODEL_UI", ui), patch.object(main, "maybe_buffer_telegram_turn", new_callable=AsyncMock) as assemble, patch.object(main, "remember_message_persistently", new_callable=AsyncMock) as persist, patch.object(main, "handle_prompt", new_callable=AsyncMock) as generate:
@@ -313,13 +314,27 @@ class ChatModelRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("", main.translation_source_material(user, "Translate"))
         self.assertNotIn("Synthetic selected model", main.context_signature_for_dedupe(user))
 
-    async def test_help_discovers_controls_only_for_existing_admin(self):
+    async def test_help_shows_member_choices_and_admin_only_tools(self):
         admin = next(iter(self.config.admin_user_ids))
         for actor in (admin, admin + 1):
             message = FakeMessage("/help")
             message.from_user.id = actor
             await main.help_command(SimpleNamespace(effective_message=message), None)
-            self.assertEqual(actor == admin, "/select_model reset" in message.last_reply)
+            self.assertIn("/select_model sol-medium persistent", message.last_reply)
+            self.assertEqual(actor == admin, "дозволи інструментів" in message.last_reply)
+
+    def test_only_explicit_administrator_can_set_owner_limit(self):
+        with patch.dict(os.environ, {"ADMIN_USER_IDS": "11,22", "OPERATOR_ALERT_CHAT_ID": "22",
+                                     "AIGAN_OWNER_USER_ID": "11"}):
+            with patch.object(main, "CONFIG", main.Config.from_env()):
+                self.assertTrue(main.is_owner_actor(11))
+                self.assertFalse(main.is_owner_actor(22))
+            with patch.dict(os.environ, {"AIGAN_OWNER_USER_ID": ""}):
+                with patch.object(main, "CONFIG", main.Config.from_env()):
+                    self.assertFalse(main.is_owner_actor(22))
+            with patch.dict(os.environ, {"AIGAN_OWNER_USER_ID": "33"}):
+                with self.assertRaisesRegex(RuntimeError, "AIGAN_OWNER_USER_ID"):
+                    main.Config.from_env()
 
     async def test_private_admin_exception_preserves_existing_policy(self):
         admin = next(iter(self.config.admin_user_ids))

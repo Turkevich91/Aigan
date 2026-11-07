@@ -1,9 +1,8 @@
 # Chat answer model controls
 
-An existing Aigan administrator can select the primary answer model and reasoning
-for the current chat. The selection also covers the chat's topics. It does not
-change another chat, global defaults, or auxiliary model roles. The primary
-answer can use a paid cloud model or a configured local text model.
+An admitted participant can select the primary answer model and reasoning for
+the current chat and its topics. The primary answer can use a paid cloud model
+or a configured local text model.
 
 [Design](https://github.com/Turkevich91/Aigan/issues/216) ·
 [Initial model panel](https://github.com/Turkevich91/Aigan/issues/217) ·
@@ -14,9 +13,10 @@ answer can use a paid cloud model or a configured local text model.
 - `/settings` or `/model` opens the model panel.
 - `/select_model astra-low 15m` selects Astra with low reasoning for 15 minutes.
 - `/select_model qwen 15m` selects local text generation (`spark` is an alias).
-- `/select_model default` removes the override and restores current defaults.
+- `/select_model sol-medium persistent` keeps Sol/medium in this chat until another selection.
+- `/select_model reset` or `default` restores the owner's persistent profile, or the deployment default if there is no owner profile. A member reset uses Sol/medium if that deployment default exceeds their permission or falls outside the catalog. When the owner resets, the chat returns to the deployment default.
 - The panel provides model, supported reasoning, duration, Apply and Reset.
-- **Інструменти** opens the independent tool permissions for this chat.
+- Administrators can open **Інструменти** to change tool permissions for this chat.
 - A selection without an explicit duration lasts 15 minutes. An explicit
   persistent selection lasts until reset.
 
@@ -75,10 +75,18 @@ progress cannot be recalled.
 
 ## State and request behavior
 
-Overrides are stored in SQLite with an absolute UTC expiry and a revision.
-Expiry is checked when resolving a request, so it survives process restarts and
-does not depend on a sleeping timer. Expiry and reset reveal the current
-configured defaults; neither restores an obsolete saved default.
+SQLite tracks the owner's persistent profile, the chat's persistent selection,
+and any timed selection. An absolute UTC expiry and a revision survive restarts.
+The first request or panel read at or after expiry uses the chat's persistent
+selection, falling back to the deployment default when none is set. For example,
+if the owner sets Luna/low and a participant selects Sol/medium persistently,
+a temporary Astra/low selection returns to Sol/medium.
+
+On upgrade, existing persistent choices and live deadlines are preserved.
+Legacy settings lack an author. When the explicit owner is the sole configured
+administrator, existing persistent profiles also establish the owner's limit.
+With multiple administrators the owner can establish a higher limit by saving
+the profile again.
 
 Each admitted primary answer takes an immutable model/reasoning snapshot before
 awaited generation work. A new selection or expiry affects subsequent requests,
@@ -109,24 +117,27 @@ propagation through existing model/settings/RunConfig seams. The implementation
 uses a separate client for local text answers and reuses the existing memory
 database location and admin/chat checks. Prompts and reminder timers do not own settings state.
 
-The operator confirmed administrator-only, current-chat scope for #217.
-The policy is specific to these settings controls:
+The main administrator is the Telegram user explicitly configured in
+`AIGAN_OWNER_USER_ID`. This user must also belong to `ADMIN_USER_IDS`.
+When no owner is configured, the member persistent limit is Sol/medium.
 
-| Actor and scope | Before | Intended behavior |
+| Actor in an admitted chat | Model controls | Tool settings |
 | --- | --- | --- |
-| Configured Aigan admin, admitted current chat | No selection UI | Read panel, select, apply and reset |
-| Ordinary admitted member | Receives normal answers | Cannot invoke controls or mutate settings; receives answers under the chat's selected profile |
-| Telegram group admin absent from Aigan admin allowlist | No settings authority | No settings authority |
-| Admin acting through another user's panel or a different chat | No panel | Denied |
-| Missing/bot/anonymous identity, forwarded or edited control | No valid settings action | No mutation |
+| Main administrator | A persistent choice also sets the chat's owner limit. A temporary choice only changes the active profile. | Can change and reset |
+| Other Aigan administrator | Can select any available profile. Their selections do not set the owner limit. | Can change and reset |
+| Ordinary participant, including a Telegram group admin without Aigan privileges | Can persist any profile through the higher of Sol/medium and the owner limit, inclusive. Above that limit, up to Astra/low for at most 15 minutes. | Cannot change or reset |
+| Unadmitted, missing or anonymous actor, bot, or actor using a copied panel | No selection | No changes |
 
-For callbacks, the actor is `callback_query.from_user`, not the bot-authored
-panel message's sender. Recheck the current admin allowlist and chat admission
-on every action. A panel nonce is bound to its owner, chat, message, revision
-and expiry; the settings store compares the expected revision atomically.
-Menu visibility does not grant authorization. A regular panel posted in a group
-is visible to its members; the controls remain restricted to the requesting
-administrator. It contains model settings, not account or credential details.
+The catalog compares model family first and reasoning within the family.
+With Spark set by the owner, a member can persist Sol/medium. With Astra/high
+set by the owner, a member can lower to Astra/medium and later return to
+Astra/high persistently. A member's downgrade preserves that right.
+
+Only the participant who opened a panel can operate it. Each callback is bound
+to its actor, chat, message, revision and expiry. A member's group commands that
+change settings and their panel buttons verify current membership with Telegram.
+The store compares revisions and checks
+the member's authority within the write transaction.
 
 ```mermaid
 sequenceDiagram
@@ -135,7 +146,7 @@ sequenceDiagram
     participant S as Chat settings store
     participant R as Primary answer runtime
     T->>U: Current actor, chat and validated action
-    U->>U: Check admin, chat, panel binding and revision
+    U->>U: Check actor role, chat, panel binding and revision
     alt Allowed and current
         U->>S: Apply or reset with expected revision
         S-->>U: Persisted selection
