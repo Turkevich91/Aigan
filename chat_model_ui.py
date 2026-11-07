@@ -26,6 +26,8 @@ from chat_model_settings import (
     parse_model_selection,
 )
 
+from chat_tool_policy import CHAT_TOOLS, ChatToolPolicy
+
 PANEL_TITLE = "Налаштування моделі · цей чат"
 CALLBACK_PREFIX = "cm:"
 CONTROL_NAMES = ("model", "settings", "select_model")
@@ -105,6 +107,7 @@ class _Panel:
     effort: str
     duration_seconds: int | None = 900
     stage: str = "model"
+    tool_policy: ChatToolPolicy | None = None
 
 
 class ChatModelUI:
@@ -180,6 +183,16 @@ class ChatModelUI:
         return f"{seconds // 60} хв" if seconds % 60 == 0 else f"{seconds} с"
 
     def _text(self, panel: _Panel, profile: Any, *, notice: str = "") -> str:
+        if panel.stage == "tools":
+            lines = [
+                f"<b>{PANEL_TITLE}</b>", "<b>Інструменти · дозволи для цього чату</b>",
+                "✅ Дозволено · 🚫 Заборонено. Натисни, щоб змінити дозвіл для всіх тем чату.",
+                "Дозволи зберігаються після зміни моделі та завершення її таймера. "
+                "Доступність також залежить від сервера й обраної моделі.",
+            ]
+            if notice:
+                lines.extend(["", html.escape(notice)])
+            return "\n".join(lines)
         lines = [
             f"<b>{PANEL_TITLE}</b>",
             "Діє для всього поточного чату, включно з усіма темами.",
@@ -215,6 +228,13 @@ class ChatModelUI:
         def button(label: str, action: str, index: int | None = None):
             return InlineKeyboardButton(label, callback_data=self._data(panel, action, index))
         rows = []
+        if panel.stage == "tools":
+            policy = panel.tool_policy
+            rows = [[button(("🚫 " if tool.key in policy.disabled else "✅ ") + tool.label, "v", index)]
+                    for index, tool in enumerate(CHAT_TOOLS)]
+            rows.extend([[button("Відновити дозволи інструментів", "z")],
+                         [button("Назад", "b"), button("Оновити", "f"), button("Закрити", "x")]])
+            return InlineKeyboardMarkup(rows)
         if panel.stage == "model":
             for index, capability in enumerate(MODEL_CATALOG):
                 label = capability.aliases[0] if capability.aliases else capability.model
@@ -227,6 +247,8 @@ class ChatModelUI:
             rows = [[button(label, "d", index)] for index, (_, label) in enumerate(DURATIONS)]
         else:
             rows = [[button("Застосувати", "a")]]
+        if panel.stage == "model":
+            rows.append([button("Інструменти", "t")])
         if panel.stage != "model":
             rows.append([button("Назад", "b")])
         rows.extend([
@@ -358,9 +380,9 @@ class ChatModelUI:
         ):
             await self._answer(query, "Панель застаріла або належить іншому адміну. Відкрий /model.", alert=True)
             return
-        indexed = action in {"m", "e", "d"}
+        indexed = action in {"m", "e", "d", "v"}
         if ((indexed and (not option.isdigit() or len(option) > 3))
-                or (not indexed and (option != "-" or action not in {"a", "r", "f", "b", "x"}))):
+                or (not indexed and (option != "-" or action not in {"a", "r", "f", "b", "x", "t", "z"}))):
             await self._answer(query, "Невідома дія.", alert=True)
             return
         try:
@@ -368,12 +390,31 @@ class ChatModelUI:
         except (OSError, sqlite3.Error, InvalidModelSelection):
             await self._answer(query, "Налаштування зараз недоступні. Відкрий /model пізніше.", alert=True)
             return
-        if action not in {"f", "x"} and profile.revision != panel.settings_revision:
+        if panel.stage == "tools" and action not in {"v", "z", "b", "f", "x"}:
+            await self._answer(query, "Недоступна дія.", alert=True)
+            return
+        if panel.stage != "tools" and action not in {"f", "x", "t"} and profile.revision != panel.settings_revision:
             await self._answer(query, "Налаштування вже змінилися. Натисни «Оновити» або відкрий /model.", alert=True)
             return
         notice = ""
         try:
-            if action == "m" and panel.stage == "model" and int(option) < len(MODEL_CATALOG):
+            if (action == "t" and panel.stage == "model") or (action == "f" and panel.stage == "tools"):
+                panel.tool_policy = self.store.tools.resolve(chat_id)
+                panel.stage = "tools"
+            elif action == "v" and panel.stage == "tools" and int(option) < len(CHAT_TOOLS):
+                tool = CHAT_TOOLS[int(option)]
+                policy = panel.tool_policy
+                panel.tool_policy = self.store.tools.set_enabled(
+                    chat_id, tool.key, tool.key in policy.disabled, expected_revision=policy.revision,
+                )
+            elif action == "z" and panel.stage == "tools":
+                panel.tool_policy = self.store.tools.reset(chat_id, expected_revision=panel.tool_policy.revision)
+                notice = "Відновлено типові дозволи інструментів для цього чату."
+            elif action == "b" and panel.stage == "tools":
+                panel.stage = "model"
+                panel.settings_revision = profile.revision
+                panel.model, panel.effort = self._draft(profile)
+            elif action == "m" and panel.stage == "model" and int(option) < len(MODEL_CATALOG):
                 capability = MODEL_CATALOG[int(option)]
                 panel.model = capability.model
                 if panel.effort not in capability.reasoning_efforts:

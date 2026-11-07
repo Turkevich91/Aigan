@@ -144,6 +144,41 @@ class ChatModelUITests(unittest.IsolatedAsyncioTestCase):
         await self.ui.handle_callback(SimpleNamespace(callback_query=query), self.context)
         return query
 
+    async def test_tool_page_toggle_persists_after_model_reset_and_in_one_chat(self):
+        from chat_tool_policy import CHAT_TOOLS
+        web = next(t for t in CHAT_TOOLS if t.key == "web")
+        await self.command("/settings")
+        await self.click("Інструменти")
+        await self.click("✅ " + web.label)
+        self.assertIn("web", self.store.tools.resolve(-1001).disabled)
+        self.assertFalse(self.store.tools.resolve(-1002).disabled)
+        await self.click("Назад")
+        await self.choose()
+        await self.click("Застосувати")
+        await self.click("Скинути до типових")
+        await self.click("Інструменти")
+        await self.click("🚫 " + web.label)
+        self.assertFalse(self.store.tools.resolve(-1001).disabled)
+
+    async def test_tool_buttons_refuse_other_actors_and_stale_revisions(self):
+        from chat_tool_policy import CHAT_TOOLS
+        web, other = CHAT_TOOLS[:2]
+        await self.command()
+        await self.click("Інструменти")
+        action = self.button("✅ " + web.label)
+        await self.click(data=action, actor=43)
+        self.assertFalse(self.store.tools.resolve(-1001).disabled)
+        policy = self.store.tools.resolve(-1001)
+        self.store.tools.set_enabled(-1001, other.key, False, expected_revision=policy.revision)
+        stale = await self.click(data=action)
+        self.assertTrue(stale.answer.await_args.kwargs["show_alert"])
+        self.assertEqual({other.key}, self.store.tools.resolve(-1001).disabled)
+        await self.click("Оновити")
+        await self.click("✅ " + web.label)
+        self.assertEqual({web.key, other.key}, self.store.tools.resolve(-1001).disabled)
+        await self.click("Відновити дозволи інструментів")
+        self.assertFalse(self.store.tools.resolve(-1001).disabled)
+
     async def choose(self, alias="astra", effort="high", duration="1 год"):
         await self.click(alias)
         await self.click(effort)
