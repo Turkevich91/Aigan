@@ -17,7 +17,7 @@ Default main-chat and interactive-vision model: `gpt-6-astra` with `low` reasoni
 - Social taste memory for sanitized group/user interests and reactions, used by proactive thought seeds.
 - Sanitized system health logs, admin self-check commands, and optional GitHub self-reporting.
 - Payload-free per-stage model telemetry for routing, usage, latency, and estimated-cost experiments.
-- Admin-only current-chat model/reasoning controls with persistent expiry and a Telegram panel; see [chat model settings](docs/chat-model-settings.md).
+- Admin-only model selection (cloud or local Qwen), timed overrides and optional tool permissions per chat; see [chat model settings](docs/chat-model-settings.md).
 - Placeholder `.env` ready for secrets.
 
 ## Setup
