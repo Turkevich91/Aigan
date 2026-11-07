@@ -15,6 +15,8 @@ import sqlite3
 import time
 from typing import Callable, Sequence
 
+from chat_tool_policy import ChatToolPolicy, TOOL_KEYS
+
 
 DEFAULT_DURATION_SECONDS = 15 * 60
 MAX_DURATION_SECONDS = 7 * 24 * 60 * 60
@@ -141,10 +143,100 @@ def _expected_revision(value: int | None) -> None:
         raise InvalidModelSelection("invalid_settings_revision")
 
 
+def _next_revision(revision: int) -> int:
+    if revision >= _MAX_INTEGER:
+        raise InvalidModelSelection("settings_revision_exhausted")
+    return revision + 1
+
+
 def _timestamp(value: float) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
         raise InvalidModelSelection("invalid_clock")
     return float(value)
+
+
+class ChatToolSettingsStore:
+    """Tool preferences have their own revisions and outlive model overrides."""
+
+    def __init__(self, connect: Callable[[], sqlite3.Connection]) -> None:
+        self._connect = connect
+        with closing(connect()) as connection, connection:
+            connection.execute("""
+                CREATE TABLE IF NOT EXISTS chat_tool_switches (
+                    chat_id INTEGER NOT NULL,
+                    tool TEXT NOT NULL,
+                    disabled INTEGER NOT NULL CHECK (disabled IN (0, 1)),
+                    last_disabled INTEGER NOT NULL,
+                    revision INTEGER NOT NULL,
+                    PRIMARY KEY(chat_id, tool)
+                )
+            """)
+
+    @staticmethod
+    def _state(connection: sqlite3.Connection, chat_id: int) -> ChatToolPolicy:
+        rows = connection.execute(
+            "SELECT tool, disabled, last_disabled, revision FROM chat_tool_switches WHERE chat_id=?",
+            (chat_id,),
+        ).fetchall()
+        disabled: set[str] = set()
+        last_disabled: list[tuple[str, int]] = []
+        revision = 0
+        for row in rows:
+            last, rev = row["last_disabled"], row["revision"]
+            if (row["disabled"] not in (0, 1) or type(last) is not int or type(rev) is not int
+                    or not 0 <= last <= rev or not 0 < rev <= _MAX_INTEGER):
+                raise InvalidModelSelection("malformed_tool_settings")
+            revision = max(revision, rev)
+            last_disabled.append((row["tool"], last))
+            if row["disabled"]:
+                disabled.add(row["tool"])
+        return ChatToolPolicy(frozenset(disabled), revision, tuple(last_disabled))
+
+    def resolve(self, chat_id: int) -> ChatToolPolicy:
+        with closing(self._connect()) as connection:
+            return self._state(connection, _chat_id(chat_id))
+
+    def set_enabled(
+        self, chat_id: int, key: str, enabled: bool, *, expected_revision: int,
+    ) -> ChatToolPolicy:
+        if key not in TOOL_KEYS or type(enabled) is not bool:
+            raise InvalidModelSelection("invalid_tool_selection")
+        return self._update(chat_id, expected_revision, key, enabled)
+
+    def reset(self, chat_id: int, *, expected_revision: int) -> ChatToolPolicy:
+        return self._update(chat_id, expected_revision, None, True)
+
+    def _update(
+        self, chat_id: int, expected_revision: int, key: str | None, enabled: bool,
+    ) -> ChatToolPolicy:
+        chat_id = _chat_id(chat_id)
+        if expected_revision is None:
+            raise InvalidModelSelection("invalid_revision")
+        _expected_revision(expected_revision)
+        with closing(self._connect()) as connection, connection:
+            connection.execute("BEGIN IMMEDIATE")
+            policy = self._state(connection, chat_id)
+            if policy.revision != expected_revision:
+                raise StaleSettingsRevision("tool_settings_changed")
+            if key is None:
+                if policy.disabled:
+                    revision = _next_revision(policy.revision)
+                    connection.execute(
+                        "UPDATE chat_tool_switches SET disabled=0, revision=? WHERE chat_id=? AND disabled=1",
+                        (revision, chat_id),
+                    )
+            else:
+                already_enabled = key not in policy.disabled
+                if enabled == already_enabled:
+                    return policy
+                revision = _next_revision(policy.revision)
+                last = dict(policy.last_disabled).get(key, 0) if enabled else revision
+                connection.execute("""
+                    INSERT INTO chat_tool_switches(chat_id, tool, disabled, last_disabled, revision)
+                    VALUES (?, ?, ?, ?, ?) ON CONFLICT(chat_id, tool) DO UPDATE SET
+                        disabled=excluded.disabled, last_disabled=excluded.last_disabled, revision=excluded.revision
+                """, (chat_id, key, int(not enabled), last, revision))
+            return self._state(connection, chat_id)
 
 
 class ChatModelSettingsStore:
@@ -159,6 +251,7 @@ class ChatModelSettingsStore:
         self.path = Path(db_path)
         self.clock = clock
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.tools = ChatToolSettingsStore(self._connect)
         with closing(self._connect()) as connection, connection:
             connection.execute("""
                 CREATE TABLE IF NOT EXISTS chat_model_settings (
@@ -202,12 +295,6 @@ class ChatModelSettingsStore:
                 updated_at=excluded.updated_at
         """, (chat_id, model, effort, expires_at, revision, now))
 
-    @staticmethod
-    def _next_revision(revision: int) -> int:
-        if revision >= _MAX_INTEGER:
-            raise InvalidModelSelection("settings_revision_exhausted")
-        return revision + 1
-
     def _state(
         self, connection: sqlite3.Connection, chat_id: int, now: float,
     ) -> tuple[int | None, tuple[str, str, float | None] | None]:
@@ -236,7 +323,7 @@ class ChatModelSettingsStore:
                 return revision, (model, effort, expires_at)
         except InvalidModelSelection:
             pass
-        revision = self._next_revision(revision)
+        revision = _next_revision(revision)
         self._write(connection, chat_id, None, None, None, revision, now)
         return revision, None
 
@@ -271,7 +358,7 @@ class ChatModelSettingsStore:
                 raise InvalidModelSelection("malformed_settings_revision")
             stale = expected_revision is not None and revision != expected_revision
             if not stale:
-                revision = self._next_revision(revision)
+                revision = _next_revision(revision)
                 self._write(connection, chat_id, model, effort, expires_at, revision, timestamp)
         # Commit expiry/repair even if the caller's previously viewed card is stale.
         if stale:
@@ -290,7 +377,7 @@ class ChatModelSettingsStore:
                 raise InvalidModelSelection("malformed_settings_revision")
             stale = expected_revision is not None and revision != expected_revision
             if not stale:
-                revision = self._next_revision(revision)
+                revision = _next_revision(revision)
                 self._write(connection, chat_id, None, None, None, revision, timestamp)
         if stale:
             raise StaleSettingsRevision("settings_changed")
