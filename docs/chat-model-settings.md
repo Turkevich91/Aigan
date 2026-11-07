@@ -39,8 +39,8 @@ price, followed by the local model:
 | `luna` | `gpt-6-luna` | none, low, medium, high, xhigh, max |
 | `qwen` | Local Qwen on Spark; no per-token API charge for its answers | Provider default |
 
-Configure the local Chat Completions service through `SPARK_BASE_URL`,
-`SPARK_API_KEY` and `SPARK_ANSWER_MODEL`. Keep credentials and deployment
+Configure the local Chat Completions service through `SPARK_BASE_URL` and
+`SPARK_ANSWER_MODEL`; set `SPARK_API_KEY` if the local service requires one. Keep credentials and deployment
 addresses outside the repository. Local answers do not fall back to a paid
 model on failure. Qwen is offered for text. Selecting it does not enable
 visual inspection of images or video, and is not an account-wide spending

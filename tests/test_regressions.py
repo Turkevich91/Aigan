@@ -4373,6 +4373,21 @@ class TelegramFormattingTests(unittest.TestCase):
             self.assertNotIn("&lt;a", rendered)
         self.assertEqual(11, "".join(chunks).count("fragment"))
 
+    def test_split_formatted_link_creates_independently_valid_entities(self) -> None:
+        from xml.etree import ElementTree
+        url = "https://example.org/Case?i=1&n=2"
+        words = "word " * 30
+        text = f'<b>Read <a href="https://example.org/Case?i=1&amp;n=2"><i>{words}&lt;b&gt;</i></a> now</b>'
+        chunks = main.split_text_chunks(text, chunk_chars=55, max_chunks=8, preserve_links=True)
+        self.assertGreater(len(chunks), 1)
+        titles = []
+        for chunk in chunks:
+            root = ElementTree.fromstring("<msg>" + main.render_telegram_html(chunk) + "</msg>")
+            for anchor in root.iter("a"):
+                self.assertEqual(url, anchor.get("href"))
+                titles.extend("".join(anchor.itertext()).split())
+        self.assertEqual(["word"] * 30 + ["<b>"], titles)
+
     def test_truncation_closes_the_link_before_the_shortening_notice(self) -> None:
         source = '<a href="https://example.org">' + "word " * 40 + "</a>"
         chunks = main.split_text_chunks(source, chunk_chars=50, max_chunks=2,

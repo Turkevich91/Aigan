@@ -95,7 +95,10 @@ def split_linked_reply(
     if not _LINK.search(text):
         return None
     text = text.strip()
-    segments = list(_segments(text))
+    # Telegram parses each message independently. When a reply must be split,
+    # cut display text, never a formatting tag or an HTML entity. Links are
+    # recreated around the corresponding display span in each message.
+    segments = [(_basic_markup(label, plain=True), url) for label, url in _segments(text)]
     visible = "".join(label for label, _ in segments)
     if len(visible) <= min(limit, max_total_chars):
         return [text]
@@ -111,7 +114,7 @@ def split_linked_reply(
         for left, right, url in spans:
             if right <= start or end <= left:
                 continue
-            fragment = visible[max(start, left):min(end, right)]
+            fragment = html.escape(visible[max(start, left):min(end, right)], quote=False)
             chunks.append(_anchor(fragment, url) if url else fragment)
         return "".join(chunks)
 
