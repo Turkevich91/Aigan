@@ -144,10 +144,72 @@ class ChatModelUITests(unittest.IsolatedAsyncioTestCase):
         await self.ui.handle_callback(SimpleNamespace(callback_query=query), self.context)
         return query
 
+    async def test_tool_page_toggle_persists_after_model_reset_and_in_one_chat(self):
+        from chat_tool_policy import CHAT_TOOLS
+        web = next(t for t in CHAT_TOOLS if t.key == "web")
+        await self.command("/settings")
+        await self.click("Інструменти")
+        await self.click("✅ " + web.label)
+        self.assertIn("web", self.store.tools.resolve(-1001).disabled)
+        self.assertFalse(self.store.tools.resolve(-1002).disabled)
+        await self.click("Назад")
+        await self.choose()
+        await self.click("Застосувати")
+        await self.click("Скинути до типових")
+        await self.click("Інструменти")
+        await self.click("🚫 " + web.label)
+        self.assertFalse(self.store.tools.resolve(-1001).disabled)
+
+    async def test_malformed_numeric_callback_does_not_change_tool_permissions(self):
+        from chat_tool_policy import CHAT_TOOLS
+        await self.command()
+        await self.click("Інструменти")
+        data = self.button("✅ " + CHAT_TOOLS[0].label)
+        for field in (2, 4):
+            parts = data.split(":")
+            parts[field] = "²"
+            bad = await self.click(data=":".join(parts))
+            self.assertTrue(bad.answer.await_args.kwargs["show_alert"])
+        self.assertFalse(self.store.tools.resolve(-1001).disabled)
+
+    async def test_tool_buttons_refuse_other_actors_and_stale_revisions(self):
+        from chat_tool_policy import CHAT_TOOLS
+        web, other = CHAT_TOOLS[:2]
+        await self.command()
+        await self.click("Інструменти")
+        action = self.button("✅ " + web.label)
+        await self.click(data=action, actor=43)
+        self.assertFalse(self.store.tools.resolve(-1001).disabled)
+        policy = self.store.tools.resolve(-1001)
+        self.store.tools.set_enabled(-1001, other.key, False, expected_revision=policy.revision)
+        stale = await self.click(data=action)
+        self.assertTrue(stale.answer.await_args.kwargs["show_alert"])
+        self.assertEqual({other.key}, self.store.tools.resolve(-1001).disabled)
+        await self.click("Оновити")
+        await self.click("✅ " + web.label)
+        self.assertEqual({web.key, other.key}, self.store.tools.resolve(-1001).disabled)
+        await self.click("Відновити дозволи інструментів")
+        self.assertFalse(self.store.tools.resolve(-1001).disabled)
+
     async def choose(self, alias="astra", effort="high", duration="1 год"):
         await self.click(alias)
         await self.click(effort)
         await self.click(duration)
+
+    async def test_spark_requires_configuration_and_skips_effort_step(self):
+        await self.command("/select_model qwen 15m")
+        self.assertFalse(self.profile().overridden)
+        await self.command()
+        query = await self.click("Spark / Qwen · недоступний")
+        self.assertTrue(query.answer.await_args.kwargs["show_alert"])
+        self.ui.spark_available = lambda: True
+        await self.command()
+        await self.click("Spark / Qwen · локально, безплатно")
+        await self.click("Назад")
+        await self.click("Spark / Qwen · локально, безплатно")
+        await self.click("15 хв")
+        await self.click("Застосувати")
+        self.assertEqual(("spark-qwen", "auto"), (self.profile().model, self.profile().reasoning_effort))
 
     async def test_select_command_defaults_to_fifteen_minutes_and_deletes_after_success(self):
         msg = await self.command("/select_model astra-low")
@@ -156,6 +218,7 @@ class ChatModelUITests(unittest.IsolatedAsyncioTestCase):
                          (current.model, current.reasoning_effort, current.expires_at))
         msg.delete.assert_awaited_once()
         self.assertIn("Застосовано", self.sent[-1][0])
+        self.assertFalse(msg.reply_text.await_args.kwargs["do_quote"])
         self.assertFalse(self.profile(-1002).overridden)
 
     async def test_persistent_and_both_reset_aliases(self):
@@ -170,6 +233,32 @@ class ChatModelUITests(unittest.IsolatedAsyncioTestCase):
         await self.command("/select_model secret-unknown-model low 15m")
         self.assertFalse(self.profile().overridden)
         self.assertNotIn("secret-unknown-model", self.sent[-1][0])
+
+    async def test_close_deletes_panel_without_a_confirmation_or_reply_quote(self):
+        msg = await self.command()
+        self.assertFalse(msg.reply_text.await_args.kwargs["do_quote"])
+        msg.delete.assert_awaited_once()
+        token = self.button("Закрити")
+        await self.click(data=token, actor=43)
+        self.panel.delete.assert_not_awaited()
+        query = await self.click(data=token)
+        self.panel.delete.assert_awaited_once()
+        query.edit_message_text.assert_not_awaited()
+        query.answer.assert_awaited_once()
+        stale = await self.click(data=token)
+        self.assertTrue(stale.answer.await_args.kwargs["show_alert"])
+        self.panel.delete.assert_awaited_once()
+        self.assertEqual(1, len(self.sent))
+
+    async def test_failed_close_can_be_retried_without_posting_a_message(self):
+        await self.command()
+        self.panel.delete.side_effect = [TelegramError("synthetic_failure"), True]
+        query = await self.click("Закрити")
+        self.assertTrue(query.answer.await_args.kwargs["show_alert"])
+        query.edit_message_text.assert_not_awaited()
+        await self.click("Закрити")
+        self.assertEqual(2, self.panel.delete.await_count)
+        self.assertEqual(1, len(self.sent))
 
     async def test_panel_draft_does_not_apply_until_confirmation(self):
         await self.command()

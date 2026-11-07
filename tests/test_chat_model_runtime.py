@@ -40,6 +40,25 @@ class ChatModelRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.token = main.ACTIVE_CHAT_MODEL.set(None)
         self.addCleanup(main.ACTIVE_CHAT_MODEL.reset, self.token)
 
+    async def test_spark_paths_fail_closed_and_block_visual_inputs(self):
+        self.store.apply(-1001, "qwen", "auto", 900)
+        with main.chat_model_scope(-1001), patch.object(main, "SPARK_ANSWER", None), \
+                patch.object(main, "OpenAI") as cloud, patch.object(main, "AsyncOpenAI") as async_cloud:
+            with self.assertRaisesRegex(RuntimeError, "spark_answer_unconfigured"):
+                main.run_plain_model_sync("synthetic")
+            with self.assertRaisesRegex(RuntimeError, "spark_answer_unconfigured"):
+                main.build_agents_run_config(model_name="spark-qwen")
+            with self.assertRaisesRegex(ValueError, "spark_visual_input_unsupported"):
+                main.primary_answer_settings(images=True)
+            with patch.object(main, "prepare_web_image_review", new_callable=AsyncMock) as review, \
+                    patch.object(main, "send_reply", new_callable=AsyncMock) as notice:
+                plan = main.ImageDeliveryPlan(query="synthetic", target_count=1, requested_count=1, quantity_kind="singular")
+                await main.maybe_send_internet_image(SimpleNamespace(), "synthetic", plan=plan)
+                review.assert_not_awaited()
+                notice.assert_awaited_once()
+            cloud.assert_not_called()
+            async_cloud.assert_not_called()
+
     def select(self, chat=-1001, model="astra", effort="high", duration=900):
         return self.store.apply(chat, model, effort, duration)
 

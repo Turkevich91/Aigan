@@ -19,12 +19,15 @@ from telegram.error import TelegramError
 
 from chat_model_settings import (
     MODEL_CATALOG,
+    SPARK_MODEL,
     ChatModelSettingsStore,
     InvalidModelSelection,
     StaleSettingsRevision,
     get_model_capability,
     parse_model_selection,
 )
+
+from chat_tool_policy import CHAT_TOOLS, ChatToolPolicy
 
 PANEL_TITLE = "Налаштування моделі · цей чат"
 CALLBACK_PREFIX = "cm:"
@@ -105,6 +108,7 @@ class _Panel:
     effort: str
     duration_seconds: int | None = 900
     stage: str = "model"
+    tool_policy: ChatToolPolicy | None = None
 
 
 class ChatModelUI:
@@ -117,6 +121,7 @@ class ChatModelUI:
         defaults: Callable[[], tuple[str, str]],
         is_admin: Callable[[int], bool],
         chat_allowed: Callable[[int, str, int], bool],
+        spark_available: Callable[[], bool] = lambda: False,
         clock: Callable[[], float] = time.time,
         delete_commands: bool = True,
         panel_ttl_seconds: int = 900,
@@ -126,6 +131,7 @@ class ChatModelUI:
         self.defaults = defaults
         self.is_admin = is_admin
         self.chat_allowed = chat_allowed
+        self.spark_available = spark_available
         self.clock = clock
         self.delete_commands = delete_commands
         self.panel_ttl_seconds = max(1, min(int(panel_ttl_seconds), 3600))
@@ -180,6 +186,16 @@ class ChatModelUI:
         return f"{seconds // 60} хв" if seconds % 60 == 0 else f"{seconds} с"
 
     def _text(self, panel: _Panel, profile: Any, *, notice: str = "") -> str:
+        if panel.stage == "tools":
+            lines = [
+                f"<b>{PANEL_TITLE}</b>", "<b>Інструменти · дозволи для цього чату</b>",
+                "✅ Дозволено · 🚫 Заборонено. Натисни, щоб змінити дозвіл для всіх тем чату.",
+                "Дозволи зберігаються після зміни моделі та завершення її таймера. "
+                "Доступність також залежить від сервера й обраної моделі.",
+            ]
+            if notice:
+                lines.extend(["", html.escape(notice)])
+            return "\n".join(lines)
         lines = [
             f"<b>{PANEL_TITLE}</b>",
             "Діє для всього поточного чату, включно з усіма темами.",
@@ -203,6 +219,9 @@ class ChatModelUI:
              "duration": "3/3 · Обери термін.",
              "confirm": "Перевір вибір і натисни «Застосувати»."}[panel.stage],
         ])
+        if SPARK_MODEL in {panel.model, profile.model}:
+            lines.append("Spark / Qwen генерує текст локально без оплати за токени відповіді. "
+                         "Допоміжні запити, зокрема для пам’яті, можуть тарифікуватися окремо.")
         if notice:
             lines.extend(["", html.escape(notice)])
         return "\n".join(lines)
@@ -215,9 +234,18 @@ class ChatModelUI:
         def button(label: str, action: str, index: int | None = None):
             return InlineKeyboardButton(label, callback_data=self._data(panel, action, index))
         rows = []
+        if panel.stage == "tools":
+            policy = panel.tool_policy
+            rows = [[button(("🚫 " if tool.key in policy.disabled else "✅ ") + tool.label, "v", index)]
+                    for index, tool in enumerate(CHAT_TOOLS)]
+            rows.extend([[button("Відновити дозволи інструментів", "z")],
+                         [button("Назад", "b"), button("Оновити", "f"), button("Закрити", "x")]])
+            return InlineKeyboardMarkup(rows)
         if panel.stage == "model":
             for index, capability in enumerate(MODEL_CATALOG):
                 label = capability.aliases[0] if capability.aliases else capability.model
+                if capability.model == SPARK_MODEL:
+                    label = "Spark / Qwen · локально, безплатно" if self.spark_available() else "Spark / Qwen · недоступний"
                 rows.append([button(("✓ " if capability.model == panel.model else "") + label, "m", index)])
         elif panel.stage == "effort":
             capability = get_model_capability(panel.model)
@@ -227,6 +255,8 @@ class ChatModelUI:
             rows = [[button(label, "d", index)] for index, (_, label) in enumerate(DURATIONS)]
         else:
             rows = [[button("Застосувати", "a")]]
+        if panel.stage == "model":
+            rows.append([button("Інструменти", "t")])
         if panel.stage != "model":
             rows.append([button("Назад", "b")])
         rows.extend([
@@ -251,7 +281,7 @@ class ChatModelUI:
     async def _notice(self, message: Any, text: str) -> None:
         await message.reply_text(
             f"<b>{PANEL_TITLE}</b>\n{html.escape(text)}",
-            parse_mode="HTML",
+            parse_mode="HTML", do_quote=False,
         )
 
     async def _open(self, message: Any, owner_id: int, chat_id: int) -> None:
@@ -259,7 +289,9 @@ class ChatModelUI:
         model, effort = self._draft(profile)
         panel = _Panel(secrets.token_urlsafe(12), owner_id, chat_id, 0, profile.revision,
                        0, self.clock() + self.panel_ttl_seconds, model, effort)
-        sent = await message.reply_text(self._text(panel, profile), reply_markup=self._markup(panel), parse_mode="HTML")
+        sent = await message.reply_text(
+            self._text(panel, profile), reply_markup=self._markup(panel), parse_mode="HTML", do_quote=False,
+        )
         panel.message_id = int(sent.message_id)
         self._prune()
         self._panels[panel.nonce] = panel
@@ -296,6 +328,9 @@ class ChatModelUI:
                 await self._notice(message, "Відновлено типову модель для всього поточного чату.")
             elif control.name == "select_model" and control.arguments:
                 selection = parse_model_selection(control.arguments)
+                if selection.model == SPARK_MODEL and not self.spark_available():
+                    await self._notice(message, "Spark / Qwen не налаштований. Обери іншу модель у /model.")
+                    return True
                 previous = self._profile(chat_id)
                 profile = self.store.apply(chat_id, selection.model, selection.reasoning_effort,
                                            selection.duration_seconds, expected_revision=previous.revision)
@@ -345,7 +380,7 @@ class ChatModelUI:
             return
         data = getattr(query, "data", None)
         parts = data.split(":") if isinstance(data, str) and len(data) <= 64 else []
-        if len(parts) != 5 or parts[0] != "cm" or not parts[2].isdigit():
+        if len(parts) != 5 or parts[0] != "cm" or not parts[2].isascii() or not parts[2].isdigit():
             await self._answer(query, "Невідома дія.", alert=True)
             return
         _, nonce, revision_text, action, option = parts
@@ -358,27 +393,61 @@ class ChatModelUI:
         ):
             await self._answer(query, "Панель застаріла або належить іншому адміну. Відкрий /model.", alert=True)
             return
-        indexed = action in {"m", "e", "d"}
-        if ((indexed and (not option.isdigit() or len(option) > 3))
-                or (not indexed and (option != "-" or action not in {"a", "r", "f", "b", "x"}))):
+        indexed = action in {"m", "e", "d", "v"}
+        if ((indexed and (not option.isascii() or not option.isdigit() or len(option) > 3))
+                or (not indexed and (option != "-" or action not in {"a", "r", "f", "b", "x", "t", "z"}))):
             await self._answer(query, "Невідома дія.", alert=True)
+            return
+        if action == "x":
+            # An in-flight deletion must exclude duplicate clicks and concurrent apply.
+            panel.panel_revision = -1
+            try:
+                await message.delete()
+            except (TelegramError, OSError):
+                panel.panel_revision = int(revision_text)
+                await self._answer(query, "Не вдалося закрити панель. Спробуй ще раз.", alert=True)
+            else:
+                self._panels.pop(nonce, None)
+                await self._answer(query)
             return
         try:
             profile = self._profile(chat_id)
         except (OSError, sqlite3.Error, InvalidModelSelection):
             await self._answer(query, "Налаштування зараз недоступні. Відкрий /model пізніше.", alert=True)
             return
-        if action not in {"f", "x"} and profile.revision != panel.settings_revision:
+        if panel.stage == "tools" and action not in {"v", "z", "b", "f"}:
+            await self._answer(query, "Недоступна дія.", alert=True)
+            return
+        if panel.stage != "tools" and action not in {"f", "t"} and profile.revision != panel.settings_revision:
             await self._answer(query, "Налаштування вже змінилися. Натисни «Оновити» або відкрий /model.", alert=True)
             return
         notice = ""
         try:
-            if action == "m" and panel.stage == "model" and int(option) < len(MODEL_CATALOG):
+            if (action == "t" and panel.stage == "model") or (action == "f" and panel.stage == "tools"):
+                panel.tool_policy = self.store.tools.resolve(chat_id)
+                panel.stage = "tools"
+            elif action == "v" and panel.stage == "tools" and int(option) < len(CHAT_TOOLS):
+                tool = CHAT_TOOLS[int(option)]
+                policy = panel.tool_policy
+                panel.tool_policy = self.store.tools.set_enabled(
+                    chat_id, tool.key, tool.key in policy.disabled, expected_revision=policy.revision,
+                )
+            elif action == "z" and panel.stage == "tools":
+                panel.tool_policy = self.store.tools.reset(chat_id, expected_revision=panel.tool_policy.revision)
+                notice = "Відновлено типові дозволи інструментів для цього чату."
+            elif action == "b" and panel.stage == "tools":
+                panel.stage = "model"
+                panel.settings_revision = profile.revision
+                panel.model, panel.effort = self._draft(profile)
+            elif action == "m" and panel.stage == "model" and int(option) < len(MODEL_CATALOG):
                 capability = MODEL_CATALOG[int(option)]
+                if capability.model == SPARK_MODEL and not self.spark_available():
+                    await self._answer(query, "Spark / Qwen не налаштований.", alert=True)
+                    return
                 panel.model = capability.model
                 if panel.effort not in capability.reasoning_efforts:
                     panel.effort = "low" if "low" in capability.reasoning_efforts else capability.reasoning_efforts[0]
-                panel.stage = "effort"
+                panel.stage = "duration" if len(capability.reasoning_efforts) == 1 else "effort"
             elif action == "e" and panel.stage == "effort":
                 efforts = get_model_capability(panel.model).reasoning_efforts
                 if int(option) >= len(efforts):
@@ -389,6 +458,9 @@ class ChatModelUI:
                 panel.duration_seconds = DURATIONS[int(option)][0]
                 panel.stage = "confirm"
             elif action == "a" and panel.stage == "confirm":
+                if panel.model == SPARK_MODEL and not self.spark_available():
+                    await self._answer(query, "Spark / Qwen не налаштований.", alert=True)
+                    return
                 profile = self.store.apply(chat_id, panel.model, panel.effort, panel.duration_seconds,
                                            expected_revision=panel.settings_revision)
                 panel.settings_revision = profile.revision
@@ -408,12 +480,8 @@ class ChatModelUI:
                 panel.duration_seconds = 900
                 panel.stage = "model"
             elif action == "b" and panel.stage != "model":
-                panel.stage = {"effort": "model", "duration": "effort", "confirm": "duration"}[panel.stage]
-            elif action == "x":
-                self._panels.pop(nonce, None)
-                await self._answer(query)
-                await query.edit_message_text(f"<b>{PANEL_TITLE}</b>\nПанель закрито.", parse_mode="HTML")
-                return
+                previous_to_duration = "model" if panel.model == SPARK_MODEL else "effort"
+                panel.stage = {"effort": "model", "duration": previous_to_duration, "confirm": "duration"}[panel.stage]
             else:
                 raise InvalidModelSelection("invalid_panel_action")
         except InvalidModelSelection:

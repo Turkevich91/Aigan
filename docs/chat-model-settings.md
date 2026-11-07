@@ -2,17 +2,21 @@
 
 An existing Aigan administrator can select the primary answer model and reasoning
 for the current chat. The selection also covers the chat's topics. It does not
-change another chat, the provider, global defaults, or auxiliary model roles.
+change another chat, global defaults, or auxiliary model roles. The primary
+answer can use a paid cloud model or a configured local text model.
 
-This is the first implementation slice of [#216](https://github.com/Turkevich91/Aigan/issues/216),
-tracked in [#217](https://github.com/Turkevich91/Aigan/issues/217).
+[Design](https://github.com/Turkevich91/Aigan/issues/216) ·
+[Initial model panel](https://github.com/Turkevich91/Aigan/issues/217) ·
+[Tool controls and local answers](https://github.com/Turkevich91/Aigan/issues/219).
 
 ## Commands and panel
 
 - `/settings` or `/model` opens the model panel.
 - `/select_model astra-low 15m` selects Astra with low reasoning for 15 minutes.
+- `/select_model qwen 15m` selects local text generation (`spark` is an alias).
 - `/select_model default` removes the override and restores current defaults.
 - The panel provides model, supported reasoning, duration, Apply and Reset.
+- **Інструменти** opens the independent tool permissions for this chat.
 - A selection without an explicit duration lasts 15 minutes. An explicit
   persistent selection lasts until reset.
 
@@ -20,17 +24,28 @@ The panel shows the current effective settings separately from its draft.
 Changing a draft does not affect answers until Apply succeeds. A replaced,
 expired, restarted or stale panel cannot overwrite a newer saved selection;
 open a fresh panel to continue. Commands are deleted on a best-effort basis
-after handling; this does not guarantee they were never visible. Ephemeral
+after handling; this does not guarantee they were never visible. The panel
+does not quote the command. **Закрити** deletes the panel message. Ephemeral
 commands and the wider native command catalog are separate work.
 
-The selectable catalog is deliberately bounded:
+The menu lists the cloud models in descending order of standard input and output
+price, followed by the local model:
 
 | Alias | Model | Supported reasoning |
 | --- | --- | --- |
-| `terra` | `gpt-6.1-terra` | none, low, medium, high, xhigh, max |
 | `astra` | `gpt-6-astra` | low, medium, high, xhigh, max |
 | `sol` | `gpt-6.1-sol` | low, medium, high, xhigh, max |
+| `terra` | `gpt-6.1-terra` | none, low, medium, high, xhigh, max |
 | `luna` | `gpt-6-luna` | none, low, medium, high, xhigh, max |
+| `qwen` | Local Qwen on Spark; no per-token API charge for its answers | Provider default |
+
+Configure the local Chat Completions service through `SPARK_BASE_URL` and
+`SPARK_ANSWER_MODEL`; set `SPARK_API_KEY` if the local service requires one. Keep credentials and deployment
+addresses outside the repository. Local answers do not fall back to a paid
+model on failure. Qwen is offered for text. Selecting it does not enable
+visual inspection of images or video, and is not an account-wide spending
+switch: embeddings and other independently configured auxiliary roles do not
+move to Spark.
 
 Supported combinations are checked before persistence or inference. The catalog
 describes API compatibility; it does not guarantee that an account has model
@@ -43,6 +58,20 @@ Capability sources, checked 2026-11-06:
 [Astra](https://developers.openai.com/api/docs/models/gpt-6-astra),
 [Sol](https://developers.openai.com/api/docs/models/gpt-6.1-sol),
 [Luna](https://developers.openai.com/api/docs/models/gpt-6-luna).
+
+## Tool permissions
+
+Open **Інструменти** to allow or block web search and page reading, YouTube
+transcripts, sending public internet images, or random draws independently.
+Tapping a tool saves its new permission immediately. A check means the chat
+permits it; deployment configuration and the selected model can still restrict
+it. The YouTube control reads transcripts, not video frames.
+
+Permissions cover all topics in the current chat and survive restarts, model
+changes, model resets and expiry. **Відновити дозволи інструментів** resets
+only the tool permissions. If another admin changed them, refresh before
+editing. Disabling a tool blocks its next invocation; a side effect already in
+progress cannot be recalled.
 
 ## State and request behavior
 
@@ -73,13 +102,12 @@ telemetry still records the selected model and observed usage.
 
 ## Ownership and authorization contract
 
-The missing capability was a durable per-chat selection, not a provider or
-memory-model change. `chat_model_settings.py` owns the supported catalog,
+Each chat has independent model and tool settings. `chat_model_settings.py` owns the supported catalog,
 validation, expiry and SQLite revision checks. `chat_model_ui.py` owns the thin
 Telegram command/panel adapter. `main.py` owns admission, request snapshots and
 propagation through existing model/settings/RunConfig seams. The implementation
-reuses the current provider client, memory database location and admin/chat
-checks. Prompts and reminder timers do not own settings state.
+uses a separate client for local text answers and reuses the existing memory
+database location and admin/chat checks. Prompts and reminder timers do not own settings state.
 
 The operator confirmed administrator-only, current-chat scope for #217.
 The policy is specific to these settings controls:
@@ -133,7 +161,7 @@ and truthful persistence failure. Runtime regressions cover concurrent requests,
 mid-run changes, model/settings/telemetry agreement, unchanged auxiliary roles,
 and controls bypassing conversation ingestion.
 
-No provider switching, video worker, general tool switches, billing lookup,
-ephemeral API upgrade or automatic failover is included. Real Telegram client
+Native video analysis, billing lookup, ephemeral commands and automatic
+provider failover are outside this release. Real Telegram client
 appearance and account-specific model access require separate field acceptance;
 mocked delivery and offline provider tests do not establish those outcomes.

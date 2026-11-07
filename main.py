@@ -20,7 +20,7 @@ import sys
 import time
 import warnings
 from collections import Counter, defaultdict, deque
-from contextlib import contextmanager
+from contextlib import AsyncExitStack, ExitStack, contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from functools import lru_cache
@@ -38,7 +38,7 @@ from agents import (
     function_tool,
     set_tracing_disabled,
 )
-from agents.mcp import MCPServerStdio
+from agents.models.openai_chatcompletions import OpenAIChatCompletionsModel
 from agents.models.openai_responses import OpenAIResponsesModel
 from openai import AsyncOpenAI, OpenAI
 from PIL import Image, UnidentifiedImageError
@@ -89,8 +89,12 @@ from image_intent import (
     public_image_subject_is_sensitive,
     semantic_image_claim_requires_guard,
 )
-from agent_capabilities import PrimaryCapabilities, randomizer_tools, conversational_tool_behavior
-from chat_model_settings import AnswerProfile, ChatModelSettingsStore
+from agent_capabilities import (
+    ChatToolMCPServer as MCPServerStdio, PrimaryCapabilities, randomizer_tools, conversational_tool_behavior,
+)
+from chat_tool_policy import CHAT_TOOLS, chat_tool_scope, tool_allowed
+from chat_model_settings import AnswerProfile, ChatModelSettingsStore, SPARK_MODEL, get_model_capability
+from spark_answer import SparkAnswerProvider
 from chat_model_ui import ChatModelUI, PANEL_TITLE, is_settings_control_message, is_settings_panel_message
 from randomizer_capability import RandomizerSession, is_randomization_request, is_randomization_repeat
 
@@ -100,6 +104,7 @@ from sticker_media import (resolve_sticker, normalize_sticker_image,
 from sticker_recognition import recognize_sticker, StickerUnavailable
 from chat_history import ChatHistorySession
 from history_retrieval import HISTORY_EMBEDDING_MODEL, HISTORY_EMBEDDING_DIMENSIONS
+from telegram_formatting import render_plain_fallback, render_telegram_html, split_linked_reply
 from history_citations import ACTIVE_HISTORY_CITATIONS, HistoryCitationSession
 from character_delivery import (
     CharacterDeliveryStore, CharacterDeliveryScope, CharacterDeliveryError,
@@ -1198,27 +1203,37 @@ def chat_model_scope(chat_id: int, *, inherit: bool = True):
     """Freeze one chat selection before awaits; nested work keeps its owner's selection."""
     active = ACTIVE_CHAT_MODEL.get()
     if inherit and active is not None and active[0] == chat_id:
-        profile = active[1]
-    else:
-        if CHAT_MODEL_SETTINGS is None:
-            raise ChatModelSettingsUnavailable("chat_model_settings_unavailable")
+        yield active[1]
+        return
+    if CHAT_MODEL_SETTINGS is None:
+        raise ChatModelSettingsUnavailable("chat_model_settings_unavailable")
+    with ExitStack() as stack:
         try:
             profile = CHAT_MODEL_SETTINGS.resolve(
                 chat_id, CONFIG.openai_model, CONFIG.model_reasoning_effort,
             )
+            stack.enter_context(chat_tool_scope(chat_id, CHAT_MODEL_SETTINGS.tools.resolve))
         except Exception as exc:
-            LOGGER.warning("Chat model selection unavailable error=%s", type(exc).__name__)
+            LOGGER.warning("Chat settings unavailable error=%s", type(exc).__name__)
             raise ChatModelSettingsUnavailable("chat_model_settings_unavailable") from None
-    token = ACTIVE_CHAT_MODEL.set((chat_id, profile))
-    try:
-        yield profile
-    finally:
-        ACTIVE_CHAT_MODEL.reset(token)
+        token = ACTIVE_CHAT_MODEL.set((chat_id, profile))
+        try:
+            yield profile
+        finally:
+            ACTIVE_CHAT_MODEL.reset(token)
+
+
+def primary_supports_images() -> bool:
+    active = ACTIVE_CHAT_MODEL.get()
+    return (active is None or not active[1].overridden
+            or get_model_capability(active[1].model).supports_images)
 
 
 def primary_answer_settings(*, images: bool = False) -> tuple[str, str]:
     active = ACTIVE_CHAT_MODEL.get()
     if active is not None and (active[1].overridden or not images):
+        if images and not primary_supports_images():
+            raise ValueError("spark_visual_input_unsupported")
         return active[1].model, active[1].reasoning_effort
     if images:
         return CONFIG.vision_interactive_model, CONFIG.vision_interactive_reasoning_effort
@@ -1240,11 +1255,13 @@ def model_control_content(message: Message | None) -> bool:
     )
 
 
+SPARK_ANSWER = SparkAnswerProvider.from_environment()
 CHAT_MODEL_UI = ChatModelUI(
     CHAT_MODEL_SETTINGS,
     defaults=lambda: (CONFIG.openai_model, CONFIG.model_reasoning_effort),
     is_admin=is_admin_actor,
     chat_allowed=chat_actor_allowed,
+    spark_available=lambda: SPARK_ANSWER is not None,
 )
 
 
@@ -1314,8 +1331,12 @@ _AGENTS_OPENAI_CLIENT: AsyncOpenAI | None = None
 _AGENTS_RESPONSE_MODEL: TelemetryOpenAIResponsesModel | None = None
 
 
-def configured_agents_model(model_name: str | None = None) -> TelemetryOpenAIResponsesModel:
+def configured_agents_model(model_name: str | None = None) -> TelemetryOpenAIResponsesModel | OpenAIChatCompletionsModel:
     global _AGENTS_OPENAI_CLIENT, _AGENTS_RESPONSE_MODEL
+    if model_name == SPARK_MODEL:
+        if SPARK_ANSWER is None:
+            raise RuntimeError("spark_answer_unconfigured")
+        return SPARK_ANSWER.agents_model()
     if _AGENTS_RESPONSE_MODEL is None:
         _AGENTS_OPENAI_CLIENT = AsyncOpenAI(api_key=CONFIG.openai_api_key)
         _AGENTS_RESPONSE_MODEL = TelemetryOpenAIResponsesModel(
@@ -1329,6 +1350,8 @@ def configured_agents_model(model_name: str | None = None) -> TelemetryOpenAIRes
 
 async def close_configured_agents_model() -> None:
     global _AGENTS_OPENAI_CLIENT, _AGENTS_RESPONSE_MODEL
+    if SPARK_ANSWER is not None:
+        await SPARK_ANSWER.close()
     client = _AGENTS_OPENAI_CLIENT
     _AGENTS_OPENAI_CLIENT = None
     _AGENTS_RESPONSE_MODEL = None
@@ -1494,8 +1517,8 @@ def build_agents_run_config(
     resolved_route = current_model_route_bucket(route_bucket)
     return RunConfig(
         model=(configured_agents_model(model_name) if model_name is not None else configured_agents_model()),
-        tracing_disabled=mode == "disabled",
-        trace_include_sensitive_data=mode == "sensitive" and not retained_image_reads,
+        tracing_disabled=mode == "disabled" or model_name == SPARK_MODEL,
+        trace_include_sensitive_data=mode == "sensitive" and not retained_image_reads and model_name != SPARK_MODEL,
         workflow_name="Aigan Telegram",
         group_id=resolved_run_id,
         trace_metadata={
@@ -1896,17 +1919,12 @@ Telegram formatting:
 - Telegram supports native formatting through parse_mode=HTML.
 - Do not use Markdown/CommonMark markers in replies: no **bold**, __underline__, ### headings, or markdown tables.
 - If emphasis is genuinely helpful, use only sparse Telegram HTML: <b>, <i>, <u>, <s>, <code>, <pre>, or <blockquote>.
+- For cited web sources, use <a href="https://...">source title</a>.
 - Prefer short plain paragraphs and simple '-' bullets over decorative formatting.
 - Never output raw '<', '>', or '&' for decoration; only use them as part of the allowed Telegram HTML tags.
 """
 
 
-TELEGRAM_HTML_TAG_RE = re.compile(
-    r"</?(?:b|strong|i|em|u|ins|s|strike|del|code|pre|blockquote)>",
-    re.IGNORECASE,
-)
-MARKDOWN_BOLD_RE = re.compile(r"\*\*(.+?)\*\*", re.DOTALL)
-MARKDOWN_HEADING_RE = re.compile(r"(?m)^\s{0,3}#{1,6}\s+(.+)$")
 CHANGELOG_PATH = APP_DIR / "CHANGELOG.md"
 MAX_VERSION_ENTRIES = 5
 PROFILE_SAMPLE_LIMIT = 60
@@ -4193,22 +4211,34 @@ def build_model_settings(*, reasoning_effort: str | None = None) -> ModelSetting
     return ModelSettings(**kwargs)
 
 
+def chat_tool_instructions() -> str:
+    disabled = [tool.label for tool in CHAT_TOOLS if not tool_allowed(tool.key)]
+    if not disabled:
+        return SYSTEM_PROMPT
+    return (SYSTEM_PROMPT + "\n\nThe following capabilities are disabled in this chat: "
+            + ", ".join(disabled)
+            + ". This overrides earlier tool guidance. Do not simulate them or claim to have used them.")
+
+
 def make_agent(
     mcp_servers: list[MCPServerStdio], capabilities: PrimaryCapabilities | None = None,
     *, model: str | None = None, reasoning_effort: str | None = None,
 ) -> Agent:
     randomizer = ACTIVE_RANDOMIZER.get() or RandomizerSession()
-    settings = build_model_settings(reasoning_effort=reasoning_effort)
-    if randomizer.required:
+    settings = (ModelSettings(max_tokens=CONFIG.max_output_tokens) if model == SPARK_MODEL
+                else build_model_settings(reasoning_effort=reasoning_effort))
+    randomizer_enabled = tool_allowed("randomizer", before_call=True)
+    if randomizer.required and randomizer_enabled:
         settings.tool_choice = "randomize"
         settings.parallel_tool_calls = False
     return Agent(
         name="Aigan",
-        instructions=SYSTEM_PROMPT,
+        instructions=chat_tool_instructions(),
         model=model or CONFIG.openai_model,
         model_settings=settings,
         mcp_servers=mcp_servers,
-        tools=reminder_agent_tools() + randomizer_tools(randomizer) + (capabilities.tools() if capabilities is not None else []),
+        tools=(reminder_agent_tools() + (randomizer_tools(randomizer) if randomizer_enabled else [])
+               + (capabilities.tools() if capabilities is not None else [])),
         tool_use_behavior=conversational_tool_behavior(randomizer, capabilities),
     )
 
@@ -7634,12 +7664,13 @@ def primary_capabilities_for_message(message: Message, prompt: str) -> PrimaryCa
             if memory_vector_available() and CONFIG.memory_embedding_model == HISTORY_EMBEDDING_MODEL
             and CONFIG.memory_embedding_dimensions == HISTORY_EMBEDDING_DIMENSIONS else None),
     ) if MEMORY is not None and current is not None else None)
-    continuation = verified_image_continuation(message) if CONFIG.web_image_search_enabled else None
+    can_deliver_images = CONFIG.web_image_search_enabled and primary_supports_images() and tool_allowed("images")
+    continuation = verified_image_continuation(message) if can_deliver_images else None
     images = (ImageCapabilitySession(ImageCapabilityContext(
         trusted_prompt=prompt, chat_id=message.chat_id,
         reply_message_id=getattr(getattr(message, "reply_to_message", None), "message_id", None),
         continuation=continuation, enabled=True,
-    )) if CONFIG.web_image_search_enabled else None)
+    )) if can_deliver_images else None)
     citations = (HistoryCitationSession(
         MEMORY, chat_id=message.chat_id,
         chat_type=str(getattr(message.chat, "type", "") or ""),
@@ -7653,7 +7684,7 @@ def primary_capabilities_for_message(message: Message, prompt: str) -> PrimaryCa
         cutoff_created_at=cutoff.isoformat(), reply_message_id=reply_id,
         history=history, citations=citations, max_bytes=CONFIG.image_max_bytes,
         sticker_inspector=inspect_retained_sticker,
-    ) if history is not None and CONFIG.image_analysis_enabled else None)
+    ) if history is not None and CONFIG.image_analysis_enabled and primary_supports_images() else None)
     return PrimaryCapabilities(
         history=history, images=images, continuation=continuation, citations=citations,
         retained_images=retained_images,
@@ -7760,14 +7791,19 @@ async def run_agent(
     )
     randomizer_token = ACTIVE_RANDOMIZER.set(randomizer_session)
     try:
-        async with web_server as web, youtube_server as youtube:
+        async with AsyncExitStack() as servers:
+            active_servers = []
+            if tool_allowed("web", before_call=True):
+                active_servers.append(await servers.enter_async_context(web_server))
+            if tool_allowed("youtube", before_call=True):
+                active_servers.append(await servers.enter_async_context(youtube_server))
             active = ACTIVE_CHAT_MODEL.get()
             explicit_profile = image_data_urls is not None or (active is not None and active[1].overridden)
             if explicit_profile:
-                agent = make_agent([web, youtube], capability_context, model=model, reasoning_effort=effort)
+                agent = make_agent(active_servers, capability_context, model=model, reasoning_effort=effort)
             else:
-                agent = (make_agent([web, youtube], capability_context)
-                         if capability_context is not None else make_agent([web, youtube]))
+                agent = (make_agent(active_servers, capability_context)
+                         if capability_context is not None else make_agent(active_servers))
             try:
                 result = await Runner.run(
                     agent,
@@ -7892,12 +7928,25 @@ def run_plain_model_sync(
         stage_kind="plain",
         intended_model=model,
         reasoning_effort=effort,
-        endpoint="responses",
+        endpoint="chat_completions" if model == SPARK_MODEL else "responses",
         route_bucket=route_bucket,
         task_class_bucket=task_class_bucket,
     )
-    client = OpenAI()
     try:
+        if model == SPARK_MODEL:
+            if SPARK_ANSWER is None:
+                raise RuntimeError("spark_answer_unconfigured")
+            response = SPARK_ANSWER.plain_completion(with_current_time_metadata(prompt), CONFIG.max_output_tokens)
+            choice = response.choices[0]
+            if choice.finish_reason != "stop" or not choice.message.content:
+                raise RuntimeError("spark_answer_incomplete")
+            # Keep private serving identifiers out of durable telemetry.
+            matched = response.model == SPARK_ANSWER.model
+            finish_model_stage(stage, status="succeeded", usage=response.usage,
+                               actual_model=model if matched else "",
+                               actual_model_source="provider_response" if matched else "not_reported")
+            return choice.message.content.strip()
+        client = OpenAI()
         response = client.responses.create(
             model=model,
             input=[
@@ -9975,7 +10024,7 @@ async def maybe_prefetch_web_context(
     route: str,
     outbound_provenance: OutboundProvenance | None = None,
 ) -> str:
-    if route != "time_sensitive":
+    if route != "time_sensitive" or not tool_allowed("web", before_call=True):
         return "(none)"
     query = web_prefetch_query(message, prompt)
     if not query:
@@ -9995,6 +10044,8 @@ async def maybe_prefetch_web_context(
                 direct_result,
                 status=direct_status,
             )
+        if not tool_allowed("web", before_call=True):
+            return f"Direct URL fetch ({direct_status}):\n{direct_result}" if direct_result else "(none)"
         result = await asyncio.to_thread(search_web, query, 5)
         search_status = classify_tool_result_failure(result) or "ok"
         append_tool_provenance(
@@ -10473,6 +10524,8 @@ async def load_web_image_result(
     candidate: dict[str, str],
     outbound_provenance: OutboundProvenance | None = None,
 ) -> WebImageResult | None:
+    if not tool_allowed("images", before_call=True):
+        return None
     image_url = candidate.get("image") or ""
     source_url = candidate.get("source") or image_url
     title = candidate.get("title") or "Зображення"
@@ -10723,6 +10776,8 @@ async def review_web_image_candidates(
         review_images: Sequence[WebImageResult],
     ) -> tuple[ImageCandidateReview, ...] | None:
         nonlocal attempts
+        if not tool_allowed("images", before_call=True):
+            raise WebImageToolRevoked
         if attempts >= max_review_calls:
             return None
         attempts += 1
@@ -10928,7 +10983,7 @@ async def send_web_image_results(
     fallback_images: Sequence[WebImageResult] = (),
 ) -> WebImageDeliveryResult:
     requested_count = max(len(images), int(intended_count or 0))
-    if not images:
+    if not images or not tool_allowed("images", before_call=True):
         return WebImageDeliveryResult((), requested_count)
     if len(images) == 1:
         try:
@@ -10987,7 +11042,7 @@ async def send_web_image_results(
     fallback_pool = [*images, *fallback_images]
     total = requested_count
     for index, image in enumerate(fallback_pool, start=1):
-        if len(sent) >= requested_count:
+        if len(sent) >= requested_count or not tool_allowed("images", before_call=True):
             break
         try:
             delivered = await send_single_web_image(message, image, index=index, total=total)
@@ -11020,7 +11075,7 @@ async def maybe_analyze_found_images(
     deliveries: Sequence[DeliveredWebImage],
 ) -> str:
     images = [delivery.image for delivery in deliveries]
-    if not images or not is_found_image_analysis_request(prompt):
+    if not images or not is_found_image_analysis_request(prompt) or not tool_allowed("images", before_call=True):
         return ""
     image_lines = "\n".join(
         f"{index}. {image.source_title} — {image.source_url or image.final_url}"
@@ -11224,6 +11279,17 @@ def record_confirmed_image_delivery(
     )
 
 
+class WebImageToolRevoked(RuntimeError):
+    pass
+
+
+async def web_image_disabled_notice(message, outbound_provenance) -> WebImageSendOutcome:
+    await send_reply(message, "Пошук і надсилання зображень вимкнено в цьому чаті.",
+                     memory_label="Aigan", route="internet_image_send",
+                     outbound_provenance=outbound_provenance)
+    return WebImageSendOutcome(True)
+
+
 class WebImageSearchPreparationError(RuntimeError):
     pass
 
@@ -11237,6 +11303,8 @@ async def prepare_web_image_review(
     search_count: int,
     outbound_provenance: OutboundProvenance | None,
 ) -> WebImageReviewResult:
+    if not tool_allowed("images", before_call=True):
+        raise WebImageToolRevoked
     try:
         search_batch = await asyncio.to_thread(
             search_image_candidate_batch,
@@ -11304,6 +11372,8 @@ async def prepare_web_image_review(
         },
     )
     loaded_images = await load_web_image_results(candidates, outbound_provenance)
+    if not tool_allowed("images", before_call=True):
+        raise WebImageToolRevoked
     return await review_web_image_candidates(
         message,
         query,
@@ -11330,6 +11400,12 @@ async def maybe_send_internet_image(
             requested_count=count,
             quantity_kind="exact" if count > 1 else "singular",
         )
+    if not tool_allowed("images", before_call=True):
+        return await web_image_disabled_notice(message, outbound_provenance)
+    if not primary_supports_images():
+        await send_reply(message, "Для пошуку з перевіркою фото обери модель із зором у /model.",
+                         memory_label="Aigan", route="internet_image_send", outbound_provenance=outbound_provenance)
+        return WebImageSendOutcome(True)
     if not CONFIG.web_image_search_enabled:
         await send_reply(
             message,
@@ -11355,6 +11431,8 @@ async def maybe_send_internet_image(
                     search_count=search_count,
                     outbound_provenance=outbound_provenance,
                 )
+    except WebImageToolRevoked:
+        return await web_image_disabled_notice(message, outbound_provenance)
     except WebImageSearchPreparationError:
         await send_reply(
             message,
@@ -11401,6 +11479,8 @@ async def maybe_send_internet_image(
             outbound_provenance=outbound_provenance,
         )
         return WebImageSendOutcome(True, target_media_count=target_count)
+    if not tool_allowed("images", before_call=True):
+        return await web_image_disabled_notice(message, outbound_provenance)
     if not review_result.succeeded:
         await send_reply(
             message,
@@ -11563,6 +11643,8 @@ async def maybe_send_internet_image(
             )
             return WebImageSendOutcome(True, ambiguous=True, target_media_count=target_count)
 
+    if not tool_allowed("images", before_call=True):
+        return await web_image_disabled_notice(message, outbound_provenance)
     await notify_operator_alert(
         message,
         "image_delivery_failed",
@@ -11586,32 +11668,6 @@ async def maybe_send_internet_image(
         },
     )
     return WebImageSendOutcome(True)
-
-
-def normalize_outgoing_markup(text: str) -> str:
-    text = MARKDOWN_HEADING_RE.sub(lambda match: f"<b>{match.group(1).strip()}</b>", text)
-    text = MARKDOWN_BOLD_RE.sub(lambda match: f"<b>{match.group(1)}</b>", text)
-    return text.replace("**", "")
-
-
-def render_telegram_html(text: str) -> str:
-    normalized = normalize_outgoing_markup(text)
-    tags: list[str] = []
-
-    def stash_tag(match: re.Match[str]) -> str:
-        tags.append(match.group(0).lower())
-        return f"@@AIGAN_TG_HTML_{len(tags) - 1}@@"
-
-    escaped = html.escape(TELEGRAM_HTML_TAG_RE.sub(stash_tag, normalized), quote=False)
-    for index, tag in enumerate(tags):
-        escaped = escaped.replace(f"@@AIGAN_TG_HTML_{index}@@", tag)
-    return escaped
-
-
-def render_plain_fallback(text: str) -> str:
-    normalized = normalize_outgoing_markup(text)
-    without_tags = TELEGRAM_HTML_TAG_RE.sub("", normalized)
-    return html.unescape(without_tags)
 
 
 def hard_wrap_text(text: str, limit: int) -> list[str]:
@@ -11686,11 +11742,16 @@ def split_text_chunks(
     chunk_chars: int | None = None,
     max_chunks: int | None = None,
     max_total_chars: int | None = None,
+    preserve_links: bool = False,
 ) -> list[str]:
     limit = max(20, min(chunk_chars or CONFIG.telegram_text_chunk_chars, 4096))
     chunk_limit = max(1, max_chunks or CONFIG.max_reply_chunks)
     total_limit = max_total_chars if max_total_chars is not None else CONFIG.max_reply_chars
     total_limit = max(1, total_limit)
+    if preserve_links:
+        linked = split_linked_reply(text, limit=limit, max_chunks=chunk_limit, max_total_chars=total_limit)
+        if linked is not None:
+            return linked
 
     text = text.strip() or "Не маю корисної відповіді на це."
     shortened = False
@@ -11805,7 +11866,7 @@ async def send_text_chunks(
     delivery_run_id: str = "",
     **kwargs: Any,
 ) -> TextDeliveryResult:
-    chunks = split_text_chunks(text)
+    chunks = split_text_chunks(text, preserve_links=not kwargs.get("literal_text", False))
     intended_count = len(chunks)
     message_ids: list[int] = []
     delivered_chunks: list[str] = []
@@ -12537,7 +12598,7 @@ async def run_character_evidence(session: CharacterEvidenceSession) -> Character
     model_run_id = current_model_run_id()
     hooks = AiganRunHooks(model_run_id, route_bucket="character",
                          intended_model=model, reasoning_effort=effort)
-    settings = build_model_settings(reasoning_effort=effort)
+    settings = (ModelSettings() if model == SPARK_MODEL else build_model_settings(reasoning_effort=effort))
     settings.max_tokens = min(CONFIG.max_output_tokens, 1800)
     agent = Agent(name="Aigan character evidence", instructions=CHARACTER_INSTRUCTIONS,
                   model=model, model_settings=settings,
@@ -14398,6 +14459,15 @@ async def handle_prompt(
         await handle_prompt_generation(message, context, prompt, allow_pending_wait, skip_cooldown=False)
 
 
+async def reject_disabled_randomizer(message: Message) -> bool:
+    session = ACTIVE_RANDOMIZER.get()
+    if session is None or not session.required or tool_allowed("randomizer", before_call=True):
+        return False
+    session.deny()
+    await send_reply(message, session.final_output(""), memory_label="Aigan")
+    return True
+
+
 async def handle_prompt_generation(
     message: Message,
     context: ContextTypes.DEFAULT_TYPE,
@@ -14418,6 +14488,8 @@ async def handle_prompt_generation(
     try:
         turn_kwargs = {"turn_context_messages": turn_context_messages} if turn_context_messages is not None else {}
         with chat_model_scope(message.chat_id):
+            if await reject_disabled_randomizer(message):
+                return
             await _handle_prompt_generation(
                 message,
                 context,
@@ -14916,6 +14988,8 @@ async def handle_image_prompt_generation(
     previous_token = ACTIVE_RANDOMIZER_PREVIOUS.set(previous)
     try:
         with chat_model_scope(message.chat_id):
+            if await reject_disabled_randomizer(message):
+                return
             await _handle_image_prompt_generation(
                 message, prompt, image_messages, context_messages, dedupe_prompt,
                 skip_cooldown=skip_cooldown, admitted_parts=admitted_parts)
@@ -14937,6 +15011,9 @@ async def _handle_image_prompt_generation(
     skip_cooldown: bool = False,
     admitted_parts: Sequence[Message] = (),
 ) -> None:
+    if not primary_supports_images():
+        await message.reply_text("Spark / Qwen працює з текстом. Для зображень обери модель із зором у /model.")
+        return
     left = cooldown_left(message)
     if left > 0 and not skip_cooldown:
         await message.reply_text(f"Зачекай {left}s перед наступним запитом.")

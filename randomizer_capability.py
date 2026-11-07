@@ -101,6 +101,15 @@ class RandomizerSession:
     def literal_output(self) -> bool:
         return self.result is not None
 
+    def deny(self) -> str:
+        """End a revoked operation without sampling or permitting a fabricated result."""
+        with self._lock:
+            if self._payload is None:
+                self.attempted = True
+                self._failure_text = "Випадковий вибір вимкнено в цьому чаті."
+                self._payload = '{"status":"error","code":"disabled_in_chat"}'
+            return self._payload
+
     def execute(
         self,
         operation: str,
