@@ -160,6 +160,18 @@ class ChatModelUITests(unittest.IsolatedAsyncioTestCase):
         await self.click("🚫 " + web.label)
         self.assertFalse(self.store.tools.resolve(-1001).disabled)
 
+    async def test_malformed_numeric_callback_does_not_change_tool_permissions(self):
+        from chat_tool_policy import CHAT_TOOLS
+        await self.command()
+        await self.click("Інструменти")
+        data = self.button("✅ " + CHAT_TOOLS[0].label)
+        for field in (2, 4):
+            parts = data.split(":")
+            parts[field] = "²"
+            bad = await self.click(data=":".join(parts))
+            self.assertTrue(bad.answer.await_args.kwargs["show_alert"])
+        self.assertFalse(self.store.tools.resolve(-1001).disabled)
+
     async def test_tool_buttons_refuse_other_actors_and_stale_revisions(self):
         from chat_tool_policy import CHAT_TOOLS
         web, other = CHAT_TOOLS[:2]

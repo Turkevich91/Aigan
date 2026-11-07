@@ -367,7 +367,7 @@ class ChatModelUI:
             return
         data = getattr(query, "data", None)
         parts = data.split(":") if isinstance(data, str) and len(data) <= 64 else []
-        if len(parts) != 5 or parts[0] != "cm" or not parts[2].isdigit():
+        if len(parts) != 5 or parts[0] != "cm" or not parts[2].isascii() or not parts[2].isdigit():
             await self._answer(query, "Невідома дія.", alert=True)
             return
         _, nonce, revision_text, action, option = parts
@@ -381,7 +381,7 @@ class ChatModelUI:
             await self._answer(query, "Панель застаріла або належить іншому адміну. Відкрий /model.", alert=True)
             return
         indexed = action in {"m", "e", "d", "v"}
-        if ((indexed and (not option.isdigit() or len(option) > 3))
+        if ((indexed and (not option.isascii() or not option.isdigit() or len(option) > 3))
                 or (not indexed and (option != "-" or action not in {"a", "r", "f", "b", "x", "t", "z"}))):
             await self._answer(query, "Невідома дія.", alert=True)
             return
