@@ -20,6 +20,7 @@ import sys
 import time
 import warnings
 from collections import Counter, defaultdict, deque
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from functools import lru_cache
@@ -44,7 +45,7 @@ from PIL import Image, UnidentifiedImageError
 from telegram import Bot, InputMediaPhoto, Message, MessageEntity, Update
 from telegram.constants import ChatAction, ChatType, ParseMode
 from telegram.error import RetryAfter, Forbidden, BadRequest, NetworkError
-from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, MessageReactionHandler, filters
+from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, MessageReactionHandler, filters
 
 from mcp_servers.web import (
     fetch_binary_url,
@@ -89,6 +90,8 @@ from image_intent import (
     semantic_image_claim_requires_guard,
 )
 from agent_capabilities import PrimaryCapabilities, randomizer_tools, conversational_tool_behavior
+from chat_model_settings import AnswerProfile, ChatModelSettingsStore
+from chat_model_ui import ChatModelUI, PANEL_TITLE, is_settings_control_message, is_settings_panel_message
 from randomizer_capability import RandomizerSession, is_randomization_request, is_randomization_repeat
 
 from retained_images import RetainedImageSession
@@ -1101,6 +1104,13 @@ async def send_activity_action(
         logger=LOGGER,
     ).send_once(action)
 
+# Chat controls are durable independently of conversational memory being enabled.
+try:
+    CHAT_MODEL_SETTINGS: ChatModelSettingsStore | None = ChatModelSettingsStore(CONFIG.memory_db_path)
+except Exception as exc:
+    LOGGER.error("Chat model settings unavailable error=%s", type(exc).__name__)
+    CHAT_MODEL_SETTINGS = None
+
 MEMORY = MemoryStore(CONFIG.memory_db_path, CONFIG.memory_retention_days) if CONFIG.memory_enabled else None
 REMINDERS = ReminderStore(CONFIG.memory_db_path) if CONFIG.reminders_enabled else None
 SYSTEM_LOG = (
@@ -1156,6 +1166,86 @@ class TextDeliveryResult:
 
 def delivered_text(result: TextDeliveryResult) -> str:
     return "\n".join(result.delivered_chunks).strip()
+
+
+ACTIVE_CHAT_MODEL: contextvars.ContextVar[tuple[int, AnswerProfile] | None] = contextvars.ContextVar(
+    "active_chat_model", default=None,
+)
+
+
+class ChatModelSettingsUnavailable(RuntimeError):
+    """The selected spend policy cannot be read; primary inference must stop."""
+
+
+async def notify_model_settings_unavailable(message: Message) -> None:
+    # Operational control notice, deliberately outside retained chat delivery.
+    await message.reply_text(
+        f"{PANEL_TITLE}\nНе можу перевірити вибрану модель цього чату. "
+        "Запит не запускаю. Спробуй ще раз трохи пізніше або перевір /model.",
+        parse_mode=None,
+    )
+
+
+def record_model_settings_unavailable(chat_id: int) -> None:
+    system_event_for_chat(
+        level="warning", component="chat_model_settings", event_type="selection_unavailable",
+        chat_id=chat_id, message="primary_generation_skipped",
+    )
+
+
+@contextmanager
+def chat_model_scope(chat_id: int, *, inherit: bool = True):
+    """Freeze one chat selection before awaits; nested work keeps its owner's selection."""
+    active = ACTIVE_CHAT_MODEL.get()
+    if inherit and active is not None and active[0] == chat_id:
+        profile = active[1]
+    else:
+        if CHAT_MODEL_SETTINGS is None:
+            raise ChatModelSettingsUnavailable("chat_model_settings_unavailable")
+        try:
+            profile = CHAT_MODEL_SETTINGS.resolve(
+                chat_id, CONFIG.openai_model, CONFIG.model_reasoning_effort,
+            )
+        except Exception as exc:
+            LOGGER.warning("Chat model selection unavailable error=%s", type(exc).__name__)
+            raise ChatModelSettingsUnavailable("chat_model_settings_unavailable") from None
+    token = ACTIVE_CHAT_MODEL.set((chat_id, profile))
+    try:
+        yield profile
+    finally:
+        ACTIVE_CHAT_MODEL.reset(token)
+
+
+def primary_answer_settings(*, images: bool = False) -> tuple[str, str]:
+    active = ACTIVE_CHAT_MODEL.get()
+    if active is not None and (active[1].overridden or not images):
+        return active[1].model, active[1].reasoning_effort
+    if images:
+        return CONFIG.vision_interactive_model, CONFIG.vision_interactive_reasoning_effort
+    return CONFIG.openai_model, CONFIG.model_reasoning_effort
+
+
+def is_admin_actor(actor_id: int | None) -> bool:
+    return actor_id in CONFIG.admin_user_ids
+
+
+def chat_actor_allowed(chat_id: int, chat_type: str, actor_id: int | None) -> bool:
+    return (not CONFIG.allowed_chat_ids or chat_id in CONFIG.allowed_chat_ids
+            or (chat_type == ChatType.PRIVATE and is_admin_actor(actor_id)))
+
+
+def model_control_content(message: Message | None) -> bool:
+    return message is not None and (
+        is_settings_control_message(message) or is_settings_panel_message(message)
+    )
+
+
+CHAT_MODEL_UI = ChatModelUI(
+    CHAT_MODEL_SETTINGS,
+    defaults=lambda: (CONFIG.openai_model, CONFIG.model_reasoning_effort),
+    is_admin=is_admin_actor,
+    chat_allowed=chat_actor_allowed,
+)
 
 
 ACTIVE_MODEL_RUN_ID: contextvars.ContextVar[str] = contextvars.ContextVar(
@@ -4164,6 +4254,8 @@ def prompt_privacy_response(prompt: str) -> str:
 
 
 def message_content(message: Message, limit: int = 3000) -> str:
+    if model_control_content(message):
+        return ""
     sticker = resolve_sticker(message)
     if sticker is not None:
         metadata = {"format": sticker.format, "representation": sticker.representation,
@@ -4233,7 +4325,15 @@ def clip_text_strict(value: str, limit: int) -> str:
 
 
 def message_text(message: Message) -> str:
+    if model_control_content(message):
+        return ""
     return (message.text or message.caption or "").strip()
+
+
+def referenced_quote_text(message: Message) -> str:
+    if model_control_content(getattr(message, "reply_to_message", None)):
+        return ""
+    return str(getattr(getattr(message, "quote", None), "text", "") or "")
 
 
 REACTION_COMPLAINT_RECENT_SECONDS = 86400
@@ -4773,7 +4873,7 @@ def source_memory_text_for(message: Message) -> str:
 
 
 def save_memory_message(message: Message, *, label: str | None = None, is_bot: bool = False, text: str | None = None) -> int | None:
-    if MEMORY is None:
+    if MEMORY is None or model_control_content(message):
         return None
 
     user = getattr(message, "from_user", None)
@@ -4848,7 +4948,7 @@ async def cache_image_for_memory(source: Any, item_id: int, chat_id: int, note: 
 
 
 async def remember_message_persistently(message: Message, label: str | None = None) -> int | None:
-    if MEMORY is None or not should_allow_chat(message):
+    if MEMORY is None or not should_allow_chat(message) or model_control_content(message):
         return None
 
     item_id = save_memory_message(message, label=label)
@@ -5633,9 +5733,8 @@ async def run_recall_intent_classifier(message: Message, prompt: str):
     metadata = recall_model_metadata(
         prompt,
         has_reply_text=bool(
-            getattr(getattr(message, "reply_to_message", None), "text", None)
-            or getattr(getattr(message, "reply_to_message", None), "caption", None)
-            or getattr(getattr(message, "quote", None), "text", None)
+            (message_text(message.reply_to_message) if message.reply_to_message is not None else "")
+            or referenced_quote_text(message)
         ),
         has_reply_image=referenced_visual_context_available(message),
     )
@@ -6488,7 +6587,10 @@ def schedule_model_policy_shadow(
     outbound_provenance: OutboundProvenance,
     tool_route_decision: ToolRouteDecision | None,
 ) -> bool:
-    if CONFIG.model_routing_mode != "shadow":
+    active = ACTIVE_CHAT_MODEL.get()
+    # The frozen router experiment describes the configured primary tier only.
+    # Manual selections are measured by response stages, never mislabeled premium.
+    if CONFIG.model_routing_mode != "shadow" or (active is not None and active[1].overridden):
         return False
     coroutine: Any = None
     try:
@@ -6666,10 +6768,12 @@ def should_expand_memory_for_prompt(route: str, prompt: str) -> bool:
 
 
 def build_reference_context(message: Message) -> str:
+    if model_control_content(getattr(message, "reply_to_message", None)):
+        return "(none)"
     sections: list[str] = []
 
     quote = getattr(message, "quote", None)
-    quote_text = getattr(quote, "text", None)
+    quote_text = referenced_quote_text(message)
     if quote_text:
         sections.append("Selected quote text from the referenced message:\n" + clip_text(quote_text, 2000))
 
@@ -6748,14 +6852,8 @@ def strip_trigger(text: str, bot_username: str | None, was_mentioned: bool = Fal
 
 
 def should_allow_chat(message: Message) -> bool:
-    if not CONFIG.allowed_chat_ids or message.chat_id in CONFIG.allowed_chat_ids:
-        return True
-
     user = message.from_user
-    if message.chat.type == ChatType.PRIVATE and user and user.id in CONFIG.admin_user_ids:
-        return True
-
-    return False
+    return chat_actor_allowed(message.chat_id, message.chat.type, user.id if user else None)
 
 
 async def handle_message_reaction_update(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -6869,7 +6967,7 @@ async def handle_message_reaction_count_update(update: Update, context: ContextT
 
 
 def is_admin_user(message: Message) -> bool:
-    return bool(message.from_user and message.from_user.id in CONFIG.admin_user_ids)
+    return bool(message.from_user and is_admin_actor(message.from_user.id))
 
 
 def cooldown_left(message: Message) -> int:
@@ -6931,7 +7029,7 @@ def context_signature_for_dedupe(message: Message) -> str:
         parts.append(f"reply:{replied_id}")
 
     quote = getattr(message, "quote", None)
-    quote_text = getattr(quote, "text", "") if quote is not None else ""
+    quote_text = referenced_quote_text(message)
     if quote_text:
         parts.append("quote:" + clip_text(quote_text, 240))
 
@@ -7373,10 +7471,10 @@ Reply naturally for Telegram. Reply in Ukrainian by default, or English only if 
 
 def translation_source_material(message: Message, prompt: str) -> str:
     quote = getattr(message, "quote", None)
-    quote_text = getattr(quote, "text", None)
+    quote_text = referenced_quote_text(message)
     if quote_text:
         return clip_text(quote_text, 4000)
-    if message.reply_to_message is not None:
+    if message.reply_to_message is not None and not model_control_content(message.reply_to_message):
         return message_content(message.reply_to_message, limit=4000)
     inline_source = inline_translation_source(prompt)
     if inline_source:
@@ -7601,8 +7699,7 @@ async def run_agent(
     image_data_urls: Sequence[str] | None = None,
 ) -> str:
     randomizer_session = ACTIVE_RANDOMIZER.get() or RandomizerSession()
-    model, effort = (vision_runtime_settings("interactive") if image_data_urls is not None
-                     else (CONFIG.openai_model, CONFIG.model_reasoning_effort))
+    model, effort = primary_answer_settings(images=image_data_urls is not None)
     previous_random_request = ACTIVE_RANDOMIZER_PREVIOUS.get()
     if previous_random_request:
         prompt += ("\n\nVerified previous successful randomization request, for the current repeat only. "
@@ -7664,7 +7761,9 @@ async def run_agent(
     randomizer_token = ACTIVE_RANDOMIZER.set(randomizer_session)
     try:
         async with web_server as web, youtube_server as youtube:
-            if image_data_urls is not None:
+            active = ACTIVE_CHAT_MODEL.get()
+            explicit_profile = image_data_urls is not None or (active is not None and active[1].overridden)
+            if explicit_profile:
                 agent = make_agent([web, youtube], capability_context, model=model, reasoning_effort=effort)
             else:
                 agent = (make_agent([web, youtube], capability_context)
@@ -7679,7 +7778,7 @@ async def run_agent(
                         run_id=model_run_id, route_bucket=model_route,
                         retained_image_reads=(capability_context is not None
                                               and capability_context.retained_images is not None),
-                        **({"model_name": model} if image_data_urls is not None else {}),
+                        **({"model_name": model} if explicit_profile else {}),
                     ),
                 )
             except asyncio.CancelledError as exc:
@@ -7771,13 +7870,14 @@ async def run_agent_for_outbound(
         ACTIVE_OUTBOUND_PROVENANCE.reset(token)
 
 
-def build_plain_model_request_settings() -> dict[str, Any]:
+def build_plain_model_request_settings(*, reasoning_effort: str | None = None) -> dict[str, Any]:
+    effort = CONFIG.model_reasoning_effort if reasoning_effort is None else reasoning_effort
     settings: dict[str, Any] = {
         "max_output_tokens": CONFIG.max_output_tokens,
         "text": {"verbosity": CONFIG.model_verbosity},
     }
-    if CONFIG.model_reasoning_effort:
-        settings["reasoning"] = {"effort": CONFIG.model_reasoning_effort}
+    if effort:
+        settings["reasoning"] = {"effort": effort}
     return settings
 
 
@@ -7787,10 +7887,11 @@ def run_plain_model_sync(
     route_bucket: str = "",
     task_class_bucket: str = "",
 ) -> str:
+    model, effort = primary_answer_settings()
     stage = begin_model_stage(
         stage_kind="plain",
-        intended_model=CONFIG.openai_model,
-        reasoning_effort=CONFIG.model_reasoning_effort,
+        intended_model=model,
+        reasoning_effort=effort,
         endpoint="responses",
         route_bucket=route_bucket,
         task_class_bucket=task_class_bucket,
@@ -7798,14 +7899,14 @@ def run_plain_model_sync(
     client = OpenAI()
     try:
         response = client.responses.create(
-            model=CONFIG.openai_model,
+            model=model,
             input=[
                 {
                     "role": "user",
                     "content": [{"type": "input_text", "text": with_current_time_metadata(prompt)}],
                 }
             ],
-            **build_plain_model_request_settings(),
+            **build_plain_model_request_settings(reasoning_effort=effort),
         )
     except Exception as exc:
         finish_model_stage(stage, status="failed", failure_class=exc)
@@ -7850,11 +7951,13 @@ async def run_plain_model_for_route(
     task_token = ACTIVE_MODEL_TASK_CLASS_BUCKET.set(
         normalize_task_class_bucket(task_class_bucket, "other")
     )
+    # Operational self-analysis keeps its configured diagnostic model.
+    profile_token = ACTIVE_CHAT_MODEL.set(None) if route_bucket == "selfcheck" else None
     try:
-        # Keep the underlying call signature stable for tests and alternate
-        # adapters while ContextVars carry bounded telemetry-only labels.
         return await run_plain_model(prompt)
     finally:
+        if profile_token is not None:
+            ACTIVE_CHAT_MODEL.reset(profile_token)
         ACTIVE_MODEL_TASK_CLASS_BUCKET.reset(task_token)
         ACTIVE_MODEL_ROUTE_BUCKET.reset(route_token)
 
@@ -7998,10 +8101,7 @@ VisionPurpose = Literal["interactive", "background"]
 
 def vision_runtime_settings(purpose: VisionPurpose) -> tuple[str, str]:
     if purpose == "interactive":
-        return (
-            CONFIG.vision_interactive_model,
-            CONFIG.vision_interactive_reasoning_effort,
-        )
+        return primary_answer_settings(images=True)
     if purpose == "background":
         return (
             CONFIG.vision_background_model,
@@ -12433,17 +12533,18 @@ async def maybe_send_chat_action(context: ContextTypes.DEFAULT_TYPE, chat_id: in
 
 async def run_character_evidence(session: CharacterEvidenceSession) -> CharacterReport:
     """Same primary model, with only target-bound reads and a validated final schema."""
+    model, effort = primary_answer_settings()
     model_run_id = current_model_run_id()
     hooks = AiganRunHooks(model_run_id, route_bucket="character",
-                         intended_model=CONFIG.openai_model, reasoning_effort=CONFIG.model_reasoning_effort)
-    settings = build_model_settings()
+                         intended_model=model, reasoning_effort=effort)
+    settings = build_model_settings(reasoning_effort=effort)
     settings.max_tokens = min(CONFIG.max_output_tokens, 1800)
     agent = Agent(name="Aigan character evidence", instructions=CHARACTER_INSTRUCTIONS,
-                  model=CONFIG.openai_model, model_settings=settings,
+                  model=model, model_settings=settings,
                   tools=session.tools(), output_type=CharacterReport)
     try:
         result = await Runner.run(agent, session.initial_prompt(), max_turns=6, hooks=hooks,
-            run_config=build_agents_run_config(run_id=model_run_id, route_bucket="character"))
+            run_config=build_agents_run_config(run_id=model_run_id, route_bucket="character", model_name=model))
         return session.validate(result.final_output)
     except asyncio.CancelledError as exc:
         hooks.finalize_pending("cancelled", exc)
@@ -12629,6 +12730,15 @@ async def handle_grounded_character(message: Message, context: ContextTypes.DEFA
 
 
 async def handle_character_command(message: Message, context: ContextTypes.DEFAULT_TYPE, args: str) -> None:
+    try:
+        with chat_model_scope(message.chat_id):
+            await _handle_character_command(message, context, args)
+    except ChatModelSettingsUnavailable:
+        record_model_settings_unavailable(message.chat_id)
+        await notify_model_settings_unavailable(message)
+
+
+async def _handle_character_command(message: Message, context: ContextTypes.DEFAULT_TYPE, args: str) -> None:
     if MEMORY is None:
         await message.reply_text("Пам'ять вимкнена, тому команда недоступна.")
         return
@@ -12707,8 +12817,13 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
     if not allow_command(message, "help"):
         return
+    model_help = (
+        "\nДля адміна: /model відкриває панель моделі цього чату; "
+        "/select_model astra-low 15m — тимчасовий вибір; /select_model reset — типові налаштування."
+        if is_admin_user(message) else ""
+    )
     await message.reply_text(
-        f"У групі клич мене так: {CONFIG.bot_trigger} питання, /ai, /питай, /п, /а, згадка або reply. Сервісні: /ids (/айді), /context (/контекст), /version (/версія), /stat (/стат), /character (/характер), /interests (/інтереси), /health (/самопочуття), /tools (/тулзи), /tool_health (/стан_тулзів), /logs (/логи), /selfcheck (/самоаналіз), /complaints (/скарги), /memory_search (/память, /памʼять, /пошук_памяті), /proactive_now (/проактив), /remind, /reminders."
+        f"У групі клич мене так: {CONFIG.bot_trigger} питання, /ai, /питай, /п, /а, згадка або reply. Сервісні: /ids (/айді), /context (/контекст), /version (/версія), /stat (/стат), /character (/характер), /interests (/інтереси), /health (/самопочуття), /tools (/тулзи), /tool_health (/стан_тулзів), /logs (/логи), /selfcheck (/самоаналіз), /complaints (/скарги), /memory_search (/память, /памʼять, /пошук_памяті), /proactive_now (/проактив), /remind, /reminders." + model_help
     )
 
 
@@ -13001,6 +13116,9 @@ async def proactive_now_command(update: Update, context: ContextTypes.DEFAULT_TY
             event_message="manual",
             outbound_provenance=outbound_provenance,
         )
+    except ChatModelSettingsUnavailable:
+        await notify_model_settings_unavailable(message)
+        return
     except Exception:
         LOGGER.exception("Manual proactive test failed")
         await message.reply_text("Тест proactive-повідомлення впав. Подивись логи.")
@@ -13932,6 +14050,9 @@ async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
     if message.from_user and message.from_user.is_bot:
         return
+    if is_settings_control_message(message):
+        await CHAT_MODEL_UI.handle_command(update, context)
+        return
 
     if await maybe_buffer_telegram_turn(message, context):
         return
@@ -14028,10 +14149,16 @@ async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 def schedule_background_task(context: ContextTypes.DEFAULT_TYPE, coro: Any) -> Any:
-    application = getattr(context, "application", None)
-    if application is not None and hasattr(application, "create_task"):
-        return application.create_task(coro)
-    return asyncio.create_task(coro)
+    # Background work must resolve its own chat selection when it is admitted.
+    # ContextVar propagation is retained for awaited work and asyncio.to_thread.
+    token = ACTIVE_CHAT_MODEL.set(None)
+    try:
+        application = getattr(context, "application", None)
+        if application is not None and hasattr(application, "create_task"):
+            return application.create_task(coro)
+        return asyncio.create_task(coro)
+    finally:
+        ACTIVE_CHAT_MODEL.reset(token)
 
 
 async def start_pending_debounce(
@@ -14290,14 +14417,18 @@ async def handle_prompt_generation(
     previous_token = ACTIVE_RANDOMIZER_PREVIOUS.set(previous_random_request)
     try:
         turn_kwargs = {"turn_context_messages": turn_context_messages} if turn_context_messages is not None else {}
-        await _handle_prompt_generation(
-            message,
-            context,
-            prompt,
-            allow_pending_wait,
-            skip_cooldown,
-            **turn_kwargs,
-        )
+        with chat_model_scope(message.chat_id):
+            await _handle_prompt_generation(
+                message,
+                context,
+                prompt,
+                allow_pending_wait,
+                skip_cooldown,
+                **turn_kwargs,
+            )
+    except ChatModelSettingsUnavailable:
+        record_model_settings_unavailable(message.chat_id)
+        await notify_model_settings_unavailable(message)
     finally:
         ACTIVE_RANDOMIZER_PREVIOUS.reset(previous_token)
         ACTIVE_RANDOMIZER.reset(randomizer_token)
@@ -14784,9 +14915,13 @@ async def handle_image_prompt_generation(
         required=admitted and (is_randomization_request(prompt) or bool(previous))))
     previous_token = ACTIVE_RANDOMIZER_PREVIOUS.set(previous)
     try:
-        await _handle_image_prompt_generation(
-            message, prompt, image_messages, context_messages, dedupe_prompt,
-            skip_cooldown=skip_cooldown, admitted_parts=admitted_parts)
+        with chat_model_scope(message.chat_id):
+            await _handle_image_prompt_generation(
+                message, prompt, image_messages, context_messages, dedupe_prompt,
+                skip_cooldown=skip_cooldown, admitted_parts=admitted_parts)
+    except ChatModelSettingsUnavailable:
+        record_model_settings_unavailable(message.chat_id)
+        await notify_model_settings_unavailable(message)
     finally:
         ACTIVE_RANDOMIZER_PREVIOUS.reset(previous_token)
         ACTIVE_RANDOMIZER.reset(token)
@@ -14999,7 +15134,14 @@ def auto_react_due(message: Message) -> bool:
 async def maybe_auto_react(message: Message, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not auto_react_due(message):
         return
+    try:
+        with chat_model_scope(message.chat_id, inherit=False):
+            await _maybe_auto_react(message, context)
+    except ChatModelSettingsUnavailable:
+        record_model_settings_unavailable(message.chat_id)
 
+
+async def _maybe_auto_react(message: Message, context: ContextTypes.DEFAULT_TYPE) -> None:
     last_auto_react_chat[message.chat_id] = time.monotonic()
     memory_context = await prepare_memory_context(message, message_text(message))
     prompt = f"""A new Telegram group message may be worth a brief response.
@@ -15451,6 +15593,27 @@ async def run_proactive_model(
     user_id: int | None = None,
     outbound_provenance: OutboundProvenance | None = None,
 ) -> str | None:
+    try:
+        with chat_model_scope(chat_id, inherit=False):
+            return await _run_proactive_model(
+                prompt, chat_id=chat_id, event_message=event_message,
+                user_id=user_id, outbound_provenance=outbound_provenance,
+            )
+    except ChatModelSettingsUnavailable:
+        record_model_settings_unavailable(chat_id)
+        if event_message == "manual":
+            raise
+        return None
+
+
+async def _run_proactive_model(
+    prompt: str,
+    *,
+    chat_id: int,
+    event_message: str = "",
+    user_id: int | None = None,
+    outbound_provenance: OutboundProvenance | None = None,
+) -> str | None:
     model_call = (
         run_agent_for_outbound(outbound_provenance, prompt)
         if outbound_provenance is not None
@@ -15508,6 +15671,25 @@ Rewrite once about a non-meta chat topic. No availability notice, no capability 
 
 
 async def run_reminder_model(
+    prompt: str,
+    *,
+    chat_id: int,
+    event_message: str = "",
+    user_id: int | None = None,
+    outbound_provenance: OutboundProvenance | None = None,
+) -> tuple[str | None, str]:
+    try:
+        with chat_model_scope(chat_id, inherit=False):
+            return await _run_reminder_model(
+                prompt, chat_id=chat_id, event_message=event_message,
+                user_id=user_id, outbound_provenance=outbound_provenance,
+            )
+    except ChatModelSettingsUnavailable:
+        record_model_settings_unavailable(chat_id)
+        return None, "model_settings_unavailable"
+
+
+async def _run_reminder_model(
     prompt: str,
     *,
     chat_id: int,
@@ -16411,6 +16593,8 @@ async def post_shutdown(application: Application) -> None:
 
 def main() -> None:
     application = Application.builder().application_class(AiganApplication).token(CONFIG.telegram_token).post_init(post_init).post_shutdown(post_shutdown).build()
+    application.add_handler(CommandHandler(["model", "settings", "select_model"], CHAT_MODEL_UI.handle_command))
+    application.add_handler(CallbackQueryHandler(CHAT_MODEL_UI.handle_callback, pattern=r"^cm:"))
     application.add_handler(CommandHandler(["start", "help"], help_command))
     application.add_handler(CommandHandler(["ids"], ids_command))
     application.add_handler(CommandHandler(["ping"], ping_command))
