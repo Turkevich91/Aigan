@@ -13,7 +13,7 @@ from pathlib import Path
 import re
 import sqlite3
 import time
-from typing import Callable, Sequence
+from typing import Callable, Iterable, Sequence
 
 from chat_tool_policy import ChatToolPolicy, TOOL_KEYS
 
@@ -48,6 +48,31 @@ MODEL_CATALOG = (
     ModelCapability("gpt-6-luna", ("luna",), ("none", *_REASONING)),
     ModelCapability(SPARK_MODEL, ("spark", "qwen"), ("auto",), supports_images=False),
 )
+_FAMILIES = {entry.aliases[0]: entry for entry in MODEL_CATALOG}
+_PROVIDER_MODEL = re.compile(r"gpt-([1-9][0-9]?(?:\.(?:0|[1-9][0-9]{0,2})){0,2})-(astra|sol|terra|luna)")
+
+
+def _provider_version(model: str) -> tuple[int, ...]:
+    match = _PROVIDER_MODEL.fullmatch(model)
+    if match is None:
+        return ()
+    version = tuple(map(int, match[1].split(".")))
+    return version if version[0] >= 6 else ()
+
+
+def catalog_from_provider_ids(ids: Iterable[str]) -> tuple[ModelCapability, ...]:
+    """Build the selectable catalog from stable provider IDs and local family policy."""
+    versions = {}
+    for model in ids:
+        if isinstance(model, str) and (version := _provider_version(model)):
+            versions[model] = version
+    newest_first = sorted(versions, key=versions.__getitem__, reverse=True)
+    return tuple(
+        replace(template, model=model)
+        for template in MODEL_CATALOG[:-1]
+        for model in newest_first
+        if model.endswith("-" + template.aliases[0])
+    ) + (MODEL_CATALOG[-1],)
 
 
 @dataclass(frozen=True)
@@ -66,18 +91,22 @@ class ParsedModelSelection:
     duration_seconds: int | None
 
 
-def get_model_capability(model: str) -> ModelCapability:
-    """Resolve only curated aliases or canonical provider model identifiers."""
+def get_model_capability(model: str, catalog: Sequence[ModelCapability] | None = None) -> ModelCapability:
+    """A supplied catalog limits selections. Persisted IDs use their stable family policy."""
     if isinstance(model, str):
         normalized = model.strip().casefold()
-        for entry in MODEL_CATALOG:
+        for entry in MODEL_CATALOG if catalog is None else catalog:
             if normalized == entry.model or normalized in entry.aliases:
                 return entry
+        if catalog is None and _provider_version(normalized):
+            return replace(_FAMILIES[normalized.rsplit("-", 1)[1]], model=normalized)
     raise InvalidModelSelection("unsupported_model")
 
 
-def validate_selection(model: str, effort: str) -> tuple[str, str]:
-    capability = get_model_capability(model)
+def validate_selection(
+    model: str, effort: str, catalog: Sequence[ModelCapability] | None = None,
+) -> tuple[str, str]:
+    capability = get_model_capability(model, catalog)
     normalized = effort.strip().casefold() if isinstance(effort, str) else ""
     if normalized not in capability.reasoning_efforts:
         raise InvalidModelSelection("unsupported_reasoning_effort")
@@ -86,7 +115,8 @@ def validate_selection(model: str, effort: str) -> tuple[str, str]:
 
 def _profile_rank(profile: tuple[str, str]) -> tuple[int, int]:
     capability = get_model_capability(profile[0])
-    return -MODEL_CATALOG.index(capability), capability.reasoning_efforts.index(profile[1])
+    family = _FAMILIES[capability.aliases[0]]
+    return -MODEL_CATALOG.index(family), capability.reasoning_efforts.index(profile[1])
 
 
 def member_duration_limit(model: str, effort: str, ceiling: tuple[str, str]) -> int | None:
@@ -115,7 +145,9 @@ def parse_duration(value: str) -> int | None:
     return seconds
 
 
-def parse_model_selection(arguments: str | Sequence[str]) -> ParsedModelSelection:
+def parse_model_selection(
+    arguments: str | Sequence[str], catalog: Sequence[ModelCapability] = MODEL_CATALOG,
+) -> ParsedModelSelection:
     """Parse ``astra-low 15m`` or ``gpt-6-astra low 15m`` arguments.
 
     Missing reasoning uses the preset default. Missing duration is fifteen minutes.
@@ -130,19 +162,19 @@ def parse_model_selection(arguments: str | Sequence[str]) -> ParsedModelSelectio
     token = parts.pop(0).casefold()
     effort = "low"
     try:
-        capability = get_model_capability(token)
+        capability = get_model_capability(token, catalog)
     except InvalidModelSelection:
         model_token, separator, effort = token.rpartition("-")
         if not separator:
             raise InvalidModelSelection("unsupported_model") from None
-        capability = get_model_capability(model_token)
+        capability = get_model_capability(model_token, catalog)
     else:
         effort = "low" if "low" in capability.reasoning_efforts else capability.reasoning_efforts[0]
         if parts and parts[0].casefold() in {"auto", "none", "mid", *_REASONING}:
             effort = parts.pop(0).casefold()
     if len(parts) > 1:
         raise InvalidModelSelection("invalid_selection_arguments")
-    model, effort = validate_selection(capability.model, "medium" if effort == "mid" else effort)
+    model, effort = validate_selection(capability.model, "medium" if effort == "mid" else effort, catalog)
     duration = parse_duration(parts[0]) if parts else DEFAULT_DURATION_SECONDS
     return ParsedModelSelection(model, effort, duration)
 
@@ -404,10 +436,10 @@ class ChatModelSettingsStore:
     def apply(
         self, chat_id: int, model: str, effort: str,
         duration_seconds: int | None = None, *, expected_revision: int | None = None,
-        role: str = "admin", now: float | None = None,
+        role: str = "admin", now: float | None = None, catalog: Sequence[ModelCapability] = MODEL_CATALOG,
     ) -> AnswerProfile:
         chat_id = _chat_id(chat_id)
-        requested = validate_selection(model, effort)
+        requested = validate_selection(model, effort, catalog)
         _expected_revision(expected_revision)
         if duration_seconds is not None and (
             type(duration_seconds) is not int or not 1 <= duration_seconds <= MAX_DURATION_SECONDS

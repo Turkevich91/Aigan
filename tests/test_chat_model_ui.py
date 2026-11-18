@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import html
 import re
 import sqlite3
@@ -194,10 +195,67 @@ class ChatModelUITests(unittest.IsolatedAsyncioTestCase):
         await self.click("Відновити дозволи інструментів")
         self.assertFalse(self.store.tools.resolve(-1001).disabled)
 
-    async def choose(self, alias="astra", effort="high", duration="1 год"):
-        await self.click(alias)
+    async def choose(self, model="gpt-6-astra", effort="high", duration="1 год"):
+        await self.click(model)
         await self.click(effort)
         await self.click(duration)
+
+    async def test_alias_and_shortcut_follow_discovery_but_visible_buttons_keep_their_model(self):
+        astra = replace(MODEL_CATALOG[0], model="gpt-6.2-astra")
+        sol = replace(MODEL_CATALOG[1], model="gpt-6.2-sol")
+        current = (astra, sol, MODEL_CATALOG[-1])
+        self.ui.get_catalog = AsyncMock(return_value=current)
+        await self.command("/select_model sol-mid persistent", user_id=77)
+        self.assertEqual(sol.model, self.profile().model)
+        await self.command("/settings", user_id=77)
+        await self.click("Astra/low · 15 хв", actor=77)
+        await self.click("Застосувати", actor=77)
+        self.assertEqual(astra.model, self.profile().model)
+        await self.command()
+        sol_token = self.button(sol.model)
+        next_astra = replace(astra, model="gpt-6.3-astra")
+        self.ui.get_catalog.return_value = (next_astra, *current)
+        await self.click(data=sol_token)
+        await self.click("medium")
+        await self.click("Постійно")
+        await self.click("Застосувати")
+        self.assertEqual(sol.model, self.profile().model)
+        self.assertTrue(self.button(next_astra.model))
+        labels = [b.text.lstrip("✓ ") for row in self.panel.reply_markup.inline_keyboard for b in row]
+        self.assertNotIn(astra.model, labels)
+        await self.command(f"/select_model {astra.model} low 15m")
+        self.assertEqual(astra.model, self.profile().model)
+
+    async def test_withdrawn_profile_cannot_be_applied_and_refresh_keeps_status_and_reset(self):
+        self.ui.get_catalog = AsyncMock(return_value=MODEL_CATALOG)
+        await self.command()
+        await self.choose()
+        self.ui.get_catalog.return_value = (MODEL_CATALOG[-1],)
+        denied = await self.click("Застосувати")
+        self.assertTrue(denied.answer.await_args.kwargs["show_alert"])
+        self.assertFalse(self.profile().overridden)
+        await self.click("Оновити")
+        self.assertIn("Зараз немає доступних моделей", self.panel.text)
+        self.assertTrue(self.button("Скинути до типових"))
+        self.assertTrue(self.button("Spark / Qwen · недоступний"))
+        await self.command(user_id=77)
+        labels = [b.text for row in self.panel.reply_markup.inline_keyboard for b in row]
+        self.assertNotIn("Astra/low · 15 хв", labels)
+
+    async def test_member_leaving_during_discovery_cannot_apply_or_use_command(self):
+        await self.command(user_id=77)
+        await self.click("Astra/low · 15 хв", actor=77)
+
+        async def discover():
+            self.context.bot.get_chat_member.return_value = SimpleNamespace(status="left")
+            return MODEL_CATALOG
+
+        self.ui.get_catalog = discover
+        await self.click("Застосувати", actor=77)
+        self.assertFalse(self.profile().overridden)
+        self.context.bot.get_chat_member.return_value = SimpleNamespace(status="member")
+        await self.command("/select_model sol-mid persistent", user_id=77)
+        self.assertFalse(self.profile().overridden)
 
     async def test_spark_requires_configuration_and_skips_effort_step(self):
         await self.command("/select_model qwen 15m")
@@ -277,11 +335,11 @@ class ChatModelUITests(unittest.IsolatedAsyncioTestCase):
 
     async def test_reasoning_options_are_model_specific(self):
         await self.command()
-        await self.click("astra")
+        await self.click("gpt-6-astra")
         labels = [button.text for row in self.panel.reply_markup.inline_keyboard for button in row]
         self.assertNotIn("none", labels)
         await self.click("Назад")
-        await self.click("terra")
+        await self.click("gpt-6.1-terra")
         labels = [button.text for row in self.panel.reply_markup.inline_keyboard for button in row]
         self.assertIn("none", labels)
 
@@ -295,6 +353,7 @@ class ChatModelUITests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(self.profile().overridden)
 
     async def test_disallowed_command_cannot_open_or_read_store(self):
+        self.ui.get_catalog = AsyncMock(side_effect=AssertionError("must not discover"))
         with patch.object(self.store, "resolve", side_effect=AssertionError("must not read")):
             for actor in (42, 77):
                 await self.command(chat_id=-999, user_id=actor)
@@ -303,7 +362,7 @@ class ChatModelUITests(unittest.IsolatedAsyncioTestCase):
     async def test_member_persistent_choice_survives_boost_and_other_chats_are_unchanged(self):
         await self.command("/select_model luna-low persistent")
         await self.command(user_id=77)
-        for item in ("sol", "medium", "Постійно", "Застосувати"):
+        for item in ("gpt-6.1-sol", "medium", "Постійно", "Застосувати"):
             await self.click(item, actor=77)
         self.assertEqual(("gpt-6.1-sol", "medium", None),
                          (self.profile().model, self.profile().reasoning_effort, self.profile().expires_at))
@@ -339,7 +398,7 @@ class ChatModelUITests(unittest.IsolatedAsyncioTestCase):
         await self.command("/settings", user_id=77)
         buttons = [b for row in self.panel.reply_markup.inline_keyboard for b in row]
         self.assertNotIn("Інструменти", [b.text for b in buttons])
-        prefix = self.button("astra").rsplit(":", 2)[0]
+        prefix = self.button("gpt-6-astra").rsplit(":", 2)[0]
         for ending in ("t:-", "v:0", "z:-"):
             query = await self.click(data=f"{prefix}:{ending}", actor=77)
             self.assertTrue(query.answer.await_args.kwargs["show_alert"])
@@ -349,7 +408,7 @@ class ChatModelUITests(unittest.IsolatedAsyncioTestCase):
 
     async def test_member_cannot_forge_reasoning_or_duration_or_promote_timed_profile(self):
         await self.command(user_id=77)
-        await self.click("astra", actor=77)
+        await self.click("gpt-6-astra", actor=77)
         low = self.button("low")
         self.assertFalse(any(b.text == "medium" for row in self.panel.reply_markup.inline_keyboard for b in row))
         rejected = await self.click(data=low.rsplit(":", 1)[0] + ":1", actor=77)
@@ -365,7 +424,7 @@ class ChatModelUITests(unittest.IsolatedAsyncioTestCase):
 
     async def test_group_callback_checks_current_membership_and_fails_closed(self):
         await self.command(user_id=77)
-        action = self.button("sol")
+        action = self.button("gpt-6.1-sol")
         lookup = self.context.bot.get_chat_member
         for result in (SimpleNamespace(status="left"), SimpleNamespace(status="kicked"),
                        SimpleNamespace(status="restricted", is_member=False), TelegramError("unavailable")):
@@ -426,13 +485,13 @@ class ChatModelUITests(unittest.IsolatedAsyncioTestCase):
 
     async def test_callback_uses_query_actor_not_bot_panel_author(self):
         await self.command()
-        query = await self.click("astra")
+        query = await self.click("gpt-6-astra")
         self.assertTrue(query.answer.await_count)
         self.assertIn("2/3", self.panel.text)
 
     async def test_other_admin_nonadmin_wrong_chat_and_wrong_message_cannot_reuse_panel(self):
         await self.command()
-        token = self.button("astra")
+        token = self.button("gpt-6-astra")
         for actor in (43, 77):
             query = await self.click(data=token, actor=actor)
             query.edit_message_text.assert_not_awaited()
@@ -449,13 +508,13 @@ class ChatModelUITests(unittest.IsolatedAsyncioTestCase):
     async def test_revoked_admin_cannot_use_existing_panel(self):
         await self.command()
         self.admins.remove(42)
-        query = await self.click("astra")
+        query = await self.click("gpt-6-astra")
         query.edit_message_text.assert_not_awaited()
         self.assertFalse(self.profile().overridden)
 
     async def test_old_step_callback_and_duplicate_apply_do_not_mutate(self):
         await self.command()
-        old = self.button("astra")
+        old = self.button("gpt-6-astra")
         await self.click(data=old)
         query = await self.click(data=old)
         query.edit_message_text.assert_not_awaited()
@@ -469,7 +528,7 @@ class ChatModelUITests(unittest.IsolatedAsyncioTestCase):
 
     async def test_unsupported_forged_actions_do_not_mutate(self):
         await self.command()
-        token = self.button("astra")
+        token = self.button("gpt-6-astra")
         prefix = token.rsplit(":", 2)[0]
         for ending in ("m:-1", "m:999", "m:astra", "a:-", "unknown:-", "r:1"):
             query = await self.click(data=f"{prefix}:{ending}")
@@ -492,7 +551,7 @@ class ChatModelUITests(unittest.IsolatedAsyncioTestCase):
     async def test_ttl_restart_and_bounded_panel_sessions(self):
         await self.command()
         old = self.panel
-        token = self.button("astra")
+        token = self.button("gpt-6-astra")
         self.now[0] += 901
         query = await self.click(data=token)
         query.edit_message_text.assert_not_awaited()
@@ -500,7 +559,7 @@ class ChatModelUITests(unittest.IsolatedAsyncioTestCase):
         query = await self.click(data=token, panel=old)
         query.edit_message_text.assert_not_awaited()
         await self.command()
-        first, first_token = self.panel, self.button("astra")
+        first, first_token = self.panel, self.button("gpt-6-astra")
         await self.command()
         await self.command()
         self.assertLessEqual(len(self.ui._panels), 2)
@@ -558,7 +617,7 @@ class ChatModelUITests(unittest.IsolatedAsyncioTestCase):
     async def test_resolver_failure_is_sanitized_for_command_and_callback(self):
         await self.command()
         with patch.object(self.store, "resolve", side_effect=sqlite3.OperationalError("private_backend_detail")):
-            query = await self.click("astra")
+            query = await self.click("gpt-6-astra")
             await self.command()
         query.answer.assert_awaited()
         query.edit_message_text.assert_not_awaited()
@@ -567,7 +626,7 @@ class ChatModelUITests(unittest.IsolatedAsyncioTestCase):
 
     async def test_unauthorized_callback_cannot_read_settings_or_panel(self):
         await self.command()
-        token = self.button("astra")
+        token = self.button("gpt-6-astra")
         with patch.object(self.store, "resolve", side_effect=AssertionError("unexpected read")):
             query = await self.click(data=token, actor=77)
         query.edit_message_text.assert_not_awaited()

@@ -16,7 +16,7 @@ from unittest.mock import AsyncMock, Mock, patch
 from tests.support import FakeMessage, configure_test_environment
 configure_test_environment()
 import main
-from chat_model_settings import ChatModelSettingsStore
+from chat_model_settings import ChatModelSettingsStore, catalog_from_provider_ids
 from chat_model_ui import ChatModelUI, PANEL_TITLE
 from memory import MemoryStore
 from tests.test_standard_tools import NoTransportMCP
@@ -151,6 +151,17 @@ class ChatModelRuntimeTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual("gpt-6.1-terra", kwargs["run_config"].model.model)
                 self.assertEqual("gpt-6.1-terra", kwargs["hooks"].intended_model)
                 self.assertEqual("none", kwargs["hooks"].reasoning_effort)
+
+    async def test_provider_discovered_version_reaches_answer_and_image_paths(self):
+        model = "gpt-6.9-sol"
+        self.store.apply(-1001, model, "medium", role="member", catalog=catalog_from_provider_ids([model]))
+        with main.chat_model_scope(-1001):
+            self.assertEqual((model, "medium"), main.primary_answer_settings(images=True))
+            with patch.object(main, "OpenAI") as client:
+                client.return_value.responses.create.return_value = SimpleNamespace(
+                    output_text="Synthetic", model=model, status="completed", usage=None)
+                main.run_plain_model_sync("Synthetic")
+                self.assertEqual(model, client.return_value.responses.create.call_args.kwargs["model"])
 
     async def test_default_image_profile_and_auxiliary_background_vision_preserved(self):
         with main.chat_model_scope(-1001):

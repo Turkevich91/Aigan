@@ -6,6 +6,19 @@ from model_telemetry import normalize_policy_version
 
 
 class RuntimeModelPricingTests(unittest.TestCase):
+    def test_62_rates_change_above_272k_for_the_full_request(self) -> None:
+        for model, at_limit, above_limit in (
+            ("gpt-6.2-sol", 542_400_000, 1_084_704_000),
+            ("gpt-6.2-astra", 2_169_600_000, 4_338_816_000),
+        ):
+            for count, expected in ((272_000, at_limit), (272_001, above_limit)):
+                with self.subTest(model=model, input_tokens=count):
+                    usage = runtime_pricing.TokenUsage(count, cached_input_tokens=2_000,
+                                                       cache_write_tokens=4_000, output_tokens=20)
+                    estimate = runtime_pricing.estimate_token_cost(model, [usage])
+                    self.assertEqual(expected, estimate.nano_usd)
+                    self.assertTrue(estimate.complete)
+
     def test_terra_61_cached_and_write_tokens_are_charged_once(self) -> None:
         estimate = runtime_pricing.estimate_token_cost(
             "gpt-6.1-terra",
@@ -115,7 +128,7 @@ class RuntimeModelPricingTests(unittest.TestCase):
             "gpt-6-astra", [runtime_pricing.TokenUsage(100, output_tokens=10)]
         )
 
-        self.assertEqual("openai-standard-2026-10-29-terra61-addendum", estimate.snapshot_version)
+        self.assertEqual("openai-standard-2026-11-18-gpt62-addendum", estimate.snapshot_version)
         self.assertIn(
             "https://developers.openai.com/api/docs/models/gpt-6.1-terra",
             runtime_pricing.PRICE_SOURCE_URLS,
@@ -134,7 +147,7 @@ class RuntimeModelPricingTests(unittest.TestCase):
         )
 
     def test_unknown_models_and_missing_usage_never_become_zero_cost(self) -> None:
-        for model in ("unpriced-model", "gpt-6", "gpt-6-astra-2026-09-04"):
+        for model in ("unpriced-model", "gpt-6", "gpt-6-astra-2026-09-04", "gpt-6.3-sol"):
             with self.subTest(model=model):
                 estimate = runtime_pricing.estimate_token_cost(
                     model, [runtime_pricing.TokenUsage(100, output_tokens=10)]
