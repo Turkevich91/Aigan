@@ -96,6 +96,7 @@ from chat_tool_policy import CHAT_TOOLS, chat_tool_scope, tool_allowed
 from chat_model_settings import AnswerProfile, ChatModelSettingsStore, SPARK_MODEL, get_model_capability
 from spark_answer import SparkAnswerProvider
 from chat_model_ui import ChatModelUI, PANEL_TITLE, is_settings_control_message, is_settings_panel_message
+from provider_model_catalog import ProviderModelCatalog
 from randomizer_capability import RandomizerSession, is_randomization_request, is_randomization_repeat
 
 from retained_images import RetainedImageSession
@@ -1270,6 +1271,7 @@ def model_control_content(message: Message | None) -> bool:
 SPARK_ANSWER = SparkAnswerProvider.from_environment()
 CHAT_MODEL_UI = ChatModelUI(
     CHAT_MODEL_SETTINGS,
+    get_catalog=ProviderModelCatalog(lambda: AsyncOpenAI(api_key=CONFIG.openai_api_key, max_retries=0)).get,
     defaults=lambda: (CONFIG.openai_model, CONFIG.model_reasoning_effort),
     is_admin=is_admin_actor,
     is_owner=is_owner_actor,

@@ -28,15 +28,20 @@ after handling; this does not guarantee they were never visible. The panel
 does not quote the command. **Закрити** deletes the panel message. Ephemeral
 commands and the wider native command catalog are separate work.
 
-The menu lists the cloud models in descending order of standard input and output
-price, followed by the local model:
+Opening the panel or selecting a model refreshes the provider's `/v1/models`
+listing when its five-minute cache expires. Buttons show the exact model ID.
+The panel shows the newest stable version in each supported family, followed by
+local Qwen when configured. Family aliases such as `sol` select the newest listed
+version. Older listed versions are selectable by their full IDs. An exact command such as
+`/select_model gpt-6.2-sol medium persistent` pins that release across catalog
+refreshes and bot restarts. Existing persistent choices keep their exact IDs.
 
-| Alias | Model | Supported reasoning |
+| Alias | Provider family or local service | Supported reasoning |
 | --- | --- | --- |
-| `astra` | `gpt-6-astra` | low, medium, high, xhigh, max |
-| `sol` | `gpt-6.1-sol` | low, medium, high, xhigh, max |
-| `terra` | `gpt-6.1-terra` | none, low, medium, high, xhigh, max |
-| `luna` | `gpt-6-luna` | none, low, medium, high, xhigh, max |
+| `astra` | Astra | low, medium, high, xhigh, max |
+| `sol` | Sol | low, medium, high, xhigh, max |
+| `terra` | Terra | none, low, medium, high, xhigh, max |
+| `luna` | Luna | none, low, medium, high, xhigh, max |
 | `qwen` | Local Qwen on Spark; no per-token API charge for its answers | Provider default |
 
 Configure the local Chat Completions service through `SPARK_BASE_URL` and
@@ -53,10 +58,18 @@ access, credit or quota. Provider errors must not silently select another model.
 The unchanged configured default can still be used when it is outside this
 catalog; resetting does not rewrite it.
 
-Capability sources, checked 2026-11-06:
+If listing fails, the panel reuses its last successful in-memory catalog. On
+a cold start it has the bundled catalog until discovery succeeds. A model
+removed from a successful listing is unavailable for new selections. A saved
+profile that the provider has retired can be replaced through the panel.
+The list API supplies model identities. The family rules above determine the
+available controls. Runtime cost estimates use exact known rates.
+
+Capability and discovery sources:
+[List models](https://developers.openai.com/api/reference/resources/models/methods/list),
 [Terra](https://developers.openai.com/api/docs/models/gpt-6.1-terra),
-[Astra](https://developers.openai.com/api/docs/models/gpt-6-astra),
-[Sol](https://developers.openai.com/api/docs/models/gpt-6.1-sol),
+[Astra](https://developers.openai.com/api/docs/models/gpt-6.2-astra),
+[Sol](https://developers.openai.com/api/docs/models/gpt-6.2-sol),
 [Luna](https://developers.openai.com/api/docs/models/gpt-6-luna).
 
 ## Tool permissions

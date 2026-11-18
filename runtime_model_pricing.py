@@ -6,8 +6,8 @@ from model_pricing.py, whose exact bytes and July 2026 rates are frozen into
 memory-extraction evaluation evidence. Keep that historical module unchanged;
 do not mutate its registry or redirect its imports to this catalog.
 
-The GPT-6.1 Terra entry was verified on 2026-10-29 and uses the standard
-30-minute cache-write rate; extended-retention cache writes are not modeled.
+GPT-6.2 Astra and Sol rates were verified on 2026-11-18. GPT-6.1 Terra was
+verified on 2026-10-29. Cache writes use the standard 30-minute retention rate.
 This addendum retains every existing rate: GPT-5.6 and Astra rates and
 request-level long-context tiers were verified on 2026-09-04. The inherited GPT-5.4
 and GPT-5.5 estimates do not account for their documented long-session surcharge;
@@ -22,10 +22,12 @@ from typing import Sequence
 
 # Persist the snapshot version and exact rates with every priced stage so a
 # later catalog refresh cannot rewrite historical runtime cost estimates.
-PRICE_SNAPSHOT_VERSION = "openai-standard-2026-10-29-terra61-addendum"
+PRICE_SNAPSHOT_VERSION = "openai-standard-2026-11-18-gpt62-addendum"
 PRICE_SOURCE_URLS = (
     "https://developers.openai.com/api/docs/pricing",
     "https://developers.openai.com/api/docs/guides/prompt-caching",
+    "https://developers.openai.com/api/docs/models/gpt-6.2-astra",
+    "https://developers.openai.com/api/docs/models/gpt-6.2-sol",
     "https://developers.openai.com/api/docs/models/gpt-6.1-terra",
     "https://developers.openai.com/api/docs/models/gpt-6-astra",
     "https://developers.openai.com/api/docs/models/gpt-5.6-sol",
@@ -161,6 +163,14 @@ _GPT_4O_MINI_TRANSCRIBE = _price(1.25, 1.25, 5.0)
 
 
 MODEL_TOKEN_PRICES: dict[str, TokenPrice] = {
+    "gpt-6.2-astra": _price(
+        8.0, 0.40, 40.0, cache_write_multiplier=1.25, long_context_threshold=272_000,
+        long_input_numerator=2, long_output_numerator=3, long_output_denominator=2,
+    ),
+    "gpt-6.2-sol": _price(
+        2.0, 0.10, 10.0, cache_write_multiplier=1.25, long_context_threshold=272_000,
+        long_input_numerator=2, long_output_numerator=3, long_output_denominator=2,
+    ),
     "gpt-6.1-terra": _TERRA_61,
     "gpt-6-astra": _ASTRA,
     "gpt-5.6-sol": _SOL,

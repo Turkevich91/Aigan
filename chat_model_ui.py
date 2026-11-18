@@ -12,7 +12,7 @@ import sqlite3
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Callable
+from typing import Any, Awaitable, Callable
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.error import TelegramError
@@ -22,6 +22,7 @@ from chat_model_settings import (
     SPARK_MODEL,
     ChatModelSettingsStore,
     InvalidModelSelection,
+    ModelCapability,
     StaleSettingsRevision,
     get_model_capability,
     member_duration_limit,
@@ -109,6 +110,7 @@ class _Panel:
     effort: str
     role: str
     member_ceiling: tuple[str, str] | None
+    catalog: tuple[ModelCapability, ...]
     duration_seconds: int | None = 900
     stage: str = "model"
     tool_policy: ChatToolPolicy | None = None
@@ -126,6 +128,7 @@ class ChatModelUI:
         chat_allowed: Callable[[int, str, int], bool],
         is_owner: Callable[[int], bool] = lambda _: False,
         spark_available: Callable[[], bool] = lambda: False,
+        get_catalog: Callable[[], Awaitable[tuple[ModelCapability, ...]]] | None = None,
         clock: Callable[[], float] = time.time,
         delete_commands: bool = True,
         panel_ttl_seconds: int = 900,
@@ -137,6 +140,7 @@ class ChatModelUI:
         self.is_owner = is_owner
         self.chat_allowed = chat_allowed
         self.spark_available = spark_available
+        self.get_catalog = get_catalog
         self.clock = clock
         self.delete_commands = delete_commands
         self.panel_ttl_seconds = max(1, min(int(panel_ttl_seconds), 3600))
@@ -146,6 +150,17 @@ class ChatModelUI:
     def _profile(self, chat_id: int):
         model, effort = self.defaults()
         return self.store.resolve(chat_id, model, effort)
+
+    async def _catalog(self) -> tuple[ModelCapability, ...]:
+        return await self.get_catalog() if self.get_catalog is not None else MODEL_CATALOG
+
+    @staticmethod
+    def _panel_models(catalog: tuple[ModelCapability, ...]) -> tuple[ModelCapability, ...]:
+        # The catalog orders each family newest first. Commands still accept older exact IDs.
+        latest = {}
+        for capability in catalog:
+            latest.setdefault(capability.aliases[0], capability)
+        return tuple(latest.values())
 
     def _role(self, actor_id: int) -> str:
         if self.is_owner(actor_id):
@@ -187,18 +202,17 @@ class ChatModelUI:
             self._panels.pop(oldest, None)
 
     @staticmethod
-    def _draft(profile: Any, ceiling: tuple[str, str] | None) -> tuple[str, str]:
+    def _draft(profile: Any, ceiling: tuple[str, str] | None, catalog: tuple[ModelCapability, ...]) -> tuple[str, str]:
         try:
-            capability = get_model_capability(profile.model)
+            family = get_model_capability(profile.model).aliases[0]
+            capability = get_model_capability(family, catalog)
         except InvalidModelSelection:
-            capability = MODEL_CATALOG[0]
-        if capability is None:
-            capability = MODEL_CATALOG[0]
+            capability = catalog[0]
         effort = profile.reasoning_effort
         if effort not in capability.reasoning_efforts:
             effort = "low" if "low" in capability.reasoning_efforts else capability.reasoning_efforts[0]
         if ceiling is not None and member_duration_limit(capability.model, effort, ceiling) == 0:
-            return ceiling
+            return capability.model, capability.reasoning_efforts[0]
         return capability.model, effort
 
     @staticmethod
@@ -233,6 +247,11 @@ class ChatModelUI:
             lines.append("Зараз діють типові налаштування.")
         updated = datetime.fromtimestamp(self.clock(), timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
         lines.append(f"Стан на {updated}.")
+        if all(cap.model == SPARK_MODEL for cap in panel.catalog) and not self.spark_available():
+            lines.append("Зараз немає доступних моделей для вибору. Спробуй «Оновити» пізніше.")
+            if notice:
+                lines.append(html.escape(notice))
+            return "\n".join(lines)
         if panel.member_ceiling is not None:
             model, effort = panel.member_ceiling
             alias = get_model_capability(model).aliases[0]
@@ -277,18 +296,19 @@ class ChatModelUI:
                          [button("Назад", "b"), button("Оновити", "f"), button("Закрити", "x")]])
             return InlineKeyboardMarkup(rows)
         if panel.stage == "model":
-            for index, capability in enumerate(MODEL_CATALOG):
+            for index, capability in enumerate(panel.catalog):
                 if not any(self._duration_allowed(panel, capability.model, effort, 900)
                            for effort in capability.reasoning_efforts):
                     continue
-                label = capability.aliases[0] if capability.aliases else capability.model
+                label = capability.model
                 if capability.model == SPARK_MODEL:
                     label = "Spark / Qwen · локально, безплатно" if self.spark_available() else "Spark / Qwen · недоступний"
                 rows.append([button(("✓ " if capability.model == panel.model else "") + label, "m", index)])
-            if panel.member_ceiling is not None and member_duration_limit("astra", "low", panel.member_ceiling) == 900:
+            if (panel.member_ceiling is not None and member_duration_limit("astra", "low", panel.member_ceiling) == 900
+                    and any("astra" in cap.aliases for cap in panel.catalog)):
                 rows.append([button("Astra/low · 15 хв", "q")])
         elif panel.stage == "effort":
-            capability = get_model_capability(panel.model)
+            capability = get_model_capability(panel.model, panel.catalog)
             rows = [[button(("✓ " if effort == panel.effort else "") + effort, "e", index)]
                     for index, effort in enumerate(capability.reasoning_efforts)
                     if self._duration_allowed(panel, panel.model, effort, 900)]
@@ -326,12 +346,13 @@ class ChatModelUI:
             parse_mode="HTML", do_quote=False,
         )
 
-    async def _open(self, message: Any, owner_id: int, chat_id: int, role: str) -> None:
+    async def _open(self, message: Any, owner_id: int, chat_id: int, role: str,
+                    catalog: tuple[ModelCapability, ...]) -> None:
         profile = self._profile(chat_id)
         ceiling = self.store.member_ceiling(chat_id) if role == "member" else None
-        model, effort = self._draft(profile, ceiling)
+        model, effort = self._draft(profile, ceiling, catalog)
         panel = _Panel(secrets.token_urlsafe(12), owner_id, chat_id, 0, profile.revision,
-                       0, self.clock() + self.panel_ttl_seconds, model, effort, role, ceiling)
+                       0, self.clock() + self.panel_ttl_seconds, model, effort, role, ceiling, catalog)
         sent = await message.reply_text(
             self._text(panel, profile), reply_markup=self._markup(panel), parse_mode="HTML", do_quote=False,
         )
@@ -360,28 +381,33 @@ class ChatModelUI:
         if self.store is None:
             await self._notice(message, "Зміна моделі зараз недоступна. Типові налаштування залишаються чинними.")
             return True
-        if role == "member" and chat_type != "private" and control.name == "select_model" and control.arguments:
-            current_member = await self._is_current_member(context.bot, chat_id, user_id)
+        open_panel = control.name in {"model", "settings"} and not control.arguments
+        reset = control.name == "select_model" and control.arguments.lower() in {"reset", "default"}
+        select = control.name == "select_model" and bool(control.arguments) and not reset
+        try:
+            if open_panel or select:
+                catalog = await self._catalog()
+            if role == "member" and chat_type != "private" and (select or reset):
+                if not await self._is_current_member(context.bot, chat_id, user_id):
+                    await self._notice(message, "Не вдалося підтвердити участь у цьому чаті.")
+                    return True
             if not self.chat_allowed(chat_id, chat_type, user_id) or self._role(user_id) != role:
                 return True
-            if not current_member:
-                await self._notice(message, "Не вдалося підтвердити участь у цьому чаті.")
-                return True
-        try:
-            if control.name in {"model", "settings"} and not control.arguments:
-                await self._open(message, user_id, chat_id, role)
-            elif control.name == "select_model" and control.arguments.lower() in {"reset", "default"}:
+            if open_panel:
+                await self._open(message, user_id, chat_id, role, self._panel_models(catalog))
+            elif reset:
                 profile = self._profile(chat_id)
                 self.store.reset(chat_id, role=role, default_profile=self.defaults(), expected_revision=profile.revision)
                 await self._notice(message, "Відновлено базовий профіль для всього поточного чату.")
-            elif control.name == "select_model" and control.arguments:
-                selection = parse_model_selection(control.arguments)
+            elif select:
+                selection = parse_model_selection(control.arguments, catalog)
                 if selection.model == SPARK_MODEL and not self.spark_available():
                     await self._notice(message, "Spark / Qwen не налаштований. Обери іншу модель у /model.")
                     return True
                 previous = self._profile(chat_id)
                 profile = self.store.apply(chat_id, selection.model, selection.reasoning_effort,
-                                           selection.duration_seconds, role=role, expected_revision=previous.revision)
+                                           selection.duration_seconds, role=role, expected_revision=previous.revision,
+                                           catalog=catalog)
                 term = "постійно"
                 if profile.expires_at is not None:
                     deadline = datetime.fromtimestamp(profile.expires_at, timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
@@ -439,15 +465,18 @@ class ChatModelUI:
         if (
             panel is None or panel.owner_id != user_id or panel.chat_id != chat_id
             or panel.message_id != getattr(message, "message_id", None)
-            or panel.role != role or panel.expires_at <= self.clock()
+            or panel.role != role or panel.expires_at <= self.clock() or panel.panel_revision != int(revision_text)
         ):
             await self._answer(query, "Панель застаріла або належить іншому учаснику. Відкрий /model.", alert=True)
             return
+        catalog = panel.catalog
+        if option == "-" and ((action == "f" and panel.stage != "tools") or (action == "a" and panel.stage == "confirm")):
+            catalog = await self._catalog()
         if role == "member" and chat_type != "private":
             if not await self._is_current_member(context.bot, chat_id, user_id):
                 await self._answer(query, "Не вдалося підтвердити участь у цьому чаті.", alert=True)
                 return
-        # The membership lookup yields control. Recheck the session and policy before writing.
+        # Membership and catalog reads yield control. Recheck the session before writing.
         if (self._panels.get(nonce) is not panel or panel.panel_revision != int(revision_text)
                 or panel.expires_at <= self.clock() or self._role(user_id) != role
                 or not self.chat_allowed(chat_id, chat_type, user_id)):
@@ -503,15 +532,15 @@ class ChatModelUI:
             elif action == "b" and panel.stage == "tools":
                 panel.stage = "model"
                 panel.settings_revision = profile.revision
-                panel.model, panel.effort = self._draft(profile, panel.member_ceiling)
+                panel.model, panel.effort = self._draft(profile, panel.member_ceiling, panel.catalog)
             elif action == "q" and panel.stage == "model" and panel.member_ceiling is not None:
                 if member_duration_limit("astra", "low", panel.member_ceiling) != 900:
                     raise InvalidModelSelection("invalid_shortcut")
-                panel.model, panel.effort = get_model_capability("astra").model, "low"
+                panel.model, panel.effort = get_model_capability("astra", panel.catalog).model, "low"
                 panel.duration_seconds = 900
                 panel.stage = "confirm"
-            elif action == "m" and panel.stage == "model" and int(option) < len(MODEL_CATALOG):
-                capability = MODEL_CATALOG[int(option)]
+            elif action == "m" and panel.stage == "model" and int(option) < len(panel.catalog):
+                capability = panel.catalog[int(option)]
                 if capability.model == SPARK_MODEL and not self.spark_available():
                     await self._answer(query, "Spark / Qwen не налаштований.", alert=True)
                     return
@@ -525,7 +554,7 @@ class ChatModelUI:
                     panel.duration_seconds = 900
                 panel.stage = "duration" if len(capability.reasoning_efforts) == 1 else "effort"
             elif action == "e" and panel.stage == "effort":
-                efforts = get_model_capability(panel.model).reasoning_efforts
+                efforts = get_model_capability(panel.model, panel.catalog).reasoning_efforts
                 if int(option) >= len(efforts) or not self._duration_allowed(panel, panel.model, efforts[int(option)], 900):
                     raise InvalidModelSelection("invalid_effort_option")
                 panel.effort = efforts[int(option)]
@@ -539,11 +568,15 @@ class ChatModelUI:
                 panel.duration_seconds = seconds
                 panel.stage = "confirm"
             elif action == "a" and panel.stage == "confirm":
+                if not any(capability.model == panel.model for capability in catalog):
+                    await self._answer(query, "Цієї моделі вже немає у списку. Натисни «Оновити».", alert=True)
+                    return
                 if panel.model == SPARK_MODEL and not self.spark_available():
                     await self._answer(query, "Spark / Qwen не налаштований.", alert=True)
                     return
                 profile = self.store.apply(chat_id, panel.model, panel.effort, panel.duration_seconds,
-                                           role=role, expected_revision=panel.settings_revision)
+                                           role=role, expected_revision=panel.settings_revision, catalog=catalog)
+                panel.catalog = self._panel_models(catalog)
                 panel.settings_revision = profile.revision
                 panel.stage = "model"
                 notice = "Збережено. Нові відповіді використовуватимуть цей вибір."
@@ -551,13 +584,14 @@ class ChatModelUI:
                 self.store.reset(chat_id, role=role, default_profile=self.defaults(), expected_revision=panel.settings_revision)
                 profile = self._profile(chat_id)
                 panel.settings_revision = profile.revision
-                panel.model, panel.effort = self._draft(profile, panel.member_ceiling)
+                panel.model, panel.effort = self._draft(profile, panel.member_ceiling, panel.catalog)
                 panel.duration_seconds = 900
                 panel.stage = "model"
                 notice = "Відновлено базовий профіль чату."
             elif action == "f":
+                panel.catalog = self._panel_models(catalog)
                 panel.settings_revision = profile.revision
-                panel.model, panel.effort = self._draft(profile, panel.member_ceiling)
+                panel.model, panel.effort = self._draft(profile, panel.member_ceiling, panel.catalog)
                 panel.duration_seconds = 900
                 panel.stage = "model"
             elif action == "b" and panel.stage != "model":

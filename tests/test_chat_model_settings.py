@@ -15,6 +15,7 @@ from chat_model_settings import (
     MAX_DURATION_SECONDS,
     MODEL_CATALOG,
     StaleSettingsRevision,
+    catalog_from_provider_ids,
     get_model_capability,
     parse_duration,
     parse_model_selection,
@@ -23,6 +24,21 @@ from chat_model_settings import (
 
 
 class ModelSelectionTests(unittest.TestCase):
+    def test_discovered_versions_have_numeric_order_scoped_aliases_and_exact_ids(self):
+        catalog = catalog_from_provider_ids([
+            "gpt-6.2-sol", "gpt-6-astra", "gpt-6.10-sol", "gpt-6.2-astra", "gpt-6.10-sol",
+            "gpt-6.2-sol-2026-11-17", "gpt-6.2-sol-preview", "gpt-6.2-sol-pro", "gpt-5.6-sol",
+            "gpt-6.2-audio", "gpt-6.2-spark", "text-embedding", "gpt-6.02-astra",
+        ])
+        self.assertEqual([c.model for c in catalog], [
+            "gpt-6.2-astra", "gpt-6-astra", "gpt-6.10-sol", "gpt-6.2-sol", "spark-qwen",
+        ])
+        self.assertEqual("gpt-6.10-sol", parse_model_selection("sol-mid persistent", catalog).model)
+        self.assertEqual("gpt-6.2-sol", parse_model_selection("gpt-6.2-sol mid 1m", catalog).model)
+        for missing in ("terra", "gpt-6.1-sol", "gpt-9-sol"):
+            with self.subTest(missing=missing), self.assertRaises(InvalidModelSelection):
+                parse_model_selection(missing, catalog)
+
     def test_catalog_and_reasoning_are_explicit(self):
         self.assertEqual(["astra", "sol", "terra", "luna", "spark"], [entry.aliases[0] for entry in MODEL_CATALOG])
         self.assertTrue(all(entry.supports_images for entry in MODEL_CATALOG[:-1]))
@@ -141,6 +157,24 @@ class ChatSettingsStoreTests(unittest.TestCase):
         self.assertTrue(profile.overridden)
         self.assertEqual("none", profile.reasoning_effort)
         self.assertIsNone(profile.expires_at)
+
+    def test_new_catalog_preserves_pinned_ids_and_family_ceiling_across_refresh_and_restart(self):
+        catalog = catalog_from_provider_ids(["gpt-6.2-astra", "gpt-6.2-sol"])
+        self.store.apply(-1001, "sol", "medium", role="member", catalog=catalog)
+        self.store.apply(-1001, "astra", "low", 60, role="member", catalog=catalog)
+        fresh = catalog_from_provider_ids(["gpt-6.3-astra", "gpt-6.3-sol"])
+        restarted = ChatModelSettingsStore(self.path, clock=lambda: self.now)
+        self.assertEqual("gpt-6.2-astra", restarted.resolve(-1001, "default", "medium").model)
+        self.now += 60
+        restored = restarted.resolve(-1001, "default", "medium")
+        self.assertEqual(("gpt-6.2-sol", None), (restored.model, restored.expires_at))
+        for model, effort in (("gpt-6.2-sol", "medium"), ("gpt-6.3-sol", "max"), ("astra", "low")):
+            with self.subTest(model=model, effort=effort), self.assertRaises(InvalidModelSelection):
+                restarted.apply(-1001, model, effort, role="member", catalog=fresh)
+        restarted.apply(-1001, "gpt-6.3-astra", "high", role="owner", catalog=fresh)
+        restarted.apply(-1001, "sol", "low", role="member", catalog=fresh)
+        selected = restarted.apply(-1001, "astra", "high", role="member", catalog=fresh)
+        self.assertEqual(("gpt-6.3-astra", None), (selected.model, selected.expires_at))
 
     def test_invalid_request_never_changes_selection(self):
         self.store.apply(-1001, "astra", "low", 60)
