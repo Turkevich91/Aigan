@@ -7057,17 +7057,36 @@ def cooldown_left(message: Message) -> int:
         return 0
 
     now = time.monotonic()
+    chat_call = last_chat_call.get(message.chat_id, 0)
+    user_call = last_user_call.get(user.id, 0) if user else 0
+    for (chat, _), window in detached_transcripts.items():
+        if chat != message.chat_id or window.cooldown_charge is None:
+            continue
+        stamp, previous_chat, previous_user = window.cooldown_charge
+        # Only discount the waiting request's own charge. The next admitted
+        # request spends this handoff when it records its own cooldown below.
+        if chat_call == stamp:
+            chat_call = previous_chat
+        if user and user.id == window.message.from_user.id and user_call == stamp:
+            user_call = previous_user
     if user:
-        left = CONFIG.user_cooldown_seconds - int(now - last_user_call.get(user.id, 0))
+        left = CONFIG.user_cooldown_seconds - int(now - user_call)
         if left > 0:
             return left
 
-    left = CONFIG.chat_cooldown_seconds - int(now - last_chat_call.get(message.chat_id, 0))
+    left = CONFIG.chat_cooldown_seconds - int(now - chat_call)
     return max(left, 0)
 
 
 def mark_cooldown(message: Message) -> None:
     now = time.monotonic()
+    for (chat, _), window in detached_transcripts.items():
+        if chat == message.chat_id:
+            window.cooldown_charge = None
+    window = ACTIVE_TRANSCRIPT_READ.get()
+    if window is not None and message.from_user:
+        window.cooldown_charge = (now, last_chat_call.get(message.chat_id, 0),
+                                  last_user_call.get(message.from_user.id, 0))
     if message.from_user:
         last_user_call[message.from_user.id] = now
     last_chat_call[message.chat_id] = now
@@ -7189,7 +7208,8 @@ def duplicate_prompt_reason(message: Message, prompt: str, *, exact_only: bool =
         return ""
     now = time.monotonic()
     prune_recent_chat_answers(message.chat_id, now)
-    records = recent_chat_answers.get(message.chat_id)
+    records = [*recent_chat_answers.get(message.chat_id, ()),
+               *(window.record for (chat, _), window in detached_transcripts.items() if chat == message.chat_id)]
     if not records:
         return ""
 
@@ -7236,22 +7256,24 @@ def should_suppress_duplicate_prompt(
     return True
 
 
+def chat_answer_record(message: Message, prompt: str, route: str) -> ChatAnswerRecord:
+    return ChatAnswerRecord(
+        prompt=(prompt if len(prompt) <= 10000 else "") if route == "randomizer" else clip_text(prompt, 500),
+        exact_prompt_digest=hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
+        normalized_prompt=normalize_prompt_for_dedupe(prompt),
+        tokens=prompt_dedupe_tokens(prompt),
+        route=route,
+        context_signature=context_signature_for_dedupe(message),
+        context_dependent=is_context_dependent_request(prompt),
+        created_at=time.monotonic(),
+    )
+
+
 def record_chat_answer(message: Message, prompt: str, route: str) -> None:
     if not CONFIG.chat_inflight_guard_enabled or CONFIG.chat_duplicate_suppress_seconds <= 0:
         return
     prune_recent_chat_answers(message.chat_id)
-    recent_chat_answers[message.chat_id].append(
-        ChatAnswerRecord(
-            prompt=(prompt if len(prompt) <= 10000 else "") if route == "randomizer" else clip_text(prompt, 500),
-            exact_prompt_digest=hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
-            normalized_prompt=normalize_prompt_for_dedupe(prompt),
-            tokens=prompt_dedupe_tokens(prompt),
-            route=route,
-            context_signature=context_signature_for_dedupe(message),
-            context_dependent=is_context_dependent_request(prompt),
-            created_at=time.monotonic(),
-        )
-    )
+    recent_chat_answers[message.chat_id].append(chat_answer_record(message, prompt, route))
 
 
 def format_history(chat_id: int) -> str:
@@ -7837,6 +7859,11 @@ async def run_agent(
         failure_error_function=mcp_tool_failure_message,
     )
 
+    # Reminder tools can mutate persistent state inside the SDK loop. Such a
+    # run keeps its slot even if it also makes a transcript request.
+    read_window = ACTIVE_TRANSCRIPT_READ.get() if reminder_tool_context is None and REMINDER_TOOL_CONTEXT.get() is None else None
+    if read_window is not None:
+        youtube_server.on_transcript_read = read_window.release
     token = REMINDER_TOOL_CONTEXT.set(reminder_tool_context) if reminder_tool_context is not None else None
     listed_ids_token = REMINDER_TOOL_LISTED_IDS.set(set()) if reminder_tool_context is not None else None
     mutations_token = (
@@ -7938,6 +7965,10 @@ async def run_agent(
             REMINDER_TOOL_LISTED_IDS.reset(listed_ids_token)
         if token is not None:
             REMINDER_TOOL_CONTEXT.reset(token)
+        if read_window is not None:
+            # Resume serialization before returning an SDK result to its
+            # caller, including image proposals and final Telegram delivery.
+            await read_window.resume()
     system_event(
         component="agent",
         event_type="run_end",
@@ -14340,12 +14371,14 @@ def schedule_background_task(context: ContextTypes.DEFAULT_TYPE, coro: Any) -> A
     # Background work must resolve its own chat selection when it is admitted.
     # ContextVar propagation is retained for awaited work and asyncio.to_thread.
     token = ACTIVE_CHAT_MODEL.set(None)
+    read_token = ACTIVE_TRANSCRIPT_READ.set(None)
     try:
         application = getattr(context, "application", None)
         if application is not None and hasattr(application, "create_task"):
             return application.create_task(coro)
         return asyncio.create_task(coro)
     finally:
+        ACTIVE_TRANSCRIPT_READ.reset(read_token)
         ACTIVE_CHAT_MODEL.reset(token)
 
 
@@ -14614,33 +14647,101 @@ async def handle_prompt(
 
 
 video_jobs: set[tuple[int, int]] = set()
+detached_transcripts: dict[tuple[int, int], "TranscriptReadWindow"] = {}
+
+
+class TranscriptReadWindow:
+    """One admitted turn may release its chat slot during a read-only SDK run."""
+
+    def __init__(self, message, prompt, lock):
+        self.message = message
+        self.prompt = prompt
+        self.key = (message.chat_id, message.message_id)
+        self.lock = lock
+        self.owns_lock = False
+        self.cooldown_charge = None
+        self.record = None
+        self.released = asyncio.get_running_loop().create_future()
+
+    async def acquire(self):
+        if self.lock is not None and not self.owns_lock:
+            await self.lock.acquire()
+            self.owns_lock = True
+
+    def unlock(self):
+        if self.owns_lock:
+            self.lock.release()
+            self.owns_lock = False
+
+    def release(self) -> bool:
+        if self.released.done():
+            return True
+        if len(detached_transcripts) >= 3:
+            return False
+        self.record = chat_answer_record(self.message, self.prompt, "youtube_read")
+        detached_transcripts[self.key] = self
+        self.unlock()
+        self.released.set_result(None)
+        return True
+
+    async def resume(self):
+        # A parent deadline may cancel the SDK while another turn owns the
+        # slot. Restore ownership before its timeout handler can issue a reply.
+        cancelled = False
+        while self.released.done() and self.lock is not None and not self.owns_lock:
+            try:
+                await self.acquire()
+            except asyncio.CancelledError:
+                cancelled = True
+        if cancelled:
+            raise asyncio.CancelledError
+
+
+ACTIVE_TRANSCRIPT_READ: contextvars.ContextVar[TranscriptReadWindow | None] = contextvars.ContextVar(
+    "active_transcript_read", default=None)
 
 
 async def run_admitted_prompt(message, context, prompt, allow_pending_wait, assembled_turn, turn_context_messages):
-    if CONFIG.chat_inflight_guard_enabled:
-        if not assembled_turn and should_suppress_duplicate_prompt(message, prompt, "before_lock"):
-            return
-        lock = chat_generation_lock(message.chat_id)
-        waited_for_generation = lock.locked()
-        async with lock:
-            if not assembled_turn and should_suppress_duplicate_prompt(message, prompt, "after_lock"):
+    lock = chat_generation_lock(message.chat_id) if CONFIG.chat_inflight_guard_enabled else None
+    window = TranscriptReadWindow(message, prompt, lock)
+    if window.key in detached_transcripts or (
+        lock is not None and not assembled_turn and should_suppress_duplicate_prompt(message, prompt, "before_lock")
+    ):
+        return
+    async def generate():
+        token = ACTIVE_TRANSCRIPT_READ.set(window)
+        try:
+            waited = bool(lock and lock.locked())
+            await window.acquire()
+            if lock is not None and not assembled_turn and should_suppress_duplicate_prompt(message, prompt, "after_lock"):
                 return
             if assembled_turn:
-                await handle_prompt_generation(
-                    message, context, prompt, allow_pending_wait, True,
-                    turn_context_messages=turn_context_messages,
-                )
+                await handle_prompt_generation(message, context, prompt, allow_pending_wait, True,
+                                             turn_context_messages=turn_context_messages)
+            elif lock is not None:
+                await handle_prompt_generation(message, context, prompt, allow_pending_wait, waited)
             else:
-                await handle_prompt_generation(message, context, prompt, allow_pending_wait, waited_for_generation)
-        return
+                await handle_prompt_generation(message, context, prompt, allow_pending_wait, skip_cooldown=waited)
+        finally:
+            if window.released.done():
+                detached_transcripts.pop(window.key, None)
+            window.unlock()
+            ACTIVE_TRANSCRIPT_READ.reset(token)
 
-    if assembled_turn:
-        await handle_prompt_generation(
-            message, context, prompt, allow_pending_wait, True,
-            turn_context_messages=turn_context_messages,
-        )
-    else:
-        await handle_prompt_generation(message, context, prompt, allow_pending_wait, skip_cooldown=False)
+    task = asyncio.create_task(generate())
+    try:
+        await asyncio.wait((task, window.released), return_when=asyncio.FIRST_COMPLETED)
+        if task.done():
+            await task
+        else:
+            # PTB drains this same generation at stop, including final delivery.
+            async def complete():
+                await task
+            track_telegram_turn_task(context, complete())
+    except asyncio.CancelledError:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        raise
 
 
 async def reject_disabled_randomizer(message: Message) -> bool:

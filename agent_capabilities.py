@@ -29,6 +29,7 @@ class ChatToolMCPServer(MCPServerStdio):
 
     _groups = {"web": "web", "youtube_transcript": "youtube"}
     _tool_names = {"web": {"search_web", "fetch_url"}, "youtube_transcript": {"get_youtube_transcript"}}
+    on_transcript_read = None
 
     async def list_tools(self, run_context=None, agent=None):
         group = self._groups.get(self.name)
@@ -43,6 +44,10 @@ class ChatToolMCPServer(MCPServerStdio):
                 or not tool_allowed(group, before_call=True)):
             return CallToolResult(isError=True, content=[
                 TextContent(type="text", text="Tool unavailable: disabled_in_chat"),
+            ])
+        if group == "youtube" and self.on_transcript_read is not None and not self.on_transcript_read():
+            return CallToolResult(isError=True, content=[
+                TextContent(type="text", text="Transcript service is busy. Please try again shortly."),
             ])
         return await super().call_tool(tool_name, arguments, meta)
 
