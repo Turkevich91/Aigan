@@ -61,6 +61,10 @@ class ChatModelRuntimeTests(unittest.IsolatedAsyncioTestCase):
             async_cloud.assert_not_called()
 
     async def test_chat_media_selection_reaches_only_its_provider_role(self):
+        with patch.object(main, "CHAT_MODEL_SETTINGS", None):
+            for settings in (main.photo_summary_settings, main.video_answer_settings):
+                with self.assertRaises(main.ChatModelSettingsUnavailable):
+                    settings(-1001)
         for key, model in (("youtube", "gpt-transcribe"), ("photo", "gpt-6.1-terra"), ("video", "gpt-6.1-sol")):
             self.store.set_media_model(-1001, key, model, role="admin", available=(model,), expected_revision=0)
         with patch.dict(os.environ, YOUTUBE_AUDIO_FALLBACK="true", YOUTUBE_TRANSCRIPTION_MODEL="gpt-4o-mini-transcribe"):

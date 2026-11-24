@@ -1252,12 +1252,16 @@ def media_default_model(tool: str) -> str:
 
 
 def photo_summary_settings(chat_id: int) -> tuple[str, str]:
-    model = CHAT_MODEL_SETTINGS.media_selection(chat_id, "photo")[0] if CHAT_MODEL_SETTINGS else None
+    if CHAT_MODEL_SETTINGS is None:
+        raise ChatModelSettingsUnavailable("chat_model_settings_unavailable")
+    model, _ = CHAT_MODEL_SETTINGS.media_selection(chat_id, "photo")
     return (model, media_effort(model)) if model else (CONFIG.vision_background_model, CONFIG.vision_background_reasoning_effort)
 
 
 def video_answer_settings(chat_id: int) -> tuple[str, str]:
-    selected = CHAT_MODEL_SETTINGS.media_selection(chat_id, "video")[0] if CHAT_MODEL_SETTINGS else None
+    if CHAT_MODEL_SETTINGS is None:
+        raise ChatModelSettingsUnavailable("chat_model_settings_unavailable")
+    selected, _ = CHAT_MODEL_SETTINGS.media_selection(chat_id, "video")
     model = selected or media_default_model("video")
     return model, media_effort(model)
 
@@ -8264,6 +8268,7 @@ Request and Telegram context:
     try:
         response = client.responses.create(
             model=model,
+            store=False,
             input=[{"role": "user", "content": content}],
             reasoning={"effort": reasoning_effort},
             max_output_tokens=CONFIG.max_output_tokens,

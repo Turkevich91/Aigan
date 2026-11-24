@@ -563,6 +563,8 @@ class ChatModelUI:
                 if action == "b":
                     panel.stage = "media" if panel.stage == "media_models" else "model"
                     panel.settings_revision = profile.revision
+                    if panel.stage == "model":
+                        panel.model, panel.effort = self._draft(profile, panel.member_ceiling, panel.catalog)
                 elif action == "f" and panel.stage == "media":
                     pass
                 elif (action == "i" and panel.stage == "media" and int(option) < len(MEDIA_TOOL_LABELS)
