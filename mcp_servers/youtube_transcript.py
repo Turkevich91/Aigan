@@ -1,9 +1,7 @@
 import os
-import re
 import sys
 import tempfile
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
 
 if __package__ in {None, ""}:
     # MCPServerStdio executes this file directly, so expose the project modules.
@@ -11,10 +9,16 @@ if __package__ in {None, ""}:
 
 from mcp.server.fastmcp import FastMCP
 from model_telemetry import ModelTelemetryStore, StageHandle
-from youtube_transcript_api import YouTubeTranscriptApi
+from provenance import canonical_source
+from youtube_transcript_api import NoTranscriptFound, TranscriptsDisabled, YouTubeTranscriptApi
 
 
 mcp = FastMCP("aigan-youtube-transcript")
+MAX_AUDIO_BYTES = 25_000_000
+
+
+class AudioFallbackUnavailable(Exception):
+    """A bounded reason why this video cannot be transcribed."""
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -92,27 +96,9 @@ def _finish_transcription_stage(
 
 
 def _video_id(value: str) -> str:
-    value = value.strip()
-    if re.fullmatch(r"[A-Za-z0-9_-]{11}", value):
-        return value
-
-    parsed = urlparse(value)
-    host = parsed.netloc.lower()
-    path = parsed.path.strip("/")
-
-    if host.endswith("youtu.be") and path:
-        return path.split("/")[0]
-    if "youtube.com" in host:
-        query_id = parse_qs(parsed.query).get("v", [""])[0]
-        if query_id:
-            return query_id
-        parts = path.split("/")
-        for marker in ("shorts", "embed", "live"):
-            if marker in parts:
-                index = parts.index(marker)
-                if len(parts) > index + 1:
-                    return parts[index + 1]
-
+    video_id = canonical_source("get_youtube_transcript", {"video": value})
+    if video_id:
+        return video_id
     raise ValueError("Could not extract YouTube video id")
 
 
@@ -132,12 +118,16 @@ def _format_entries(entries: list[dict], include_timestamps: bool, max_chars: in
 
 
 def _fetch_caption_transcript(video_id: str, languages: list[str]) -> list[dict]:
-    try:
-        return YouTubeTranscriptApi.get_transcript(video_id, languages=languages)
-    except AttributeError:
-        api = YouTubeTranscriptApi()
-        fetched = api.fetch(video_id, languages=languages)
-        return fetched.to_raw_data()
+    tracks = YouTubeTranscriptApi().list(video_id)
+    # A manual en-US track is also usable when the caller requests en.
+    regional_codes = [
+        track.language_code
+        for lang in languages
+        for track in tracks
+        if track.language_code.casefold().startswith(lang.casefold() + "-")
+    ]
+    track = tracks.find_transcript(languages + regional_codes)
+    return track.fetch().to_raw_data()
 
 
 def _audio_fallback_enabled() -> bool:
@@ -149,38 +139,42 @@ def _transcribe_audio_fallback(video_url: str, max_chars: int) -> str:
     from yt_dlp import YoutubeDL
 
     max_duration = int(os.getenv("YOUTUBE_MAX_DURATION_SECONDS", "1200"))
-    model = os.getenv("YOUTUBE_TRANSCRIPTION_MODEL", "gpt-4o-mini-transcribe")
+    model = os.getenv("YOUTUBE_TRANSCRIPTION_MODEL", "gpt-transcribe")
+
+    def require_bounded_video(info, *, incomplete):
+        if incomplete:
+            return
+        duration = info.get("duration")
+        within_limit = isinstance(duration, (float, int)) and 0 < duration <= max_duration
+        if info.get("is_live") or not within_limit:
+            raise AudioFallbackUnavailable(
+                f"Audio requires a completed video with a known duration up to {max_duration}s."
+            )
 
     with tempfile.TemporaryDirectory() as tmp:
         tmp_path = Path(tmp)
-        with YoutubeDL({"quiet": True, "noplaylist": True}) as ydl:
-            info = ydl.extract_info(video_url, download=False)
-            duration = int(info.get("duration") or 0)
-            if duration > max_duration:
-                return (
-                    f"Video is {duration}s long, over YOUTUBE_MAX_DURATION_SECONDS={max_duration}. "
-                    "Refusing audio transcription."
-                )
-
         output_template = str(tmp_path / "audio.%(ext)s")
         options = {
             "format": "bestaudio/best",
             "outtmpl": output_template,
             "noplaylist": True,
             "quiet": True,
+            "noprogress": True,
+            "match_filter": require_bounded_video,
+            "max_filesize": MAX_AUDIO_BYTES,
             "postprocessors": [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3"}],
         }
         with YoutubeDL(options) as ydl:
             ydl.download([video_url])
 
-        audio_files = list(tmp_path.glob("audio.*"))
-        if not audio_files:
-            return "Audio download finished, but no audio file was found."
+        audio = tmp_path / "audio.mp3"
+        if not audio.is_file() or not 0 < audio.stat().st_size <= MAX_AUDIO_BYTES:
+            raise AudioFallbackUnavailable("No complete audio file within the upload size limit was available.")
 
         client = OpenAI()
         stage = _begin_transcription_stage(model)
         try:
-            with audio_files[0].open("rb") as audio_file:
+            with audio.open("rb") as audio_file:
                 result = client.audio.transcriptions.create(model=model, file=audio_file)
         except Exception as exc:
             _finish_transcription_stage(
@@ -194,7 +188,9 @@ def _transcribe_audio_fallback(video_url: str, max_chars: int) -> str:
             status="succeeded",
             usage=getattr(result, "usage", None),
         )
-        text = getattr(result, "text", str(result))
+        text = getattr(result, "text", None)
+        if not isinstance(text, str) or not text.strip():
+            raise AudioFallbackUnavailable("No speech was transcribed.")
         return text[:max_chars]
 
 
@@ -225,15 +221,15 @@ def get_youtube_transcript(
                 "Transcript/captions. If the transcript is Russian, summarize or explain it in Ukrainian, not Russian:\n\n"
                 f"{transcript}"
             )
-        return "Transcript was fetched but contained no text."
+    except (TranscriptsDisabled, NoTranscriptFound):
+        pass
     except Exception as exc:
-        if not _audio_fallback_enabled():
-            return (
-                f"No caption transcript available for {video_id}: {type(exc).__name__}: {exc}\n"
-                "Audio fallback is disabled. Set YOUTUBE_AUDIO_FALLBACK=true to use OpenAI transcription."
-            )
+        return f"Caption lookup failed for {video_id}: {type(exc).__name__}."
 
-    video_url = video if video.startswith("http") else f"https://www.youtube.com/watch?v={video_id}"
+    if not _audio_fallback_enabled():
+        return f"No caption transcript available for {video_id}. Audio fallback is disabled."
+
+    video_url = f"https://www.youtube.com/watch?v={video_id}"
     try:
         transcript = _transcribe_audio_fallback(video_url, max_chars)
         return (
@@ -241,8 +237,10 @@ def get_youtube_transcript(
             "Audio transcription. If the transcription is Russian, summarize or explain it in Ukrainian, not Russian:\n\n"
             f"{transcript}"
         )
+    except AudioFallbackUnavailable as exc:
+        return f"Audio transcription unavailable for {video_id}: {exc}"
     except Exception as exc:
-        return f"Audio transcription failed for {video_id}: {type(exc).__name__}: {exc}"
+        return f"Audio transcription failed for {video_id}: {type(exc).__name__}."
 
 
 if __name__ == "__main__":
