@@ -1,3 +1,4 @@
+import logging
 import os
 import sys
 import tempfile
@@ -15,6 +16,9 @@ from youtube_transcript_api import NoTranscriptFound, TranscriptsDisabled, YouTu
 
 mcp = FastMCP("aigan-youtube-transcript")
 MAX_AUDIO_BYTES = 25_000_000
+# yt-dlp can log source URLs and media details even when running quietly.
+DOWNLOADER_LOG = logging.Logger("aigan.youtube.downloader")
+DOWNLOADER_LOG.disabled = True
 
 
 class AudioFallbackUnavailable(Exception):
@@ -160,6 +164,7 @@ def _transcribe_audio_fallback(video_url: str, max_chars: int) -> str:
             "noplaylist": True,
             "quiet": True,
             "noprogress": True,
+            "logger": DOWNLOADER_LOG,
             "match_filter": require_bounded_video,
             "max_filesize": MAX_AUDIO_BYTES,
             "postprocessors": [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3"}],

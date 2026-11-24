@@ -1,3 +1,5 @@
+import contextlib
+import io
 import os
 import subprocess
 import sys
@@ -63,6 +65,30 @@ class ExplodingTelemetry:
 
 
 class YoutubeTranscriptTelemetryTests(unittest.TestCase):
+    def test_downloader_diagnostics_remain_private(self):
+        marker = "synthetic downloader detail"
+        modules = fake_dependency_modules()
+
+        def fail_download(downloader, _urls):
+            logger = downloader.options["logger"]
+            logger.debug(marker)
+            logger.warning(marker)
+            logger.error(marker)
+            raise RuntimeError(marker)
+
+        with (
+            patch.dict(sys.modules, modules),
+            patch.dict(os.environ, {"YOUTUBE_AUDIO_FALLBACK": "true"}),
+            patch.object(modules["yt_dlp"].YoutubeDL, "download", fail_download),
+            patch.object(youtube_transcript, "_fetch_caption_transcript", return_value=[]),
+            contextlib.redirect_stderr(io.StringIO()) as err,
+            contextlib.redirect_stdout(io.StringIO()) as out,
+        ):
+            result = youtube_transcript.get_youtube_transcript("abcdefghijk")
+        self.assertEqual("Audio transcription failed for abcdefghijk: RuntimeError.", result)
+        self.assertEqual("", out.getvalue())
+        self.assertEqual("", err.getvalue())
+
     def test_regional_captions_need_one_listing_and_no_audio(self):
         tracks = MagicMock()
         regional = SimpleNamespace(language_code="en-US")
