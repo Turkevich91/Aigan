@@ -149,6 +149,7 @@ class TelegramVideoTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(main, "video_answer_settings", create=True) as select:
             for kind, text in (("supergroup", "what happens here?"), ("private", "")):
                 msg = FakeMessage(text, chat_type=kind)
+                msg.from_user.id = 1234
                 msg.video = self.attachment
                 context = SimpleNamespace(bot=SimpleNamespace(id=999, username="aigan"))
                 with patch.object(main, "remember_message_persistently", new=AsyncMock()):
@@ -156,19 +157,72 @@ class TelegramVideoTests(unittest.IsolatedAsyncioTestCase):
             select.assert_not_called()
             self.attachment.get_file.assert_not_awaited()
 
+    async def test_explicit_non_admin_group_video_request_respects_chat_allowlist(self):
+        context = SimpleNamespace(bot=SimpleNamespace(id=999, username="aigan"))
+        inspect = AsyncMock(return_value=True)
+        with patch.object(main, "video_answer_settings", create=True, return_value=self.profile), \
+             patch.object(main, "BOT_USERNAME", "aigan"), patch.object(main, "respond_to_video_request", inspect), \
+             patch.object(main, "remember_message_persistently", new=AsyncMock()):
+            for chat in (-1001, -1002):
+                msg = FakeMessage("", chat_type="supergroup", chat_id=chat)
+                msg.from_user.id = 1234
+                msg.caption = "@aigan опиши відео"
+                msg.video = self.attachment
+                await main.text_message(SimpleNamespace(effective_message=msg), context)
+                await asyncio.gather(*main.telegram_turn_tasks)
+        inspect.assert_awaited_once()
+        self.assertEqual(inspect.await_args.args[0].chat_id, -1001)
+        self.assertEqual(inspect.await_args.args[1], "опиши відео")
+
     async def test_provider_receives_only_request_before_routing_and_never_downloads_unrelated_clip(self):
         client = MagicMock()
         client.__aenter__.return_value = client
         client.responses.create = AsyncMock(return_value=SimpleNamespace(
             output_text='{"inspect":"unrelated"}', status="completed"))
-        with patch.object(main, "AsyncOpenAI", return_value=client):
+        with patch.object(main, "AsyncOpenAI", return_value=client), patch.object(main, "activity_presence_for_message") as presence:
             self.assertFalse(await main.respond_to_video_request(
                 FakeMessage(), "What is twelve times three?", self.attachment, self.profile))
+        presence.assert_not_called()
         kwargs = client.responses.create.await_args.kwargs
         self.assertEqual((kwargs["model"], kwargs["reasoning"]["effort"]), self.profile)
         self.assertIsInstance(kwargs["input"], str)
         self.assertFalse(kwargs["store"])
         self.attachment.get_file.assert_not_awaited()
+
+    async def test_accepted_video_presence_stops_on_success_failure_and_cancellation(self):
+        for outcome in ("success", "failure", "cancel"):
+            with self.subTest(outcome=outcome):
+                msg = FakeMessage("Describe this clip.")
+                client = MagicMock()
+                client.__aenter__.return_value = client
+                client.responses.create = AsyncMock(return_value=SimpleNamespace(
+                    output_text='{"inspect":"frames"}', status="completed"))
+                presence = SimpleNamespace(start=AsyncMock(), stop=AsyncMock())
+                async def inspect(*args, **kwargs):
+                    presence.start.assert_awaited_once()
+                    presence.stop.assert_not_awaited()
+                    if outcome == "cancel":
+                        raise asyncio.CancelledError()
+                    if outcome == "failure":
+                        raise VideoUnavailable("Не вдалося прочитати відео.")
+                    return "Видно два кольори."
+                async def deliver(*args, **kwargs):
+                    presence.stop.assert_awaited_once()
+                    return SimpleNamespace(delivered_chunks=())
+                with patch.object(main, "AsyncOpenAI", return_value=client), \
+                     patch.object(main, "activity_presence_for_message", return_value=presence) as factory, \
+                     patch.object(main, "inspect_clip", side_effect=inspect), \
+                     patch.object(main, "send_reply", side_effect=deliver) as delivery:
+                    work = main.respond_to_video_request(msg, msg.text, self.attachment, self.profile)
+                    if outcome == "cancel":
+                        with self.assertRaises(asyncio.CancelledError):
+                            await work
+                        delivery.assert_not_awaited()
+                    else:
+                        self.assertTrue(await work)
+                        delivery.assert_awaited_once()
+                    factory.assert_called_once_with(msg, action=main.ChatAction.TYPING)
+                    presence.stop.assert_awaited_once()
 
     async def test_oversize_rejected_before_download(self):
         self.attachment.file_size = 25_000_000

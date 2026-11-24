@@ -14697,10 +14697,15 @@ async def respond_to_video_request(message, prompt, attachment, settings) -> boo
                 return False
             ACTIVE_MODEL_ROUTE_BUCKET.set("telegram_video")
             histories[message.chat_id].append(f"{user_label(message)}: {prompt[:500]}")
-            response = await inspect_clip(attachment, request=prompt, mode=decision,
-                adapter=runtime_media_frame_adapter(), max_bytes=CONFIG.media_frame_max_bytes,
-                max_duration=min(CONFIG.media_frame_max_duration_seconds, 180),
-                ffmpeg=CONFIG.media_frame_ffmpeg_path, answer=answer, transcribe=transcribe)
+            presence = activity_presence_for_message(message, action=ChatAction.TYPING)
+            try:
+                await presence.start()
+                response = await inspect_clip(attachment, request=prompt, mode=decision,
+                    adapter=runtime_media_frame_adapter(), max_bytes=CONFIG.media_frame_max_bytes,
+                    max_duration=min(CONFIG.media_frame_max_duration_seconds, 180),
+                    ffmpeg=CONFIG.media_frame_ffmpeg_path, answer=answer, transcribe=transcribe)
+            finally:
+                await presence.stop()
     except VideoUnavailable as exc:
         response = str(exc)
     except Exception as exc:
