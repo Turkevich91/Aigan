@@ -135,6 +135,9 @@ from media_acquisition import (
     YtDlpMediaAcquisitionAdapter,
 )
 from media_frames import FfmpegMediaFrameAdapter, MediaFrameAdapter, MediaFrameLimits, NullMediaFrameAdapter
+from telegram_video import (
+    VIDEO_ANSWER_INSTRUCTIONS, VIDEO_INTENT_FORMAT, VIDEO_INTENT_INSTRUCTIONS, VideoUnavailable, inspect_clip,
+)
 from runtime_model_pricing import PRICE_SNAPSHOT_VERSION, token_price_for_model
 from model_routing import (
     MODEL_POLICY_ROUTER_SYSTEM_PROMPT,
@@ -14537,6 +14540,50 @@ async def handle_prompt(
         await message.reply_text("Занадто довго. Надішли коротшу версію.")
         return
 
+    # Only this admitted, authored request can select the current attachment
+    # or direct reply. Never scan history, external replies or passive posts.
+    clip = None
+    if (CONFIG.media_frame_extraction_enabled and prompt.strip() and prompt != DEFAULT_CONTEXT_PROMPT
+            and message.from_user is not None and not message.from_user.is_bot
+            and (assembled_turn or not (is_forwarded_message(message) or is_generated_or_channel_sender(message)))):
+        clip = visual_media_file_ref_from(message) or visual_media_file_ref_from(getattr(message, "reply_to_message", None))
+    if clip is not None:
+        job = (message.chat_id, message.message_id)
+        if job in video_jobs:
+            return
+        if len(video_jobs) >= 3:
+            await message.reply_text("Обробляю інші відеозапити. Спробуй трохи пізніше.")
+            return
+        video_jobs.add(job)
+        try:
+            settings = video_answer_settings(message.chat_id)
+        except Exception:
+            video_jobs.discard(job)
+            await notify_model_settings_unavailable(message)
+            return
+
+        async def process_clip_request():
+            token = ACTIVE_VIDEO_REQUEST.set((clip[0], settings))
+            try:
+                await run_admitted_prompt(message, context, prompt, allow_pending_wait, assembled_turn, turn_context_messages)
+            finally:
+                ACTIVE_VIDEO_REQUEST.reset(token)
+                video_jobs.discard(job)
+
+        if assembled_turn:
+            await process_clip_request()
+        else:
+            # PTB can be consuming updates sequentially when assembly is off.
+            track_telegram_turn_task(context, process_clip_request())
+        return
+    await run_admitted_prompt(message, context, prompt, allow_pending_wait, assembled_turn, turn_context_messages)
+
+
+video_jobs: set[tuple[int, int]] = set()
+ACTIVE_VIDEO_REQUEST = contextvars.ContextVar("active_video_request", default=None)
+
+
+async def run_admitted_prompt(message, context, prompt, allow_pending_wait, assembled_turn, turn_context_messages):
     if CONFIG.chat_inflight_guard_enabled:
         if not assembled_turn and should_suppress_duplicate_prompt(message, prompt, "before_lock"):
             return
@@ -14569,6 +14616,74 @@ async def reject_disabled_randomizer(message: Message) -> bool:
         return False
     session.deny()
     await send_reply(message, session.final_output(""), memory_label="Aigan")
+    return True
+
+
+async def video_provider_call(call, *, model, effort, stage_kind, endpoint):
+    stage = begin_model_stage(stage_kind=stage_kind, intended_model=model, reasoning_effort=effort,
+                              endpoint=endpoint, route_bucket="telegram_video")
+    try:
+        result = await call
+    except asyncio.CancelledError as exc:
+        finish_model_stage(stage, status="cancelled", failure_class=exc)
+        raise
+    except Exception as exc:
+        finish_model_stage(stage, status="failed", failure_class=exc)
+        raise
+    status, failure = response_telemetry_status(result) if endpoint == "responses" else ("succeeded", "")
+    actual, source = response_actual_model(result)
+    finish_model_stage(stage, status=status, failure_class=failure, usage=getattr(result, "usage", None),
+                       actual_model=actual, actual_model_source=source)
+    if status != "succeeded":
+        raise ValueError("incomplete_video_response")
+    return result
+
+
+async def respond_to_video_request(message, prompt, attachment, settings) -> bool:
+    model, effort = settings
+    try:
+        async with asyncio.timeout(110), AsyncOpenAI(
+            api_key=CONFIG.openai_api_key, timeout=50, max_retries=0,
+        ) as client:
+            async def respond(instructions, model_input, *, classify=False):
+                options = {"text": VIDEO_INTENT_FORMAT} if classify else {}
+                result = await video_provider_call(client.responses.create(
+                    model=model, instructions=instructions, input=model_input, reasoning={"effort": effort},
+                    max_output_tokens=512 if classify else CONFIG.max_output_tokens, store=False, **options),
+                    model=model, effort=effort, stage_kind="router" if classify else "vision", endpoint="responses")
+                text = (result.output_text or "").strip()
+                if not text:
+                    raise ValueError("empty_video_response")
+                return text
+
+            async def answer(content):
+                return await respond(VIDEO_ANSWER_INSTRUCTIONS, [{"role": "user", "content": content}])
+
+            async def transcribe(stream):
+                stt = "gpt-4o-mini-transcribe"
+                result = await video_provider_call(client.audio.transcriptions.create(model=stt, file=stream),
+                    model=stt, effort="", stage_kind="transcription", endpoint="audio_transcriptions")
+                return result.text.strip()
+
+            decision = json.loads(await respond(VIDEO_INTENT_INSTRUCTIONS, prompt, classify=True)).get("inspect")
+            if decision not in {"frames", "speech", "both"}:
+                return False
+            ACTIVE_MODEL_ROUTE_BUCKET.set("telegram_video")
+            response = await inspect_clip(attachment, request=prompt, mode=decision,
+                adapter=runtime_media_frame_adapter(), max_bytes=CONFIG.media_frame_max_bytes,
+                max_duration=min(CONFIG.media_frame_max_duration_seconds, 180),
+                ffmpeg=CONFIG.media_frame_ffmpeg_path, answer=answer, transcribe=transcribe)
+    except VideoUnavailable as exc:
+        response = str(exc)
+    except Exception as exc:
+        LOGGER.warning("Telegram video request unavailable error=%s", type(exc).__name__)
+        response = "Не вдалося перевірити відео. Спробуй пізніше або надішли коротший фрагмент."
+    delivery = await send_reply(message, response, memory_label="Aigan", route="telegram_video",
+                                outbound_provenance=provenance_for_message(message, "telegram_video"))
+    if delivered := delivered_text(delivery):
+        histories[message.chat_id].append(f"Aigan: {delivered[:500]}")
+        passive_contexts[message.chat_id].append(f"Aigan: {clip_text(delivered, 700)}")
+        record_chat_answer(message, prompt, "telegram_video")
     return True
 
 
@@ -14633,6 +14748,9 @@ async def _handle_prompt_generation(
     histories[message.chat_id].append(f"{user_label(message)}: {prompt[:500]}")
 
     await send_activity_action(context.bot, message.chat_id, ChatAction.TYPING, message=message)
+    selected_video = ACTIVE_VIDEO_REQUEST.get()
+    if selected_video and await respond_to_video_request(message, prompt, *selected_video):
+        return
     classification = await classify_request_with_intent(message, prompt)
     route, recall_intent = classification
     image_policy = getattr(classification, "image_policy", None)

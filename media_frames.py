@@ -1,7 +1,12 @@
+"""Bounded local container inspection and interval-frame extraction.
+
+Owner: Aigan media frame adapter.
+"""
 from __future__ import annotations
 
 import asyncio
 import json
+import math
 import shutil
 import subprocess
 import tempfile
@@ -10,6 +15,11 @@ from pathlib import Path
 from typing import Any, Callable, Protocol, Sequence
 
 from system_log import sanitize_text
+
+
+# Only standalone local media containers. Network protocols, playlist and
+# concatenation demuxers are outside the Telegram attachment boundary.
+LOCAL_MEDIA_OPTIONS = ("-protocol_whitelist", "file", "-format_whitelist", "mov,matroska,webm,avi,gif,mpeg,mpegts")
 
 
 MEDIA_FRAME_FAILURE_CATEGORIES = {
@@ -287,7 +297,16 @@ class FfmpegMediaFrameAdapter:
                 )
             temp_dir = Path(tempfile.mkdtemp(prefix="aigan-media-frames-"))
             output_pattern = temp_dir / "frame_%03d.jpg"
-            await asyncio.to_thread(self._extract_interval_frames, source_path, output_pattern, metadata, limits)
+            worker = asyncio.create_task(asyncio.to_thread(
+                self._extract_interval_frames, source_path, output_pattern, metadata, limits))
+            try:
+                await asyncio.shield(worker)
+            except asyncio.CancelledError:
+                # subprocess.run is bounded by its own timeout. Wait for it to
+                # finish writing before deleting the isolated work directory.
+                await asyncio.gather(worker, return_exceptions=True)
+                shutil.rmtree(temp_dir, ignore_errors=True)
+                raise
             frame_paths = sorted(temp_dir.glob("frame_*.jpg"))
             if not frame_paths:
                 result = self._failure(
@@ -300,16 +319,17 @@ class FfmpegMediaFrameAdapter:
                 result._temp_dir = temp_dir
                 await result.cleanup()
                 return result
-            selected_paths = frame_paths[: limits.selected_frame_count]
-            duration = float(metadata.get("duration_seconds") or 0.0)
-            step = duration / (len(frame_paths) + 1) if duration > 0 else 0.0
+            count = min(len(frame_paths), limits.selected_frame_count)
+            indices = ([len(frame_paths) // 2] if count == 1 else
+                       [round(i * (len(frame_paths) - 1) / (count - 1)) for i in range(count)])
+            interval = 1 / sample_fps(metadata, limits)
             frames = tuple(
                 MediaFrameCandidate(
-                    path=path,
-                    timestamp_seconds=round((index + 1) * step, 3) if step else float(index),
+                    path=frame_paths[index],
+                    timestamp_seconds=round(index * interval, 3),
                     index=index + 1,
                 )
-                for index, path in enumerate(selected_paths)
+                for index in indices
             )
             self.last_failure_category = ""
             return MediaFrameResult(
@@ -412,6 +432,7 @@ class FfmpegMediaFrameAdapter:
                 "json",
                 "-show_streams",
                 "-show_format",
+                *LOCAL_MEDIA_OPTIONS,
                 str(source_path),
             ],
             timeout_seconds,
@@ -427,8 +448,7 @@ class FfmpegMediaFrameAdapter:
         metadata: dict[str, Any],
         limits: MediaFrameLimits,
     ) -> None:
-        duration = float(metadata.get("duration_seconds") or limits.max_duration_seconds)
-        fps = max(0.01, min(1.0, limits.candidate_frame_count / max(duration, 1.0)))
+        fps = sample_fps(metadata, limits)
         output = self.command_runner(
             [
                 self.ffmpeg_path,
@@ -436,10 +456,14 @@ class FfmpegMediaFrameAdapter:
                 "-loglevel",
                 "error",
                 "-y",
+                "-nostdin",
+                *LOCAL_MEDIA_OPTIONS,
                 "-i",
                 str(source_path),
+                "-t",
+                str(limits.max_duration_seconds),
                 "-vf",
-                f"fps={fps:.6f},scale={limits.output_width}:-2",
+                f"fps={fps:.6f}:round=up,scale={limits.output_width}:{limits.output_width}:force_original_aspect_ratio=decrease",
                 "-frames:v",
                 str(limits.candidate_frame_count),
                 str(output_pattern),
@@ -478,6 +502,10 @@ class FfmpegMediaFrameAdapter:
         )
 
 
+def sample_fps(metadata: dict[str, Any], limits: MediaFrameLimits) -> float:
+    return min(1.0, limits.candidate_frame_count / max(float(metadata["duration_seconds"]), 1.0))
+
+
 def run_command(command: Sequence[str], timeout_seconds: int) -> CommandOutput:
     completed = subprocess.run(
         list(command),
@@ -513,7 +541,7 @@ def parse_ffprobe_metadata(payload: str) -> dict[str, Any]:
     if not stream:
         raise RuntimeError("metadata_failed")
     fmt = data.get("format") or {}
-    duration = parse_float(stream.get("duration")) or parse_float(fmt.get("duration")) or 0.0
+    duration = max(parse_float(stream.get("duration")) or 0, parse_float(fmt.get("duration")) or 0)
     frame_count = parse_int(stream.get("nb_frames"))
     fps = parse_ratio(stream.get("avg_frame_rate")) or parse_ratio(stream.get("r_frame_rate")) or 0.0
     width = parse_int(stream.get("width")) or 0
@@ -526,6 +554,7 @@ def parse_ffprobe_metadata(payload: str) -> dict[str, Any]:
             "fps": round(fps, 3) if fps else 0,
             "frame_count": frame_count,
             "codec": safe_code_label(stream.get("codec_name") or "", default="unknown"),
+            "has_audio": any(item.get("codec_type") == "audio" for item in data.get("streams", [])),
         }
     )
 
@@ -534,7 +563,9 @@ def validate_metadata(metadata: dict[str, Any], limits: MediaFrameLimits) -> str
     duration = float(metadata.get("duration_seconds") or 0)
     width = int(metadata.get("width") or 0)
     height = int(metadata.get("height") or 0)
-    if duration and duration > limits.max_duration_seconds:
+    if not math.isfinite(duration) or duration <= 0:
+        return "metadata_failed"
+    if duration > limits.max_duration_seconds:
         return "duration_too_long"
     if width <= 0 or height <= 0:
         return "metadata_failed"
@@ -571,7 +602,7 @@ def parse_ratio(value: Any) -> float | None:
 
 def sanitize_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
     clean: dict[str, Any] = {}
-    for key in ("duration_seconds", "width", "height", "fps", "frame_count", "codec"):
+    for key in ("duration_seconds", "width", "height", "fps", "frame_count", "codec", "has_audio"):
         if key in metadata and metadata[key] is not None:
             clean[key] = metadata[key]
     return clean
