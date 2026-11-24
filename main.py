@@ -14687,7 +14687,7 @@ async def respond_to_video_request(message, prompt, attachment, settings) -> boo
                 return await respond(VIDEO_ANSWER_INSTRUCTIONS, [{"role": "user", "content": content}])
 
             async def transcribe(stream):
-                stt = "gpt-4o-mini-transcribe"
+                stt = "gpt-transcribe"
                 result = await video_provider_call(client.audio.transcriptions.create(model=stt, file=stream),
                     model=stt, effort="", stage_kind="transcription", endpoint="audio_transcriptions")
                 return result.text.strip()
