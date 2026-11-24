@@ -18,6 +18,7 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.error import TelegramError
 
 from chat_model_settings import (
+    MEDIA_TOOL_LABELS, MINI_VISION_MODEL, TRANSCRIPTION_MODELS, media_model_allowed,
     MODEL_CATALOG,
     SPARK_MODEL,
     ChatModelSettingsStore,
@@ -114,6 +115,10 @@ class _Panel:
     duration_seconds: int | None = 900
     stage: str = "model"
     tool_policy: ChatToolPolicy | None = None
+    media_tool: str = ""
+    media_revision: int = 0
+    media_selected: str | None = None
+    media_options: tuple[str, ...] = ()
 
 
 class ChatModelUI:
@@ -129,6 +134,8 @@ class ChatModelUI:
         is_owner: Callable[[int], bool] = lambda _: False,
         spark_available: Callable[[], bool] = lambda: False,
         get_catalog: Callable[[], Awaitable[tuple[ModelCapability, ...]]] | None = None,
+        get_media_catalog: Callable[[], Awaitable[tuple[str, ...]]] | None = None,
+        media_default: Callable[[str], str] = lambda tool: TRANSCRIPTION_MODELS[0] if tool == "youtube" else MINI_VISION_MODEL,
         clock: Callable[[], float] = time.time,
         delete_commands: bool = True,
         panel_ttl_seconds: int = 900,
@@ -141,6 +148,8 @@ class ChatModelUI:
         self.chat_allowed = chat_allowed
         self.spark_available = spark_available
         self.get_catalog = get_catalog
+        self.get_media_catalog = get_media_catalog
+        self.media_default = media_default
         self.clock = clock
         self.delete_commands = delete_commands
         self.panel_ttl_seconds = max(1, min(int(panel_ttl_seconds), 3600))
@@ -222,6 +231,17 @@ class ChatModelUI:
         return f"{seconds // 60} хв" if seconds % 60 == 0 else f"{seconds} с"
 
     def _text(self, panel: _Panel, profile: Any, *, notice: str = "") -> str:
+        if panel.stage in {"media", "media_models"}:
+            lines = [f"<b>{PANEL_TITLE}</b>", "<b>Моделі медіаінструментів</b>"]
+            if panel.stage == "media":
+                lines.append("Обери інструмент. Його модель діє для всіх у цьому чаті.")
+            else:
+                current = panel.media_selected or self.media_default(panel.media_tool)
+                lines.extend([MEDIA_TOOL_LABELS[panel.media_tool], f"Зараз: <code>{html.escape(current)}</code>.",
+                              "Натисни модель, щоб застосувати її до нових запитів."])
+            if notice:
+                lines.append(html.escape(notice))
+            return "\n".join(lines)
         if panel.stage == "tools":
             lines = [
                 f"<b>{PANEL_TITLE}</b>", "<b>Інструменти · дозволи для цього чату</b>",
@@ -288,6 +308,16 @@ class ChatModelUI:
         def button(label: str, action: str, index: int | None = None):
             return InlineKeyboardButton(label, callback_data=self._data(panel, action, index))
         rows = []
+        if panel.stage in {"media", "media_models"}:
+            if panel.stage == "media":
+                rows = [[button(label, "i", index)] for index, label in enumerate(MEDIA_TOOL_LABELS.values())]
+            else:
+                current = panel.media_selected or self.media_default(panel.media_tool)
+                rows = [[button(("✓ " if model == current else "") + model, "s", index)]
+                        for index, model in enumerate(panel.media_options)]
+                rows.append([button("Типова модель інструмента", "u")])
+            rows.append([button("Назад", "b"), button("Оновити", "f"), button("Закрити", "x")])
+            return InlineKeyboardMarkup(rows)
         if panel.stage == "tools":
             policy = panel.tool_policy
             rows = [[button(("🚫 " if tool.key in policy.disabled else "✅ ") + tool.label, "v", index)]
@@ -319,6 +349,8 @@ class ChatModelUI:
             rows = [[button("Застосувати", "a")]]
         if panel.stage == "model" and panel.role != "member":
             rows.append([button("Інструменти", "t")])
+        if panel.stage == "model":
+            rows.append([button("Моделі медіаінструментів", "h")])
         if panel.stage != "model":
             rows.append([button("Назад", "b")])
         rows.extend([
@@ -470,8 +502,13 @@ class ChatModelUI:
             await self._answer(query, "Панель застаріла або належить іншому учаснику. Відкрий /model.", alert=True)
             return
         catalog = panel.catalog
-        if option == "-" and ((action == "f" and panel.stage != "tools") or (action == "a" and panel.stage == "confirm")):
+        media_stage = panel.stage in {"media", "media_models"}
+        if option == "-" and ((action == "f" and panel.stage != "tools" and not media_stage) or (action == "a" and panel.stage == "confirm")):
             catalog = await self._catalog()
+        media_catalog = ()
+        if media_stage and action in {"i", "s", "f"}:
+            media_catalog = (await self.get_media_catalog() if self.get_media_catalog else
+                             (*TRANSCRIPTION_MODELS, MINI_VISION_MODEL, *(c.model for c in catalog if c.supports_images)))
         if role == "member" and chat_type != "private":
             if not await self._is_current_member(context.bot, chat_id, user_id):
                 await self._answer(query, "Не вдалося підтвердити участь у цьому чаті.", alert=True)
@@ -482,9 +519,9 @@ class ChatModelUI:
                 or not self.chat_allowed(chat_id, chat_type, user_id)):
             await self._answer(query, "Панель застаріла. Відкрий /model.", alert=True)
             return
-        indexed = action in {"m", "e", "d", "v"}
+        indexed = action in {"m", "e", "d", "v", "i", "s"}
         if ((indexed and (not option.isascii() or not option.isdigit() or len(option) > 3))
-                or (not indexed and (option != "-" or action not in {"a", "r", "f", "b", "x", "t", "z", "q"}))):
+                or (not indexed and (option != "-" or action not in {"a", "r", "f", "b", "x", "t", "z", "q", "h", "u"}))):
             await self._answer(query, "Невідома дія.", alert=True)
             return
         if role == "member" and (panel.stage == "tools" or action in {"t", "v", "z"}):
@@ -512,12 +549,38 @@ class ChatModelUI:
         if panel.stage == "tools" and action not in {"v", "z", "b", "f"}:
             await self._answer(query, "Недоступна дія.", alert=True)
             return
-        if panel.stage != "tools" and action not in {"f", "t"} and profile.revision != panel.settings_revision:
+        if media_stage and action not in {"i", "s", "u", "b", "f"}:
+            await self._answer(query, "Недоступна дія.", alert=True)
+            return
+        if not media_stage and panel.stage != "tools" and action not in {"f", "t", "h"} and profile.revision != panel.settings_revision:
             await self._answer(query, "Налаштування вже змінилися. Натисни «Оновити» або відкрий /model.", alert=True)
             return
         notice = ""
         try:
-            if (action == "t" and panel.stage == "model") or (action == "f" and panel.stage == "tools"):
+            if action == "h" and panel.stage == "model":
+                panel.stage = "media"
+            elif media_stage:
+                if action == "b":
+                    panel.stage = "media" if panel.stage == "media_models" else "model"
+                    panel.settings_revision = profile.revision
+                elif action == "f" and panel.stage == "media":
+                    pass
+                elif (action == "i" and panel.stage == "media" and int(option) < len(MEDIA_TOOL_LABELS)
+                      or action == "f" and panel.stage == "media_models"):
+                    if action == "i":
+                        panel.media_tool = tuple(MEDIA_TOOL_LABELS)[int(option)]
+                    panel.media_options = tuple(m for m in media_catalog if media_model_allowed(panel.media_tool, m, panel.member_ceiling))
+                    panel.media_selected, panel.media_revision = self.store.media_selection(chat_id, panel.media_tool)
+                    panel.stage = "media_models"
+                elif panel.stage == "media_models" and (action == "u" or action == "s" and int(option) < len(panel.media_options)):
+                    model = None if action == "u" else panel.media_options[int(option)]
+                    self.store.set_media_model(chat_id, panel.media_tool, model, expected_revision=panel.media_revision,
+                                               role=role, available=media_catalog)
+                    panel.media_selected, panel.media_revision = self.store.media_selection(chat_id, panel.media_tool)
+                    notice = "Збережено для цього інструмента."
+                else:
+                    raise InvalidModelSelection("invalid_media_action")
+            elif (action == "t" and panel.stage == "model") or (action == "f" and panel.stage == "tools"):
                 panel.tool_policy = self.store.tools.resolve(chat_id)
                 panel.stage = "tools"
             elif action == "v" and panel.stage == "tools" and int(option) < len(CHAT_TOOLS):

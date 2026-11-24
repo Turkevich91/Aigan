@@ -93,7 +93,7 @@ from agent_capabilities import (
     ChatToolMCPServer as MCPServerStdio, PrimaryCapabilities, randomizer_tools, conversational_tool_behavior,
 )
 from chat_tool_policy import CHAT_TOOLS, chat_tool_scope, tool_allowed
-from chat_model_settings import AnswerProfile, ChatModelSettingsStore, SPARK_MODEL, get_model_capability
+from chat_model_settings import AnswerProfile, ChatModelSettingsStore, MINI_VISION_MODEL, SPARK_MODEL, get_model_capability, media_effort
 from spark_answer import SparkAnswerProvider
 from chat_model_ui import ChatModelUI, PANEL_TITLE, is_settings_control_message, is_settings_panel_message
 from provider_model_catalog import ProviderModelCatalog
@@ -1238,6 +1238,27 @@ def primary_supports_images() -> bool:
             or get_model_capability(active[1].model).supports_images)
 
 
+def media_default_model(tool: str) -> str:
+    if tool == "youtube":
+        return os.getenv("YOUTUBE_TRANSCRIPTION_MODEL") or "gpt-transcribe"
+    if tool == "photo":
+        return CONFIG.vision_background_model
+    if tool == "video":
+        return MINI_VISION_MODEL
+    raise ValueError("unknown_media_tool")
+
+
+def photo_summary_settings(chat_id: int) -> tuple[str, str]:
+    model = CHAT_MODEL_SETTINGS.media_selection(chat_id, "photo")[0] if CHAT_MODEL_SETTINGS else None
+    return (model, media_effort(model)) if model else (CONFIG.vision_background_model, CONFIG.vision_background_reasoning_effort)
+
+
+def video_answer_settings(chat_id: int) -> tuple[str, str]:
+    selected = CHAT_MODEL_SETTINGS.media_selection(chat_id, "video")[0] if CHAT_MODEL_SETTINGS else None
+    model = selected or media_default_model("video")
+    return model, media_effort(model)
+
+
 def primary_answer_settings(*, images: bool = False) -> tuple[str, str]:
     active = ACTIVE_CHAT_MODEL.get()
     if active is not None and (active[1].overridden or not images):
@@ -1269,9 +1290,12 @@ def model_control_content(message: Message | None) -> bool:
 
 
 SPARK_ANSWER = SparkAnswerProvider.from_environment()
+CHAT_MODEL_CATALOG = ProviderModelCatalog(lambda: AsyncOpenAI(api_key=CONFIG.openai_api_key, max_retries=0))
 CHAT_MODEL_UI = ChatModelUI(
     CHAT_MODEL_SETTINGS,
-    get_catalog=ProviderModelCatalog(lambda: AsyncOpenAI(api_key=CONFIG.openai_api_key, max_retries=0)).get,
+    get_catalog=CHAT_MODEL_CATALOG.get,
+    get_media_catalog=CHAT_MODEL_CATALOG.media_models,
+    media_default=media_default_model,
     defaults=lambda: (CONFIG.openai_model, CONFIG.model_reasoning_effort),
     is_admin=is_admin_actor,
     is_owner=is_owner_actor,
@@ -7592,6 +7616,10 @@ def youtube_mcp_environment(*, run_id: str, route_bucket: str) -> dict[str, str]
     }
     if not audio_fallback_enabled:
         return child_env
+    active = ACTIVE_CHAT_MODEL.get()
+    if active is not None and CHAT_MODEL_SETTINGS is not None:
+        model, _ = CHAT_MODEL_SETTINGS.media_selection(active[0], "youtube")
+        child_env["YOUTUBE_TRANSCRIPTION_MODEL"] = model or media_default_model("youtube")
     child_env["OPENAI_API_KEY"] = CONFIG.openai_api_key
     if CONFIG.model_telemetry_enabled:
         child_env.update(
@@ -9747,7 +9775,7 @@ def configured_capability_rows() -> list[CapabilityRow]:
         )
     )
     youtube_audio_fallback_enabled = _env_bool("YOUTUBE_AUDIO_FALLBACK", False)
-    youtube_transcription_model = os.getenv("YOUTUBE_TRANSCRIPTION_MODEL", "gpt-4o-mini-transcribe").strip()
+    youtube_transcription_model = media_default_model("youtube")
     youtube_max_duration_raw = os.getenv("YOUTUBE_MAX_DURATION_SECONDS", "1200").strip()
     youtube_max_duration: int | None
     try:
