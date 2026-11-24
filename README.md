@@ -342,7 +342,7 @@ Each tool family should provide a small adapter with:
 
 Tool failures must not block message persistence, embeddings, memory recall, `/stat`, `/character`, Telegram routing, or normal replies. Tool outputs that are later saved to memory must be stored as source context, not as user-authored text.
 
-The media frame extraction adapter remains registered as `media_frames` for future tooling experiments, but it is not wired into chat routing. Telegram video/animation/video-note/video-document messages are treated as attachments plus any text/caption/reply context visible to the bot; Aigan does not download them for frame extraction or visual summaries.
+When `MEDIA_FRAME_EXTRACTION_ENABLED=true`, an explicit question about an attached Telegram clip or its direct reply can use bounded frame sampling and speech transcription. Ordinary group uploads stay silent. In `/model`, **Моделі медіаінструментів** selects separate models for video interpretation, saved photo descriptions and YouTube audio transcription.
 
 The public media acquisition boundary is registered as `media_acquisition` and is disabled by default. It remains a metadata-only `yt-dlp` telemetry probe and is not wired into chat routing. It records only stable platform/backend/capability fields and sanitized failure categories such as `unsupported_url`, `auth_or_rate_limited`, `challenge_required`, `duration_limit`, or `metadata_failed`; it must not log raw media URLs, provider stderr, source text, transcripts, frame OCR, usernames, tokens, or local paths.
 

@@ -1243,7 +1243,7 @@ def primary_supports_images() -> bool:
 
 def media_default_model(tool: str) -> str:
     if tool == "youtube":
-        return os.getenv("YOUTUBE_TRANSCRIPTION_MODEL") or "gpt-transcribe"
+        return os.getenv("YOUTUBE_TRANSCRIPTION_MODEL", "gpt-transcribe").strip()
     if tool == "photo":
         return CONFIG.vision_background_model
     if tool == "video":
@@ -7628,6 +7628,11 @@ def youtube_mcp_environment(*, run_id: str, route_bucket: str) -> dict[str, str]
     if active is not None and CHAT_MODEL_SETTINGS is not None:
         model, _ = CHAT_MODEL_SETTINGS.media_selection(active[0], "youtube")
         child_env["YOUTUBE_TRANSCRIPTION_MODEL"] = model or media_default_model("youtube")
+    elif "YOUTUBE_TRANSCRIPTION_MODEL" in os.environ:
+        child_env["YOUTUBE_TRANSCRIPTION_MODEL"] = media_default_model("youtube")
+    if child_env.get("YOUTUBE_TRANSCRIPTION_MODEL", "gpt-transcribe") == "":
+        child_env["YOUTUBE_AUDIO_FALLBACK"] = "false"
+        return child_env
     child_env["OPENAI_API_KEY"] = CONFIG.openai_api_key
     if CONFIG.model_telemetry_enabled:
         child_env.update(
