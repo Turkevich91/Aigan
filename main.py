@@ -23,7 +23,7 @@ from collections import Counter, defaultdict, deque
 from contextlib import AsyncExitStack, ExitStack, contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from functools import lru_cache
+from functools import lru_cache, partial
 from itertools import count
 from pathlib import Path
 from typing import AbstractSet, Any, Callable, Literal, Sequence, cast
@@ -7824,12 +7824,13 @@ async def run_agent(
         client_session_timeout_seconds=CONFIG.mcp_tool_timeout_seconds,
         failure_error_function=mcp_tool_failure_message,
     )
+    youtube_env = youtube_mcp_environment(run_id=model_run_id, route_bucket=model_route)
     youtube_server = MCPServerStdio(
         name="youtube_transcript",
         params={
             "command": sys.executable,
             "args": [str(APP_DIR / "mcp_servers" / "youtube_transcript.py")],
-            "env": youtube_mcp_environment(run_id=model_run_id, route_bucket=model_route),
+            "env": youtube_env,
         },
         cache_tools_list=True,
         client_session_timeout_seconds=CONFIG.mcp_tool_timeout_seconds,
@@ -7861,6 +7862,11 @@ async def run_agent(
                 active_servers.append(await servers.enter_async_context(web_server))
             if tool_allowed("youtube", before_call=True):
                 active_servers.append(await servers.enter_async_context(youtube_server))
+                if youtube_env.get("OPENAI_API_KEY"):
+                    # The audio-enabled child's single tool can outlive ordinary MCP
+                    # discovery. Keep the SDK's authorization and retry wrappers.
+                    session = youtube_server.session
+                    session.call_tool = partial(session.call_tool, read_timeout_seconds=timedelta(seconds=75))
             active = ACTIVE_CHAT_MODEL.get()
             explicit_profile = image_data_urls is not None or (active is not None and active[1].overridden)
             if explicit_profile:

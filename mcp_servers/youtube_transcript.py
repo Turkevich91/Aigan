@@ -2,6 +2,7 @@ import logging
 import os
 import sys
 import tempfile
+import threading
 from pathlib import Path
 
 if __package__ in {None, ""}:
@@ -51,11 +52,16 @@ def _build_model_telemetry_store() -> ModelTelemetryStore | None:
         return None
 
 
-MODEL_TELEMETRY = _build_model_telemetry_store()
+MODEL_TELEMETRY: ModelTelemetryStore | None = None
+_STORE_LOCK = threading.Lock()
 
 
 def _begin_transcription_stage(model: str) -> StageHandle | None:
-    store = MODEL_TELEMETRY
+    global MODEL_TELEMETRY
+    with _STORE_LOCK:
+        if MODEL_TELEMETRY is None:
+            MODEL_TELEMETRY = _build_model_telemetry_store()
+        store = MODEL_TELEMETRY
     if store is None:
         return None
     try:

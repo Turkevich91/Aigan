@@ -297,18 +297,25 @@ class YoutubeTranscriptTelemetryTests(unittest.TestCase):
             finally:
                 store.close()
 
-    def test_direct_script_import_resolves_project_modules_without_pythonpath(self) -> None:
+    def test_direct_script_opens_database_only_on_first_transcription(self) -> None:
         script_path = Path(youtube_transcript.__file__).resolve()
         environment = os.environ.copy()
         environment.pop("PYTHONPATH", None)
-        environment["MODEL_TELEMETRY_ENABLED"] = "false"
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        environment["MODEL_TELEMETRY_ENABLED"] = "true"
+        environment["MODEL_TELEMETRY_DB_PATH"] = str(Path(directory.name) / "stages.sqlite")
         completed = subprocess.run(
             [
                 sys.executable,
                 "-c",
                 (
-                    "import runpy; "
-                    "runpy.run_path('youtube_transcript.py', run_name='direct_import_test')"
+                    "import os, runpy; from pathlib import Path; "
+                    "m = runpy.run_path('youtube_transcript.py', run_name='direct_import_test'); "
+                    "db = Path(os.environ['MODEL_TELEMETRY_DB_PATH']); "
+                    "assert not db.exists(); "
+                    "m['_begin_transcription_stage']('gpt-transcribe'); "
+                    "assert db.exists()"
                 ),
             ],
             cwd=script_path.parent,
