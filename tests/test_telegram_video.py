@@ -1,6 +1,8 @@
 """Admission, bounded media processing and provider isolation for Telegram clips."""
 import asyncio
 import base64
+from collections import defaultdict, deque
+from contextlib import ExitStack
 from dataclasses import replace
 import io
 import json
@@ -37,12 +39,14 @@ class TelegramVideoTests(unittest.IsolatedAsyncioTestCase):
                 msg.reply_to_message = target
             barrier = asyncio.Event()
             started = asyncio.Event()
-            async def generate(*args, **kwargs):
-                self.assertEqual(main.ACTIVE_VIDEO_REQUEST.get(), (self.attachment, self.profile))
+            async def generate(_msg, _prompt, clip, settings):
+                self.assertIs(clip, self.attachment)
+                self.assertEqual(settings, self.profile)
                 started.set()
                 await barrier.wait()
+                return True
             with patch.object(main, "video_answer_settings", create=True, return_value=self.profile) as select:
-                with patch.object(main, "handle_prompt_generation", side_effect=generate):
+                with patch.object(main, "respond_to_video_request", side_effect=generate):
                     await main.handle_prompt(msg, SimpleNamespace(), msg.text, allow_pending_wait=False)
                     await asyncio.wait_for(started.wait(), 2)
                     select.assert_called_once_with(msg.chat_id)
@@ -51,6 +55,95 @@ class TelegramVideoTests(unittest.IsolatedAsyncioTestCase):
                     barrier.set()
                     await asyncio.gather(*main.telegram_turn_tasks)
             self.assertFalse(main.video_jobs)
+
+    async def test_same_sender_completes_text_with_video_blocked_in_both_ingress_modes(self):
+        from telegram_turn_assembly import TurnAssembler
+        from tests.test_telegram_turn_assembly import ManualClock, AsyncioClock
+
+        for assembled in (False, True):
+            with self.subTest(assembled=assembled):
+                clock = ManualClock()
+                clock.advance(5000)
+                started, release = asyncio.Event(), asyncio.Event()
+                chat = -1001
+                async def slow_video(msg, prompt, clip, settings):
+                    self.assertIs(clip, self.attachment)
+                    self.assertEqual(settings, self.profile)
+                    started.set()
+                    await release.wait()
+                    return True
+                def message(text, number):
+                    msg = FakeMessage(text, chat_type="private", chat_id=chat, message_id=number)
+                    msg.from_user.id = 1234
+                    return msg
+                async def settle():
+                    for _ in range(30):
+                        await asyncio.sleep(0)
+                context = SimpleNamespace(bot=SimpleNamespace(id=99, username="test_bot", send_chat_action=AsyncMock()),
+                                          application=SimpleNamespace(create_task=asyncio.create_task))
+                async def ingest(msg):
+                    await main.text_message(SimpleNamespace(effective_message=msg), context)
+                    await settle()
+                with ExitStack() as stack:
+                    overrides = {
+                        "CONFIG": replace(main.CONFIG, telegram_turn_assembly_enabled=assembled,
+                            chat_inflight_guard_enabled=True, telegram_turn_assembly_seconds=2),
+                        "time": clock, "asyncio": AsyncioClock(clock), "telegram_turn_stopping": False,
+                        "telegram_turn_assembler": TurnAssembler(), "telegram_turn_ingress": {},
+                        "telegram_turn_tasks": set(), "telegram_turn_dispatch_locks": {}, "chat_generation_locks": {},
+                        "pending_requests": {}, "last_user_call": {}, "last_chat_call": {}, "MEMORY": None,
+                        "remember_message_persistently": AsyncMock(), "remember_self_complaint_signal": MagicMock(),
+                        "respond_to_video_request": slow_video, "BOT_USERNAME": "test_bot",
+                        "classify_request_with_intent": AsyncMock(return_value=("normal", None)),
+                        "run_agent_for_outbound": AsyncMock(return_value="Normal text answer."),
+                    }
+                    overrides["recent_chat_answers"] = defaultdict(deque)
+                    for key, value in overrides.items():
+                        stack.enter_context(patch.object(main, key, value))
+                    stack.enter_context(patch.object(main, "video_answer_settings", create=True, return_value=self.profile))
+                    try:
+                        video_prompt = message("Describe the attached clip.", 801)
+                        if assembled:
+                            # Authored question followed by a separate source attachment.
+                            await ingest(video_prompt)
+                            source = message("", 802)
+                            source.video = self.attachment
+                            await ingest(source)
+                        else:
+                            video_prompt.video = self.attachment
+                            await ingest(video_prompt)
+                        clock.advance(5002)
+                        await asyncio.wait_for(started.wait(), 2)
+                        normal = message("Explain how a thermometer works.", 803)
+                        await ingest(normal)
+                        clock.advance(5004)
+                        await settle()
+                        self.assertEqual([call["text"] for call in normal.reply_calls], ["Normal text answer."])
+                        self.assertFalse(release.is_set())
+                    finally:
+                        release.set()
+                        await settle()
+                        await asyncio.gather(*main.telegram_turn_tasks)
+
+    async def test_unrelated_attachment_runs_normal_generation_once_and_preserves_turn_context(self):
+        msg, source = FakeMessage("What is three plus four?"), FakeMessage()
+        source.video = self.attachment
+        normal = AsyncMock()
+        with patch.object(main, "video_answer_settings", create=True, return_value=self.profile):
+            with patch.object(main, "respond_to_video_request", new=AsyncMock(return_value=False)) as inspect:
+                with patch.object(main, "handle_prompt_generation", normal):
+                    await main.handle_prompt(msg, SimpleNamespace(), msg.text, allow_pending_wait=False,
+                        assembled_turn=True, turn_context_messages=[source])
+                    await asyncio.gather(*main.telegram_turn_tasks)
+        inspect.assert_awaited_once_with(msg, msg.text, self.attachment, self.profile)
+        normal.assert_awaited_once()
+        self.assertEqual(normal.await_args.kwargs["turn_context_messages"], [source])
+
+    def test_same_caption_on_distinct_clips_has_separate_deduplication_identity(self):
+        first, other = FakeMessage("Describe this clip"), FakeMessage("Describe this clip")
+        first.video = SimpleNamespace(file_unique_id="synthetic-one")
+        other.video = SimpleNamespace(file_unique_id="synthetic-two")
+        self.assertNotEqual(main.context_signature_for_dedupe(first), main.context_signature_for_dedupe(other))
 
     async def test_group_passive_video_and_bare_private_upload_never_inspect(self):
         with patch.object(main, "video_answer_settings", create=True) as select:

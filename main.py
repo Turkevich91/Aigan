@@ -7121,6 +7121,10 @@ def context_signature_for_dedupe(message: Message) -> str:
 
     if has_current_context_payload(message):
         parts.append("payload:" + clip_text(message_content(message, 500), 360))
+    clip = visual_media_file_ref_from(message)
+    if clip and (clip_id := getattr(clip[0], "file_unique_id", None)):
+        # Two uploads with the same caption can contain different footage.
+        parts.append(f"clip:{clip_id}")
 
     return " || ".join(parts) if parts else "none"
 
@@ -14551,10 +14555,20 @@ async def handle_prompt(
     if (CONFIG.media_frame_extraction_enabled and prompt.strip() and prompt != DEFAULT_CONTEXT_PROMPT
             and message.from_user is not None and not message.from_user.is_bot
             and (assembled_turn or not (is_forwarded_message(message) or is_generated_or_channel_sender(message)))):
-        clip = visual_media_file_ref_from(message) or visual_media_file_ref_from(getattr(message, "reply_to_message", None))
+        for part in (message, *(turn_context_messages or ())):
+            if part.chat_id != message.chat_id:
+                continue
+            clip = visual_media_file_ref_from(part)
+            reply = getattr(part, "reply_to_message", None)
+            if clip is None and getattr(reply, "chat_id", None) == message.chat_id:
+                clip = visual_media_file_ref_from(reply)
+            if clip is not None:
+                break
     if clip is not None:
         job = (message.chat_id, message.message_id)
         if job in video_jobs:
+            return
+        if not assembled_turn and should_suppress_duplicate_prompt(message, prompt, "before_video"):
             return
         if len(video_jobs) >= 3:
             await message.reply_text("Обробляю інші відеозапити. Спробуй трохи пізніше.")
@@ -14568,24 +14582,27 @@ async def handle_prompt(
             return
 
         async def process_clip_request():
-            token = ACTIVE_VIDEO_REQUEST.set((clip[0], settings))
+            token = ACTIVE_MODEL_RUN_ID.set(secrets.token_hex(16))
+            route_token = ACTIVE_MODEL_ROUTE_BUCKET.set("telegram_video")
             try:
-                await run_admitted_prompt(message, context, prompt, allow_pending_wait, assembled_turn, turn_context_messages)
+                # Clip work owns its own bounded capacity. Neither the dispatch
+                # lock, text-generation lock nor text cooldown belongs to it.
+                if not await respond_to_video_request(message, prompt, clip[0], settings):
+                    ACTIVE_MODEL_ROUTE_BUCKET.set("pre_route")
+                    await run_admitted_prompt(message, context, prompt, allow_pending_wait, assembled_turn, turn_context_messages)
             finally:
-                ACTIVE_VIDEO_REQUEST.reset(token)
+                ACTIVE_MODEL_RUN_ID.reset(token)
+                ACTIVE_MODEL_ROUTE_BUCKET.reset(route_token)
                 video_jobs.discard(job)
 
-        if assembled_turn:
-            await process_clip_request()
-        else:
-            # PTB can be consuming updates sequentially when assembly is off.
-            track_telegram_turn_task(context, process_clip_request())
+        # Return to the update dispatcher or assembled-turn dispatcher before
+        # any provider/file request. Application shutdown tracks this task.
+        track_telegram_turn_task(context, process_clip_request())
         return
     await run_admitted_prompt(message, context, prompt, allow_pending_wait, assembled_turn, turn_context_messages)
 
 
 video_jobs: set[tuple[int, int]] = set()
-ACTIVE_VIDEO_REQUEST = contextvars.ContextVar("active_video_request", default=None)
 
 
 async def run_admitted_prompt(message, context, prompt, allow_pending_wait, assembled_turn, turn_context_messages):
@@ -14674,6 +14691,7 @@ async def respond_to_video_request(message, prompt, attachment, settings) -> boo
             if decision not in {"frames", "speech", "both"}:
                 return False
             ACTIVE_MODEL_ROUTE_BUCKET.set("telegram_video")
+            histories[message.chat_id].append(f"{user_label(message)}: {prompt[:500]}")
             response = await inspect_clip(attachment, request=prompt, mode=decision,
                 adapter=runtime_media_frame_adapter(), max_bytes=CONFIG.media_frame_max_bytes,
                 max_duration=min(CONFIG.media_frame_max_duration_seconds, 180),
@@ -14753,9 +14771,6 @@ async def _handle_prompt_generation(
     histories[message.chat_id].append(f"{user_label(message)}: {prompt[:500]}")
 
     await send_activity_action(context.bot, message.chat_id, ChatAction.TYPING, message=message)
-    selected_video = ACTIVE_VIDEO_REQUEST.get()
-    if selected_video and await respond_to_video_request(message, prompt, *selected_video):
-        return
     classification = await classify_request_with_intent(message, prompt)
     route, recall_intent = classification
     image_policy = getattr(classification, "image_policy", None)
