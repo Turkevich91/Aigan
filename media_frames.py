@@ -290,11 +290,12 @@ class FfmpegMediaFrameAdapter:
                     cleanup_status="not_needed",
                     diagnostics={"max_bytes": limits.max_bytes},
                 )
-            deadline = time.monotonic() + min(limits.timeout_seconds, 30)
-            metadata = await asyncio.to_thread(self._probe_metadata, source_path, limits.timeout_seconds)
+            sparse_enabled = request.sparse_max_duration_seconds > limits.max_duration_seconds
+            probe_timeout = min(limits.timeout_seconds, 30) if sparse_enabled else limits.timeout_seconds
+            deadline = time.monotonic() + probe_timeout
+            metadata = await finish_media_worker(self._probe_metadata, source_path, probe_timeout)
             validation_failure = validate_metadata(metadata, limits)
-            sparse = (validation_failure == "duration_too_long"
-                      and request.sparse_max_duration_seconds > limits.max_duration_seconds)
+            sparse = validation_failure == "duration_too_long" and sparse_enabled
             if sparse:
                 backend = "ffmpeg_sparse"
                 sparse_cap = min(request.sparse_max_duration_seconds, SPARSE_FRAME_MAX_SECONDS)
@@ -304,7 +305,7 @@ class FfmpegMediaFrameAdapter:
                     if remaining <= 0:
                         raise subprocess.TimeoutExpired("ffprobe", limits.timeout_seconds)
                     analyze_us = int(min(metadata["video_start_seconds"] + 2, SPARSE_FRAME_MAX_SECONDS) * 1_000_000)
-                    metadata = await asyncio.to_thread(self._probe_metadata, source_path, remaining, analyze_us)
+                    metadata = await finish_media_worker(self._probe_metadata, source_path, remaining, analyze_us)
                 track = {**metadata, "duration_seconds": metadata.get("video_duration_seconds")}
                 validation_failure = validate_metadata(track, replace(limits, max_duration_seconds=sparse_cap))
             if validation_failure:
@@ -316,19 +317,14 @@ class FfmpegMediaFrameAdapter:
                     metadata=metadata,
                 )
             temp_dir = Path(tempfile.mkdtemp(prefix="aigan-media-frames-"))
-            if sparse:
-                count = min(limits.selected_frame_count, max(1, min(request.sparse_frame_count, 5)))
-                extract = asyncio.to_thread(self._extract_sparse_frames, source_path, temp_dir, metadata, limits, count, deadline)
-            else:
-                extract = asyncio.to_thread(self._extract_interval_frames, source_path, temp_dir / "frame_%03d.jpg",
-                                            metadata, limits)
-            worker = asyncio.create_task(extract)
             try:
-                await asyncio.shield(worker)
+                if sparse:
+                    count = min(limits.selected_frame_count, max(1, min(request.sparse_frame_count, 5)))
+                    await finish_media_worker(self._extract_sparse_frames, source_path, temp_dir, metadata, limits, count, deadline)
+                else:
+                    await finish_media_worker(self._extract_interval_frames, source_path, temp_dir / "frame_%03d.jpg",
+                                              metadata, limits)
             except asyncio.CancelledError:
-                # subprocess.run is bounded by its own timeout. Wait for it to
-                # finish writing before deleting the isolated work directory.
-                await asyncio.gather(worker, return_exceptions=True)
                 shutil.rmtree(temp_dir, ignore_errors=True)
                 raise
             frame_paths = sorted(temp_dir.glob("frame_*.jpg"))
@@ -562,6 +558,24 @@ def sample_fps(metadata: dict[str, Any], limits: MediaFrameLimits) -> float:
     return min(1.0, limits.candidate_frame_count / max(float(metadata["duration_seconds"]), 1.0))
 
 
+async def finish_media_worker(function, *args):
+    """Keep the local files and worker slot until the bounded subprocess has exited."""
+    task = asyncio.create_task(asyncio.to_thread(function, *args))
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                continue
+            except Exception:
+                break
+        if not task.cancelled():
+            task.exception()
+        raise
+
+
 def run_command(command: Sequence[str], timeout_seconds: float) -> CommandOutput:
     completed = subprocess.run(
         list(command),
@@ -594,8 +608,12 @@ def parse_ffprobe_metadata(payload: str) -> dict[str, Any]:
     except json.JSONDecodeError as exc:
         raise RuntimeError("metadata_failed") from exc
     streams = data.get("streams", [])
-    stream = next((item for item in streams if item.get("codec_type") == "video"
-                   and not (item.get("disposition") or {}).get("attached_pic")), None)
+    video_tracks = (item for item in streams if item.get("codec_type") == "video"
+                    and not (item.get("disposition") or {}).get("attached_pic"))
+    # Players prefer the default track. Without a default prefer the largest picture; ties keep stream order.
+    stream = max(video_tracks, default=None, key=lambda item: (
+        bool((item.get("disposition") or {}).get("default")),
+        (parse_int(item.get("width")) or 0) * (parse_int(item.get("height")) or 0)))
     if not stream:
         raise RuntimeError("metadata_failed")
     fmt = data.get("format") or {}

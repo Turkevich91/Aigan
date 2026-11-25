@@ -189,6 +189,22 @@ class TelegramVideoTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(kwargs["store"])
         self.attachment.get_file.assert_not_awaited()
 
+    async def test_sparse_request_keeps_the_midpoint_within_the_local_provider_frame_budget(self):
+        msg = FakeMessage("Describe the clip.")
+        intent = '{"inspect":"frames"}'
+        local = SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=intent))])
+        client = MagicMock()
+        client.__aenter__.return_value = client
+        client.responses.create = AsyncMock(return_value=SimpleNamespace(output_text=intent, status="completed"))
+        with patch.object(main, "AsyncOpenAI", return_value=client), \
+             patch.object(main.SPARK_MEDIA_VISION, "clip_response", new=AsyncMock(return_value=local)), \
+             patch.object(main, "activity_presence_for_message", return_value=AsyncMock()), \
+             patch.object(main, "inspect_clip", new=AsyncMock(return_value="sampled")) as inspect, \
+             patch.object(main, "send_reply", new=AsyncMock(return_value=SimpleNamespace(delivered_chunks=()))):
+            for settings, budget in (((main.SPARK_MODEL, "auto"), 3), (("gpt-6.1-terra", "none"), 5)):
+                await main.respond_to_video_request(msg, msg.text, self.attachment, settings)
+                self.assertEqual(inspect.await_args.kwargs["sparse_frame_count"], budget)
+
     async def test_accepted_video_presence_stops_on_success_failure_and_cancellation(self):
         for outcome in ("success", "failure", "cancel"):
             with self.subTest(outcome=outcome):

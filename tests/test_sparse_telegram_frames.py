@@ -1,9 +1,11 @@
 """Real seek positions, visual-track duration, request isolation and extraction budgets."""
+import asyncio
 import json
 from pathlib import Path
 import shutil
 import subprocess
 import tempfile
+import threading
 import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -84,6 +86,55 @@ class SparseTelegramTests(unittest.IsolatedAsyncioTestCase):
                 await inspect_clip(attachment, mode=mode, **opts)
         transcribe.assert_not_awaited()
 
+    @unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"), "requires media tools")
+    async def test_default_video_track_supplies_both_duration_and_pixels(self):
+        self.media("-f", "lavfi", "-i", "color=red:r=1:s=128x96:d=2",
+                   "-f", "lavfi", "-i", "color=blue:r=1:s=64x48:d=121",
+                   "-map", "0:v", "-map", "1:v", "-c:v", "mpeg4", "-disposition:v:0", "0",
+                   "-disposition:v:1", "default")
+        req = MediaFrameRequest(self.source, sparse_max_duration_seconds=1800, sparse_frame_count=3)
+        async with self.adapter.frame_session(req) as result:
+            self.assertTrue(result.ok, result.failure_category)
+            self.assertEqual([0, 60, 120], [f.timestamp_seconds for f in result.frames])
+            for frame in result.frames:
+                with Image.open(frame.path) as im:
+                    rgb = im.getpixel((10, 10))
+                self.assertEqual(2, rgb.index(max(rgb)))
+
+    async def test_cancellation_keeps_input_alive_until_each_bounded_probe_exits(self):
+        for hold_on in (1, 2):
+            with self.subTest(hold_on=hold_on):
+                started, release = threading.Event(), threading.Event()
+                paths = []
+                def runner(command, timeout):
+                    paths.append(Path(command[-1]))
+                    if len(paths) == hold_on:
+                        started.set()
+                        if not release.wait(3):
+                            raise TimeoutError("test release")
+                        self.assertTrue(paths[-1].is_file())
+                    return CommandOutput(0, json.dumps({"streams": [{"codec_type":"video", "start_time":10,
+                        "width":0, "height":0, "duration":5}], "format":{"duration":140}}), "")
+                async def download(custom_path):
+                    custom_path.write_bytes(b"fixture")
+                attachment = SimpleNamespace(file_size=7, get_file=AsyncMock(return_value=SimpleNamespace(
+                    file_size=7, download_to_drive=download)))
+                work = asyncio.create_task(inspect_clip(attachment, request="Describe", mode="frames",
+                    adapter=FfmpegMediaFrameAdapter(command_runner=runner), max_bytes=1024, max_duration=90,
+                    sparse_max_duration=1800, ffmpeg="ffmpeg", answer=AsyncMock(), transcribe=AsyncMock()))
+                try:
+                    self.assertTrue(await asyncio.to_thread(started.wait, 2))
+                    for _ in range(2):
+                        work.cancel()
+                        await asyncio.sleep(0)
+                        self.assertFalse(work.done())
+                        self.assertTrue(paths[-1].exists())
+                finally:
+                    release.set()
+                    with self.assertRaises(asyncio.CancelledError):
+                        await work
+                self.assertFalse(paths[-1].exists())
+
     async def test_missing_video_duration_and_seek_timeout_leave_no_frames(self):
         self.source.write_bytes(b"local input")
         def probe(duration):
@@ -95,12 +146,15 @@ class SparseTelegramTests(unittest.IsolatedAsyncioTestCase):
         for duration, expected in ((None, "metadata_failed"), ("1801", "duration_too_long"), ("150", "timeout")):
             workdirs = []
             def run(command, timeout):
+                self.assertGreater(timeout, 0)
+                self.assertLessEqual(timeout, 30)
                 if command[0] == "ffprobe":
                     return probe(duration)
                 workdirs.append(Path(command[-1]).parent)
                 raise subprocess.TimeoutExpired("ffmpeg", timeout)
             adapter = FfmpegMediaFrameAdapter(command_runner=run)
-            async with adapter.frame_session(MediaFrameRequest(self.source, sparse_max_duration_seconds=1800)) as result:
+            req = MediaFrameRequest(self.source, sparse_max_duration_seconds=1800, timeout_seconds=120)
+            async with adapter.frame_session(req) as result:
                 self.assertEqual(expected, result.failure_category)
                 self.assertFalse(result.frames)
             self.assertFalse(any(d.exists() for d in workdirs))
