@@ -3,6 +3,8 @@ import asyncio
 from contextlib import asynccontextmanager
 from dataclasses import replace
 from pathlib import Path
+import shutil
+import subprocess
 import tempfile
 from types import SimpleNamespace
 import unittest
@@ -13,7 +15,7 @@ from tests.support import configure_test_environment, FakeMessage
 configure_test_environment()
 import main
 from chat_model_settings import ChatModelSettingsStore, SPARK_MODEL, media_model_allowed
-from media_frames import MediaFrameCandidate, MediaFrameResult
+from media_frames import FfmpegMediaFrameAdapter, MediaFrameCandidate, MediaFrameLimits, MediaFrameResult
 
 
 LINK = "https://www.tiktok.com/@sample/video/7000000000000000001"
@@ -120,6 +122,40 @@ class TikTokRoutingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.delivery.await_args.args[1], "Test frame received.")
         self.assertFalse(paths[0].parent.exists())
         self.assertFalse(main.video_jobs)
+
+    @unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"), "requires ffmpeg and ffprobe")
+    async def test_actual_duration_uses_tiktok_budget_and_preserves_telegram_budget(self):
+        adapter = FfmpegMediaFrameAdapter(limits=MediaFrameLimits(max_duration_seconds=90, candidate_frame_count=4,
+            selected_frame_count=2, output_width=64, timeout_seconds=10))
+        with tempfile.TemporaryDirectory() as tmp:
+            for seconds, accepted in ((108, True), (180, True), (181, False)):
+                with self.subTest(seconds=seconds):
+                    fixture = Path(tmp) / f"clip-{seconds}.mp4"
+                    subprocess.run(["ffmpeg", "-nostdin", "-v", "error", "-f", "lavfi", "-i",
+                        f"color=blue:s=64x48:r=1:d={seconds}", "-c:v", "mpeg4", str(fixture)],
+                        check=True, timeout=10)
+                    async def fetch(_url, destination, *, max_bytes, max_duration):
+                        self.assertEqual((max_bytes, max_duration), (20_000_000, 180))
+                        shutil.copyfile(fixture, destination)
+                    self.model_outputs('{"inspect":"frames"}', "Two blue samples.")
+                    self.client.responses.create.reset_mock()
+                    with patch.object(main, "runtime_media_frame_adapter", return_value=adapter), \
+                         patch.object(main, "fetch_tiktok_video", side_effect=fetch):
+                        await self.dispatch()
+                        await asyncio.gather(*main.telegram_turn_tasks)
+                    answer = self.delivery.await_args.args[1]
+                    self.assertEqual(self.client.responses.create.await_count, 2 if accepted else 1)
+                    self.assertIn("Two blue" if accepted else "задовге", answer)
+                    if seconds == 108:
+                        async def download(custom_path):
+                            shutil.copyfile(fixture, custom_path)
+                        remote = SimpleNamespace(file_size=fixture.stat().st_size, download_to_drive=download)
+                        attachment = SimpleNamespace(file_size=remote.file_size, get_file=AsyncMock(return_value=remote))
+                        self.model_outputs('{"inspect":"frames"}')
+                        with patch.object(main, "runtime_media_frame_adapter", return_value=adapter):
+                            await main.respond_to_video_request(self.message, "Describe this", attachment,
+                                                                ("gpt-6.1-terra", "none"))
+                        self.assertIn("задовге", self.delivery.await_args.args[1])
 
     async def test_cancelled_download_cleans_work_directory_and_worker_slot(self):
         started = asyncio.Event()

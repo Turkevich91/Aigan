@@ -140,7 +140,7 @@ from telegram_video import (
     VIDEO_ANSWER_INSTRUCTIONS, VIDEO_INTENT_FORMAT, VIDEO_INTENT_INSTRUCTIONS, VideoUnavailable, inspect_clip,
     inspect_local_clip,
 )
-from tiktok_acquisition import TikTokUnavailable, fetch_tiktok_video, normalize_tiktok_video_url
+from tiktok_acquisition import TIKTOK_MAX_BYTES, TikTokUnavailable, fetch_tiktok_video, normalize_tiktok_video_url
 from runtime_model_pricing import PRICE_SNAPSHOT_VERSION, token_price_for_model
 from model_routing import (
     MODEL_POLICY_ROUTER_SYSTEM_PROMPT,
@@ -14865,6 +14865,8 @@ async def respond_to_video_request(message, prompt, attachment, settings) -> boo
                     ffmpeg=CONFIG.media_frame_ffmpeg_path, answer=answer, transcribe=transcribe)
                 if tiktok:
                     attachment.check_allowed()
+                    options["max_bytes"] = min(CONFIG.media_frame_max_bytes, TIKTOK_MAX_BYTES)
+                    options["max_duration"] = MediaFrameLimits().hard_max_duration_seconds
                     with tempfile.TemporaryDirectory(prefix="aigan-tiktok-") as tmp:
                         source = Path(tmp) / "clip.mp4"
                         await fetch_tiktok_video(attachment.url, source, max_bytes=options["max_bytes"],
