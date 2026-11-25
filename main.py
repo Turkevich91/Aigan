@@ -1920,8 +1920,8 @@ DEFAULT_CONTEXT_PROMPT = "Проаналізуй це повідомлення �
 def load_conversation_guidance(filename: str, fallback: str) -> str:
     try:
         return (APP_DIR / "prompts" / filename).read_text(encoding="utf-8").strip()
-    except OSError:
-        LOGGER.warning("Conversation guidance unavailable: %s", filename)
+    except (OSError, UnicodeDecodeError) as exc:
+        LOGGER.warning("Conversation guidance unavailable: %s (%s)", filename, type(exc).__name__)
         return fallback
 
 
