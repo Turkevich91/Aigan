@@ -1927,7 +1927,18 @@ BOT_ID: int | None = None
 DEFAULT_CONTEXT_PROMPT = "Проаналізуй це повідомлення або вкладення й дай корисну відповідь українською."
 
 
-SYSTEM_PROMPT = """Name: Aigan.
+def load_conversation_guidance(filename: str, fallback: str) -> str:
+    try:
+        return (APP_DIR / "prompts" / filename).read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeDecodeError) as exc:
+        LOGGER.warning("Conversation guidance unavailable: %s (%s)", filename, type(exc).__name__)
+        return fallback
+
+
+CONVERSATION_STYLE = load_conversation_guidance("conversation_style.md", "- Be concise and conversational.")
+CONVERSATION_REPLY_CUE = load_conversation_guidance("conversation_reply.md", "Reply naturally for Telegram.")
+
+SYSTEM_PROMPT = f"""Name: Aigan.
 Style: short, observant, dry, topical, independent. Speak from context, not from role labels.
 
 Language policy:
@@ -1940,8 +1951,8 @@ Language policy:
 Tone:
 - competent, calm, concise, observant, and intellectually independent.
 - You are Aigan. When chat memory contains sender labels such as "Aigan", "@thrd_ua_bot", or bot replies with is_bot=true, treat them as your own previous messages.
-- In direct user requests, be genuinely useful. In proactive messages, speak from the topic, not from your role or capabilities.
-- dry humor, irony, and mild sarcasm are allowed only when they fit the moment.
+{CONVERSATION_STYLE}
+- In proactive messages, speak from the topic.
 - no clowning, slapstick, forced punchlines, meme spam, or theatrical persona.
 - do not introduce yourself or explain your role unless the user asks a simple identity question.
 - never mock a participant's identity, vulnerability, appearance, nationality, religion, gender, health, or other protected/personal traits.
@@ -4316,6 +4327,9 @@ def make_agent(
     randomizer = ACTIVE_RANDOMIZER.get() or RandomizerSession()
     settings = (ModelSettings(max_tokens=CONFIG.max_output_tokens) if model == SPARK_MODEL
                 else build_model_settings(reasoning_effort=reasoning_effort))
+    # Greedy decoding keeps the local chat model grounded on corrections and social cues.
+    if model == SPARK_MODEL and current_model_route_bucket() == "normal":
+        settings.temperature = 0.0
     randomizer_enabled = tool_allowed("randomizer", before_call=True)
     if randomizer.required and randomizer_enabled:
         settings.tool_choice = "randomize"
@@ -7611,7 +7625,7 @@ If the semantic long-term memory block contains matches, do not claim that old m
 
 If Request route is "memory_recall", answer from the recalled long-term memory block. If it contains matches, do not say that you cannot see old chat memory. If it explicitly says there are no matches, say that you searched retained chat memory and ask one concise clarifying question for a date, person, or more specific phrase.
 
-Reply naturally for Telegram. Reply in Ukrainian by default, or English only if explicitly requested. Never reply in Russian. Keep it concise unless the user asks for detail.
+{CONVERSATION_REPLY_CUE if route == "normal" else "Reply naturally for Telegram."} Reply in Ukrainian by default, or English only if explicitly requested. Never reply in Russian. Keep it concise unless the user asks for detail.
 """
 
 
