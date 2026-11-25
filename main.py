@@ -93,7 +93,7 @@ from agent_capabilities import (
     ChatToolMCPServer as MCPServerStdio, PrimaryCapabilities, randomizer_tools, conversational_tool_behavior,
 )
 from chat_tool_policy import CHAT_TOOLS, chat_tool_scope, tool_allowed
-from chat_model_settings import AnswerProfile, ChatModelSettingsStore, MINI_VISION_MODEL, SPARK_MODEL, get_model_capability, media_effort
+from chat_model_settings import AnswerProfile, ChatModelSettingsStore, SPARK_MODEL, get_model_capability, media_effort
 from spark_answer import SparkAnswerProvider
 from chat_model_ui import ChatModelUI, PANEL_TITLE, is_settings_control_message, is_settings_panel_message
 from provider_model_catalog import ProviderModelCatalog
@@ -1245,17 +1245,18 @@ def media_default_model(tool: str) -> str:
     if tool == "youtube":
         return os.getenv("YOUTUBE_TRANSCRIPTION_MODEL", "gpt-transcribe").strip()
     if tool == "photo":
-        return CONFIG.vision_background_model
+        return "gpt-6-luna"
     if tool == "video":
-        return MINI_VISION_MODEL
+        return "gpt-6.1-terra"
     raise ValueError("unknown_media_tool")
 
 
 def photo_summary_settings(chat_id: int) -> tuple[str, str]:
     if CHAT_MODEL_SETTINGS is None:
         raise ChatModelSettingsUnavailable("chat_model_settings_unavailable")
-    model, _ = CHAT_MODEL_SETTINGS.media_selection(chat_id, "photo")
-    return (model, media_effort(model)) if model else (CONFIG.vision_background_model, CONFIG.vision_background_reasoning_effort)
+    selected, _ = CHAT_MODEL_SETTINGS.media_selection(chat_id, "photo")
+    model = selected or media_default_model("photo")
+    return model, media_effort(model)
 
 
 def video_answer_settings(chat_id: int) -> tuple[str, str]:

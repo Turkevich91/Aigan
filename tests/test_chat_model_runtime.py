@@ -72,8 +72,13 @@ class ChatModelRuntimeTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual("gpt-transcribe", main.youtube_mcp_environment(run_id="test", route_bucket="tool")["YOUTUBE_TRANSCRIPTION_MODEL"])
                 self.assertEqual(("gpt-6.1-terra", "none"), main.photo_summary_settings(-1001))
                 self.assertEqual(("gpt-6.1-sol", "low"), main.video_answer_settings(-1001))
-                self.assertEqual(("gpt-5.4-mini", "none"), main.video_answer_settings(-2002))
+                self.assertEqual(("gpt-6-luna", "none"), main.photo_summary_settings(-2002))
+                self.assertEqual(("gpt-6.1-terra", "none"), main.video_answer_settings(-2002))
                 self.assertEqual(("gpt-5.6-sol", "low"), main.primary_answer_settings())
+            for tool, resolve in (("photo", main.photo_summary_settings), ("video", main.video_answer_settings)):
+                _, revision = self.store.media_selection(-1001, tool)
+                self.store.set_media_model(-1001, tool, None, role="admin", available=(), expected_revision=revision)
+                self.assertEqual(resolve(-1001), (main.media_default_model(tool), "none"))
             with main.chat_model_scope(-2002):
                 self.assertEqual("gpt-4o-mini-transcribe", main.youtube_mcp_environment(run_id="test", route_bucket="tool")["YOUTUBE_TRANSCRIPTION_MODEL"])
 
