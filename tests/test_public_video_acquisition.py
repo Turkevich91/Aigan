@@ -58,6 +58,17 @@ class PublicVideoTests(IsolatedAsyncioTestCase):
         self.assertEqual(self.path.read_bytes(), MP4)
         self.assertEqual(check.call_count, 3)
 
+    async def test_one_byte_http_fragments_preserve_the_mp4_signature(self):
+        class FragmentedResponse(httpx.AsyncByteStream):
+            async def __aiter__(self):
+                for byte in MP4:
+                    yield bytes((byte,))
+
+        reply = httpx.Response(200, headers={"content-type": "video/mp4"}, stream=FragmentedResponse())
+        with self.serve({MEDIA: reply}):
+            await self.fetch(MEDIA)
+        self.assertEqual(self.path.read_bytes(), MP4)
+
     async def test_selects_only_actual_player_and_resolves_base_after_redirect(self):
         canonical = "https://media.example.org/article/"
         html = b"""<base href="../"><template><video src="bait.mp4"></video></template>

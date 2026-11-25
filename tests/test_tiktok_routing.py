@@ -117,7 +117,7 @@ class TikTokRoutingTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_public_404_does_not_generate_an_answer_and_the_text_lane_remains_free(self):
         self.message.reply_to_message = FakeMessage(FILE)
-        self.message.text = "Що видно?"
+        self.message.text = "Опиши ключові моменти відео і логотип у кадрі"
         self.model_outputs('{"inspect":"frames"}')
         started, finish = asyncio.Event(), asyncio.Event()
         async def fetch(url, destination, *, max_bytes, max_duration, before_call):

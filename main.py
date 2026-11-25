@@ -2190,7 +2190,12 @@ PROMPT_PRIVACY_RE = re.compile(
     r"(?i)("
     r"\b(?:system|developer|hidden|internal)\s+(?:prompt|instruction|policy|setup|message|log)s?\b|"
     r"\b(?:show|reveal|print|dump|leak|share|summarize|describe)\b.{0,60}\b(?:(?:your|system|developer|hidden|internal)\s+(?:prompt|instruction|policy|setup|message|log)s?|env|secret|token|api\s+key|tool\s+wiring|private\s+log)s?\b|"
-    r"(?:покажи|скинь|розкрий|раскрой|слей|злий|выведи|виведи|перекажи|перескажи|опиши).{0,80}(?:(?:твій|твой|свій|свой|системн|девелопер|розробник|прихован|скрыт|внутрішн|внутренн)\w*.{0,30}(?:промпт|інструкц|инструкц|налаштуван|настро)|env|секрет|токен|ключ|лог|інструмент|tool)|"
+    r"(?:покажи|скинь|розкрий|раскрой|слей|злий|выведи|виведи|перекажи|перескажи|опиши).{0,80}(?:"
+    r"(?:твій|твой|тво[їия]|свій|свой|сво[їия]|системн|девелопер|розробник|прихован|скрыт|внутрішн|внутренн)"
+    r"\w*.{0,30}(?:промпт|інструкц|инструкц|налаштуван|настро|інструмент|инструмент|tool)|"
+    r"\b(?:env|секрет\w*|токен\w*|ключ(?:і|и|ей|ів|а|у|ем|ом|ам|ами|ах)?|лог(?:и|ів|ов|а|у|ом|ам|ами|ах)?)\b|"
+    r"\b(?:інструмент|инструмент|tool)\w*.{0,35}\b(?:бота|сервера|mcp|у тебе|в тебе|у тебя|ти використовуєш|ты используешь))|"
+    r"\b(?:show|reveal|print|dump|leak|share|summarize|describe|list)\b.{0,60}\b(?:your|internal|hidden|connected|configured)\s+tools?\b|"
     r"(?:системн|девелоперськ|розробницьк|прихован|внутрішн)\w*.{0,40}(?:промпт|інструкц|політик|налаштуван|лог)|"
     r"(?:системн|девелоперск|разработч|скрыт|внутренн)\w*.{0,40}(?:промпт|инструкц|политик|настро|лог)|"
     r"(?:твій|твой|свій|свой).{0,30}(?:промпт|інструкц|инструкц|налаштуван|настро)|"
@@ -2201,6 +2206,16 @@ PROMPT_PRIVACY_RE = re.compile(
     r")",
     re.UNICODE,
 )
+_TOOL_NOUN = r"\b(?:інструмент\w*|инструмент\w*|tools?)\b"
+TOOL_DISCLOSURE_RE = re.compile(
+    r"\b(?:покажи|скинь|розкрий|раскрой|слей|злий|выведи|виведи|перекажи|перескажи|опиши|show|list|describe)\b"
+    r".{0,80}" + _TOOL_NOUN, re.I)
+# A scene reference disambiguates ordinary tools. Explicit internal or credential requests still win.
+_SCENE_LOCATION = (
+    r"\b(?:[ву]|на|із|з|из|in|on)\s+(?:(?:цьому|цього|этом|этого|the|this)\s+)?"
+    r"(?:кадр\w*|відео|видео|роли[кцч]\w*|ролі[кцч]\w*|кліп\w*|video|frame|clip)\b")
+SCENE_TOOL_REFERENCE_RE = re.compile(
+    rf"{_TOOL_NOUN}[^.!?;]{{0,40}}{_SCENE_LOCATION}|{_SCENE_LOCATION}[^.!?;]{{0,40}}{_TOOL_NOUN}", re.I)
 PUBLIC_IDENTITY_RE = re.compile(
     r"(?i)^\s*(хто\s+ти|кто\s+ты|who\s+are\s+you|що\s+ти\s+таке|что\s+ты\s+такое|як\s+тебе\s+звати|как\s+тебя\s+зовут)\s*[?.!]*\s*$",
     re.UNICODE,
@@ -4344,7 +4359,8 @@ def prompt_privacy_response(prompt: str) -> str:
         return ""
     if PUBLIC_IDENTITY_RE.search(normalized):
         return "Aigan. Дивлюся на контекст, пам'ять чату і відповідаю по суті."
-    if PROMPT_PRIVACY_RE.search(normalized):
+    if PROMPT_PRIVACY_RE.search(normalized) or (
+            TOOL_DISCLOSURE_RE.search(normalized) and not SCENE_TOOL_REFERENCE_RE.search(normalized)):
         return "Лінива версія: внутрішню кухню не переказую. Можу говорити про поведінку або конкретний баг."
     return ""
 
