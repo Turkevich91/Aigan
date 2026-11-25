@@ -674,7 +674,7 @@ class Config:
         ).strip()
         vision_background_model = os.getenv(
             "VISION_BACKGROUND_MODEL",
-            legacy_vision_model or "gpt-5.4-mini",
+            legacy_vision_model or "gpt-6-luna",
         ).strip()
         vision_interactive_reasoning_effort = os.getenv(
             "VISION_INTERACTIVE_REASONING_EFFORT",
@@ -2798,16 +2798,20 @@ def tool_router_schema() -> dict[str, Any]:
 
 
 def run_tool_router_model_sync(metadata: dict[str, Any]) -> str:
+    model = CONFIG.tool_router_model
+    effort = "none" if model == "gpt-6-luna" else ""
     stage = begin_model_stage(
         stage_kind="router",
-        intended_model=CONFIG.tool_router_model,
+        intended_model=model,
+        reasoning_effort=effort,
         endpoint="responses",
         task_class_bucket="router",
     )
     client = OpenAI()
     try:
         response = client.responses.create(
-            model=CONFIG.tool_router_model,
+            model=model,
+            **({"reasoning": {"effort": effort}} if effort else {}),
             input=[
                 {
                     "role": "system",

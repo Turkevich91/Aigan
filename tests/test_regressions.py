@@ -529,9 +529,9 @@ class AgentsSdkCompatibilityTests(unittest.TestCase):
         self.assertEqual("gpt-5.6-terra", config.model_tier_balanced_model)
         self.assertEqual("gpt-5.4-mini", config.image_intent_router_model)
         self.assertEqual("gpt-5.6-terra", config.image_operation_authorizer_model)
-        self.assertEqual("gpt-5.4-mini", config.vision_background_model)
+        self.assertEqual("gpt-6-luna", config.vision_background_model)
         self.assertEqual("none", config.vision_background_reasoning_effort)
-        self.assertEqual("gpt-5.4-mini", config.image_candidate_review_model)
+        self.assertEqual("gpt-6-luna", config.image_candidate_review_model)
         self.assertEqual("text-embedding-3-small", config.memory_embedding_model)
 
     def test_explicit_model_and_legacy_reasoning_overrides_remain_supported(self) -> None:
@@ -620,9 +620,9 @@ class AgentsSdkCompatibilityTests(unittest.TestCase):
 
         self.assertEqual("gpt-5.6-sol", config.vision_interactive_model)
         self.assertEqual("low", config.vision_interactive_reasoning_effort)
-        self.assertEqual("gpt-5.4-mini", config.vision_background_model)
+        self.assertEqual("gpt-6-luna", config.vision_background_model)
         self.assertEqual("none", config.vision_background_reasoning_effort)
-        self.assertEqual("gpt-5.4-mini", config.image_candidate_review_model)
+        self.assertEqual("gpt-6-luna", config.image_candidate_review_model)
 
         environment["VISION_MODEL"] = "legacy-vision-model"
         with patch.dict(os.environ, environment, clear=True):
@@ -15854,6 +15854,20 @@ class LivingReminderTests(unittest.TestCase):
                 main.REMINDER_TOOL_CONTEXT.reset(token)
 
             self.assertEqual(expected_names, names)
+
+    def test_reminder_router_pins_luna_effort_and_preserves_other_models(self) -> None:
+        for model in ("gpt-6-luna", "gpt-5.4-nano"):
+            with self.subTest(model=model), patch.object(main, "CONFIG", replace(main.CONFIG, tool_router_model=model)), patch.object(main, "OpenAI") as client:
+                client.return_value.responses.create.return_value = SimpleNamespace(
+                    output_text="{}", model=model, status="completed", usage=None,
+                )
+                main.run_tool_router_model_sync({"trusted_text": "synthetic"})
+                request = client.return_value.responses.create.call_args.kwargs
+                self.assertEqual(model, request["model"])
+                if model == "gpt-6-luna":
+                    self.assertEqual({"effort": "none"}, request["reasoning"])
+                else:
+                    self.assertNotIn("reasoning", request)
 
     def test_config_from_env_preserves_unconfigured_tool_router_model(self) -> None:
         with patch.dict(os.environ, {"TOOL_ROUTER_MODEL": "   "}):
