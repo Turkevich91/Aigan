@@ -6,8 +6,9 @@ from model_telemetry import normalize_policy_version
 
 
 class RuntimeModelPricingTests(unittest.TestCase):
-    def test_62_rates_change_above_272k_for_the_full_request(self) -> None:
+    def test_current_model_rates_change_above_272k_for_the_full_request(self) -> None:
         for model, at_limit, above_limit in (
+            ("gpt-6-luna", 27_130_000, 54_255_200),
             ("gpt-6.2-sol", 542_400_000, 1_084_704_000),
             ("gpt-6.2-astra", 2_169_600_000, 4_338_816_000),
         ):
@@ -128,7 +129,7 @@ class RuntimeModelPricingTests(unittest.TestCase):
             "gpt-6-astra", [runtime_pricing.TokenUsage(100, output_tokens=10)]
         )
 
-        self.assertEqual("openai-standard-2026-11-18-gpt62-addendum", estimate.snapshot_version)
+        self.assertEqual("openai-standard-2026-11-25-luna-addendum", estimate.snapshot_version)
         self.assertIn(
             "https://developers.openai.com/api/docs/models/gpt-6.1-terra",
             runtime_pricing.PRICE_SOURCE_URLS,

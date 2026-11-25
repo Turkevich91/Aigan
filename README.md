@@ -177,9 +177,9 @@ Image analysis is enabled by default for photos and image documents that Telegra
 IMAGE_ANALYSIS_ENABLED=true
 VISION_INTERACTIVE_MODEL=gpt-6-astra
 VISION_INTERACTIVE_REASONING_EFFORT=low
-VISION_BACKGROUND_MODEL=gpt-5.4-mini
+VISION_BACKGROUND_MODEL=gpt-6-luna
 VISION_BACKGROUND_REASONING_EFFORT=none
-IMAGE_CANDIDATE_REVIEW_MODEL=gpt-5.4-mini
+IMAGE_CANDIDATE_REVIEW_MODEL=gpt-6-luna
 IMAGE_MAX_BYTES=6000000
 ```
 
@@ -191,6 +191,8 @@ Reaction-asset descriptions use the background model, while
 public-web candidate safety/relevance review keeps its dedicated reviewer. The legacy
 `VISION_MODEL` key remains a background compatibility fallback; interactive vision never
 inherits it, so an old Mini setting cannot silently weaken an explicit image answer.
+
+[Specialist model evaluation and selection results](docs/auxiliary-model-eval-results-2026-11-25.md).
 
 For an existing Sol deployment, update only `OPENAI_MODEL`,
 `MODEL_TIER_PREMIUM_MODEL`, and `VISION_INTERACTIVE_MODEL` where they currently
