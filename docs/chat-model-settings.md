@@ -74,9 +74,11 @@ Capability and discovery sources:
 
 ## Tool permissions
 
-Open **Моделі медіаінструментів** from `/model` or `/settings` to select a model for YouTube audio transcription, saved photo descriptions, Telegram clips or public TikTok videos. A tap saves that tool’s choice for the current chat. **Типова модель інструмента** restores its deployment default. The primary answer profile, its timer and other media selections have separate settings.
+Open **Моделі медіаінструментів** from `/model` or `/settings` to select a model for YouTube audio transcription, saved photo descriptions, Telegram clips, TikTok or other public video links. A tap saves that tool’s choice for the current chat. **Типова модель інструмента** restores its deployment default. The primary answer profile, its timer and other media selections have separate settings.
 
-New chats and tools reset to their defaults use `gpt-6-luna` for photo descriptions and `gpt-6.1-terra` for both Telegram video and TikTok. These vision defaults use `none` reasoning effort. The TikTok model choice is saved even when the server has disabled link inspection or TikTok refuses the media download. In the latter case, participants can send the clip as a Telegram video attachment.
+New chats and tools reset to their defaults use `gpt-6-luna` for photo descriptions and `gpt-6.1-terra` for Telegram clips, TikTok and other public video links. These vision defaults use `none` reasoning effort. The TikTok model choice is saved even when the server has disabled link inspection or TikTok refuses the media download. In the latter case, participants can send the clip as a Telegram video attachment.
+
+**Відео за посиланням** applies to an explicit question about a direct MP4 or a public page with a supported video player. Ask in the same message as the link or reply to the message containing it. Both web reading and public video analysis must be enabled for the chat. Eligible chats can select the locally qualified **Spark / Qwen** model here as well.
 
 YouTube uses public captions first. The audio menu offers file transcription models. The photo and video menus offer image-capable cloud models, including Mini. The video model interprets sampled frames and any extracted speech. Participants can make persistent vision selections within their chat model ceiling. Administrators and the owner can select from all supported options returned by discovery.
 

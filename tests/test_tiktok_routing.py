@@ -1,4 +1,4 @@
-"""TikTok-only admission, settings, bounded delivery and failure behavior."""
+"""Admission, model selection and bounded delivery for explicitly linked clips."""
 import asyncio
 import io
 import json
@@ -21,6 +21,8 @@ from media_frames import FfmpegMediaFrameAdapter, MediaFrameCandidate, MediaFram
 
 
 LINK = "https://www.tiktok.com/@sample/video/7000000000000000001"
+PAGE = "https://example.org/post/42"
+FILE = "https://example.org/short.MP4?sample=1"
 
 
 class TikTokRoutingTests(unittest.IsolatedAsyncioTestCase):
@@ -55,14 +57,14 @@ class TikTokRoutingTests(unittest.IsolatedAsyncioTestCase):
         await main.handle_prompt(self.message, self.context, self.message.text, allow_pending_wait=False)
 
     def test_one_explicit_source_from_authored_request_or_direct_same_chat_reply(self):
-        self.assertEqual(main.requested_tiktok_url(self.message, self.message.text), LINK)
+        self.assertEqual(main.requested_video_link(self.message, self.message.text), ("tiktok", LINK))
         for prompt in (LINK, LINK + "?!", "Describe https://youtu.be/x", "What about " + LINK + " https://example.com"):
-            self.assertIsNone(main.requested_tiktok_url(self.message, prompt))
+            self.assertIsNone(main.requested_video_link(self.message, prompt))
         self.message.reply_to_message = FakeMessage(LINK)
-        self.assertEqual(main.requested_tiktok_url(self.message, "What happens?"), LINK)
-        self.assertIsNone(main.requested_tiktok_url(self.message, "Read https://example.com"))
+        self.assertEqual(main.requested_video_link(self.message, "What happens?"), ("tiktok", LINK))
+        self.assertIsNone(main.requested_video_link(self.message, "Read https://example.com"))
         self.message.reply_to_message.chat_id = -2
-        self.assertIsNone(main.requested_tiktok_url(self.message, "What happens?"))
+        self.assertIsNone(main.requested_video_link(self.message, "What happens?"))
         self.assertTrue(media_model_allowed("tiktok", SPARK_MODEL))
         self.assertEqual(main.video_answer_settings(-2, "tiktok"), ("gpt-6.1-terra", "none"))
         with patch.object(self.store, "media_selection", return_value=(SPARK_MODEL, 1)):
@@ -70,6 +72,105 @@ class TikTokRoutingTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(self.store, "media_selection", return_value=("unknown-model", 1)):
             with self.assertRaises(main.ChatModelSettingsUnavailable):
                 main.video_answer_settings(-2, "tiktok")
+
+    def test_public_video_only_selects_one_explicit_file_or_referenced_player(self):
+        for prompt, expected in (
+                ("Опиши кадри " + PAGE, PAGE), ("What is shown? " + FILE, FILE),
+                ("Summarize the article " + PAGE, None), ("Video games are fun " + PAGE, None),
+                ("Глянь відео " + PAGE + " " + FILE, None), ("@bot " + FILE, None),
+                ("Глянь відео " + " ".join((FILE, FILE, FILE, PAGE)), None),
+                ("Describe this video https://youtu.be/sample", None),
+                ("Describe this video https://www.instagram.com/reel/sample", None)):
+            with self.subTest(prompt=prompt):
+                value = main.requested_video_link(self.message, prompt)
+                self.assertEqual(value, ("public_video", expected) if expected else None)
+        self.message.reply_to_message = FakeMessage("Ось коротке відео " + PAGE)
+        self.assertEqual(main.requested_video_link(self.message, "Що тут відбувається?"), ("public_video", PAGE))
+        self.assertIsNone(main.requested_video_link(self.message, "Summarize the article"))
+        self.message.reply_to_message = FakeMessage("Previous article " + PAGE)
+        self.assertIsNone(main.requested_video_link(self.message, "Що думаєш?"))
+        self.message.reply_to_message.entities = [SimpleNamespace(type=main.MessageEntity.TEXT_LINK, url=FILE)]
+        self.assertIsNone(main.requested_video_link(self.message, "Опиши відео"))
+        self.message.reply_to_message.text = "Плеєр"
+        self.assertEqual(main.requested_video_link(self.message, "Опиши відео"), ("public_video", FILE))
+        self.message.reply_to_message.text = FILE
+        self.assertEqual(main.requested_video_link(self.message, "Опиши відео"), ("public_video", FILE))
+        self.message.reply_to_message.chat_id = 2
+        self.assertIsNone(main.requested_video_link(self.message, "Опиши відео"))
+        with patch.object(main, "CONFIG", replace(main.CONFIG, tiktok_video_enabled=False)):
+            self.assertIsNone(main.requested_video_link(self.message, "Describe the video " + LINK))
+        self.message.forward_from = SimpleNamespace(id=234)
+        self.assertIsNone(main.requested_video_link(self.message, "Describe the video " + FILE))
+
+    async def test_passive_group_link_and_private_article_never_call_video_router(self):
+        with patch.object(main, "remember_message_persistently", new_callable=AsyncMock), \
+             patch.object(main, "fetch_public_video", new_callable=AsyncMock) as fetch:
+            passive = FakeMessage("Describe the video " + FILE, chat_type="supergroup")
+            await main.text_message(SimpleNamespace(effective_message=passive), self.context)
+            self.assertFalse(passive.reply_calls)
+            self.normal.assert_not_awaited()
+            self.message.text = "Summarize this article " + PAGE
+            await main.text_message(SimpleNamespace(effective_message=self.message), self.context)
+            self.normal.assert_awaited_once()
+            self.client.responses.create.assert_not_awaited()
+            fetch.assert_not_awaited()
+
+    async def test_public_404_does_not_generate_an_answer_and_the_text_lane_remains_free(self):
+        self.message.reply_to_message = FakeMessage(FILE)
+        self.message.text = "Що видно?"
+        self.model_outputs('{"inspect":"frames"}')
+        started, finish = asyncio.Event(), asyncio.Event()
+        async def fetch(url, destination, *, max_bytes, max_duration, before_call):
+            self.assertEqual(url, FILE)
+            before_call()
+            started.set()
+            await finish.wait()
+            raise main.PublicVideoUnavailable("not_found")
+        with patch.object(main, "fetch_public_video", side_effect=fetch):
+            await self.dispatch()
+            try:
+                await asyncio.wait_for(started.wait(), 2)
+                self.assertEqual(1, len(main.video_jobs))
+                text = FakeMessage("How's it going?", chat_type="private", message_id=103)
+                await main.handle_prompt(text, self.context, text.text, allow_pending_wait=False)
+                self.normal.assert_awaited_once()
+            finally:
+                finish.set()
+                await asyncio.gather(*main.telegram_turn_tasks)
+        self.client.responses.create.assert_awaited_once()
+        self.assertEqual(self.client.responses.create.await_args.kwargs["model"], "gpt-6.1-terra")
+        self.assertNotIn(FILE, str(self.client.responses.create.await_args))
+        self.assertIn("404", self.delivery.await_args.args[1])
+        self.assertEqual("public_video", self.delivery.await_args.kwargs["route"])
+        self.normal.assert_awaited_once()
+        self.assertFalse(main.video_jobs)
+
+    async def test_public_video_needs_both_permissions_and_rechecks_before_delivery(self):
+        self.message.text = "Опиши відео " + PAGE
+        def set_tool(key, enabled):
+            chat = self.message.chat_id
+            self.store.tools.set_enabled(chat, key, enabled, expected_revision=self.store.tools.resolve(chat).revision)
+        with patch.object(main, "fetch_public_video", new_callable=AsyncMock) as fetch:
+            for key in ("web", "public_video"):
+                set_tool(key, False)
+                await self.dispatch()
+                await asyncio.gather(*main.telegram_turn_tasks)
+                fetch.assert_not_awaited()
+                self.client.responses.create.assert_not_awaited()
+                self.assertIn("вимкнено", self.delivery.await_args.args[1])
+                set_tool(key, True)
+            self.model_outputs('{"inspect":"frames"}')
+            async def inspect(_source, **options):
+                self.assertEqual("public_video_clip", options["source_family"])
+                set_tool("web", False)
+                set_tool("web", True)
+                return "protected visual details"
+            with patch.object(main, "inspect_local_clip", side_effect=inspect):
+                await self.dispatch()
+                await asyncio.gather(*main.telegram_turn_tasks)
+            fetch.assert_awaited_once()
+            self.assertIn("вимкнено", self.delivery.await_args.args[1])
+            self.assertNotIn("protected", self.delivery.await_args.args[1])
 
     async def test_malformed_local_intent_stops_without_falling_back_or_downloading(self):
         self.select("tiktok", SPARK_MODEL)

@@ -189,6 +189,12 @@ class ChatModelUITests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("OpenAI", self.panel.text)
         await self.click("Spark / Qwen · локально")
         self.assertEqual(("spark-qwen", 1), self.store.media_selection(-1001, "video"))
+        await self.click("Назад")
+        await self.click("Відео за посиланням")
+        self.assertIn("gpt-6.1-terra", self.panel.text)
+        self.assertIn("вебчитання", self.panel.text)
+        await self.click("Spark / Qwen · локально")
+        self.assertEqual(("spark-qwen", 1), self.store.media_selection(-1001, "public_video"))
 
     async def test_media_menu_independent_persistent_models_and_ownership(self):
         self.ui.tool_available = lambda key: True
@@ -198,7 +204,8 @@ class ChatModelUITests(unittest.IsolatedAsyncioTestCase):
         for label, key, model in (("Аудіо YouTube", "youtube", "gpt-4o-mini-transcribe"),
                                   ("Фото для пам’яті", "photo", "gpt-6-luna"),
                                   ("Відео Telegram", "video", "gpt-6.1-terra"),
-                                  ("Відео TikTok", "tiktok", "gpt-6-luna")):
+                                  ("Відео TikTok", "tiktok", "gpt-6-luna"),
+                                  ("Відео за посиланням", "public_video", "gpt-6.1-sol")):
             await self.click(label)
             wrong_actor = await self.click(model, actor=45)
             self.assertTrue(wrong_actor.answer.await_args.kwargs["show_alert"])

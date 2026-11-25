@@ -248,7 +248,10 @@ class ChatModelUI:
                         lines.append("Обробку посилань TikTok на сервері вимкнено. Вибір моделі зберігається.")
                     lines.append("Доступ до відео залежить від мережі TikTok. Якщо відео недоступне, "
                                  "надішли його файлом у Telegram.")
-                if panel.media_tool in ("video", "tiktok") and SPARK_MODEL in panel.media_options:
+                if panel.media_tool == "public_video":
+                    lines.append("Для прямого MP4 або публічної сторінки з відеоплеєром. "
+                                 "Потрібні дозволи на вебчитання та аналіз відео за посиланням.")
+                if panel.media_tool in ("video", "tiktok", "public_video") and SPARK_MODEL in panel.media_options:
                     lines.append("Spark / Qwen аналізує кадри локально. Для розпізнавання мовлення використовується OpenAI.")
             if notice:
                 lines.append(html.escape(notice))
