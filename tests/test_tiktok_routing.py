@@ -1,5 +1,7 @@
 """TikTok-only admission, settings, bounded delivery and failure behavior."""
 import asyncio
+import io
+import json
 from contextlib import asynccontextmanager
 from dataclasses import replace
 from pathlib import Path
@@ -86,6 +88,66 @@ class TikTokRoutingTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIn("Не вдалося", self.delivery.await_args.args[1])
             else:
                 self.normal.assert_awaited_once()
+
+    async def test_local_stt_requires_spoken_request_and_current_permission(self):
+        self.select("tiktok", SPARK_MODEL)
+        public_file = Path(self.enterContext(tempfile.TemporaryDirectory())) / "frame.jpg"
+        public_file.write_bytes(b"frame")
+
+        @asynccontextmanager
+        async def frame_session(request):
+            yield MediaFrameResult(True, frames=(MediaFrameCandidate(public_file, 0, 0),), metadata={"has_audio": True})
+
+        async def fetch(url, destination, **kwargs):
+            destination.write_bytes(b"video")
+
+        cloud_stt = AsyncMock(return_value=SimpleNamespace(text="The spoken line.", usage=None))
+        self.client.audio.transcriptions.create = cloud_stt
+        cases = [
+            ("Describe the visible change in English.", "both", "visual", "", False),
+            ("Переклади напис на екрані.", "speech", "visual", "", False),
+            ("Is there instrumental music?", "both", "other_audio", "", False),
+            ("What color is the sign?", "speech", "spoken_words", "transcribe", False),
+            ("Переклади слова диктора.", "speech", "spoken_words", "слова диктора", True),
+            ("Describe the scene and translate the dialogue.", "both", "spoken_words", "translate the dialogue", True),
+            ("Transcribe the clip.", "speech", "spoken_words", "Transcribe", False),
+        ]
+        for i, (request, decision, source, quote, expected_cloud) in enumerate(cases):
+            with self.subTest(request=request):
+                cloud_stt.reset_mock()
+                self.delivery.reset_mock()
+                self.message = FakeMessage(request + " " + LINK, chat_type="private", message_id=400+i)
+                async def local(instructions, model_input, *, schema, before_call):
+                    before_call()
+                    if schema == main.VIDEO_INTENT_FORMAT["format"]:
+                        answer = json.dumps({"inspect": decision})
+                    elif schema == main.SPEECH_SCOPE_FORMAT:
+                        answer = json.dumps({"source": source, "evidence": quote})
+                    else:
+                        answer = "Answer from the available evidence."
+                    return SimpleNamespace(model="local", usage=None, choices=[SimpleNamespace(message=SimpleNamespace(content=answer))])
+                async def extract(source_path, ffmpeg, duration, transcribe):
+                    if i == len(cases)-1:
+                        policy = self.store.tools.resolve(self.message.chat_id)
+                        self.store.tools.set_enabled(self.message.chat_id, "tiktok", False, expected_revision=policy.revision)
+                    return await transcribe(io.BytesIO(b"audio"))
+                with patch.object(main.SPARK_MEDIA_VISION, "clip_response", side_effect=local), \
+                     patch.object(main, "fetch_tiktok_video", side_effect=fetch), \
+                     patch.object(main, "runtime_media_frame_adapter", return_value=SimpleNamespace(frame_session=frame_session)), \
+                     patch("telegram_video.transcribe_clip", side_effect=extract) as extraction:
+                    await self.dispatch()
+                    await asyncio.gather(*main.telegram_turn_tasks)
+                self.assertEqual(int(expected_cloud), cloud_stt.await_count)
+                if i < 4:
+                    extraction.assert_not_awaited()
+                delivered = self.delivery.await_args.args[1]
+                if source == "other_audio":
+                    self.assertIn("музику", delivered)
+                elif i == len(cases)-1:
+                    self.assertIn("недоступний", delivered)
+                elif i != 3:
+                    self.assertIn("Answer from the available evidence.", delivered)
+                self.client.responses.create.assert_not_awaited()
 
     async def test_passive_group_and_private_bare_link_do_not_start_tiktok(self):
         self.model_outputs()

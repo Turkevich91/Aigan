@@ -139,7 +139,7 @@ from media_acquisition import (
 from media_frames import FfmpegMediaFrameAdapter, MediaFrameAdapter, MediaFrameLimits, NullMediaFrameAdapter
 from telegram_video import (
     VIDEO_ANSWER_INSTRUCTIONS, VIDEO_INTENT_FORMAT, VIDEO_INTENT_INSTRUCTIONS, VideoUnavailable, inspect_clip,
-    inspect_local_clip, TELEGRAM_VIDEO_MAX_BYTES,
+    inspect_local_clip, TELEGRAM_VIDEO_MAX_BYTES, SPEECH_SCOPE_INSTRUCTIONS, SPEECH_SCOPE_FORMAT, confirmed_speech_scope,
 )
 from tiktok_acquisition import TIKTOK_MAX_BYTES, TikTokUnavailable, fetch_tiktok_video, normalize_tiktok_video_url
 from runtime_model_pricing import PRICE_SNAPSHOT_VERSION, token_price_for_model
@@ -14849,21 +14849,21 @@ async def respond_to_video_request(message, prompt, attachment, settings) -> boo
         async with asyncio.timeout(110), AsyncOpenAI(
             api_key=CONFIG.openai_api_key, timeout=50, max_retries=0,
         ) as client:
-            async def respond(instructions, model_input, *, classify=False):
+            async def respond(instructions, model_input, *, schema=None):
                 if tiktok:
                     attachment.check_allowed()
                 if model == SPARK_MODEL:
                     result = await video_provider_call(SPARK_MEDIA_VISION.clip_response(
-                        instructions, model_input, schema=VIDEO_INTENT_FORMAT["format"] if classify else None,
+                        instructions, model_input, schema=schema,
                         before_call=attachment.check_allowed if tiktok else None),
-                        model=model, effort=effort, stage_kind="router" if classify else "vision",
+                        model=model, effort=effort, stage_kind="router" if schema else "vision",
                         endpoint="chat_completions", route=route)
                     return result.choices[0].message.content.strip()
-                options = {"text": VIDEO_INTENT_FORMAT} if classify else {}
+                options = {"text": {"format": schema}} if schema else {}
                 result = await video_provider_call(client.responses.create(
                     model=model, instructions=instructions, input=model_input, reasoning={"effort": effort},
-                    max_output_tokens=512 if classify else CONFIG.max_output_tokens, store=False, **options),
-                    model=model, effort=effort, stage_kind="router" if classify else "vision", endpoint="responses", route=route)
+                    max_output_tokens=512 if schema else CONFIG.max_output_tokens, store=False, **options),
+                    model=model, effort=effort, stage_kind="router" if schema else "vision", endpoint="responses", route=route)
                 text = (result.output_text or "").strip()
                 if not text:
                     raise ValueError("empty_video_response")
@@ -14881,7 +14881,11 @@ async def respond_to_video_request(message, prompt, attachment, settings) -> boo
                 return result.text.strip()
 
             question = URL_TOKEN_RE.sub("[відео]", prompt) if tiktok else prompt
-            decision = json.loads(await respond(VIDEO_INTENT_INSTRUCTIONS, question, classify=True)).get("inspect")
+            async def speech_scope():
+                raw = await respond(SPEECH_SCOPE_INSTRUCTIONS, question, schema=SPEECH_SCOPE_FORMAT)
+                return confirmed_speech_scope(raw, question)
+
+            decision = json.loads(await respond(VIDEO_INTENT_INSTRUCTIONS, question, schema=VIDEO_INTENT_FORMAT["format"])).get("inspect")
             if decision == "unrelated":
                 return False
             if decision not in {"frames", "speech", "both"}:
@@ -14894,6 +14898,8 @@ async def respond_to_video_request(message, prompt, attachment, settings) -> boo
                 options = dict(request=question, mode=decision,
                     adapter=runtime_media_frame_adapter(), max_bytes=telegram_bytes, max_duration=telegram_seconds,
                     ffmpeg=CONFIG.media_frame_ffmpeg_path, answer=answer, transcribe=transcribe)
+                if model == SPARK_MODEL:
+                    options["speech_scope"] = speech_scope
                 if tiktok:
                     attachment.check_allowed()
                     options["max_bytes"] = min(CONFIG.media_frame_max_bytes, TIKTOK_MAX_BYTES)
