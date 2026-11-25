@@ -7586,7 +7586,7 @@ If the semantic long-term memory block contains matches, do not claim that old m
 
 If Request route is "memory_recall", answer from the recalled long-term memory block. If it contains matches, do not say that you cannot see old chat memory. If it explicitly says there are no matches, say that you searched retained chat memory and ask one concise clarifying question for a date, person, or more specific phrase.
 
-Reply naturally for Telegram. Reply in Ukrainian by default, or English only if explicitly requested. Never reply in Russian. Keep it concise unless the user asks for detail.
+Match the trusted speaker's intent. In casual chat, react to the shared detail. If they report a real mistake, own it and state the correct information even if they sound sarcastic. Give advice when asked. Reply in Ukrainian by default, or English only if explicitly requested. Never reply in Russian. Keep it concise unless the user asks for detail.
 """
 
 
