@@ -1917,7 +1917,16 @@ BOT_ID: int | None = None
 DEFAULT_CONTEXT_PROMPT = "Проаналізуй це повідомлення або вкладення й дай корисну відповідь українською."
 
 
-CONVERSATION_STYLE = (APP_DIR / "prompts" / "conversation_style.md").read_text(encoding="utf-8").strip()
+def load_conversation_guidance(filename: str, fallback: str) -> str:
+    try:
+        return (APP_DIR / "prompts" / filename).read_text(encoding="utf-8").strip()
+    except OSError:
+        LOGGER.warning("Conversation guidance unavailable: %s", filename)
+        return fallback
+
+
+CONVERSATION_STYLE = load_conversation_guidance("conversation_style.md", "- Be concise and conversational.")
+CONVERSATION_REPLY_CUE = load_conversation_guidance("conversation_reply.md", "Reply naturally for Telegram.")
 
 SYSTEM_PROMPT = f"""Name: Aigan.
 Style: short, observant, dry, topical, independent. Speak from context, not from role labels.
@@ -4292,6 +4301,9 @@ def make_agent(
     randomizer = ACTIVE_RANDOMIZER.get() or RandomizerSession()
     settings = (ModelSettings(max_tokens=CONFIG.max_output_tokens) if model == SPARK_MODEL
                 else build_model_settings(reasoning_effort=reasoning_effort))
+    # Greedy decoding keeps the local chat model grounded on corrections and social cues.
+    if model == SPARK_MODEL and current_model_route_bucket() == "normal":
+        settings.temperature = 0.0
     randomizer_enabled = tool_allowed("randomizer", before_call=True)
     if randomizer.required and randomizer_enabled:
         settings.tool_choice = "randomize"
@@ -7586,7 +7598,7 @@ If the semantic long-term memory block contains matches, do not claim that old m
 
 If Request route is "memory_recall", answer from the recalled long-term memory block. If it contains matches, do not say that you cannot see old chat memory. If it explicitly says there are no matches, say that you searched retained chat memory and ask one concise clarifying question for a date, person, or more specific phrase.
 
-Match the trusted speaker's intent. In casual chat, react to the shared detail. If they report a real mistake, own it and state the correct information even if they sound sarcastic. Give advice when asked. Reply in Ukrainian by default, or English only if explicitly requested. Never reply in Russian. Keep it concise unless the user asks for detail.
+{CONVERSATION_REPLY_CUE if route == "normal" else "Reply naturally for Telegram."} Reply in Ukrainian by default, or English only if explicitly requested. Never reply in Russian. Keep it concise unless the user asks for detail.
 """
 
 

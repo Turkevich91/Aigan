@@ -41,6 +41,17 @@ class ChatModelRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.token = main.ACTIVE_CHAT_MODEL.set(None)
         self.addCleanup(main.ACTIVE_CHAT_MODEL.reset, self.token)
 
+    def test_greedy_sampling_only_for_normal_local_conversation(self):
+        for route, model, expected in (("normal", main.SPARK_MODEL, 0.0),
+                                       ("memory_recall", main.SPARK_MODEL, None),
+                                       ("normal", self.config.openai_model, None)):
+            with self.subTest(route=route, model=model):
+                token = main.ACTIVE_MODEL_ROUTE_BUCKET.set(route)
+                try:
+                    self.assertEqual(main.make_agent([], model=model).model_settings.temperature, expected)
+                finally:
+                    main.ACTIVE_MODEL_ROUTE_BUCKET.reset(token)
+
     async def test_spark_paths_fail_closed_and_block_visual_inputs(self):
         self.store.apply(-1001, "qwen", "auto", 900)
         with main.chat_model_scope(-1001), patch.object(main, "SPARK_ANSWER", None), \
