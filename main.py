@@ -93,7 +93,7 @@ from agent_capabilities import (
     ChatToolMCPServer as MCPServerStdio, PrimaryCapabilities, randomizer_tools, conversational_tool_behavior,
 )
 from chat_tool_policy import CHAT_TOOLS, chat_tool_scope, tool_allowed
-from chat_model_settings import AnswerProfile, ChatModelSettingsStore, SPARK_MODEL, get_model_capability, media_effort
+from chat_model_settings import AnswerProfile, ChatModelSettingsStore, MEDIA_MODEL_DEFAULTS, SPARK_MODEL, get_model_capability, media_effort
 from spark_answer import SparkAnswerProvider
 from chat_model_ui import ChatModelUI, PANEL_TITLE, is_settings_control_message, is_settings_panel_message
 from provider_model_catalog import ProviderModelCatalog
@@ -1243,12 +1243,10 @@ def primary_supports_images() -> bool:
 
 def media_default_model(tool: str) -> str:
     if tool == "youtube":
-        return os.getenv("YOUTUBE_TRANSCRIPTION_MODEL", "gpt-transcribe").strip()
-    if tool == "photo":
-        return "gpt-6-luna"
-    if tool == "video":
-        return "gpt-6.1-terra"
-    raise ValueError("unknown_media_tool")
+        return os.getenv("YOUTUBE_TRANSCRIPTION_MODEL", MEDIA_MODEL_DEFAULTS[tool]).strip()
+    if tool not in MEDIA_MODEL_DEFAULTS:
+        raise ValueError("unknown_media_tool")
+    return MEDIA_MODEL_DEFAULTS[tool]
 
 
 def photo_summary_settings(chat_id: int) -> tuple[str, str]:
