@@ -94,7 +94,7 @@ from agent_capabilities import (
     ChatToolMCPServer as MCPServerStdio, PrimaryCapabilities, randomizer_tools, conversational_tool_behavior,
 )
 from chat_tool_policy import CHAT_TOOLS, ChatToolRun, chat_tool_scope, tool_allowed
-from chat_model_settings import AnswerProfile, ChatModelSettingsStore, MEDIA_MODEL_DEFAULTS, SPARK_MODEL, get_model_capability, media_effort
+from chat_model_settings import AnswerProfile, ChatModelSettingsStore, MEDIA_MODEL_DEFAULTS, SPARK_MODEL, get_model_capability, media_effort, media_model_allowed
 from spark_answer import SparkAnswerProvider
 from chat_model_ui import ChatModelUI, PANEL_TITLE, is_settings_control_message, is_settings_panel_message
 from provider_model_catalog import ProviderModelCatalog
@@ -1267,6 +1267,8 @@ def video_answer_settings(chat_id: int, tool: str = "video") -> tuple[str, str]:
         raise ChatModelSettingsUnavailable("chat_model_settings_unavailable")
     selected, _ = CHAT_MODEL_SETTINGS.media_selection(chat_id, tool)
     model = selected or media_default_model(tool)
+    if tool == "tiktok" and not media_model_allowed(tool, model):
+        raise ChatModelSettingsUnavailable("invalid_tiktok_model")
     return model, media_effort(model)
 
 

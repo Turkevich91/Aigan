@@ -63,6 +63,9 @@ class TikTokRoutingTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(main.requested_tiktok_url(self.message, "What happens?"))
         self.assertFalse(media_model_allowed("tiktok", SPARK_MODEL))
         self.assertEqual(main.video_answer_settings(-2, "tiktok"), ("gpt-6.1-terra", "none"))
+        with patch.object(self.store, "media_selection", return_value=(SPARK_MODEL, 1)):
+            with self.assertRaises(main.ChatModelSettingsUnavailable):
+                main.video_answer_settings(-2, "tiktok")
 
     async def test_passive_group_and_private_bare_link_do_not_start_tiktok(self):
         self.model_outputs()
