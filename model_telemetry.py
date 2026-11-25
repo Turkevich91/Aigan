@@ -67,6 +67,7 @@ ROUTE_BUCKETS = {
     "reminder_clarification",
     "selfcheck",
     "time_sensitive",
+    "telegram_video",
     "tool",
     "translate_reference",
     "vision",

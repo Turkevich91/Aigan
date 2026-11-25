@@ -1,3 +1,5 @@
+import contextlib
+import io
 import os
 import subprocess
 import sys
@@ -5,7 +7,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from mcp_servers import youtube_transcript
 from model_telemetry import ModelTelemetryStore
@@ -15,7 +17,7 @@ class SecretTranscriptionFailure(RuntimeError):
     pass
 
 
-def fake_dependency_modules(*, response: object | None = None, error: Exception | None = None):
+def fake_dependency_modules(*, response: object | None = None, error: Exception | None = None, duration=30):
     class FakeYoutubeDL:
         def __init__(self, options):
             self.options = options
@@ -26,10 +28,8 @@ def fake_dependency_modules(*, response: object | None = None, error: Exception 
         def __exit__(self, exc_type, exc, traceback):
             return False
 
-        def extract_info(self, video_url, download=False):
-            return {"duration": 30}
-
         def download(self, video_urls):
+            self.options["match_filter"]({"duration": duration}, incomplete=False)
             output = self.options["outtmpl"].replace("%(ext)s", "mp3")
             Path(output).write_bytes(b"fake audio")
 
@@ -65,6 +65,80 @@ class ExplodingTelemetry:
 
 
 class YoutubeTranscriptTelemetryTests(unittest.TestCase):
+    def test_downloader_diagnostics_remain_private(self):
+        marker = "synthetic downloader detail"
+        modules = fake_dependency_modules()
+
+        def fail_download(downloader, _urls):
+            logger = downloader.options["logger"]
+            logger.debug(marker)
+            logger.warning(marker)
+            logger.error(marker)
+            raise RuntimeError(marker)
+
+        with (
+            patch.dict(sys.modules, modules),
+            patch.dict(os.environ, {"YOUTUBE_AUDIO_FALLBACK": "true"}),
+            patch.object(modules["yt_dlp"].YoutubeDL, "download", fail_download),
+            patch.object(youtube_transcript, "_fetch_caption_transcript", return_value=[]),
+            contextlib.redirect_stderr(io.StringIO()) as err,
+            contextlib.redirect_stdout(io.StringIO()) as out,
+        ):
+            result = youtube_transcript.get_youtube_transcript("abcdefghijk")
+        self.assertEqual("Audio transcription failed for abcdefghijk: RuntimeError.", result)
+        self.assertEqual("", out.getvalue())
+        self.assertEqual("", err.getvalue())
+
+    def test_regional_captions_need_one_listing_and_no_audio(self):
+        tracks = MagicMock()
+        regional = SimpleNamespace(language_code="en-US")
+        tracks.__iter__.side_effect = lambda: iter([regional])
+        track = tracks.find_transcript.return_value
+        track.fetch.return_value.to_raw_data.return_value = [{"text": "caption", "start": 2}]
+        with (
+            patch.object(youtube_transcript, "YouTubeTranscriptApi") as api,
+            patch.object(youtube_transcript, "_transcribe_audio_fallback") as audio,
+            patch.dict(os.environ, {"YOUTUBE_AUDIO_FALLBACK": "true"}),
+        ):
+            api.return_value.list.return_value = tracks
+            result = youtube_transcript.get_youtube_transcript("abcdefghijk", languages="en")
+        self.assertIn("[00:02] caption", result)
+        api.return_value.list.assert_called_once_with("abcdefghijk")
+        tracks.find_transcript.assert_called_once_with(["en", "en-US"])
+        audio.assert_not_called()
+
+    def test_only_missing_captions_allow_a_canonical_audio_request(self):
+        with (
+            patch.object(youtube_transcript, "_fetch_caption_transcript", return_value=[]) as captions,
+            patch.object(youtube_transcript, "_transcribe_audio_fallback", return_value="spoken") as audio,
+            patch.dict(os.environ, {"YOUTUBE_AUDIO_FALLBACK": "true"}),
+        ):
+            result = youtube_transcript.get_youtube_transcript("https://youtu.be/abcdefghijk?t=2")
+            self.assertIn("spoken", result)
+            audio.assert_called_once_with("https://www.youtube.com/watch?v=abcdefghijk", 16000)
+            captions.side_effect = ConnectionError("private network detail")
+            result = youtube_transcript.get_youtube_transcript("abcdefghijk")
+            self.assertIn("Caption lookup failed", result)
+            self.assertNotIn("private", result)
+            self.assertEqual(1, audio.call_count)
+            with patch.dict(os.environ, {"YOUTUBE_AUDIO_FALLBACK": "false"}):
+                captions.side_effect = youtube_transcript.TranscriptsDisabled("abcdefghijk")
+                result = youtube_transcript.get_youtube_transcript("abcdefghijk")
+                self.assertIn("fallback is disabled", result)
+            self.assertEqual(1, audio.call_count)
+
+    def test_unavailable_audio_is_not_reported_as_transcribed(self):
+        for duration in (None, 0, 61):
+            with (
+                self.subTest(duration=duration),
+                patch.dict(os.environ, {"YOUTUBE_AUDIO_FALLBACK": "true"}),
+                patch.dict(sys.modules, fake_dependency_modules(duration=duration)),
+                patch.object(youtube_transcript, "_fetch_caption_transcript", return_value=[]),
+            ):
+                result = youtube_transcript.get_youtube_transcript("abcdefghijk")
+                self.assertIn("Audio transcription unavailable", result)
+                self.assertNotIn("Audio transcription.", result)
+
     def setUp(self) -> None:
         self.original_store = youtube_transcript.MODEL_TELEMETRY
         self.env = patch.dict(
@@ -223,18 +297,25 @@ class YoutubeTranscriptTelemetryTests(unittest.TestCase):
             finally:
                 store.close()
 
-    def test_direct_script_import_resolves_project_modules_without_pythonpath(self) -> None:
+    def test_direct_script_opens_database_only_on_first_transcription(self) -> None:
         script_path = Path(youtube_transcript.__file__).resolve()
         environment = os.environ.copy()
         environment.pop("PYTHONPATH", None)
-        environment["MODEL_TELEMETRY_ENABLED"] = "false"
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        environment["MODEL_TELEMETRY_ENABLED"] = "true"
+        environment["MODEL_TELEMETRY_DB_PATH"] = str(Path(directory.name) / "stages.sqlite")
         completed = subprocess.run(
             [
                 sys.executable,
                 "-c",
                 (
-                    "import runpy; "
-                    "runpy.run_path('youtube_transcript.py', run_name='direct_import_test')"
+                    "import os, runpy; from pathlib import Path; "
+                    "m = runpy.run_path('youtube_transcript.py', run_name='direct_import_test'); "
+                    "db = Path(os.environ['MODEL_TELEMETRY_DB_PATH']); "
+                    "assert not db.exists(); "
+                    "m['_begin_transcription_stage']('gpt-transcribe'); "
+                    "assert db.exists()"
                 ),
             ],
             cwd=script_path.parent,

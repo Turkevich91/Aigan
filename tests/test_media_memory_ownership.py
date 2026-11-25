@@ -1,4 +1,5 @@
 """Source media and neutral descriptions stay separate from interactive replies."""
+import asyncio
 from contextlib import ExitStack
 from dataclasses import replace
 from pathlib import Path
@@ -28,6 +29,7 @@ class MediaMemoryOwnershipTests(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(self.store.close)
         self.addCleanup(self.stack.close)
         self.vision = AsyncMock(return_value="A separate interactive explanation.")
+        self.addAsyncCleanup(main.stop_photo_summaries)
         self.enqueue = Mock()
         for name, value in {
             "MEMORY": self.store,
@@ -199,10 +201,89 @@ class MediaMemoryOwnershipTests(unittest.IsolatedAsyncioTestCase):
         self.vision.return_value = "Neutral amber lighthouse."
         with patch.object(main, "CONFIG", replace(main.CONFIG, memory_eager_image_summary=True)):
             await main.remember_message_persistently(reply)
-        self.assertEqual([call(self.item(source).id), call(self.item(reply).id)], self.enqueue.call_args_list)
+            await main.photo_summary_worker
+        self.assertCountEqual([call(self.item(source).id), call(self.item(reply).id)], self.enqueue.call_args_list)
         self.vision.assert_awaited_once()
         self.assertEqual("background", self.vision.await_args.kwargs["purpose"])
         self.assertEqual("Neutral amber lighthouse.", self.item(source).vision_summary)
+
+    async def test_eager_indexing_allows_text_turns_and_coalesces_the_same_image(self):
+        source = self.image_message()
+        started, release = asyncio.Event(), asyncio.Event()
+
+        async def slow_vision(*args, **kwargs):
+            started.set()
+            await release.wait()
+            return "Neutral amber lighthouse."
+
+        self.vision.side_effect = slow_vision
+        with patch.object(main, "CONFIG", replace(main.CONFIG, memory_eager_image_summary=True)):
+            await asyncio.wait_for(main.remember_message_persistently(source), 1)
+            await asyncio.wait_for(started.wait(), 1)
+            await asyncio.wait_for(main.remember_message_persistently(source), 1)
+            reply = FakeMessage("What was the context?", message_id=11)
+            reply.reply_to_message = source
+            await asyncio.wait_for(main.remember_message_persistently(reply), 1)
+            await asyncio.wait_for(main.prepare_memory_context(reply, reply.text, force_images=True), 1)
+            self.assertEqual("", self.item(source).vision_summary)
+            self.assertEqual([self.item(source).id], list(main.pending_photo_summaries))
+            self.assertFalse(source.reply_calls)
+            release.set()
+            await main.photo_summary_worker
+            await main.remember_message_persistently(source)
+        self.assertEqual([self.item(source).id], [hit.item.id for hit in self.fts("amber lighthouse")])
+        self.vision.assert_awaited_once()
+
+    async def test_queue_uses_each_photos_chat_profile_and_caps_outstanding_work(self):
+        source = self.image_message()
+        other = self.image_message(chat_id=-2002)
+        overflow = self.image_message(chat_id=-3003)
+        profiles = {-1001: ("gpt-5.4-mini", "none"), -2002: ("gpt-6-astra", "low")}
+        with (
+            patch.object(main, "CONFIG", replace(main.CONFIG, memory_eager_image_summary=True)),
+            patch.object(main, "MAX_PENDING_PHOTO_SUMMARIES", 2),
+            patch.object(main, "photo_summary_settings", side_effect=profiles.__getitem__),
+        ):
+            for message in (source, other, overflow):
+                await main.remember_message_persistently(message)
+            self.assertEqual(2, len(main.pending_photo_summaries))
+            await main.photo_summary_worker
+        self.assertEqual(list(profiles.values()), [entry.kwargs["settings"] for entry in self.vision.await_args_list])
+        self.assertEqual("", self.item(overflow).vision_summary)
+        self.enqueue.assert_any_call(self.item(overflow).id)
+
+    async def test_failed_eager_description_keeps_caption_and_defers_retries(self):
+        source = self.image_message()
+        self.vision.side_effect = RuntimeError("synthetic provider failure")
+        with patch.object(main, "CONFIG", replace(main.CONFIG, memory_eager_image_summary=True)):
+            await main.remember_message_persistently(source)
+            await main.photo_summary_worker
+            self.enqueue.assert_called_once_with(self.item(source).id)
+            self.assertEqual("", self.item(source).vision_summary)
+            self.assertEqual(set(), main.schedule_recent_photo_summaries(source.chat_id))
+            self.vision.assert_awaited_once()
+            main.photo_summary_retry_after[self.item(source).id] = 0
+            self.vision.side_effect = None
+            self.assertEqual({self.item(source).id}, main.schedule_recent_photo_summaries(source.chat_id))
+            await main.photo_summary_worker
+        self.assertEqual(self.vision.return_value, self.item(source).vision_summary)
+
+    async def test_shutdown_releases_owned_work_and_preserves_unsummarized_row(self):
+        started = asyncio.Event()
+        async def blocked_vision(*args, **kwargs):
+            started.set()
+            await asyncio.Event().wait()
+
+        source = self.image_message()
+        self.vision.side_effect = blocked_vision
+        with patch.object(main, "CONFIG", replace(main.CONFIG, memory_eager_image_summary=True)):
+            await main.remember_message_persistently(source)
+            await asyncio.wait_for(started.wait(), 1)
+            await asyncio.wait_for(main.stop_photo_summaries(), 1)
+        self.assertIsNone(main.photo_summary_worker)
+        self.assertEqual({}, main.pending_photo_summaries)
+        self.assertEqual([self.item(source).id],
+                         [row.id for row in self.store.unsummarized_recent_images(source.chat_id)])
 
     async def test_album_interactive_answer_is_only_stored_as_bot_output(self):
         first, second = self.image_message(), self.image_message(11)
