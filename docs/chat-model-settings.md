@@ -78,7 +78,7 @@ Open **Моделі медіаінструментів** from `/model` or `/sett
 
 New chats and tools reset to their defaults use `gpt-6-luna` for photo descriptions and `gpt-6.1-terra` for Telegram clips, TikTok and other public video links. These vision defaults use `none` reasoning effort. The TikTok model choice is saved even when the server has disabled link inspection or TikTok refuses the media download. In the latter case, participants can send the clip as a Telegram video attachment.
 
-**Відео за посиланням** applies to an explicit question about a direct MP4 or a public page with a supported video player. Ask in the same message as the link or reply to the message containing it. Both web reading and public video analysis must be enabled for the chat. Eligible chats can select the locally qualified **Spark / Qwen** model here as well.
+**Відео за посиланням** applies to an explicit question about a public HTTPS MP4 or an HTML page that declares its MP4 in a video player. An installation with frame extraction enabled can opt in with `PUBLIC_VIDEO_URL_ENABLED=true`. The default is off. Ask in the same message as the link or reply to the message containing it. Both web reading and public video analysis must be enabled for the chat. Eligible chats can select the locally qualified **Spark / Qwen** model here as well.
 
 YouTube uses public captions first. The audio menu offers file transcription models. The photo and video menus offer image-capable cloud models, including Mini. The video model interprets sampled frames and any extracted speech. Participants can make persistent vision selections within their chat model ceiling. Administrators and the owner can select from all supported options returned by discovery.
 

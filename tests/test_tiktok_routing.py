@@ -2,6 +2,7 @@
 import asyncio
 import io
 import json
+import os
 from contextlib import asynccontextmanager
 from dataclasses import replace
 from pathlib import Path
@@ -30,7 +31,7 @@ class TikTokRoutingTests(unittest.IsolatedAsyncioTestCase):
         tmp = self.enterContext(tempfile.TemporaryDirectory())
         self.store = ChatModelSettingsStore(Path(tmp) / "settings.sqlite3")
         self.enterContext(patch.object(main, "CHAT_MODEL_SETTINGS", self.store))
-        self.enterContext(patch.object(main, "CONFIG", replace(main.CONFIG, tiktok_video_enabled=True,
+        self.enterContext(patch.object(main, "CONFIG", replace(main.CONFIG, tiktok_video_enabled=True, public_video_url_enabled=True,
             media_frame_extraction_enabled=True, telegram_turn_assembly_enabled=False, chat_inflight_guard_enabled=False)))
         self.enterContext(patch.object(main, "video_jobs", set()))
         self.enterContext(patch.object(main, "telegram_turn_tasks", set()))
@@ -86,6 +87,10 @@ class TikTokRoutingTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(value, ("public_video", expected) if expected else None)
         self.message.reply_to_message = FakeMessage("Ось коротке відео " + PAGE)
         self.assertEqual(main.requested_video_link(self.message, "Що тут відбувається?"), ("public_video", PAGE))
+        for ask in ("Перекажи", "Резюмуй", "Транскрибуй", "Зроби конспект", "Зроби стислий виклад"):
+            with self.subTest(ask=ask):
+                self.assertEqual(main.requested_video_link(self.message, ask), ("public_video", PAGE))
+                self.assertEqual(main.requested_video_link(self.message, ask + " відео " + PAGE), ("public_video", PAGE))
         self.assertIsNone(main.requested_video_link(self.message, "Summarize the article"))
         self.message.reply_to_message = FakeMessage("Previous article " + PAGE)
         self.assertIsNone(main.requested_video_link(self.message, "Що думаєш?"))
@@ -115,6 +120,26 @@ class TikTokRoutingTests(unittest.IsolatedAsyncioTestCase):
             self.client.responses.create.assert_not_awaited()
             fetch.assert_not_awaited()
 
+    async def test_rollout_off_restores_text_route_without_acquisition_or_media_model_calls(self):
+        with patch.dict(os.environ):
+            os.environ.pop("PUBLIC_VIDEO_URL_ENABLED", None)
+            self.assertFalse(main.Config.from_env().public_video_url_enabled)
+            os.environ["PUBLIC_VIDEO_URL_ENABLED"] = "true"
+            self.assertTrue(main.Config.from_env().public_video_url_enabled)
+        with patch.object(main, "CONFIG", replace(main.CONFIG, public_video_url_enabled=False)), \
+             patch.object(main, "normalize_public_video_url") as normalize, \
+             patch.object(main, "fetch_public_video", new_callable=AsyncMock) as fetch:
+            self.assertFalse(main.CHAT_MODEL_UI.tool_available("public_video"))
+            self.assertEqual(main.requested_video_link(self.message, self.message.text), ("tiktok", LINK))
+            self.message.text = "Перекажи відео " + FILE
+            await self.dispatch()
+            self.normal.assert_awaited_once()
+            normalize.assert_not_called()
+            fetch.assert_not_awaited()
+            self.client.responses.create.assert_not_awaited()
+            self.assertFalse(main.video_jobs)
+        self.assertTrue(main.CHAT_MODEL_UI.tool_available("public_video"))
+
     async def test_public_404_does_not_generate_an_answer_and_the_text_lane_remains_free(self):
         self.message.reply_to_message = FakeMessage(FILE)
         self.message.text = "Опиши ключові моменти відео і логотип у кадрі"
@@ -126,7 +151,7 @@ class TikTokRoutingTests(unittest.IsolatedAsyncioTestCase):
             started.set()
             await finish.wait()
             raise main.PublicVideoUnavailable("not_found")
-        with patch.object(main, "fetch_public_video", side_effect=fetch):
+        with patch.object(main, "fetch_public_video", side_effect=fetch), patch.object(main, "system_event") as event:
             await self.dispatch()
             try:
                 await asyncio.wait_for(started.wait(), 2)
@@ -141,6 +166,12 @@ class TikTokRoutingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.client.responses.create.await_args.kwargs["model"], "gpt-6.1-terra")
         self.assertNotIn(FILE, str(self.client.responses.create.await_args))
         self.assertIn("404", self.delivery.await_args.args[1])
+        failure = next(c.kwargs for c in event.call_args_list if c.kwargs.get("event_type") == "acquisition_failed")
+        self.assertEqual(set(failure), {"component", "event_type", "route", "message", "duration_ms"})
+        self.assertEqual(failure["message"], "not_found")
+        self.assertGreaterEqual(failure["duration_ms"], 0)
+        self.assertNotIn(FILE, str(failure))
+        self.assertEqual(str(main.PublicVideoUnavailable(FILE)), "unavailable")
         self.assertEqual("public_video", self.delivery.await_args.kwargs["route"])
         self.normal.assert_awaited_once()
         self.assertFalse(main.video_jobs)
@@ -158,6 +189,7 @@ class TikTokRoutingTests(unittest.IsolatedAsyncioTestCase):
                 fetch.assert_not_awaited()
                 self.client.responses.create.assert_not_awaited()
                 self.assertIn("вимкнено", self.delivery.await_args.args[1])
+                self.normal.assert_not_awaited()
                 set_tool(key, True)
             self.model_outputs('{"inspect":"frames"}')
             async def inspect(_source, **options):
@@ -171,6 +203,21 @@ class TikTokRoutingTests(unittest.IsolatedAsyncioTestCase):
             fetch.assert_awaited_once()
             self.assertIn("вимкнено", self.delivery.await_args.args[1])
             self.assertNotIn("protected", self.delivery.await_args.args[1])
+
+    async def test_revoke_during_unrelated_decision_never_falls_through_to_web(self):
+        self.message.text = "Резюмуй відео " + PAGE
+        def decide(**kwargs):
+            chat = self.message.chat_id
+            revision = self.store.tools.resolve(chat).revision
+            self.store.tools.set_enabled(chat, "public_video", False, expected_revision=revision)
+            return SimpleNamespace(output_text='{"inspect":"unrelated"}', status="completed")
+        self.client.responses.create.side_effect = decide
+        with patch.object(main, "fetch_public_video", new_callable=AsyncMock) as fetch:
+            await self.dispatch()
+            await asyncio.gather(*main.telegram_turn_tasks)
+            self.normal.assert_not_awaited()
+            fetch.assert_not_awaited()
+            self.assertIn("вимкнено", self.delivery.await_args.args[1])
 
     async def test_malformed_local_intent_stops_without_falling_back_or_downloading(self):
         self.select("tiktok", SPARK_MODEL)

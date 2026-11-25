@@ -443,6 +443,7 @@ class Config:
     mcp_tool_timeout_seconds: float
     media_frame_extraction_enabled: bool
     tiktok_video_enabled: bool
+    public_video_url_enabled: bool
     media_frame_ffmpeg_path: str
     media_frame_ffprobe_path: str
     media_frame_max_duration_seconds: int
@@ -976,6 +977,7 @@ class Config:
             mcp_tool_timeout_seconds=max(1.0, float(os.getenv("MCP_TOOL_TIMEOUT_SECONDS", "30"))),
             media_frame_extraction_enabled=_env_bool("MEDIA_FRAME_EXTRACTION_ENABLED", False),
             tiktok_video_enabled=_env_bool("TIKTOK_VIDEO_ENABLED", False),
+            public_video_url_enabled=_env_bool("PUBLIC_VIDEO_URL_ENABLED", False),
             media_frame_ffmpeg_path=os.getenv("MEDIA_FRAME_FFMPEG_PATH", "ffmpeg").strip() or "ffmpeg",
             media_frame_ffprobe_path=os.getenv("MEDIA_FRAME_FFPROBE_PATH", "ffprobe").strip() or "ffprobe",
             media_frame_max_duration_seconds=int(os.getenv("MEDIA_FRAME_MAX_DURATION_SECONDS", "90")),
@@ -1313,7 +1315,7 @@ CHAT_MODEL_UI = ChatModelUI(
     get_catalog=CHAT_MODEL_CATALOG.get,
     get_media_catalog=CHAT_MODEL_CATALOG.media_models,
     media_default=media_default_model,
-    tool_available=lambda key: (key != "public_video" or CONFIG.media_frame_extraction_enabled)
+    tool_available=lambda key: (key != "public_video" or (CONFIG.public_video_url_enabled and CONFIG.media_frame_extraction_enabled))
         and (key != "tiktok" or (CONFIG.tiktok_video_enabled and CONFIG.media_frame_extraction_enabled)),
     defaults=lambda: (CONFIG.openai_model, CONFIG.model_reasoning_effort),
     is_admin=is_admin_actor,
@@ -14564,14 +14566,19 @@ class LinkedClip:
 VIDEO_REFERENCE_RE = re.compile(
     r"\b(?:mp4|vid[eé]os?|clips?|footage|(?:відео|видео)(?:запис\w*|файл\w*|ролик\w*)?|"
     r"ролик\w*|ролік\w*|кліп\w*|клип\w*|кадр\w*)\b", re.IGNORECASE)
+VIDEO_SUMMARY_ACTION_PATTERN = (
+    r"перекажи|підсумуй|резюмуй|транскрибуй|зроби\s+(?:(?:короткий|стислий)\s+)?(?:конспект|переказ|виклад)|"
+    r"зроби\s+(?:транскрипцію|розшифровку)")
 VIDEO_REQUEST_RE = re.compile(
-    rf"\b(?:{PAYLOAD_ACTION_PATTERN}|watch|look|read|listen|tell|transcrib\w*|"
+    rf"\b(?:{PAYLOAD_ACTION_PATTERN}|{VIDEO_SUMMARY_ACTION_PATTERN}|watch|look|read|listen|tell|transcrib\w*|"
     r"подивись|подивися|посмотри|глянь|переглянь|розбери|разбери|прочитай|"
     r"розшифруй|расшифруй|що|что|як|как|чому|почему|what|how|why)\b", re.IGNORECASE)
 
 
 def requested_video_link(message: Message, prompt: str) -> tuple[str, str] | None:
     """Only consider one link in the addressed request or its direct same-chat reply."""
+    if not (CONFIG.public_video_url_enabled or CONFIG.tiktok_video_enabled):
+        return None
     reply = getattr(message, "reply_to_message", None)
     if reply is None and "://" not in prompt and "www." not in prompt.lower() and not (
             getattr(message, "entities", None) or getattr(message, "caption_entities", None)):
@@ -14600,10 +14607,12 @@ def requested_video_link(message: Message, prompt: str) -> tuple[str, str] | Non
     url = urls[0]
     if CONFIG.tiktok_video_enabled and (tiktok := normalize_tiktok_video_url(url)):
         return "tiktok", tiktok
+    if not CONFIG.public_video_url_enabled:
+        return None
     # An ordinary article question stays on the text route. A direct file, or an
     # explicitly referenced video on a page, can be evaluated for clip intent.
     path = re.split(r"[?#]", url, maxsplit=1)[0]
-    refers_to_action = re.search(r"\b(?:happen(?:s|ed|ing)?|відбува\w*|происход\w*)\b", question, re.I)
+    refers_to_action = re.search(rf"\b(?:happen(?:s|ed|ing)?|відбува\w*|происход\w*|{VIDEO_SUMMARY_ACTION_PATTERN})\b", question, re.I)
     if not (path.casefold().endswith(".mp4") or VIDEO_REFERENCE_RE.search(question)
             or (refers_to_action and VIDEO_REFERENCE_RE.search(URL_TOKEN_RE.sub(" ", source_hint)))):
         return None
@@ -14950,6 +14959,8 @@ async def respond_to_video_request(message, prompt, attachment, settings) -> boo
                 return confirmed_speech_scope(raw, question)
 
             decision = json.loads(await respond(VIDEO_INTENT_INSTRUCTIONS, question, schema=VIDEO_INTENT_FORMAT["format"])).get("inspect")
+            if linked:
+                attachment.check_allowed()
             if decision == "unrelated":
                 return False
             if decision not in {"frames", "speech", "both"}:
@@ -14975,7 +14986,13 @@ async def respond_to_video_request(message, prompt, attachment, settings) -> boo
                         if tiktok:
                             await fetch_tiktok_video(attachment.url, source, **limits)
                         else:
-                            await fetch_public_video(attachment.url, source, before_call=attachment.check_allowed, **limits)
+                            started = time.monotonic()
+                            try:
+                                await fetch_public_video(attachment.url, source, before_call=attachment.check_allowed, **limits)
+                            except PublicVideoUnavailable as exc:
+                                system_event(component="public_video", event_type="acquisition_failed", route=route,
+                                    message=str(exc), duration_ms=int((time.monotonic() - started) * 1000))
+                                raise
                         attachment.check_allowed()
                         response = await inspect_local_clip(source, source_family=attachment.tool + "_clip", **options)
                 else:
@@ -14996,6 +15013,7 @@ async def respond_to_video_request(message, prompt, attachment, settings) -> boo
                   "denied": "Сайт обмежив доступ до відео.",
                   "no_player": "На цій сторінці не знайшов доступного відеоплеєра.",
                   "ambiguous": "На сторінці кілька відео. Надішли посилання на потрібний ролик.",
+                  "incomplete": "Сайт передав порожній або неповний файл.",
                   "limits": "Сторінка або ролик перевищує ліміт аналізу."}.get(str(exc), "Не вдалося прочитати відео за посиланням.")
         response = reason + " Можеш надіслати відеофайл у Telegram."
     except Exception as exc:

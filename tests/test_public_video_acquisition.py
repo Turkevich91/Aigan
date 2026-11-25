@@ -40,8 +40,8 @@ class PublicVideoTests(IsolatedAsyncioTestCase):
     def test_url_checks_are_lexical_admit_public_hosts_and_canonicalize(self):
         self.assertEqual(acq.normalize_public_video_url("https://EXAMPLE.org:443/clip?sig=a%26b#part"),
                          "https://example.org/clip?sig=a%26b")
-        self.assertEqual(acq.normalize_public_video_url("http://example.org:80/é"), "http://example.org/é")
-        for url in ["https://127.0.0.1/", "http://[::1]/", "http://localhost/", "http://host.internal/",
+        self.assertEqual(acq.normalize_public_video_url("https://example.org:443/é"), "https://example.org/é")
+        for url in ["http://example.org/clip", "https://127.0.0.1/", "http://[::1]/", "http://localhost/", "http://host.internal/",
                     "https://x.yandex.ru./video", "https://rt.com/video", "ftp://example.org/clip", "https://host:2/",
                     "https://u@video.example.org/", "https://video.example.org:999/", "https://example.org\\@other.org",
                     "https://m.youtube.com/v", "https://a.tiktokcdn-eu.com/v", "https://r.googlevideo.com/x",
@@ -91,13 +91,17 @@ class PublicVideoTests(IsolatedAsyncioTestCase):
             (PAGE, {PAGE: response(body=b'<video controlslist="nodownload" src="/x.mp4">')}, "denied"),
             (PAGE, {PAGE: response(body=b'<video src="/1.mp4"></video><video src="/2.mp4"></video>')}, "ambiguous"),
             (PAGE, {PAGE: response(302, location="https://foo.su/clip")}, "url"),
+            (PAGE, {PAGE: response(302, location="http://example.org/clip.mp4")}, "url"),
+            (PAGE, {PAGE: response(body=b'<video src="http://example.org/clip.mp4">')}, "url"),
             (PAGE, {PAGE: response(body=b'<video src="https://m.youtube.com/clip">')}, "url"),
             (PAGE, {PAGE: response(body=b'<video><source type="audio/ogg" src="/other"></video>')}, "unsupported"),
             (PAGE, {PAGE: response(body=b"<div id='player'></div><script>loadPlayer()</script>")}, "no_player"),
             (MEDIA, {MEDIA: response(body=b"#EXTM3U", mime="video/mp4")}, "unsupported"),
             (MEDIA, {MEDIA: response(body=MP4, mime="video/mp4", **{"content-encoding":"gzip"})}, "unsupported"),
             (MEDIA, {MEDIA: response(body=MP4, mime="video/mp4", **{"content-length":"4097"})}, "limits"),
-            (MEDIA, {MEDIA: response(body=MP4, mime="video/mp4", **{"content-length":"600"})}, "limits"),
+            (MEDIA, {MEDIA: response(body=MP4, mime="video/mp4", **{"content-length":"600"})}, "incomplete"),
+            (MEDIA, {MEDIA: response(body=b"", mime="video/mp4", **{"content-length":"0"})}, "incomplete"),
+            (MEDIA, {MEDIA: response(body=b"", mime="video/mp4")}, "incomplete"),
             (MEDIA, {MEDIA: response(body=MP4 + bytes(4096), mime="video/mp4")}, "limits"),
             (PAGE, {PAGE: response(body=b"a", **{"content-length":str(acq._PAGE_BYTES + 1)})}, "limits"),
         ]:

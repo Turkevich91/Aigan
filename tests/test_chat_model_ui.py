@@ -227,6 +227,19 @@ class ChatModelUITests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("gpt-6.1-terra", self.store.media_selection(-1001, "video")[0])
         self.assertEqual("gpt-6-luna", self.store.media_selection(-1001, "tiktok")[0])
 
+    async def test_public_video_panel_shows_rollout_state_and_keeps_selection(self):
+        self.ui.tool_available = lambda key: key != "public_video"
+        await self.command()
+        await self.click("Моделі медіаінструментів")
+        await self.click("Відео за посиланням")
+        self.assertIn("на сервері вимкнено", self.panel.text)
+        await self.click("gpt-6-luna")
+        self.assertEqual(("gpt-6-luna", 1), self.store.media_selection(-1001, "public_video"))
+        self.ui.tool_available = lambda key: True
+        await self.click("Назад")
+        await self.click("Відео за посиланням")
+        self.assertNotIn("на сервері вимкнено", self.panel.text)
+
     async def test_tiktok_model_can_be_saved_offline_and_tool_toggle_obeys_deployment(self):
         self.ui.tool_available = lambda key: key != "tiktok"
         await self.command()

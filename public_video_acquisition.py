@@ -30,18 +30,23 @@ _EXCLUDED_DOMAINS = (
 class PublicVideoUnavailable(Exception):
     """A fixed acquisition failure category, safe for routing to a user message."""
 
+    def __init__(self, reason: str):
+        codes = {"url", "not_found", "gone", "denied", "unavailable", "unsupported", "ambiguous",
+                 "no_player", "limits", "timeout", "incomplete"}
+        super().__init__(reason if reason in codes else "unavailable")
+
 
 def normalize_public_video_url(raw: str) -> str | None:
-    """Admit HTTP(S) on standard ports, without DNS or any other network I/O."""
+    """Admit public HTTPS on its standard port without performing network I/O."""
     if not isinstance(raw, str) or not 1 <= len(raw) <= 8192 or not raw.isprintable():
         return None
     if any(character in raw for character in (" ", "\\")):
         return None
     try:
         parts = urlsplit(raw)
-        if parts.scheme not in ("http", "https") or not parts.hostname or parts.username is not None:
+        if parts.scheme != "https" or not parts.hostname or parts.username is not None:
             return None
-        if parts.port not in (None, 443 if parts.scheme == "https" else 80):
+        if parts.port not in (None, 443):
             return None
         host = parts.hostname.rstrip(".").encode("idna").decode("ascii").lower()
         if not _HOST.fullmatch(host) or len(host) > 253 or _is_blocked_russian_host(host):
@@ -176,7 +181,8 @@ async def fetch_public_video(url: str, destination: Path, *, max_bytes: int, max
                 before_call()
             cleanup.pop_all()
     except PublicMediaTransferError as exc:
-        raise PublicVideoUnavailable("limits" if str(exc) == "size" else "url") from None
+        reason = {"size": "limits", "incomplete": "incomplete", "address": "url"}.get(str(exc), "unavailable")
+        raise PublicVideoUnavailable(reason) from None
     except (TimeoutError, httpx.TimeoutException):
         raise PublicVideoUnavailable("timeout") from None
     except (httpx.HTTPError, OSError, ValueError):

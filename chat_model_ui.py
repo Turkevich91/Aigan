@@ -249,6 +249,8 @@ class ChatModelUI:
                     lines.append("Доступ до відео залежить від мережі TikTok. Якщо відео недоступне, "
                                  "надішли його файлом у Telegram.")
                 if panel.media_tool == "public_video":
+                    if not self.tool_available("public_video"):
+                        lines.append("Аналіз відеопосилань на сервері вимкнено. Вибір моделі можна зберегти.")
                     lines.append("Для прямого MP4 або публічної сторінки з відеоплеєром. "
                                  "Потрібні дозволи на вебчитання та аналіз відео за посиланням.")
                 if panel.media_tool in ("video", "tiktok", "public_video") and SPARK_MODEL in panel.media_options:
