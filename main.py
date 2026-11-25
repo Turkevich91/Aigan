@@ -138,7 +138,7 @@ from media_acquisition import (
 from media_frames import FfmpegMediaFrameAdapter, MediaFrameAdapter, MediaFrameLimits, NullMediaFrameAdapter
 from telegram_video import (
     VIDEO_ANSWER_INSTRUCTIONS, VIDEO_INTENT_FORMAT, VIDEO_INTENT_INSTRUCTIONS, VideoUnavailable, inspect_clip,
-    inspect_local_clip,
+    inspect_local_clip, TELEGRAM_VIDEO_MAX_BYTES,
 )
 from tiktok_acquisition import TIKTOK_MAX_BYTES, TikTokUnavailable, fetch_tiktok_video, normalize_tiktok_video_url
 from runtime_model_pricing import PRICE_SNAPSHOT_VERSION, token_price_for_model
@@ -14824,6 +14824,8 @@ async def respond_to_video_request(message, prompt, attachment, settings) -> boo
     model, effort = settings
     tiktok = isinstance(attachment, TikTokClip)
     route = "tiktok_video" if tiktok else "telegram_video"
+    telegram_bytes = min(CONFIG.media_frame_max_bytes, TELEGRAM_VIDEO_MAX_BYTES)
+    telegram_seconds = min(CONFIG.media_frame_max_duration_seconds, MediaFrameLimits().hard_max_duration_seconds)
     try:
         async with asyncio.timeout(110), AsyncOpenAI(
             api_key=CONFIG.openai_api_key, timeout=50, max_retries=0,
@@ -14862,8 +14864,7 @@ async def respond_to_video_request(message, prompt, attachment, settings) -> boo
             try:
                 await presence.start()
                 options = dict(request=question, mode=decision,
-                    adapter=runtime_media_frame_adapter(), max_bytes=CONFIG.media_frame_max_bytes,
-                    max_duration=min(CONFIG.media_frame_max_duration_seconds, 180),
+                    adapter=runtime_media_frame_adapter(), max_bytes=telegram_bytes, max_duration=telegram_seconds,
                     ffmpeg=CONFIG.media_frame_ffmpeg_path, answer=answer, transcribe=transcribe)
                 if tiktok:
                     attachment.check_allowed()
@@ -14881,7 +14882,9 @@ async def respond_to_video_request(message, prompt, attachment, settings) -> boo
     except VideoUnavailable as exc:
         response = str(exc)
     except TikTokUnavailable:
-        response = "Не вдалося відкрити це публічне відео TikTok. Надішли його відеофайлом у Telegram."
+        response = (f"Не вдалося отримати відео з TikTok. Надішли його відеофайлом у Telegram "
+                    f"(до {telegram_seconds} с і {telegram_bytes / 1_000_000:g} МБ на файл). "
+                    "Довший ролик розділи на два або більше фрагментів.")
     except Exception as exc:
         LOGGER.warning("Video request unavailable route=%s error=%s", route, type(exc).__name__)
         response = "Не вдалося перевірити відео. Спробуй пізніше або надішли коротший фрагмент."

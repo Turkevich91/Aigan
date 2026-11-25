@@ -76,7 +76,7 @@ Capability and discovery sources:
 
 Open **Моделі медіаінструментів** from `/model` or `/settings` to select a model for YouTube audio transcription, saved photo descriptions, Telegram clips or public TikTok videos. A tap saves that tool’s choice for the current chat. **Типова модель інструмента** restores its deployment default. The primary answer profile, its timer and other media selections have separate settings.
 
-New chats and tools reset to their defaults use `gpt-6-luna` for photo descriptions and `gpt-6.1-terra` for Telegram video. Both use `none` reasoning effort.
+New chats and tools reset to their defaults use `gpt-6-luna` for photo descriptions and `gpt-6.1-terra` for both Telegram video and TikTok. These vision defaults use `none` reasoning effort. The TikTok model choice is saved even when the server has disabled link inspection or TikTok refuses the media download. In the latter case, participants can send the clip as a Telegram video attachment.
 
 YouTube uses public captions first. The audio menu offers file transcription models. The photo and video menus offer image-capable cloud models, including Mini. The video model interprets sampled frames and any extracted speech. Participants can make persistent vision selections within their chat model ceiling. Administrators and the owner can select from all supported options returned by discovery.
 

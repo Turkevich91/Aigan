@@ -194,23 +194,24 @@ class ChatModelUITests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("gpt-6.1-terra", self.store.media_selection(-1001, "video")[0])
         self.assertEqual("gpt-6-luna", self.store.media_selection(-1001, "tiktok")[0])
 
-    async def test_tiktok_controls_follow_deployment_and_reject_withdrawn_buttons(self):
-        self.ui.tool_available = lambda key: True
+    async def test_tiktok_model_can_be_saved_offline_and_tool_toggle_obeys_deployment(self):
+        self.ui.tool_available = lambda key: key != "tiktok"
         await self.command()
         await self.click("Моделі медіаінструментів")
-        enter = self.button("Відео TikTok")
-        self.ui.tool_available = lambda key: key != "tiktok"
-        self.assertTrue((await self.click(data=enter)).answer.await_args.kwargs["show_alert"])
-        self.ui.tool_available = lambda key: True
-        await self.click(data=enter)
-        choose = self.button("gpt-6-luna")
-        reset = self.button("Типова модель інструмента")
-        self.ui.tool_available = lambda key: key != "tiktok"
-        for token in (choose, reset):
-            self.assertTrue((await self.click(data=token)).answer.await_args.kwargs["show_alert"])
-        self.assertEqual((None, 0), self.store.media_selection(-1001, "tiktok"))
+        await self.click("Відео TikTok")
+        self.assertIn("gpt-6.1-terra", self.panel.text)
+        self.assertIn("на сервері вимкнено", self.panel.text)
+        self.assertIn("залежить від мережі TikTok", self.panel.text)
+        self.assertIn("надішли його файлом у Telegram", self.panel.text)
+        await self.click("gpt-6-luna")
+        self.assertEqual(("gpt-6-luna", 1), self.store.media_selection(-1001, "tiktok"))
+        self.assertEqual((None, 0), self.store.media_selection(-1001, "video"))
         await self.click("Назад")
-        self.assertFalse(any("TikTok" in b.text for row in self.panel.reply_markup.inline_keyboard for b in row))
+        await self.click("Відео TikTok")
+        self.assertIn("gpt-6-luna", self.panel.text)
+        await self.click("Типова модель інструмента")
+        self.assertEqual((None, 2), self.store.media_selection(-1001, "tiktok"))
+        await self.click("Назад")
         await self.click("Назад")
         self.ui.tool_available = lambda key: True
         await self.click("Інструменти")

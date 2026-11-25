@@ -184,6 +184,8 @@ class TikTokRoutingTests(unittest.IsolatedAsyncioTestCase):
         self.presence.stop.assert_awaited_once()
 
     async def test_unrelated_declined_then_inaccessible_clip_gives_upload_alternative(self):
+        self.enterContext(patch.object(main, "CONFIG", replace(main.CONFIG,
+            media_frame_max_duration_seconds=72, media_frame_max_bytes=5_000_000)))
         self.model_outputs('{"inspect":"unrelated"}', '{"inspect":"both"}')
         with patch.object(main, "fetch_tiktok_video", side_effect=main.TikTokUnavailable("unavailable")) as fetch:
             await self.dispatch()
@@ -194,6 +196,8 @@ class TikTokRoutingTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.gather(*main.telegram_turn_tasks)
             fetch.assert_awaited_once()
         self.assertIn("відеофайлом", self.delivery.await_args.args[1])
+        self.assertIn("до 72 с і 5 МБ на файл", self.delivery.await_args.args[1])
+        self.assertIn("два або більше фрагментів", self.delivery.await_args.args[1])
         self.assertEqual(2, self.client.responses.create.await_count)
         self.presence.stop.assert_awaited_once()
         self.assertFalse(main.video_jobs)

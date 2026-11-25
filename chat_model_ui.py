@@ -241,6 +241,11 @@ class ChatModelUI:
                 current = panel.media_selected or self.media_default(panel.media_tool)
                 lines.extend([MEDIA_TOOL_LABELS[panel.media_tool], f"Зараз: <code>{html.escape(current)}</code>.",
                               "Натисни модель, щоб застосувати її до нових запитів."])
+                if panel.media_tool == "tiktok":
+                    if not self.tool_available("tiktok"):
+                        lines.append("Обробку посилань TikTok на сервері вимкнено. Вибір моделі зберігається.")
+                    lines.append("Доступ до відео залежить від мережі TikTok. Якщо відео недоступне, "
+                                 "надішли його файлом у Telegram.")
             if notice:
                 lines.append(html.escape(notice))
             return "\n".join(lines)
@@ -312,8 +317,7 @@ class ChatModelUI:
         rows = []
         if panel.stage in {"media", "media_models"}:
             if panel.stage == "media":
-                rows = [[button(label, "i", index)] for index, (key, label) in enumerate(MEDIA_TOOL_LABELS.items())
-                        if self.tool_available(key)]
+                rows = [[button(label, "i", index)] for index, label in enumerate(MEDIA_TOOL_LABELS.values())]
             else:
                 current = panel.media_selected or self.media_default(panel.media_tool)
                 rows = [[button(("✓ " if model == current else "") + model, "s", index)]
@@ -573,17 +577,11 @@ class ChatModelUI:
                 elif (action == "i" and panel.stage == "media" and int(option) < len(MEDIA_TOOL_LABELS)
                       or action == "f" and panel.stage == "media_models"):
                     key = tuple(MEDIA_TOOL_LABELS)[int(option)] if action == "i" else panel.media_tool
-                    if not self.tool_available(key):
-                        await self._answer(query, "Інструмент зараз недоступний.", alert=True)
-                        return
                     panel.media_tool = key
                     panel.media_options = tuple(m for m in media_catalog if media_model_allowed(panel.media_tool, m, panel.member_ceiling))
                     panel.media_selected, panel.media_revision = self.store.media_selection(chat_id, panel.media_tool)
                     panel.stage = "media_models"
                 elif panel.stage == "media_models" and (action == "u" or action == "s" and int(option) < len(panel.media_options)):
-                    if not self.tool_available(panel.media_tool):
-                        await self._answer(query, "Інструмент зараз недоступний.", alert=True)
-                        return
                     model = None if action == "u" else panel.media_options[int(option)]
                     self.store.set_media_model(chat_id, panel.media_tool, model, expected_revision=panel.media_revision,
                                                role=role, available=media_catalog)

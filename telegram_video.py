@@ -14,6 +14,7 @@ import tempfile
 from media_frames import LOCAL_MEDIA_OPTIONS, MediaFrameRequest, run_command
 
 
+TELEGRAM_VIDEO_MAX_BYTES = 20_000_000
 VIDEO_INTENT_INSTRUCTIONS = """An admitted Telegram user has supplied or replied to one video.
 Choose what the CURRENT authored request explicitly asks to inspect. Use frames for visual
 questions (including 'what happens here?'), speech for spoken words, transcription or spoken
@@ -44,7 +45,7 @@ async def inspect_clip(attachment, *, request: str, mode: str, adapter, max_byte
                        max_duration: int, ffmpeg: str, answer, transcribe) -> str:
     # Telegram's hosted Bot API limits downloads to 20 MB. Check a known
     # size before letting its client buffer the file and verify actual bytes.
-    limit = min(max_bytes, 20_000_000)
+    limit = min(max_bytes, TELEGRAM_VIDEO_MAX_BYTES)
     too_large = "Відео перевищує ліміт розміру. Надішли коротший фрагмент."
     size = int(getattr(attachment, "file_size", 0) or 0)
     if size > limit:
