@@ -134,6 +134,7 @@ class ChatModelUI:
         is_owner: Callable[[int], bool] = lambda _: False,
         spark_available: Callable[[], bool] = lambda: False,
         tool_available: Callable[[str], bool] = lambda key: key != "tiktok",
+        spark_media_available: Callable[[], bool] = lambda: False,
         get_catalog: Callable[[], Awaitable[tuple[ModelCapability, ...]]] | None = None,
         get_media_catalog: Callable[[], Awaitable[tuple[str, ...]]] | None = None,
         media_default: Callable[[str], str] = MEDIA_MODEL_DEFAULTS.__getitem__,
@@ -149,6 +150,7 @@ class ChatModelUI:
         self.chat_allowed = chat_allowed
         self.spark_available = spark_available
         self.tool_available = tool_available
+        self.spark_media_available = spark_media_available
         self.get_catalog = get_catalog
         self.get_media_catalog = get_media_catalog
         self.media_default = media_default
@@ -246,6 +248,8 @@ class ChatModelUI:
                         lines.append("Обробку посилань TikTok на сервері вимкнено. Вибір моделі зберігається.")
                     lines.append("Доступ до відео залежить від мережі TikTok. Якщо відео недоступне, "
                                  "надішли його файлом у Telegram.")
+                if panel.media_tool in ("video", "tiktok") and SPARK_MODEL in panel.media_options:
+                    lines.append("Spark / Qwen аналізує кадри локально. Для розпізнавання мовлення використовується OpenAI.")
             if notice:
                 lines.append(html.escape(notice))
             return "\n".join(lines)
@@ -320,7 +324,8 @@ class ChatModelUI:
                 rows = [[button(label, "i", index)] for index, label in enumerate(MEDIA_TOOL_LABELS.values())]
             else:
                 current = panel.media_selected or self.media_default(panel.media_tool)
-                rows = [[button(("✓ " if model == current else "") + model, "s", index)]
+                rows = [[button(("✓ " if model == current else "") +
+                                ("Spark / Qwen · локально" if model == SPARK_MODEL else model), "s", index)]
                         for index, model in enumerate(panel.media_options)]
                 rows.append([button("Типова модель інструмента", "u")])
             rows.append([button("Назад", "b"), button("Оновити", "f"), button("Закрити", "x")])
@@ -516,6 +521,11 @@ class ChatModelUI:
         if media_stage and action in {"i", "s", "f"}:
             media_catalog = (await self.get_media_catalog() if self.get_media_catalog else
                              (*TRANSCRIPTION_MODELS, MINI_VISION_MODEL, *(c.model for c in catalog if c.supports_images)))
+            local_indices = {str(i) for i, tool in enumerate(MEDIA_TOOL_LABELS) if media_model_allowed(tool, SPARK_MODEL)}
+            wants_local = ((panel.stage == "media" and action == "i" and option in local_indices)
+                           or (panel.stage == "media_models" and media_model_allowed(panel.media_tool, SPARK_MODEL)))
+            if wants_local and self.spark_media_available():
+                media_catalog = (*media_catalog, SPARK_MODEL)
         if role == "member" and chat_type != "private":
             if not await self._is_current_member(context.bot, chat_id, user_id):
                 await self._answer(query, "Не вдалося підтвердити участь у цьому чаті.", alert=True)

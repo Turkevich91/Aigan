@@ -8,7 +8,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.error import TelegramError
@@ -163,6 +163,32 @@ class ChatModelUITests(unittest.IsolatedAsyncioTestCase):
         await self.click("Інструменти")
         await self.click("🚫 " + web.label)
         self.assertFalse(self.store.tools.resolve(-1001).disabled)
+
+    async def test_local_photo_choice_rechecks_availability_and_stays_in_its_chat_and_tool(self):
+        qualified = Mock(return_value=True)
+        self.ui.spark_media_available = qualified
+        await self.command()
+        await self.click("Моделі медіаінструментів")
+        await self.click("Аудіо YouTube")
+        qualified.assert_not_called()
+        self.assertNotIn("Spark / Qwen · локально", [b.text for row in self.panel.reply_markup.inline_keyboard for b in row])
+        await self.click("Назад")
+        await self.click("Фото для пам’яті")
+        stale = self.button("Spark / Qwen · локально")
+        qualified.return_value = False
+        await self.click(data=stale)
+        self.assertEqual((None, 0), self.store.media_selection(-1001, "photo"))
+        qualified.return_value = True
+        await self.click("Оновити")
+        await self.click("Spark / Qwen · локально")
+        self.assertEqual(("spark-qwen", 1), self.store.media_selection(-1001, "photo"))
+        self.assertEqual((None, 0), self.store.media_selection(-2002, "photo"))
+        self.assertEqual((None, 0), self.store.media_selection(-1001, "video"))
+        await self.click("Назад")
+        await self.click("Відео Telegram")
+        self.assertIn("OpenAI", self.panel.text)
+        await self.click("Spark / Qwen · локально")
+        self.assertEqual(("spark-qwen", 1), self.store.media_selection(-1001, "video"))
 
     async def test_media_menu_independent_persistent_models_and_ownership(self):
         self.ui.tool_available = lambda key: True

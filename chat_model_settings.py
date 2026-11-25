@@ -42,6 +42,8 @@ MEDIA_MODEL_DEFAULTS = {
 
 
 def media_effort(model: str) -> str:
+    if model == SPARK_MODEL:
+        return "auto"
     if model == MINI_VISION_MODEL:
         return "none"
     capability = get_model_capability(model)
@@ -51,6 +53,8 @@ def media_effort(model: str) -> str:
 
 
 def media_model_allowed(tool: str, model: str, ceiling: tuple[str, str] | None = None) -> bool:
+    if model == SPARK_MODEL:
+        return tool in ("photo", "video", "tiktok") and (ceiling is None or member_duration_limit(model, "auto", ceiling) is None)
     if tool == "youtube":
         return model in TRANSCRIPTION_MODELS
     if tool not in ("photo", "video", "tiktok"):

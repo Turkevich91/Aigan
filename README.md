@@ -17,7 +17,7 @@ Default main-chat and interactive-vision model: `gpt-6-astra` with `low` reasoni
 - Social taste memory for sanitized group/user interests and reactions, used by proactive thought seeds.
 - Sanitized system health logs, admin self-check commands, and optional GitHub self-reporting.
 - Payload-free per-stage model telemetry for routing, usage, latency, and estimated-cost experiments.
-- Admin-only model selection (cloud or local Qwen), timed overrides and optional tool permissions per chat; see [chat model settings](docs/chat-model-settings.md).
+- Per-chat model choices with participant limits, timed overrides and administrator-controlled tool permissions. [Chat model settings](docs/chat-model-settings.md)
 - Placeholder `.env` ready for secrets.
 
 ## Setup
@@ -347,6 +347,8 @@ Tool failures must not block message persistence, embeddings, memory recall, `/s
 When `MEDIA_FRAME_EXTRACTION_ENABLED=true`, an explicit question about an attached Telegram clip or its direct reply can use bounded frame sampling and speech transcription. With `TIKTOK_VIDEO_ENABLED=true`, participants can also ask about one public TikTok video link in their request or in the same chat message they reply to. When the public clip is inaccessible, Aigan asks for a Telegram upload. In `/model`, **Моделі медіаінструментів** selects separate models for TikTok, Telegram video, saved photos and YouTube audio. **Інструменти** controls TikTok access for the chat.
 
 TikTok inspection requires a public video file accessible from the server. TikTok may serve the post page and deny the file download. In that case Aigan asks for a Telegram upload. The TikTok model choice stays available in the menu even while link inspection is disabled. Public TikTok clips have limits of 180 seconds and 20 MB, subject to the configured frame byte limit. The local media probe verifies the downloaded clip before analysis. Telegram attachments use their configured duration limit, 90 seconds by default.
+
+Participants can manually select **Spark / Qwen · локально** for saved photo descriptions, Telegram clip frames or available TikTok clips in the current chat after the local provider passes its image check. The clip option uses up to four numbered samples. Speech transcription uses OpenAI when requested. Direct questions about a photo use the primary vision-capable model.
 
 The public media acquisition boundary is registered as `media_acquisition` and is disabled by default. It remains a metadata-only `yt-dlp` telemetry probe and is not wired into chat routing. It records only stable platform/backend/capability fields and sanitized failure categories such as `unsupported_url`, `auth_or_rate_limited`, `challenge_required`, `duration_limit`, or `metadata_failed`; it must not log raw media URLs, provider stderr, source text, transcripts, frame OCR, usernames, tokens, or local paths.
 

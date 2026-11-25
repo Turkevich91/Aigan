@@ -46,11 +46,11 @@ refreshes and bot restarts. Existing persistent choices keep their exact IDs.
 
 Configure the local Chat Completions service through `SPARK_BASE_URL` and
 `SPARK_ANSWER_MODEL`; set `SPARK_API_KEY` if the local service requires one. Keep credentials and deployment
-addresses outside the repository. Local answers do not fall back to a paid
-model on failure. Qwen is offered for text. Selecting it does not enable
-visual inspection of images or video, and is not an account-wide spending
-switch: embeddings and other independently configured auxiliary roles do not
-move to Spark.
+addresses outside the repository. The Qwen answer preset handles text. Choose
+a vision-capable primary model for direct questions about a photo. Local photo
+memory and Telegram clip analysis have their own selections in the media menu.
+Embeddings and other auxiliary roles use their configured providers. A failed
+local inference leaves that task unavailable.
 
 Supported combinations are checked before persistence or inference. The catalog
 describes API compatibility; it does not guarantee that an account has model
@@ -79,6 +79,8 @@ Open **Моделі медіаінструментів** from `/model` or `/sett
 New chats and tools reset to their defaults use `gpt-6-luna` for photo descriptions and `gpt-6.1-terra` for both Telegram video and TikTok. These vision defaults use `none` reasoning effort. The TikTok model choice is saved even when the server has disabled link inspection or TikTok refuses the media download. In the latter case, participants can send the clip as a Telegram video attachment.
 
 YouTube uses public captions first. The audio menu offers file transcription models. The photo and video menus offer image-capable cloud models, including Mini. The video model interprets sampled frames and any extracted speech. Participants can make persistent vision selections within their chat model ceiling. Administrators and the owner can select from all supported options returned by discovery.
+
+**Spark / Qwen · локально** appears under **Фото для пам’яті**, **Відео Telegram** and **Відео TikTok** after a background check reads a random number from a synthetic image. Use **Оновити** if the check was still running when the panel opened. Selecting the local model for photos sends one bounded still image with a fixed description request. For an available clip it answers the current question from up to four numbered samples in one image. Speech recognition, when requested, uses the configured cloud transcription route. The choices apply independently to future work in the current chat. **Типова модель інструмента** resets one choice.
 
 Open **Інструменти** to allow or block web search and page reading, YouTube
 transcripts, sending public internet images, random draws or TikTok video inspection independently.

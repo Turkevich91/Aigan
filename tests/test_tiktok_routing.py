@@ -61,11 +61,31 @@ class TikTokRoutingTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(main.requested_tiktok_url(self.message, "Read https://example.com"))
         self.message.reply_to_message.chat_id = -2
         self.assertIsNone(main.requested_tiktok_url(self.message, "What happens?"))
-        self.assertFalse(media_model_allowed("tiktok", SPARK_MODEL))
+        self.assertTrue(media_model_allowed("tiktok", SPARK_MODEL))
         self.assertEqual(main.video_answer_settings(-2, "tiktok"), ("gpt-6.1-terra", "none"))
         with patch.object(self.store, "media_selection", return_value=(SPARK_MODEL, 1)):
+            self.assertEqual(main.video_answer_settings(-2, "tiktok"), (SPARK_MODEL, "auto"))
+        with patch.object(self.store, "media_selection", return_value=("unknown-model", 1)):
             with self.assertRaises(main.ChatModelSettingsUnavailable):
                 main.video_answer_settings(-2, "tiktok")
+
+    async def test_malformed_local_intent_stops_without_falling_back_or_downloading(self):
+        self.select("tiktok", SPARK_MODEL)
+        for number, text in enumerate(("{}", '{"inspect":"unknown"}', '{"inspect":"unrelated"}')):
+            self.message = FakeMessage("Inspect this clip " + LINK, chat_type="private", message_id=200+number)
+            result = SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=text))],
+                                     usage=None, model="local")
+            with patch.object(main.SPARK_MEDIA_VISION, "clip_response", new=AsyncMock(return_value=result)), \
+                    patch.object(main, "fetch_tiktok_video", new_callable=AsyncMock) as fetch:
+                await self.dispatch()
+                await asyncio.gather(*main.telegram_turn_tasks)
+                fetch.assert_not_awaited()
+                self.client.responses.create.assert_not_awaited()
+            if number < 2:
+                self.normal.assert_not_awaited()
+                self.assertIn("Не вдалося", self.delivery.await_args.args[1])
+            else:
+                self.normal.assert_awaited_once()
 
     async def test_passive_group_and_private_bare_link_do_not_start_tiktok(self):
         self.model_outputs()
