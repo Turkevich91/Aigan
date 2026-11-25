@@ -18,7 +18,7 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.error import TelegramError
 
 from chat_model_settings import (
-    MEDIA_TOOL_LABELS, MINI_VISION_MODEL, TRANSCRIPTION_MODELS, media_model_allowed,
+    MEDIA_MODEL_DEFAULTS, MEDIA_TOOL_LABELS, MINI_VISION_MODEL, TRANSCRIPTION_MODELS, media_model_allowed,
     MODEL_CATALOG,
     SPARK_MODEL,
     ChatModelSettingsStore,
@@ -135,7 +135,7 @@ class ChatModelUI:
         spark_available: Callable[[], bool] = lambda: False,
         get_catalog: Callable[[], Awaitable[tuple[ModelCapability, ...]]] | None = None,
         get_media_catalog: Callable[[], Awaitable[tuple[str, ...]]] | None = None,
-        media_default: Callable[[str], str] = lambda tool: TRANSCRIPTION_MODELS[0] if tool == "youtube" else MINI_VISION_MODEL,
+        media_default: Callable[[str], str] = MEDIA_MODEL_DEFAULTS.__getitem__,
         clock: Callable[[], float] = time.time,
         delete_commands: bool = True,
         panel_ttl_seconds: int = 900,

@@ -184,7 +184,9 @@ IMAGE_MAX_BYTES=6000000
 ```
 
 Explicit direct, replied, and found-image explanations use the interactive model.
-Lazy memory summaries and reaction-asset descriptions use the background model, while
+Saved photo descriptions use the chat's photo model (default `gpt-6-luna`).
+Requested Telegram clips use the chat's video model (default `gpt-6.1-terra`).
+Reaction-asset descriptions use the background model, while
 public-web candidate safety/relevance review keeps its dedicated reviewer. The legacy
 `VISION_MODEL` key remains a background compatibility fallback; interactive vision never
 inherits it, so an old Mini setting cannot silently weaken an explicit image answer.
