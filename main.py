@@ -1071,6 +1071,7 @@ logging.basicConfig(
 logging.getLogger().setLevel(LOG_LEVEL)
 LOGGER = logging.getLogger("aigan")
 logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 
 def activity_presence_settings() -> ActivityPresenceSettings:
