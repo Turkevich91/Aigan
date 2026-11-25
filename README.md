@@ -192,6 +192,8 @@ public-web candidate safety/relevance review keeps its dedicated reviewer. The l
 `VISION_MODEL` key remains a background compatibility fallback; interactive vision never
 inherits it, so an old Mini setting cannot silently weaken an explicit image answer.
 
+[Specialist model evaluation and selection results](docs/auxiliary-model-eval-results-2026-11-25.md).
+
 For an existing Sol deployment, update only `OPENAI_MODEL`,
 `MODEL_TIER_PREMIUM_MODEL`, and `VISION_INTERACTIVE_MODEL` where they currently
 select `gpt-5.6-sol`, using `gpt-6-astra` and keeping both reasoning efforts at
