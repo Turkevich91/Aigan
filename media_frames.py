@@ -10,6 +10,7 @@ import math
 import shutil
 import subprocess
 import tempfile
+import time
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable, Protocol, Sequence
@@ -20,6 +21,7 @@ from system_log import sanitize_text
 # Only standalone local media containers. Network protocols, playlist and
 # concatenation demuxers are outside the Telegram attachment boundary.
 LOCAL_MEDIA_OPTIONS = ("-protocol_whitelist", "file", "-format_whitelist", "mov,matroska,webm,avi,gif,mpeg,mpegts")
+SPARSE_FRAME_MAX_SECONDS = 1800
 
 
 MEDIA_FRAME_FAILURE_CATEGORIES = {
@@ -85,6 +87,8 @@ class MediaFrameRequest:
     max_selected_frame_count: int | None = None
     timeout_seconds: int | None = None
     mode: str = "visual_summary"
+    sparse_frame_count: int = 5
+    sparse_max_duration_seconds: int = 0
 
 
 @dataclass(frozen=True)
@@ -243,7 +247,7 @@ class CommandOutput:
     stderr: str = ""
 
 
-CommandRunner = Callable[[Sequence[str], int], CommandOutput]
+CommandRunner = Callable[[Sequence[str], float], CommandOutput]
 
 
 class FfmpegMediaFrameAdapter:
@@ -271,6 +275,7 @@ class FfmpegMediaFrameAdapter:
         limits = request_limits(self.limits, request)
         source_path = Path(request.source_path)
         temp_dir: Path | None = None
+        backend = "ffmpeg_interval"
         try:
             if not source_path.is_file():
                 return self._failure(request, "input_missing", backend="ffmpeg_interval", cleanup_status="not_needed")
@@ -285,20 +290,39 @@ class FfmpegMediaFrameAdapter:
                     cleanup_status="not_needed",
                     diagnostics={"max_bytes": limits.max_bytes},
                 )
+            deadline = time.monotonic() + min(limits.timeout_seconds, 30)
             metadata = await asyncio.to_thread(self._probe_metadata, source_path, limits.timeout_seconds)
             validation_failure = validate_metadata(metadata, limits)
+            sparse = (validation_failure == "duration_too_long"
+                      and request.sparse_max_duration_seconds > limits.max_duration_seconds)
+            if sparse:
+                backend = "ffmpeg_sparse"
+                sparse_cap = min(request.sparse_max_duration_seconds, SPARSE_FRAME_MAX_SECONDS)
+                if metadata["video_start_seconds"] > 0 and not (metadata["width"] and metadata["height"]):
+                    # With a delayed picture some containers expose dimensions only in its first packet.
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise subprocess.TimeoutExpired("ffprobe", limits.timeout_seconds)
+                    analyze_us = int(min(metadata["video_start_seconds"] + 2, SPARSE_FRAME_MAX_SECONDS) * 1_000_000)
+                    metadata = await asyncio.to_thread(self._probe_metadata, source_path, remaining, analyze_us)
+                track = {**metadata, "duration_seconds": metadata.get("video_duration_seconds")}
+                validation_failure = validate_metadata(track, replace(limits, max_duration_seconds=sparse_cap))
             if validation_failure:
                 return self._failure(
                     request,
                     validation_failure,
-                    backend="ffmpeg_interval",
+                    backend=backend,
                     cleanup_status="not_needed",
                     metadata=metadata,
                 )
             temp_dir = Path(tempfile.mkdtemp(prefix="aigan-media-frames-"))
-            output_pattern = temp_dir / "frame_%03d.jpg"
-            worker = asyncio.create_task(asyncio.to_thread(
-                self._extract_interval_frames, source_path, output_pattern, metadata, limits))
+            if sparse:
+                count = min(limits.selected_frame_count, max(1, min(request.sparse_frame_count, 5)))
+                extract = asyncio.to_thread(self._extract_sparse_frames, source_path, temp_dir, metadata, limits, count, deadline)
+            else:
+                extract = asyncio.to_thread(self._extract_interval_frames, source_path, temp_dir / "frame_%03d.jpg",
+                                            metadata, limits)
+            worker = asyncio.create_task(extract)
             try:
                 await asyncio.shield(worker)
             except asyncio.CancelledError:
@@ -308,11 +332,19 @@ class FfmpegMediaFrameAdapter:
                 shutil.rmtree(temp_dir, ignore_errors=True)
                 raise
             frame_paths = sorted(temp_dir.glob("frame_*.jpg"))
+            if sparse:
+                # Variable frame rate and very short tracks can map multiple seeks to the same picture.
+                by_time = {int(path.stem.rsplit("_", 1)[1]): path for path in frame_paths}
+                start = metadata["video_start_seconds"]
+                end = start + metadata["video_duration_seconds"]
+                if any(stamp < 0 or not start - .001 <= stamp / 1000 <= end + .001 for stamp in by_time):
+                    raise RuntimeError("decode_failed")
+                frame_paths = [by_time[stamp] for stamp in sorted(by_time)]
             if not frame_paths:
                 result = self._failure(
                     request,
                     "no_frames_selected",
-                    backend="ffmpeg_interval",
+                    backend=backend,
                     cleanup_status="pending",
                     metadata=metadata,
                 )
@@ -322,11 +354,11 @@ class FfmpegMediaFrameAdapter:
             count = min(len(frame_paths), limits.selected_frame_count)
             indices = ([len(frame_paths) // 2] if count == 1 else
                        [round(i * (len(frame_paths) - 1) / (count - 1)) for i in range(count)])
-            interval = 1 / sample_fps(metadata, limits)
             frames = tuple(
                 MediaFrameCandidate(
                     path=frame_paths[index],
-                    timestamp_seconds=round(index * interval, 3),
+                    timestamp_seconds=(int(frame_paths[index].stem.rsplit("_", 1)[1]) / 1000 if sparse
+                                       else round(index / sample_fps(metadata, limits), 3)),
                     index=index + 1,
                 )
                 for index in indices
@@ -334,7 +366,7 @@ class FfmpegMediaFrameAdapter:
             self.last_failure_category = ""
             return MediaFrameResult(
                 ok=True,
-                backend="ffmpeg_interval",
+                backend=backend,
                 source_family=safe_code_label(request.source_family, default="media"),
                 frames=frames,
                 metadata=sanitize_metadata(metadata),
@@ -350,7 +382,7 @@ class FfmpegMediaFrameAdapter:
                 _temp_dir=temp_dir,
             )
         except subprocess.TimeoutExpired:
-            result = self._failure(request, "timeout", backend="ffmpeg_interval", cleanup_status="pending")
+            result = self._failure(request, "timeout", backend=backend, cleanup_status="pending")
             result._temp_dir = temp_dir
             await result.cleanup()
             return result
@@ -359,7 +391,7 @@ class FfmpegMediaFrameAdapter:
             result = self._failure(
                 request,
                 category,
-                backend="ffmpeg_interval",
+                backend=backend,
                 cleanup_status="pending" if temp_dir is not None else "not_needed",
             )
             result._temp_dir = temp_dir
@@ -369,7 +401,7 @@ class FfmpegMediaFrameAdapter:
             result = self._failure(
                 request,
                 "unexpected_error",
-                backend="ffmpeg_interval",
+                backend=backend,
                 cleanup_status="pending" if temp_dir is not None else "not_needed",
                 diagnostics={"error_type": safe_code_label(type(exc).__name__, default="error")},
             )
@@ -422,7 +454,7 @@ class FfmpegMediaFrameAdapter:
     async def cleanup(self) -> None:
         return None
 
-    def _probe_metadata(self, source_path: Path, timeout_seconds: int) -> dict[str, Any]:
+    def _probe_metadata(self, source_path: Path, timeout_seconds: float, analyze_us: int | None = None) -> dict[str, Any]:
         output = self.command_runner(
             [
                 self.ffprobe_path,
@@ -432,6 +464,7 @@ class FfmpegMediaFrameAdapter:
                 "json",
                 "-show_streams",
                 "-show_format",
+                *(["-analyzeduration", str(analyze_us)] if analyze_us else []),
                 *LOCAL_MEDIA_OPTIONS,
                 str(source_path),
             ],
@@ -462,6 +495,8 @@ class FfmpegMediaFrameAdapter:
                 str(source_path),
                 "-t",
                 str(limits.max_duration_seconds),
+                "-map",
+                f"0:{metadata['video_stream_index']}",
                 "-vf",
                 f"fps={fps:.6f}:round=up,scale={limits.output_width}:{limits.output_width}:force_original_aspect_ratio=decrease",
                 "-frames:v",
@@ -472,6 +507,27 @@ class FfmpegMediaFrameAdapter:
         )
         if output.returncode != 0:
             raise RuntimeError("decode_failed")
+
+    def _extract_sparse_frames(self, source_path, directory, metadata, limits, count, deadline):
+        """Seek once per sample. Image filenames retain decoded presentation timestamps in ms."""
+        duration = metadata["video_duration_seconds"]
+        offset = metadata["video_start_seconds"]
+        end = max(0, duration - max(1., 1 / (metadata["fps"] or 1.)))
+        for i in range(count):
+            seek = offset + (end / 2 if count == 1 else i * end / (count - 1))
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired("ffmpeg", min(limits.timeout_seconds, 30))
+            pattern = directory / f"frame_{i:02d}_%d.jpg"
+            output = self.command_runner([
+                self.ffmpeg_path, "-v", "error", "-nostdin", "-threads", "1", "-filter_threads", "1",
+                "-ss", f"{seek:.6f}", "-copyts", "-start_at_zero", *LOCAL_MEDIA_OPTIONS, "-i", str(source_path),
+                "-map", f"0:{metadata['video_stream_index']}", "-an", "-sn", "-dn",
+                "-vf", f"scale={limits.output_width}:{limits.output_width}:force_original_aspect_ratio=decrease",
+                "-frames:v", "1", "-threads", "1", "-fps_mode", "passthrough", "-enc_time_base", "1:1000", "-frame_pts", "1",
+                str(pattern)], remaining)
+            if output.returncode or not any(directory.glob(f"frame_{i:02d}_*.jpg")):
+                raise RuntimeError("decode_failed")
 
     def _failure(
         self,
@@ -506,7 +562,7 @@ def sample_fps(metadata: dict[str, Any], limits: MediaFrameLimits) -> float:
     return min(1.0, limits.candidate_frame_count / max(float(metadata["duration_seconds"]), 1.0))
 
 
-def run_command(command: Sequence[str], timeout_seconds: int) -> CommandOutput:
+def run_command(command: Sequence[str], timeout_seconds: float) -> CommandOutput:
     completed = subprocess.run(
         list(command),
         check=False,
@@ -537,26 +593,41 @@ def parse_ffprobe_metadata(payload: str) -> dict[str, Any]:
         data = json.loads(payload or "{}")
     except json.JSONDecodeError as exc:
         raise RuntimeError("metadata_failed") from exc
-    stream = next((item for item in data.get("streams", []) if item.get("codec_type") == "video"), None)
+    streams = data.get("streams", [])
+    stream = next((item for item in streams if item.get("codec_type") == "video"
+                   and not (item.get("disposition") or {}).get("attached_pic")), None)
     if not stream:
         raise RuntimeError("metadata_failed")
     fmt = data.get("format") or {}
-    duration = max(parse_float(stream.get("duration")) or 0, parse_float(fmt.get("duration")) or 0)
+    video_duration = parse_float(stream.get("duration")) or 0
+    if not video_duration:
+        ticks = parse_int(stream.get("duration_ts")) or 0
+        video_duration = ticks * (parse_ratio(stream.get("time_base")) or 0)
+    format_duration = parse_float(fmt.get("duration")) or 0
+    if not all(math.isfinite(value) for value in (video_duration, format_duration)):
+        raise RuntimeError("metadata_failed")
+    duration = max(video_duration, format_duration)
+    if not video_duration and len(streams) == 1:
+        video_duration = format_duration
+    video_start = (parse_float(stream.get("start_time")) or 0) - (parse_float(fmt.get("start_time")) or 0)
+    if not math.isfinite(video_start):
+        raise RuntimeError("metadata_failed")
     frame_count = parse_int(stream.get("nb_frames"))
     fps = parse_ratio(stream.get("avg_frame_rate")) or parse_ratio(stream.get("r_frame_rate")) or 0.0
     width = parse_int(stream.get("width")) or 0
     height = parse_int(stream.get("height")) or 0
-    return sanitize_metadata(
-        {
-            "duration_seconds": round(duration, 3) if duration else 0,
-            "width": width,
-            "height": height,
-            "fps": round(fps, 3) if fps else 0,
-            "frame_count": frame_count,
-            "codec": safe_code_label(stream.get("codec_name") or "", default="unknown"),
-            "has_audio": any(item.get("codec_type") == "audio" for item in data.get("streams", [])),
-        }
-    )
+    return {
+        "duration_seconds": round(duration, 3) if duration else 0,
+        "width": width,
+        "height": height,
+        "fps": round(fps, 3) if fps and math.isfinite(fps) and fps > 0 else 0,
+        "frame_count": frame_count,
+        "codec": safe_code_label(stream.get("codec_name") or "", default="unknown"),
+        "has_audio": any(item.get("codec_type") == "audio" for item in streams),
+        "video_duration_seconds": video_duration,
+        "video_start_seconds": max(0., video_start),
+        "video_stream_index": parse_int(stream.get("index")) or 0,
+    }
 
 
 def validate_metadata(metadata: dict[str, Any], limits: MediaFrameLimits) -> str:

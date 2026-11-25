@@ -136,7 +136,7 @@ from media_acquisition import (
     NullMediaAcquisitionAdapter,
     YtDlpMediaAcquisitionAdapter,
 )
-from media_frames import FfmpegMediaFrameAdapter, MediaFrameAdapter, MediaFrameLimits, NullMediaFrameAdapter
+from media_frames import FfmpegMediaFrameAdapter, MediaFrameAdapter, MediaFrameLimits, NullMediaFrameAdapter, SPARSE_FRAME_MAX_SECONDS
 from telegram_video import (
     VIDEO_ANSWER_INSTRUCTIONS, VIDEO_INTENT_FORMAT, VIDEO_INTENT_INSTRUCTIONS, VideoUnavailable, inspect_clip,
     inspect_local_clip, TELEGRAM_VIDEO_MAX_BYTES, SPEECH_SCOPE_INSTRUCTIONS, SPEECH_SCOPE_FORMAT, confirmed_speech_scope,
@@ -445,6 +445,7 @@ class Config:
     media_frame_ffmpeg_path: str
     media_frame_ffprobe_path: str
     media_frame_max_duration_seconds: int
+    telegram_sparse_max_duration_seconds: int
     media_frame_max_bytes: int
     media_frame_candidate_count: int
     media_frame_selected_count: int
@@ -729,6 +730,10 @@ class Config:
                     "OPERATOR_ALERT_CHAT_ID must identify an ADMIN_USER_IDS operator"
                 )
 
+        interval_limit = int(os.getenv("MEDIA_FRAME_MAX_DURATION_SECONDS", "90"))
+        # Preserve custom deployments' existing ceiling until explicitly extended.
+        sparse_default = SPARSE_FRAME_MAX_SECONDS if interval_limit == MediaFrameLimits().max_duration_seconds else interval_limit
+        sparse_limit = int(os.getenv("TELEGRAM_VIDEO_SPARSE_MAX_SECONDS", str(sparse_default)))
         return cls(
             telegram_token=token,
             openai_api_key=api_key,
@@ -977,7 +982,8 @@ class Config:
             tiktok_video_enabled=_env_bool("TIKTOK_VIDEO_ENABLED", False),
             media_frame_ffmpeg_path=os.getenv("MEDIA_FRAME_FFMPEG_PATH", "ffmpeg").strip() or "ffmpeg",
             media_frame_ffprobe_path=os.getenv("MEDIA_FRAME_FFPROBE_PATH", "ffprobe").strip() or "ffprobe",
-            media_frame_max_duration_seconds=int(os.getenv("MEDIA_FRAME_MAX_DURATION_SECONDS", "90")),
+            media_frame_max_duration_seconds=interval_limit,
+            telegram_sparse_max_duration_seconds=min(SPARSE_FRAME_MAX_SECONDS, max(0, sparse_limit)),
             media_frame_max_bytes=int(os.getenv("MEDIA_FRAME_MAX_BYTES", "50000000")),
             media_frame_candidate_count=int(os.getenv("MEDIA_FRAME_CANDIDATE_COUNT", "24")),
             media_frame_selected_count=int(os.getenv("MEDIA_FRAME_SELECTED_COUNT", "5")),
@@ -14910,7 +14916,9 @@ async def respond_to_video_request(message, prompt, attachment, settings) -> boo
                                                 max_duration=options["max_duration"])
                         response = await inspect_local_clip(source, source_family="tiktok_clip", **options)
                 else:
-                    response = await inspect_clip(attachment, **options)
+                    # Three samples keep start, middle and end visible together on the four-tile local sheet.
+                    response = await inspect_clip(attachment, sparse_max_duration=CONFIG.telegram_sparse_max_duration_seconds,
+                                                  sparse_frame_count=3 if model == SPARK_MODEL else 5, **options)
             finally:
                 await presence.stop()
     except VideoUnavailable as exc:

@@ -236,11 +236,12 @@ class TikTokRoutingTests(unittest.IsolatedAsyncioTestCase):
                             shutil.copyfile(fixture, custom_path)
                         remote = SimpleNamespace(file_size=fixture.stat().st_size, download_to_drive=download)
                         attachment = SimpleNamespace(file_size=remote.file_size, get_file=AsyncMock(return_value=remote))
-                        self.model_outputs('{"inspect":"frames"}')
+                        self.model_outputs('{"inspect":"speech"}')
                         with patch.object(main, "runtime_media_frame_adapter", return_value=adapter):
                             await main.respond_to_video_request(self.message, "Describe this", attachment,
                                                                 ("gpt-6.1-terra", "none"))
-                        self.assertIn("задовге", self.delivery.await_args.args[1])
+                        self.assertIn("мовлення", self.delivery.await_args.args[1])
+                        self.assertIn("90 с", self.delivery.await_args.args[1])
 
     async def test_cancelled_download_cleans_work_directory_and_worker_slot(self):
         started = asyncio.Event()

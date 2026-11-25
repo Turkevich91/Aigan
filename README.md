@@ -186,6 +186,7 @@ IMAGE_MAX_BYTES=6000000
 Explicit direct, replied, and found-image explanations use the interactive model.
 Saved photo descriptions use the chat's photo model (default `gpt-6-luna`).
 Requested Telegram clips use the chat's video model (default `gpt-6.1-terra`).
+For longer Telegram uploads, a visual-only question can inspect up to five timestamped frames. The local Qwen model receives up to three samples covering the beginning, middle and end. The default sparse limit is 30 minutes of video within the hosted Telegram download limit of 20 MB. Speech requests keep the ordinary clip duration limit. Set `TELEGRAM_VIDEO_SPARSE_MAX_SECONDS` to lower the visual limit or to `0` to disable sparse sampling. An existing custom interval duration limit is retained unless a sparse limit is supplied.
 Reaction-asset descriptions use the background model, while
 public-web candidate safety/relevance review keeps its dedicated reviewer. The legacy
 `VISION_MODEL` key remains a background compatibility fallback; interactive vision never
