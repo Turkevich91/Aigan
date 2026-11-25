@@ -17,7 +17,8 @@ from media_frames import LOCAL_MEDIA_OPTIONS, MediaFrameRequest, run_command
 TELEGRAM_VIDEO_MAX_BYTES = 20_000_000
 VIDEO_INTENT_INSTRUCTIONS = """An admitted Telegram user has supplied or replied to one video.
 Classify the evidence the CURRENT authored request explicitly asks to inspect.
-Use frames for visible details, on-screen writing or subtitles, and general questions about the
+Use frames to read or translate visible captions, credits and subtitles (титри, субтитри).
+They are text in the image, even if they reproduce dialogue. Use frames for visible details and general questions about the
 action, plot, or changes from beginning to end. A request to summarize a clip or answer in a
 particular language uses frames unless the user asks about spoken words. Use speech for requests
 to transcribe, translate or interpret spoken words. Use both only when the user explicitly asks
@@ -39,6 +40,8 @@ dialogue, or quote sung words. If present ALWAYS choose spoken_words, including 
 are ALSO requested. Copy the exact words requesting it into evidence, in the original language.
 Example: "Describe the action and what the speaker said" -> spoken_words, evidence "what the speaker said".
 Example: "Опиши дії та переклади слова ведучого" -> spoken_words, evidence "переклади слова ведучого".
+Reading or translating captions, credits or subtitles (титри, субтитри) is visual, including when
+the written text represents dialogue. Example: "Переклади титри" -> visual, evidence "".
 Only if there is no such request, leave evidence empty and choose: visual for visible information,
 written text, subtitles or general changes; other_audio for music or environmental noise alone;
 unclear for an ambiguous audio request. The requested answer language is not a request to
