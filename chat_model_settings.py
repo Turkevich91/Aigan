@@ -31,6 +31,36 @@ class StaleSettingsRevision(ValueError):
     """The settings changed after the caller observed their revision."""
 
 
+MEDIA_TOOL_LABELS = {"youtube": "Аудіо YouTube", "photo": "Фото для пам’яті", "video": "Відео Telegram"}
+TRANSCRIPTION_MODELS = ("gpt-transcribe", "gpt-4o-mini-transcribe", "gpt-4o-transcribe")
+MINI_VISION_MODEL = "gpt-5.4-mini"
+
+
+def media_effort(model: str) -> str:
+    if model == MINI_VISION_MODEL:
+        return "none"
+    capability = get_model_capability(model)
+    if not capability.supports_images:
+        raise InvalidModelSelection("not_a_vision_model")
+    return "none" if "none" in capability.reasoning_efforts else "low"
+
+
+def media_model_allowed(tool: str, model: str, ceiling: tuple[str, str] | None = None) -> bool:
+    if tool == "youtube":
+        return model in TRANSCRIPTION_MODELS
+    if tool not in ("photo", "video"):
+        return False
+    if model == MINI_VISION_MODEL:
+        return True
+    try:
+        effort = media_effort(model)
+        return get_model_capability(model).model == model and (
+            ceiling is None or member_duration_limit(model, effort, ceiling) is None
+        )
+    except InvalidModelSelection:
+        return False
+
+
 @dataclass(frozen=True)
 class ModelCapability:
     model: str
@@ -328,6 +358,12 @@ class ChatModelSettingsStore:
         with closing(self._connect()) as connection, connection:
             connection.execute("BEGIN IMMEDIATE")
             connection.execute("""
+                CREATE TABLE IF NOT EXISTS chat_media_models (
+                    chat_id INTEGER NOT NULL, tool TEXT NOT NULL, model TEXT,
+                    revision INTEGER NOT NULL, PRIMARY KEY (chat_id, tool)
+                )
+            """)
+            connection.execute("""
                 CREATE TABLE IF NOT EXISTS chat_model_settings (
                     chat_id INTEGER PRIMARY KEY,
                     model TEXT,
@@ -356,6 +392,36 @@ class ChatModelSettingsStore:
 
     def close(self) -> None:
         """Compatibility lifecycle hook; no connection is retained between calls."""
+
+    def media_selection(self, chat_id: int, tool: str) -> tuple[str | None, int]:
+        if tool not in MEDIA_TOOL_LABELS:
+            raise InvalidModelSelection("unknown_media_tool")
+        with closing(self._connect()) as connection:
+            row = connection.execute("SELECT model, revision FROM chat_media_models WHERE chat_id=? AND tool=?",
+                                     (_chat_id(chat_id), tool)).fetchone()
+        return tuple(row) if row is not None else (None, 0)
+
+    def set_media_model(self, chat_id: int, tool: str, model: str | None, *, role: str,
+                        expected_revision: int, available: tuple[str, ...]) -> None:
+        chat_id = _chat_id(chat_id)
+        _expected_revision(expected_revision)
+        if role not in {"member", "admin", "owner"} or tool not in MEDIA_TOOL_LABELS:
+            raise InvalidModelSelection("invalid_media_selection")
+        with closing(self._connect()) as connection, connection:
+            connection.execute("BEGIN IMMEDIATE")
+            ceiling = self._member_ceiling(self._state(connection, chat_id, self._now(None))) if role == "member" else None
+            if model is not None and (model not in available or not media_model_allowed(tool, model, ceiling)):
+                raise InvalidModelSelection("invalid_media_selection")
+            row = connection.execute("SELECT model, revision FROM chat_media_models WHERE chat_id=? AND tool=?",
+                                     (chat_id, tool)).fetchone()
+            current, revision = tuple(row) if row is not None else (None, 0)
+            if revision != expected_revision:
+                raise StaleSettingsRevision("media_selection_changed")
+            if current != model:
+                connection.execute("""
+                    INSERT INTO chat_media_models(chat_id, tool, model, revision) VALUES (?, ?, ?, ?)
+                    ON CONFLICT(chat_id, tool) DO UPDATE SET model=excluded.model, revision=excluded.revision
+                """, (chat_id, tool, model, _next_revision(revision)))
 
     def _now(self, now: float | None) -> float:
         return _timestamp(self.clock() if now is None else now)

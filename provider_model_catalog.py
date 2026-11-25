@@ -7,7 +7,7 @@ from time import monotonic
 
 from openai import APIError, AsyncOpenAI
 
-from chat_model_settings import MODEL_CATALOG, ModelCapability, catalog_from_provider_ids
+from chat_model_settings import MINI_VISION_MODEL, MODEL_CATALOG, TRANSCRIPTION_MODELS, ModelCapability, catalog_from_provider_ids
 
 
 class ProviderModelCatalog:
@@ -15,6 +15,7 @@ class ProviderModelCatalog:
         self._client_factory = client_factory
         self._lock = asyncio.Lock()
         self._snapshot = MODEL_CATALOG
+        self._ids = frozenset([MINI_VISION_MODEL, *TRANSCRIPTION_MODELS, *(cap.model for cap in MODEL_CATALOG)])
         self._refresh_at = 0.0
 
     async def get(self) -> tuple[ModelCapability, ...]:
@@ -41,5 +42,15 @@ class ProviderModelCatalog:
                 self._refresh_at = monotonic() + 30
             else:
                 self._snapshot = snapshot
+                self._ids = frozenset(ids)
                 self._refresh_at = monotonic() + 300
             return self._snapshot
+
+    async def media_models(self) -> tuple[str, ...]:
+        catalog = await self.get()
+        latest = {}
+        for capability in catalog:
+            if capability.supports_images:
+                latest.setdefault(capability.aliases[0], capability.model)
+        return tuple(model for model in (*TRANSCRIPTION_MODELS, MINI_VISION_MODEL, *reversed(latest.values()))
+                     if model in self._ids)

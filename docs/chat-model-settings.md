@@ -74,6 +74,10 @@ Capability and discovery sources:
 
 ## Tool permissions
 
+Open **Моделі медіаінструментів** from `/model` or `/settings` to select a model for YouTube audio transcription, saved photo descriptions, or analysis of a requested Telegram clip. A tap saves that tool’s choice for the current chat. **Типова модель інструмента** restores its deployment default. The primary answer profile, its timer and other media selections have separate settings.
+
+YouTube uses public captions first. The audio menu offers file transcription models. The photo and video menus offer image-capable cloud models, including Mini. The video model interprets sampled frames and any extracted speech. Participants can make persistent vision selections within their chat model ceiling. Administrators and the owner can select from all supported options returned by discovery.
+
 Open **Інструменти** to allow or block web search and page reading, YouTube
 transcripts, sending public internet images, or random draws independently.
 Tapping a tool saves its new permission immediately. A check means the chat

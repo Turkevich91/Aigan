@@ -61,6 +61,7 @@ class StickerAdmissionTests(unittest.IsolatedAsyncioTestCase):
             self.stack.enter_context(patch.object(main, name, value))
 
     async def asyncTearDown(self):
+        await main.stop_photo_summaries()
         for task in self.tasks:
             if not task.done():
                 task.cancel()
@@ -101,6 +102,8 @@ class StickerAdmissionTests(unittest.IsolatedAsyncioTestCase):
         message = self.sticker()
         with patch.object(main, "CONFIG", replace(main.CONFIG, telegram_turn_assembly_enabled=assembly)):
             await self.ingest(message)
+            if main.photo_summary_worker:
+                await main.photo_summary_worker
         self.recognition.assert_not_awaited()
         self.vision.assert_not_awaited()
         self.image_handler.assert_not_awaited()
@@ -124,6 +127,7 @@ class StickerAdmissionTests(unittest.IsolatedAsyncioTestCase):
         queued = self.queued_image("photo")
         message = self.sticker()
         await self.ingest(message)
+        await main.photo_summary_worker
         self.vision.assert_awaited_once()
         self.assertEqual("background", self.vision.await_args.kwargs["purpose"])
         self.assertEqual("Neutral unrelated photo summary", self.store.item_by_id(queued).vision_summary)

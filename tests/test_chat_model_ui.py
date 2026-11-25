@@ -164,6 +164,41 @@ class ChatModelUITests(unittest.IsolatedAsyncioTestCase):
         await self.click("🚫 " + web.label)
         self.assertFalse(self.store.tools.resolve(-1001).disabled)
 
+    async def test_media_menu_independent_persistent_models_and_ownership(self):
+        await self.command()
+        before = self.profile()
+        await self.click("Моделі медіаінструментів")
+        for label, key, model in (("Аудіо YouTube", "youtube", "gpt-4o-mini-transcribe"),
+                                  ("Фото для пам’яті", "photo", "gpt-6-luna"),
+                                  ("Відео Telegram", "video", "gpt-6.1-terra")):
+            await self.click(label)
+            wrong_actor = await self.click(model, actor=45)
+            self.assertTrue(wrong_actor.answer.await_args.kwargs["show_alert"])
+            self.assertEqual((None, 0), self.store.media_selection(-1001, key))
+            await self.click(model)
+            self.assertEqual((model, 1), self.store.media_selection(-1001, key))
+            self.assertEqual((None, 0), self.store.media_selection(-2002, key))
+            await self.click("Назад")
+        await self.click("Аудіо YouTube")
+        stale = self.button("gpt-transcribe")
+        self.store.set_media_model(-1001, "youtube", "gpt-4o-transcribe", role="admin", expected_revision=1,
+                                   available=("gpt-4o-transcribe",))
+        self.assertTrue((await self.click(data=stale)).answer.await_args.kwargs["show_alert"])
+        await self.click("Оновити")
+        await self.click("Типова модель інструмента")
+        self.assertIsNone(self.store.media_selection(-1001, "youtube")[0])
+        self.assertEqual(before, self.profile())
+        self.assertEqual("gpt-6-luna", self.store.media_selection(-1001, "photo")[0])
+
+    async def test_member_media_menu_filters_persistent_ceiling_and_endpoint(self):
+        await self.command(user_id=55)
+        await self.click("Моделі медіаінструментів", actor=55)
+        await self.click("Відео Telegram", actor=55)
+        labels = [b.text for row in self.panel.reply_markup.inline_keyboard for b in row]
+        self.assertFalse(any("astra" in name or "transcribe" in name or "Qwen" in name for name in labels))
+        await self.click("gpt-6-luna", actor=55)
+        self.assertEqual("gpt-6-luna", self.store.media_selection(-1001, "video")[0])
+
     async def test_malformed_numeric_callback_does_not_change_tool_permissions(self):
         from chat_tool_policy import CHAT_TOOLS
         await self.command()

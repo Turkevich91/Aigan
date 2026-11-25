@@ -4060,10 +4060,13 @@ class TimeContextTests(unittest.TestCase):
 
     def test_run_agent_configures_mcp_timeout_and_failure_formatter(self) -> None:
         server_kwargs: list[dict[str, object]] = []
+        sessions = []
 
         class FakeMCPServer:
             def __init__(self, *args, **kwargs) -> None:
                 server_kwargs.append(kwargs)
+                self.session = SimpleNamespace(call_tool=AsyncMock())
+                sessions.append(self.session)
 
             async def __aenter__(self):
                 return self
@@ -4074,7 +4077,7 @@ class TimeContextTests(unittest.TestCase):
         original_config = main.CONFIG
         try:
             main.CONFIG = replace(main.CONFIG, mcp_tool_timeout_seconds=42.0)
-            with patch.object(main, "MCPServerStdio", FakeMCPServer):
+            with patch.dict(os.environ, {"YOUTUBE_AUDIO_FALLBACK": "true"}), patch.object(main, "MCPServerStdio", FakeMCPServer):
                 with patch.object(main, "make_agent", return_value="agent"):
                     with patch.object(
                         main.Runner,
@@ -4089,6 +4092,11 @@ class TimeContextTests(unittest.TestCase):
         for kwargs in server_kwargs:
             self.assertEqual(42.0, kwargs["client_session_timeout_seconds"])
             self.assertIs(main.mcp_tool_failure_message, kwargs["failure_error_function"])
+        self.assertIsInstance(sessions[0].call_tool, AsyncMock)
+        asyncio.run(sessions[1].call_tool("get_youtube_transcript", {}))
+        sessions[1].call_tool.func.assert_awaited_once_with(
+            "get_youtube_transcript", {}, read_timeout_seconds=main.timedelta(seconds=75)
+        )
         run_config = runner.await_args.kwargs["run_config"]
         self.assertEqual(
             original_config.agents_tracing_mode == "disabled",

@@ -60,6 +60,23 @@ class ChatModelRuntimeTests(unittest.IsolatedAsyncioTestCase):
             cloud.assert_not_called()
             async_cloud.assert_not_called()
 
+    async def test_chat_media_selection_reaches_only_its_provider_role(self):
+        with patch.object(main, "CHAT_MODEL_SETTINGS", None):
+            for settings in (main.photo_summary_settings, main.video_answer_settings):
+                with self.assertRaises(main.ChatModelSettingsUnavailable):
+                    settings(-1001)
+        for key, model in (("youtube", "gpt-transcribe"), ("photo", "gpt-6.1-terra"), ("video", "gpt-6.1-sol")):
+            self.store.set_media_model(-1001, key, model, role="admin", available=(model,), expected_revision=0)
+        with patch.dict(os.environ, YOUTUBE_AUDIO_FALLBACK="true", YOUTUBE_TRANSCRIPTION_MODEL="gpt-4o-mini-transcribe"):
+            with main.chat_model_scope(-1001):
+                self.assertEqual("gpt-transcribe", main.youtube_mcp_environment(run_id="test", route_bucket="tool")["YOUTUBE_TRANSCRIPTION_MODEL"])
+                self.assertEqual(("gpt-6.1-terra", "none"), main.photo_summary_settings(-1001))
+                self.assertEqual(("gpt-6.1-sol", "low"), main.video_answer_settings(-1001))
+                self.assertEqual(("gpt-5.4-mini", "none"), main.video_answer_settings(-2002))
+                self.assertEqual(("gpt-5.6-sol", "low"), main.primary_answer_settings())
+            with main.chat_model_scope(-2002):
+                self.assertEqual("gpt-4o-mini-transcribe", main.youtube_mcp_environment(run_id="test", route_bucket="tool")["YOUTUBE_TRANSCRIPTION_MODEL"])
+
     def select(self, chat=-1001, model="astra", effort="high", duration=900):
         return self.store.apply(chat, model, effort, duration)
 
