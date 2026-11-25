@@ -96,6 +96,7 @@ from agent_capabilities import (
 from chat_tool_policy import CHAT_TOOLS, ChatToolRun, chat_tool_scope, tool_allowed
 from chat_model_settings import AnswerProfile, ChatModelSettingsStore, MEDIA_MODEL_DEFAULTS, SPARK_MODEL, get_model_capability, media_effort, media_model_allowed
 from spark_answer import SparkAnswerProvider
+from spark_media_vision import SparkMediaVision
 from chat_model_ui import ChatModelUI, PANEL_TITLE, is_settings_control_message, is_settings_panel_message
 from provider_model_catalog import ProviderModelCatalog
 from randomizer_capability import RandomizerSession, is_randomization_request, is_randomization_repeat
@@ -1304,6 +1305,7 @@ def model_control_content(message: Message | None) -> bool:
 
 
 SPARK_ANSWER = SparkAnswerProvider.from_environment()
+SPARK_MEDIA_VISION = SparkMediaVision(SPARK_ANSWER)
 CHAT_MODEL_CATALOG = ProviderModelCatalog(lambda: AsyncOpenAI(api_key=CONFIG.openai_api_key, max_retries=0))
 CHAT_MODEL_UI = ChatModelUI(
     CHAT_MODEL_SETTINGS,
@@ -1316,6 +1318,7 @@ CHAT_MODEL_UI = ChatModelUI(
     is_owner=is_owner_actor,
     chat_allowed=chat_actor_allowed,
     spark_available=lambda: SPARK_ANSWER is not None,
+    spark_media_available=SPARK_MEDIA_VISION.menu_available,
 )
 
 
@@ -1404,6 +1407,7 @@ def configured_agents_model(model_name: str | None = None) -> TelemetryOpenAIRes
 
 async def close_configured_agents_model() -> None:
     global _AGENTS_OPENAI_CLIENT, _AGENTS_RESPONSE_MODEL
+    await SPARK_MEDIA_VISION.close()
     if SPARK_ANSWER is not None:
         await SPARK_ANSWER.close()
     client = _AGENTS_OPENAI_CLIENT
@@ -8396,13 +8400,24 @@ Stored message context:
 {format_memory_items([item])}
 """
     try:
-        summary = await asyncio.wait_for(
-            run_vision(
-                prompt, [data_url], purpose="background", route_bucket="memory_index",
-                settings=photo_summary_settings(item.chat_id),
-            ),
-            timeout=120,
-        )
+        settings = photo_summary_settings(item.chat_id)
+        if settings[0] == SPARK_MODEL:
+            stage = begin_model_stage(stage_kind="vision", intended_model=SPARK_MODEL,
+                                      reasoning_effort="auto", endpoint="chat_completions", route_bucket="memory_index")
+            try:
+                result = await SPARK_MEDIA_VISION.summarize(data_url)
+            except (Exception, asyncio.CancelledError) as exc:
+                finish_model_stage(stage, status="cancelled" if isinstance(exc, asyncio.CancelledError) else "failed",
+                                   failure_class=exc)
+                raise
+            finish_model_stage(stage, status="succeeded", usage=result.usage, actual_model=SPARK_MODEL,
+                               actual_model_source="provider_response")
+            summary = result.choices[0].message.content.strip()
+        else:
+            summary = await asyncio.wait_for(
+                run_vision(prompt, [data_url], purpose="background", route_bucket="memory_index", settings=settings),
+                timeout=120,
+            )
     except Exception as exc:
         LOGGER.warning("Photo memory summary failed error=%s", type(exc).__name__)
         return False
@@ -14814,6 +14829,9 @@ async def video_provider_call(call, *, model, effort, stage_kind, endpoint, rout
         raise
     status, failure = response_telemetry_status(result) if endpoint == "responses" else ("succeeded", "")
     actual, source = response_actual_model(result)
+    if model == SPARK_MODEL:
+        # The local adapter checks the serving ID before returning a response.
+        actual, source = SPARK_MODEL, "provider_response"
     finish_model_stage(stage, status=status, failure_class=failure, usage=getattr(result, "usage", None),
                        actual_model=actual, actual_model_source=source)
     if status != "succeeded":
@@ -14834,6 +14852,13 @@ async def respond_to_video_request(message, prompt, attachment, settings) -> boo
             async def respond(instructions, model_input, *, classify=False):
                 if tiktok:
                     attachment.check_allowed()
+                if model == SPARK_MODEL:
+                    result = await video_provider_call(SPARK_MEDIA_VISION.clip_response(
+                        instructions, model_input, schema=VIDEO_INTENT_FORMAT["format"] if classify else None,
+                        before_call=attachment.check_allowed if tiktok else None),
+                        model=model, effort=effort, stage_kind="router" if classify else "vision",
+                        endpoint="chat_completions", route=route)
+                    return result.choices[0].message.content.strip()
                 options = {"text": VIDEO_INTENT_FORMAT} if classify else {}
                 result = await video_provider_call(client.responses.create(
                     model=model, instructions=instructions, input=model_input, reasoning={"effort": effort},
@@ -14857,8 +14882,10 @@ async def respond_to_video_request(message, prompt, attachment, settings) -> boo
 
             question = URL_TOKEN_RE.sub("[відео]", prompt) if tiktok else prompt
             decision = json.loads(await respond(VIDEO_INTENT_INSTRUCTIONS, question, classify=True)).get("inspect")
-            if decision not in {"frames", "speech", "both"}:
+            if decision == "unrelated":
                 return False
+            if decision not in {"frames", "speech", "both"}:
+                raise ValueError("invalid_video_inspection_decision")
             ACTIVE_MODEL_ROUTE_BUCKET.set(route)
             histories[message.chat_id].append(f"{user_label(message)}: {prompt[:500]}")
             presence = activity_presence_for_message(message, action=ChatAction.TYPING)
@@ -15442,7 +15469,8 @@ async def _handle_image_prompt_generation(
     admitted_parts: Sequence[Message] = (),
 ) -> None:
     if not primary_supports_images():
-        await message.reply_text("Spark / Qwen працює з текстом. Для зображень обери модель із зором у /model.")
+        await message.reply_text("Основна модель Spark / Qwen відповідає на текст. Для запитання про фото обери модель із зором у /model. "
+                                 "Локальні описи фото для пам’яті й кадри відео налаштовуються в «Моделі медіаінструментів».")
         return
     left = cooldown_left(message)
     if left > 0 and not skip_cooldown:
@@ -16940,6 +16968,7 @@ async def post_init(application: Application) -> None:
 
     telegram_turn_stopping = False
 
+    SPARK_MEDIA_VISION.menu_available()
     apply_agents_tracing_policy(CONFIG.agents_tracing_mode)
 
     me = await application.bot.get_me()

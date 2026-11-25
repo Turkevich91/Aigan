@@ -33,11 +33,14 @@ class SparkAnswerProvider:
         api_key = os.getenv("SPARK_API_KEY", "").strip() or "local"
         return cls(base_url=base_url, model=model, api_key=api_key)
 
-    def agents_model(self) -> OpenAIChatCompletionsModel:
+    def async_client(self) -> AsyncOpenAI:
         if self._client is None:
             self._client = AsyncOpenAI(base_url=self.base_url, api_key=self.api_key,
                                        timeout=90, max_retries=0, organization="", project="")
-        return OpenAIChatCompletionsModel(self.model, self._client)
+        return self._client
+
+    def agents_model(self) -> OpenAIChatCompletionsModel:
+        return OpenAIChatCompletionsModel(self.model, self.async_client())
 
     def plain_completion(self, prompt: str, max_tokens: int) -> ChatCompletion:
         with OpenAI(base_url=self.base_url, api_key=self.api_key, timeout=90,

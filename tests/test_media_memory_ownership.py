@@ -194,6 +194,28 @@ class MediaMemoryOwnershipTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("Neutral amber lighthouse.", self.item(source).vision_summary)
         self.assertEqual("", self.item(reply).vision_summary)
 
+    async def test_manual_spark_summary_receives_only_pixels_and_never_saves_a_failed_guess(self):
+        from chat_model_settings import ChatModelSettingsStore, SPARK_MODEL
+        settings = ChatModelSettingsStore(Path(self.tmp.name) / "local-settings.sqlite3")
+        source = self.image_message(caption="Caption <|reserved|> with unrelated claims.")
+        await main.remember_message_persistently(source)
+        settings.set_media_model(source.chat_id, "photo", SPARK_MODEL, role="admin",
+                                 expected_revision=0, available=(SPARK_MODEL,))
+        provider = AsyncMock()
+        result = SimpleNamespace(usage=None, choices=[SimpleNamespace(message=SimpleNamespace(content="Червона квітка."))])
+        provider.summarize.side_effect = [ValueError("unavailable"), result]
+        with patch.object(main, "CHAT_MODEL_SETTINGS", settings), patch.object(main, "SPARK_MEDIA_VISION", provider):
+            self.assertFalse(await main.summarize_memory_photo(self.item(source)))
+            self.assertEqual("", self.item(source).vision_summary)
+            self.assertTrue(await main.summarize_memory_photo(self.item(source)))
+        self.assertEqual("Червона квітка.", self.item(source).vision_summary)
+        self.assertEqual([self.item(source).id], [hit.item.id for hit in self.fts("квітка")])
+        self.vision.assert_not_awaited()
+        args = provider.summarize.await_args.args
+        self.assertEqual(1, len(args))
+        self.assertTrue(args[0].startswith("data:image/jpeg;base64,"))
+        self.assertNotIn("reserved", args[0])
+
     async def test_eager_summary_enqueues_new_source_once_alongside_current_reply(self):
         source = self.image_message()
         reply = FakeMessage("Explain source", message_id=11)
