@@ -142,6 +142,7 @@ from telegram_video import (
     inspect_local_clip, TELEGRAM_VIDEO_MAX_BYTES, SPEECH_SCOPE_INSTRUCTIONS, SPEECH_SCOPE_FORMAT, confirmed_speech_scope,
 )
 from tiktok_acquisition import TIKTOK_MAX_BYTES, TikTokUnavailable, fetch_tiktok_video, normalize_tiktok_video_url
+from public_video_acquisition import PublicVideoUnavailable, fetch_public_video, normalize_public_video_url
 from runtime_model_pricing import PRICE_SNAPSHOT_VERSION, token_price_for_model
 from model_routing import (
     MODEL_POLICY_ROUTER_SYSTEM_PROMPT,
@@ -442,6 +443,7 @@ class Config:
     mcp_tool_timeout_seconds: float
     media_frame_extraction_enabled: bool
     tiktok_video_enabled: bool
+    public_video_url_enabled: bool
     media_frame_ffmpeg_path: str
     media_frame_ffprobe_path: str
     media_frame_max_duration_seconds: int
@@ -980,6 +982,7 @@ class Config:
             mcp_tool_timeout_seconds=max(1.0, float(os.getenv("MCP_TOOL_TIMEOUT_SECONDS", "30"))),
             media_frame_extraction_enabled=_env_bool("MEDIA_FRAME_EXTRACTION_ENABLED", False),
             tiktok_video_enabled=_env_bool("TIKTOK_VIDEO_ENABLED", False),
+            public_video_url_enabled=_env_bool("PUBLIC_VIDEO_URL_ENABLED", False),
             media_frame_ffmpeg_path=os.getenv("MEDIA_FRAME_FFMPEG_PATH", "ffmpeg").strip() or "ffmpeg",
             media_frame_ffprobe_path=os.getenv("MEDIA_FRAME_FFPROBE_PATH", "ffprobe").strip() or "ffprobe",
             media_frame_max_duration_seconds=interval_limit,
@@ -1275,8 +1278,8 @@ def video_answer_settings(chat_id: int, tool: str = "video") -> tuple[str, str]:
         raise ChatModelSettingsUnavailable("chat_model_settings_unavailable")
     selected, _ = CHAT_MODEL_SETTINGS.media_selection(chat_id, tool)
     model = selected or media_default_model(tool)
-    if tool == "tiktok" and not media_model_allowed(tool, model):
-        raise ChatModelSettingsUnavailable("invalid_tiktok_model")
+    if tool in ("tiktok", "public_video") and not media_model_allowed(tool, model):
+        raise ChatModelSettingsUnavailable("invalid_link_video_model")
     return model, media_effort(model)
 
 
@@ -1318,7 +1321,8 @@ CHAT_MODEL_UI = ChatModelUI(
     get_catalog=CHAT_MODEL_CATALOG.get,
     get_media_catalog=CHAT_MODEL_CATALOG.media_models,
     media_default=media_default_model,
-    tool_available=lambda key: key != "tiktok" or (CONFIG.tiktok_video_enabled and CONFIG.media_frame_extraction_enabled),
+    tool_available=lambda key: (key != "public_video" or (CONFIG.public_video_url_enabled and CONFIG.media_frame_extraction_enabled))
+        and (key != "tiktok" or (CONFIG.tiktok_video_enabled and CONFIG.media_frame_extraction_enabled)),
     defaults=lambda: (CONFIG.openai_model, CONFIG.model_reasoning_effort),
     is_admin=is_admin_actor,
     is_owner=is_owner_actor,
@@ -1964,7 +1968,8 @@ Tool use:
 - For forwarded or replied-to current-looking news, use fresh web context when the user explicitly invoked the bot or sent it in private chat.
 - For search, formulate queries in Ukrainian or English. Prefer Ukrainian, English, European, US, or international sources.
 - Do not use Russian search queries, Russian search services, or Russian-language sources when alternatives exist.
-- Use the YouTube transcript MCP for YouTube links or requests to summarize/transcribe a video.
+- Use the YouTube transcript MCP for spoken content in YouTube videos.
+- Ground visual claims in inspected frames and spoken words in a transcript. A filename, page title, description or search snippet is metadata: attribute it to the source if relevant. If only metadata is available, say you could not view the clip.
 - Do not invent a transcript if the tool says one is unavailable.
 - If a YouTube transcript is Russian, summarize and explain it in Ukrainian, not Russian.
 - If the user asks to translate referenced text, translate it directly; do not analyze it, search the web, or reuse old chat memory.
@@ -2193,7 +2198,12 @@ PROMPT_PRIVACY_RE = re.compile(
     r"(?i)("
     r"\b(?:system|developer|hidden|internal)\s+(?:prompt|instruction|policy|setup|message|log)s?\b|"
     r"\b(?:show|reveal|print|dump|leak|share|summarize|describe)\b.{0,60}\b(?:(?:your|system|developer|hidden|internal)\s+(?:prompt|instruction|policy|setup|message|log)s?|env|secret|token|api\s+key|tool\s+wiring|private\s+log)s?\b|"
-    r"(?:покажи|скинь|розкрий|раскрой|слей|злий|выведи|виведи|перекажи|перескажи|опиши).{0,80}(?:(?:твій|твой|свій|свой|системн|девелопер|розробник|прихован|скрыт|внутрішн|внутренн)\w*.{0,30}(?:промпт|інструкц|инструкц|налаштуван|настро)|env|секрет|токен|ключ|лог|інструмент|tool)|"
+    r"(?:покажи|скинь|розкрий|раскрой|слей|злий|выведи|виведи|перекажи|перескажи|опиши).{0,80}(?:"
+    r"(?:твій|твой|тво[їия]|свій|свой|сво[їия]|системн|девелопер|розробник|прихован|скрыт|внутрішн|внутренн)"
+    r"\w*.{0,30}(?:промпт|інструкц|инструкц|налаштуван|настро|інструмент|инструмент|tool)|"
+    r"\b(?:env|секрет\w*|токен\w*|ключ(?:і|и|ей|ів|а|у|ем|ом|ам|ами|ах)?|лог(?:и|ів|ов|а|у|ом|ам|ами|ах)?)\b|"
+    r"\b(?:інструмент|инструмент|tool)\w*.{0,35}\b(?:бота|сервера|mcp|у тебе|в тебе|у тебя|ти використовуєш|ты используешь))|"
+    r"\b(?:show|reveal|print|dump|leak|share|summarize|describe|list)\b.{0,60}\b(?:your|internal|hidden|connected|configured)\s+tools?\b|"
     r"(?:системн|девелоперськ|розробницьк|прихован|внутрішн)\w*.{0,40}(?:промпт|інструкц|політик|налаштуван|лог)|"
     r"(?:системн|девелоперск|разработч|скрыт|внутренн)\w*.{0,40}(?:промпт|инструкц|политик|настро|лог)|"
     r"(?:твій|твой|свій|свой).{0,30}(?:промпт|інструкц|инструкц|налаштуван|настро)|"
@@ -2204,6 +2214,16 @@ PROMPT_PRIVACY_RE = re.compile(
     r")",
     re.UNICODE,
 )
+_TOOL_NOUN = r"\b(?:інструмент\w*|инструмент\w*|tools?)\b"
+TOOL_DISCLOSURE_RE = re.compile(
+    r"\b(?:покажи|скинь|розкрий|раскрой|слей|злий|выведи|виведи|перекажи|перескажи|опиши|show|list|describe)\b"
+    r".{0,80}" + _TOOL_NOUN, re.I)
+# A scene reference disambiguates ordinary tools. Explicit internal or credential requests still win.
+_SCENE_LOCATION = (
+    r"\b(?:[ву]|на|із|з|из|in|on)\s+(?:(?:цьому|цього|этом|этого|the|this)\s+)?"
+    r"(?:кадр\w*|відео|видео|роли[кцч]\w*|ролі[кцч]\w*|кліп\w*|video|frame|clip)\b")
+SCENE_TOOL_REFERENCE_RE = re.compile(
+    rf"{_TOOL_NOUN}[^.!?;]{{0,40}}{_SCENE_LOCATION}|{_SCENE_LOCATION}[^.!?;]{{0,40}}{_TOOL_NOUN}", re.I)
 PUBLIC_IDENTITY_RE = re.compile(
     r"(?i)^\s*(хто\s+ти|кто\s+ты|who\s+are\s+you|що\s+ти\s+таке|что\s+ты\s+такое|як\s+тебе\s+звати|как\s+тебя\s+зовут)\s*[?.!]*\s*$",
     re.UNICODE,
@@ -4347,7 +4367,8 @@ def prompt_privacy_response(prompt: str) -> str:
         return ""
     if PUBLIC_IDENTITY_RE.search(normalized):
         return "Aigan. Дивлюся на контекст, пам'ять чату і відповідаю по суті."
-    if PROMPT_PRIVACY_RE.search(normalized):
+    if PROMPT_PRIVACY_RE.search(normalized) or (
+            TOOL_DISCLOSURE_RE.search(normalized) and not SCENE_TOOL_REFERENCE_RE.search(normalized)):
         return "Лінива версія: внутрішню кухню не переказую. Можу говорити про поведінку або конкретний баг."
     return ""
 
@@ -10169,7 +10190,7 @@ def clean_web_prefetch_query(text: str) -> str:
     return text[:300]
 
 
-def extract_current_prompt_urls(text: str) -> list[str]:
+def extract_current_prompt_urls(text: str, *, limit: int | None = 3) -> list[str]:
     urls: list[str] = []
     for raw in URL_TOKEN_RE.findall(text or ""):
         url = raw.strip().rstrip(".,;:!?)]}>\"'")
@@ -10177,7 +10198,7 @@ def extract_current_prompt_urls(text: str) -> list[str]:
             url = f"https://{url}"
         if url.casefold().startswith(("http://", "https://")):
             urls.append(url)
-    return urls[:3]
+    return urls[:limit]
 
 
 def web_prefetch_query(message: Message, prompt: str) -> str:
@@ -14531,31 +14552,81 @@ async def resolve_pending_after_debounce(
 
 
 @dataclass(frozen=True)
-class TikTokClip:
+class LinkedClip:
+    tool: str
     url: str
     policy: ChatToolRun
 
+    @property
+    def route(self) -> str:
+        return "tiktok_video" if self.tool == "tiktok" else self.tool
+
     def check_allowed(self):
-        if not self.policy.allows("tiktok", before_call=True):
+        if self.tool == "public_video":
+            if not all(self.policy.allows(key, before_call=True) for key in ("web", self.tool)):
+                raise VideoUnavailable("Аналіз відео за посиланням вимкнено в цьому чаті.")
+        elif not self.policy.allows(self.tool, before_call=True):
             raise VideoUnavailable("Аналіз TikTok недоступний у цьому чаті.")
 
 
-def requested_tiktok_url(message: Message, prompt: str) -> str | None:
-    # Only a current authored question may select one link, including a direct
-    # same-chat reply. Quoted previews, forwarded history and other links do not select a source.
-    reply = getattr(message, "reply_to_message", None)
-    source = prompt
-    if "tiktok.com" not in source.casefold():
-        if (getattr(reply, "chat_id", None) != message.chat_id or is_forwarded_message(message)
-                or is_generated_or_channel_sender(message)):
-            return None
-        source = message_text(reply)
-        if "tiktok.com" not in source.casefold() or has_url(prompt):
-            return None
-    if not any(ch.isalpha() for ch in URL_TOKEN_RE.sub("", prompt)):
+VIDEO_REFERENCE_RE = re.compile(
+    r"\b(?:mp4|vid[eé]os?|clips?|footage|(?:відео|видео)(?:запис\w*|файл\w*|ролик\w*)?|"
+    r"ролик\w*|ролік\w*|кліп\w*|клип\w*|кадр\w*)\b", re.IGNORECASE)
+VIDEO_SUMMARY_ACTION_PATTERN = (
+    r"перекажи|підсумуй|резюмуй|транскрибуй|зроби\s+(?:(?:короткий|стислий)\s+)?(?:конспект|переказ|виклад)|"
+    r"зроби\s+(?:транскрипцію|розшифровку)")
+VIDEO_REQUEST_RE = re.compile(
+    rf"\b(?:{PAYLOAD_ACTION_PATTERN}|{VIDEO_SUMMARY_ACTION_PATTERN}|watch|look|read|listen|tell|transcrib\w*|"
+    r"подивись|подивися|посмотри|глянь|переглянь|розбери|разбери|прочитай|"
+    r"розшифруй|расшифруй|що|что|як|как|чому|почему|what|how|why)\b", re.IGNORECASE)
+
+
+def requested_video_link(message: Message, prompt: str) -> tuple[str, str] | None:
+    """Only consider one link in the addressed request or its direct same-chat reply."""
+    if not (CONFIG.public_video_url_enabled or CONFIG.tiktok_video_enabled):
         return None
-    urls = extract_current_prompt_urls(source)
-    return normalize_tiktok_video_url(urls[0]) if len(urls) == 1 else None
+    reply = getattr(message, "reply_to_message", None)
+    if reply is None and "://" not in prompt and "www." not in prompt.lower() and not (
+            getattr(message, "entities", None) or getattr(message, "caption_entities", None)):
+        return None
+    if is_forwarded_message(message) or is_generated_or_channel_sender(message):
+        return None
+
+    def authored_urls(text, part):
+        urls = extract_current_prompt_urls(text, limit=None)
+        entities = (getattr(part, "entities", None) or getattr(part, "caption_entities", None) or ())
+        urls.extend(entity.url for entity in entities if entity.type == MessageEntity.TEXT_LINK and entity.url)
+        return list(dict.fromkeys(urls))
+
+    urls = authored_urls(prompt, message)
+    source_hint = ""
+    if not urls:
+        if getattr(reply, "chat_id", None) != message.chat_id:
+            return None
+        source_hint = message_text(reply)
+        urls = authored_urls(source_hint, reply)
+    if len(urls) != 1:
+        return None
+    question = URL_TOKEN_RE.sub(" ", prompt)
+    if not any(ch.isalpha() for ch in re.sub(r"@\w+", "", question)):
+        return None
+    url = urls[0]
+    if CONFIG.tiktok_video_enabled and (tiktok := normalize_tiktok_video_url(url)):
+        return "tiktok", tiktok
+    if not CONFIG.public_video_url_enabled:
+        return None
+    # An ordinary article question stays on the text route. A direct file, or an
+    # explicitly referenced video on a page, can be evaluated for clip intent.
+    path = re.split(r"[?#]", url, maxsplit=1)[0]
+    refers_to_action = re.search(rf"\b(?:happen(?:s|ed|ing)?|відбува\w*|происход\w*|{VIDEO_SUMMARY_ACTION_PATTERN})\b", question, re.I)
+    if not (path.casefold().endswith(".mp4") or VIDEO_REFERENCE_RE.search(question)
+            or (refers_to_action and VIDEO_REFERENCE_RE.search(URL_TOKEN_RE.sub(" ", source_hint)))):
+        return None
+    if "?" not in question and not VIDEO_REQUEST_RE.search(question):
+        return None
+    if public_url := normalize_public_video_url(url):
+        return "public_video", public_url
+    return None
 
 
 async def handle_prompt(
@@ -14653,7 +14724,7 @@ async def handle_prompt(
     # Only this admitted, authored request can select the current attachment
     # or direct reply. Never scan history, external replies or passive posts.
     clip = None
-    tiktok_url = None
+    link = None
     if (CONFIG.media_frame_extraction_enabled and prompt.strip() and prompt != DEFAULT_CONTEXT_PROMPT
             and message.from_user is not None and not message.from_user.is_bot
             and (assembled_turn or not (is_forwarded_message(message) or is_generated_or_channel_sender(message)))):
@@ -14666,25 +14737,26 @@ async def handle_prompt(
                 clip = visual_media_file_ref_from(reply)
             if clip is not None:
                 break
-        if clip is None and CONFIG.tiktok_video_enabled:
-            tiktok_url = requested_tiktok_url(message, prompt)
-    if clip is not None or tiktok_url:
+        if clip is None:
+            link = requested_video_link(message, prompt)
+    if clip is not None or link:
         job = (message.chat_id, message.message_id)
         if job in video_jobs:
             return
         if not assembled_turn and should_suppress_duplicate_prompt(
-                message, prompt, "before_video", exact_only=bool(tiktok_url and has_url(prompt))):
+                message, prompt, "before_video", exact_only=bool(link and has_url(prompt))):
             return
         if len(video_jobs) >= 3:
             await message.reply_text("Обробляю інші відеозапити. Спробуй трохи пізніше.")
             return
         video_jobs.add(job)
         try:
-            if tiktok_url:
-                settings = video_answer_settings(message.chat_id, "tiktok")
+            if link:
+                tool, url = link
+                settings = video_answer_settings(message.chat_id, tool)
                 resolve = CHAT_MODEL_SETTINGS.tools.resolve
-                source = TikTokClip(tiktok_url, ChatToolRun(message.chat_id, resolve(message.chat_id), resolve))
-                route = "tiktok_video"
+                source = LinkedClip(tool, url, ChatToolRun(message.chat_id, resolve(message.chat_id), resolve))
+                route = source.route
             else:
                 settings = video_answer_settings(message.chat_id)
                 source = clip[0]
@@ -14847,8 +14919,9 @@ async def video_provider_call(call, *, model, effort, stage_kind, endpoint, rout
 
 async def respond_to_video_request(message, prompt, attachment, settings) -> bool:
     model, effort = settings
-    tiktok = isinstance(attachment, TikTokClip)
-    route = "tiktok_video" if tiktok else "telegram_video"
+    linked = isinstance(attachment, LinkedClip)
+    tiktok = linked and attachment.tool == "tiktok"
+    route = attachment.route if linked else "telegram_video"
     telegram_bytes = min(CONFIG.media_frame_max_bytes, TELEGRAM_VIDEO_MAX_BYTES)
     telegram_seconds = min(CONFIG.media_frame_max_duration_seconds, MediaFrameLimits().hard_max_duration_seconds)
     try:
@@ -14856,12 +14929,12 @@ async def respond_to_video_request(message, prompt, attachment, settings) -> boo
             api_key=CONFIG.openai_api_key, timeout=50, max_retries=0,
         ) as client:
             async def respond(instructions, model_input, *, schema=None):
-                if tiktok:
+                if linked:
                     attachment.check_allowed()
                 if model == SPARK_MODEL:
                     result = await video_provider_call(SPARK_MEDIA_VISION.clip_response(
                         instructions, model_input, schema=schema,
-                        before_call=attachment.check_allowed if tiktok else None),
+                        before_call=attachment.check_allowed if linked else None),
                         model=model, effort=effort, stage_kind="router" if schema else "vision",
                         endpoint="chat_completions", route=route)
                     return result.choices[0].message.content.strip()
@@ -14879,25 +14952,27 @@ async def respond_to_video_request(message, prompt, attachment, settings) -> boo
                 return await respond(VIDEO_ANSWER_INSTRUCTIONS, [{"role": "user", "content": content}])
 
             async def transcribe(stream):
-                if tiktok:
+                if linked:
                     attachment.check_allowed()
                 stt = "gpt-transcribe"
                 result = await video_provider_call(client.audio.transcriptions.create(model=stt, file=stream),
                     model=stt, effort="", stage_kind="transcription", endpoint="audio_transcriptions", route=route)
                 return result.text.strip()
 
-            question = URL_TOKEN_RE.sub("[відео]", prompt) if tiktok else prompt
+            question = URL_TOKEN_RE.sub("[відео]", prompt) if linked else prompt
             async def speech_scope():
                 raw = await respond(SPEECH_SCOPE_INSTRUCTIONS, question, schema=SPEECH_SCOPE_FORMAT)
                 return confirmed_speech_scope(raw, question)
 
             decision = json.loads(await respond(VIDEO_INTENT_INSTRUCTIONS, question, schema=VIDEO_INTENT_FORMAT["format"])).get("inspect")
+            if linked:
+                attachment.check_allowed()
             if decision == "unrelated":
                 return False
             if decision not in {"frames", "speech", "both"}:
                 raise ValueError("invalid_video_inspection_decision")
             ACTIVE_MODEL_ROUTE_BUCKET.set(route)
-            histories[message.chat_id].append(f"{user_label(message)}: {prompt[:500]}")
+            histories[message.chat_id].append(f"{user_label(message)}: {question[:500]}")
             presence = activity_presence_for_message(message, action=ChatAction.TYPING)
             try:
                 await presence.start()
@@ -14906,27 +14981,49 @@ async def respond_to_video_request(message, prompt, attachment, settings) -> boo
                     ffmpeg=CONFIG.media_frame_ffmpeg_path, answer=answer, transcribe=transcribe)
                 if model == SPARK_MODEL:
                     options["speech_scope"] = speech_scope
-                if tiktok:
+                if linked:
                     attachment.check_allowed()
-                    options["max_bytes"] = min(CONFIG.media_frame_max_bytes, TIKTOK_MAX_BYTES)
-                    options["max_duration"] = MediaFrameLimits().hard_max_duration_seconds
-                    with tempfile.TemporaryDirectory(prefix="aigan-tiktok-") as tmp:
+                    if tiktok:
+                        options["max_bytes"] = min(CONFIG.media_frame_max_bytes, TIKTOK_MAX_BYTES)
+                        options["max_duration"] = MediaFrameLimits().hard_max_duration_seconds
+                    with tempfile.TemporaryDirectory(prefix="aigan-linked-video-") as tmp:
                         source = Path(tmp) / "clip.mp4"
-                        await fetch_tiktok_video(attachment.url, source, max_bytes=options["max_bytes"],
-                                                max_duration=options["max_duration"])
-                        response = await inspect_local_clip(source, source_family="tiktok_clip", **options)
+                        limits = dict(max_bytes=options["max_bytes"], max_duration=options["max_duration"])
+                        if tiktok:
+                            await fetch_tiktok_video(attachment.url, source, **limits)
+                        else:
+                            started = time.monotonic()
+                            try:
+                                await fetch_public_video(attachment.url, source, before_call=attachment.check_allowed, **limits)
+                            except PublicVideoUnavailable as exc:
+                                system_event(component="public_video", event_type="acquisition_failed", route=route,
+                                    message=str(exc), duration_ms=int((time.monotonic() - started) * 1000))
+                                raise
+                        attachment.check_allowed()
+                        response = await inspect_local_clip(source, source_family=attachment.tool + "_clip", **options)
                 else:
                     # Three samples keep start, middle and end visible together on the four-tile local sheet.
                     response = await inspect_clip(attachment, sparse_max_duration=CONFIG.telegram_sparse_max_duration_seconds,
                                                   sparse_frame_count=3 if model == SPARK_MODEL else 5, **options)
             finally:
                 await presence.stop()
+            if linked:
+                attachment.check_allowed()
     except VideoUnavailable as exc:
         response = str(exc)
     except TikTokUnavailable:
         response = (f"Не вдалося отримати відео з TikTok. Надішли його відеофайлом у Telegram "
                     f"(до {telegram_seconds} с і {telegram_bytes / 1_000_000:g} МБ на файл). "
                     "Довший ролик розділи на два або більше фрагментів.")
+    except PublicVideoUnavailable as exc:
+        reason = {"not_found": "За цим посиланням відео або сторінку не знайдено (404).",
+                  "gone": "Цей ролик або сторінку видалено.",
+                  "denied": "Сайт обмежив доступ до відео.",
+                  "no_player": "На цій сторінці не знайшов доступного відеоплеєра.",
+                  "ambiguous": "На сторінці кілька відео. Надішли посилання на потрібний ролик.",
+                  "incomplete": "Сайт передав порожній або неповний файл.",
+                  "limits": "Сторінка або ролик перевищує ліміт аналізу."}.get(str(exc), "Не вдалося прочитати відео за посиланням.")
+        response = reason + " Можеш надіслати відеофайл у Telegram."
     except Exception as exc:
         LOGGER.warning("Video request unavailable route=%s error=%s", route, type(exc).__name__)
         response = "Не вдалося перевірити відео. Спробуй пізніше або надішли коротший фрагмент."

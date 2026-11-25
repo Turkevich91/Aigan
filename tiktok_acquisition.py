@@ -6,14 +6,18 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import asynccontextmanager
-import ipaddress
 import json
 from pathlib import Path
 import re
-import socket
 from urllib.parse import urljoin, urlsplit
 
 import httpx
+
+from public_media_http import (
+    PublicMediaTransferError as TikTokUnavailable,
+    bounded_chunks as _chunks,
+    pinned_get as _get,
+)
 
 
 _VIDEO_PATH = re.compile(r"/@([a-zA-Z0-9_.]{1,24})/video/([0-9]{15,22})/?")
@@ -27,10 +31,6 @@ _PAGE_LIMIT = 2_000_000
 TIKTOK_MAX_BYTES = 20_000_000
 _MAX_DURATION = 180
 _DEADLINE = 30
-
-
-class TikTokUnavailable(Exception):
-    """Only a fixed reason may cross the provider boundary."""
 
 
 def _https_parts(url):
@@ -70,34 +70,6 @@ def _cdn_url(raw):
 
 
 @asynccontextmanager
-async def _get(url, referrer):
-    # Pin the vetted numeric destination. HTTPS still authenticates the original
-    # hostname via SNI. A fresh direct transport cannot replay cookies, inherit a
-    # proxy, follow unvalidated redirects or reuse TLS for another authority.
-    target = httpx.URL(url)
-    records = await asyncio.get_running_loop().getaddrinfo(
-        target.host, 443, family=socket.AF_INET, type=socket.SOCK_STREAM
-    )
-    addresses = [ipaddress.IPv4Address(record[4][0]) for record in records]
-    if not addresses or any(not ip.is_global or ip.is_multicast or ip.is_reserved for ip in addresses):
-        raise TikTokUnavailable("address")
-    headers = {"Host": target.host, "Accept-Encoding": "identity"}
-    if referrer:
-        headers["Referer"] = referrer
-    request = httpx.Request(
-        "GET", target.copy_with(host=str(addresses[0])),
-        headers=headers,
-        extensions={"sni_hostname": target.host},
-    )
-    async with httpx.AsyncHTTPTransport(trust_env=False) as transport:
-        response = await transport.handle_async_request(request)
-        try:
-            yield response
-        finally:
-            await response.aclose()
-
-
-@asynccontextmanager
 async def _open(url, normalize, *, referrer=None):
     for _ in range(4):
         url = normalize(url)
@@ -117,21 +89,6 @@ async def _open(url, normalize, *, referrer=None):
             yield url, response
             return
     raise TikTokUnavailable("redirect")
-
-
-async def _chunks(response, limit):
-    header = response.headers.get("content-length")
-    length = int(header) if header is not None else None
-    if length is not None and not 0 < length <= limit:
-        raise TikTokUnavailable("size")
-    count = 0
-    async for block in response.aiter_raw(chunk_size=64 * 1024):
-        count += len(block)
-        if count > limit:
-            raise TikTokUnavailable("size")
-        yield block
-    if count == 0 or (length is not None and count != length):
-        raise TikTokUnavailable("size")
 
 
 def _download_address(page, post_id, max_bytes, max_duration):

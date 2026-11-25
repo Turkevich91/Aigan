@@ -32,12 +32,13 @@ class StaleSettingsRevision(ValueError):
 
 
 MEDIA_TOOL_LABELS = {"youtube": "Аудіо YouTube", "photo": "Фото для пам’яті", "video": "Відео Telegram",
-                     "tiktok": "Відео TikTok"}
+                     "tiktok": "Відео TikTok", "public_video": "Відео за посиланням"}
+VISUAL_MEDIA_TOOLS = {"photo", "video", "tiktok", "public_video"}
 TRANSCRIPTION_MODELS = ("gpt-transcribe", "gpt-4o-mini-transcribe", "gpt-4o-transcribe")
 MINI_VISION_MODEL = "gpt-5.4-mini"
 MEDIA_MODEL_DEFAULTS = {
     "youtube": TRANSCRIPTION_MODELS[0], "photo": "gpt-6-luna",
-    "video": "gpt-6.1-terra", "tiktok": "gpt-6.1-terra",
+    "video": "gpt-6.1-terra", "tiktok": "gpt-6.1-terra", "public_video": "gpt-6.1-terra",
 }
 
 
@@ -54,10 +55,10 @@ def media_effort(model: str) -> str:
 
 def media_model_allowed(tool: str, model: str, ceiling: tuple[str, str] | None = None) -> bool:
     if model == SPARK_MODEL:
-        return tool in ("photo", "video", "tiktok") and (ceiling is None or member_duration_limit(model, "auto", ceiling) is None)
+        return tool in VISUAL_MEDIA_TOOLS and (ceiling is None or member_duration_limit(model, "auto", ceiling) is None)
     if tool == "youtube":
         return model in TRANSCRIPTION_MODELS
-    if tool not in ("photo", "video", "tiktok"):
+    if tool not in VISUAL_MEDIA_TOOLS:
         return False
     if model == MINI_VISION_MODEL:
         return True
