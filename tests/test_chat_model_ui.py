@@ -165,12 +165,14 @@ class ChatModelUITests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(self.store.tools.resolve(-1001).disabled)
 
     async def test_media_menu_independent_persistent_models_and_ownership(self):
+        self.ui.tool_available = lambda key: True
         await self.command()
         before = self.profile()
         await self.click("Моделі медіаінструментів")
         for label, key, model in (("Аудіо YouTube", "youtube", "gpt-4o-mini-transcribe"),
                                   ("Фото для пам’яті", "photo", "gpt-6-luna"),
-                                  ("Відео Telegram", "video", "gpt-6.1-terra")):
+                                  ("Відео Telegram", "video", "gpt-6.1-terra"),
+                                  ("Відео TikTok", "tiktok", "gpt-6-luna")):
             await self.click(label)
             wrong_actor = await self.click(model, actor=45)
             self.assertTrue(wrong_actor.answer.await_args.kwargs["show_alert"])
@@ -189,6 +191,37 @@ class ChatModelUITests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(self.store.media_selection(-1001, "youtube")[0])
         self.assertEqual(before, self.profile())
         self.assertEqual("gpt-6-luna", self.store.media_selection(-1001, "photo")[0])
+        self.assertEqual("gpt-6.1-terra", self.store.media_selection(-1001, "video")[0])
+        self.assertEqual("gpt-6-luna", self.store.media_selection(-1001, "tiktok")[0])
+
+    async def test_tiktok_model_can_be_saved_offline_and_tool_toggle_obeys_deployment(self):
+        self.ui.tool_available = lambda key: key != "tiktok"
+        await self.command()
+        await self.click("Моделі медіаінструментів")
+        await self.click("Відео TikTok")
+        self.assertIn("gpt-6.1-terra", self.panel.text)
+        self.assertIn("на сервері вимкнено", self.panel.text)
+        self.assertIn("залежить від мережі TikTok", self.panel.text)
+        self.assertIn("надішли його файлом у Telegram", self.panel.text)
+        await self.click("gpt-6-luna")
+        self.assertEqual(("gpt-6-luna", 1), self.store.media_selection(-1001, "tiktok"))
+        self.assertEqual((None, 0), self.store.media_selection(-1001, "video"))
+        await self.click("Назад")
+        await self.click("Відео TikTok")
+        self.assertIn("gpt-6-luna", self.panel.text)
+        await self.click("Типова модель інструмента")
+        self.assertEqual((None, 2), self.store.media_selection(-1001, "tiktok"))
+        await self.click("Назад")
+        await self.click("Назад")
+        self.ui.tool_available = lambda key: True
+        await self.click("Інструменти")
+        toggle = self.button("✅ Аналіз відео TikTok")
+        before = self.store.tools.resolve(-1001)
+        self.ui.tool_available = lambda key: key != "tiktok"
+        self.assertTrue((await self.click(data=toggle)).answer.await_args.kwargs["show_alert"])
+        self.assertEqual(before, self.store.tools.resolve(-1001))
+        await self.click("Оновити")
+        self.assertFalse(any("TikTok" in b.text for row in self.panel.reply_markup.inline_keyboard for b in row))
 
     async def test_member_media_menu_filters_persistent_ceiling_and_endpoint(self):
         await self.command(user_id=55)

@@ -133,6 +133,7 @@ class ChatModelUI:
         chat_allowed: Callable[[int, str, int], bool],
         is_owner: Callable[[int], bool] = lambda _: False,
         spark_available: Callable[[], bool] = lambda: False,
+        tool_available: Callable[[str], bool] = lambda key: key != "tiktok",
         get_catalog: Callable[[], Awaitable[tuple[ModelCapability, ...]]] | None = None,
         get_media_catalog: Callable[[], Awaitable[tuple[str, ...]]] | None = None,
         media_default: Callable[[str], str] = MEDIA_MODEL_DEFAULTS.__getitem__,
@@ -147,6 +148,7 @@ class ChatModelUI:
         self.is_owner = is_owner
         self.chat_allowed = chat_allowed
         self.spark_available = spark_available
+        self.tool_available = tool_available
         self.get_catalog = get_catalog
         self.get_media_catalog = get_media_catalog
         self.media_default = media_default
@@ -239,6 +241,11 @@ class ChatModelUI:
                 current = panel.media_selected or self.media_default(panel.media_tool)
                 lines.extend([MEDIA_TOOL_LABELS[panel.media_tool], f"Зараз: <code>{html.escape(current)}</code>.",
                               "Натисни модель, щоб застосувати її до нових запитів."])
+                if panel.media_tool == "tiktok":
+                    if not self.tool_available("tiktok"):
+                        lines.append("Обробку посилань TikTok на сервері вимкнено. Вибір моделі зберігається.")
+                    lines.append("Доступ до відео залежить від мережі TikTok. Якщо відео недоступне, "
+                                 "надішли його файлом у Telegram.")
             if notice:
                 lines.append(html.escape(notice))
             return "\n".join(lines)
@@ -321,7 +328,7 @@ class ChatModelUI:
         if panel.stage == "tools":
             policy = panel.tool_policy
             rows = [[button(("🚫 " if tool.key in policy.disabled else "✅ ") + tool.label, "v", index)]
-                    for index, tool in enumerate(CHAT_TOOLS)]
+                    for index, tool in enumerate(CHAT_TOOLS) if self.tool_available(tool.key)]
             rows.extend([[button("Відновити дозволи інструментів", "z")],
                          [button("Назад", "b"), button("Оновити", "f"), button("Закрити", "x")]])
             return InlineKeyboardMarkup(rows)
@@ -569,8 +576,8 @@ class ChatModelUI:
                     pass
                 elif (action == "i" and panel.stage == "media" and int(option) < len(MEDIA_TOOL_LABELS)
                       or action == "f" and panel.stage == "media_models"):
-                    if action == "i":
-                        panel.media_tool = tuple(MEDIA_TOOL_LABELS)[int(option)]
+                    key = tuple(MEDIA_TOOL_LABELS)[int(option)] if action == "i" else panel.media_tool
+                    panel.media_tool = key
                     panel.media_options = tuple(m for m in media_catalog if media_model_allowed(panel.media_tool, m, panel.member_ceiling))
                     panel.media_selected, panel.media_revision = self.store.media_selection(chat_id, panel.media_tool)
                     panel.stage = "media_models"
@@ -587,6 +594,9 @@ class ChatModelUI:
                 panel.stage = "tools"
             elif action == "v" and panel.stage == "tools" and int(option) < len(CHAT_TOOLS):
                 tool = CHAT_TOOLS[int(option)]
+                if not self.tool_available(tool.key):
+                    await self._answer(query, "Інструмент зараз недоступний.", alert=True)
+                    return
                 policy = panel.tool_policy
                 panel.tool_policy = self.store.tools.set_enabled(
                     chat_id, tool.key, tool.key in policy.disabled, expected_revision=policy.revision,

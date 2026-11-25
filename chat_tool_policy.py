@@ -19,6 +19,7 @@ CHAT_TOOLS = (
     ChatTool("youtube", "Транскрипти YouTube"),
     ChatTool("images", "Пошук і надсилання зображень"),
     ChatTool("randomizer", "Випадковий вибір"),
+    ChatTool("tiktok", "Аналіз відео TikTok"),
 )
 TOOL_KEYS = frozenset(tool.key for tool in CHAT_TOOLS)
 

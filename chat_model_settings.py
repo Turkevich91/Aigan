@@ -31,10 +31,14 @@ class StaleSettingsRevision(ValueError):
     """The settings changed after the caller observed their revision."""
 
 
-MEDIA_TOOL_LABELS = {"youtube": "Аудіо YouTube", "photo": "Фото для пам’яті", "video": "Відео Telegram"}
+MEDIA_TOOL_LABELS = {"youtube": "Аудіо YouTube", "photo": "Фото для пам’яті", "video": "Відео Telegram",
+                     "tiktok": "Відео TikTok"}
 TRANSCRIPTION_MODELS = ("gpt-transcribe", "gpt-4o-mini-transcribe", "gpt-4o-transcribe")
 MINI_VISION_MODEL = "gpt-5.4-mini"
-MEDIA_MODEL_DEFAULTS = {"youtube": TRANSCRIPTION_MODELS[0], "photo": "gpt-6-luna", "video": "gpt-6.1-terra"}
+MEDIA_MODEL_DEFAULTS = {
+    "youtube": TRANSCRIPTION_MODELS[0], "photo": "gpt-6-luna",
+    "video": "gpt-6.1-terra", "tiktok": "gpt-6.1-terra",
+}
 
 
 def media_effort(model: str) -> str:
@@ -49,7 +53,7 @@ def media_effort(model: str) -> str:
 def media_model_allowed(tool: str, model: str, ceiling: tuple[str, str] | None = None) -> bool:
     if tool == "youtube":
         return model in TRANSCRIPTION_MODELS
-    if tool not in ("photo", "video"):
+    if tool not in ("photo", "video", "tiktok"):
         return False
     if model == MINI_VISION_MODEL:
         return True
