@@ -68,6 +68,7 @@ ROUTE_BUCKETS = {
     "selfcheck",
     "time_sensitive",
     "telegram_video",
+    "tiktok_video",
     "tool",
     "translate_reference",
     "vision",

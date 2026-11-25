@@ -17,6 +17,7 @@ import random
 import re
 import secrets
 import sys
+import tempfile
 import time
 import warnings
 from collections import Counter, defaultdict, deque
@@ -92,7 +93,7 @@ from image_intent import (
 from agent_capabilities import (
     ChatToolMCPServer as MCPServerStdio, PrimaryCapabilities, randomizer_tools, conversational_tool_behavior,
 )
-from chat_tool_policy import CHAT_TOOLS, chat_tool_scope, tool_allowed
+from chat_tool_policy import CHAT_TOOLS, ChatToolRun, chat_tool_scope, tool_allowed
 from chat_model_settings import AnswerProfile, ChatModelSettingsStore, MEDIA_MODEL_DEFAULTS, SPARK_MODEL, get_model_capability, media_effort
 from spark_answer import SparkAnswerProvider
 from chat_model_ui import ChatModelUI, PANEL_TITLE, is_settings_control_message, is_settings_panel_message
@@ -137,7 +138,9 @@ from media_acquisition import (
 from media_frames import FfmpegMediaFrameAdapter, MediaFrameAdapter, MediaFrameLimits, NullMediaFrameAdapter
 from telegram_video import (
     VIDEO_ANSWER_INSTRUCTIONS, VIDEO_INTENT_FORMAT, VIDEO_INTENT_INSTRUCTIONS, VideoUnavailable, inspect_clip,
+    inspect_local_clip,
 )
+from tiktok_acquisition import TikTokUnavailable, fetch_tiktok_video, normalize_tiktok_video_url
 from runtime_model_pricing import PRICE_SNAPSHOT_VERSION, token_price_for_model
 from model_routing import (
     MODEL_POLICY_ROUTER_SYSTEM_PROMPT,
@@ -437,6 +440,7 @@ class Config:
     web_image_candidate_max_bytes: int
     mcp_tool_timeout_seconds: float
     media_frame_extraction_enabled: bool
+    tiktok_video_enabled: bool
     media_frame_ffmpeg_path: str
     media_frame_ffprobe_path: str
     media_frame_max_duration_seconds: int
@@ -969,6 +973,7 @@ class Config:
             ),
             mcp_tool_timeout_seconds=max(1.0, float(os.getenv("MCP_TOOL_TIMEOUT_SECONDS", "30"))),
             media_frame_extraction_enabled=_env_bool("MEDIA_FRAME_EXTRACTION_ENABLED", False),
+            tiktok_video_enabled=_env_bool("TIKTOK_VIDEO_ENABLED", False),
             media_frame_ffmpeg_path=os.getenv("MEDIA_FRAME_FFMPEG_PATH", "ffmpeg").strip() or "ffmpeg",
             media_frame_ffprobe_path=os.getenv("MEDIA_FRAME_FFPROBE_PATH", "ffprobe").strip() or "ffprobe",
             media_frame_max_duration_seconds=int(os.getenv("MEDIA_FRAME_MAX_DURATION_SECONDS", "90")),
@@ -1257,11 +1262,11 @@ def photo_summary_settings(chat_id: int) -> tuple[str, str]:
     return model, media_effort(model)
 
 
-def video_answer_settings(chat_id: int) -> tuple[str, str]:
+def video_answer_settings(chat_id: int, tool: str = "video") -> tuple[str, str]:
     if CHAT_MODEL_SETTINGS is None:
         raise ChatModelSettingsUnavailable("chat_model_settings_unavailable")
-    selected, _ = CHAT_MODEL_SETTINGS.media_selection(chat_id, "video")
-    model = selected or media_default_model("video")
+    selected, _ = CHAT_MODEL_SETTINGS.media_selection(chat_id, tool)
+    model = selected or media_default_model(tool)
     return model, media_effort(model)
 
 
@@ -1302,6 +1307,7 @@ CHAT_MODEL_UI = ChatModelUI(
     get_catalog=CHAT_MODEL_CATALOG.get,
     get_media_catalog=CHAT_MODEL_CATALOG.media_models,
     media_default=media_default_model,
+    tool_available=lambda key: key != "tiktok" or (CONFIG.tiktok_video_enabled and CONFIG.media_frame_extraction_enabled),
     defaults=lambda: (CONFIG.openai_model, CONFIG.model_reasoning_effort),
     is_admin=is_admin_actor,
     is_owner=is_owner_actor,
@@ -14500,6 +14506,34 @@ async def resolve_pending_after_debounce(
         )
 
 
+@dataclass(frozen=True)
+class TikTokClip:
+    url: str
+    policy: ChatToolRun
+
+    def check_allowed(self):
+        if not self.policy.allows("tiktok", before_call=True):
+            raise VideoUnavailable("Аналіз TikTok недоступний у цьому чаті.")
+
+
+def requested_tiktok_url(message: Message, prompt: str) -> str | None:
+    # Only a current authored question may select one link, including a direct
+    # same-chat reply. Quoted previews, forwarded history and other links do not select a source.
+    reply = getattr(message, "reply_to_message", None)
+    source = prompt
+    if "tiktok.com" not in source.casefold():
+        if (getattr(reply, "chat_id", None) != message.chat_id or is_forwarded_message(message)
+                or is_generated_or_channel_sender(message)):
+            return None
+        source = message_text(reply)
+        if "tiktok.com" not in source.casefold() or has_url(prompt):
+            return None
+    if not any(ch.isalpha() for ch in URL_TOKEN_RE.sub("", prompt)):
+        return None
+    urls = extract_current_prompt_urls(source)
+    return normalize_tiktok_video_url(urls[0]) if len(urls) == 1 else None
+
+
 async def handle_prompt(
     message: Message,
     context: ContextTypes.DEFAULT_TYPE,
@@ -14595,6 +14629,7 @@ async def handle_prompt(
     # Only this admitted, authored request can select the current attachment
     # or direct reply. Never scan history, external replies or passive posts.
     clip = None
+    tiktok_url = None
     if (CONFIG.media_frame_extraction_enabled and prompt.strip() and prompt != DEFAULT_CONTEXT_PROMPT
             and message.from_user is not None and not message.from_user.is_bot
             and (assembled_turn or not (is_forwarded_message(message) or is_generated_or_channel_sender(message)))):
@@ -14607,18 +14642,29 @@ async def handle_prompt(
                 clip = visual_media_file_ref_from(reply)
             if clip is not None:
                 break
-    if clip is not None:
+        if clip is None and CONFIG.tiktok_video_enabled:
+            tiktok_url = requested_tiktok_url(message, prompt)
+    if clip is not None or tiktok_url:
         job = (message.chat_id, message.message_id)
         if job in video_jobs:
             return
-        if not assembled_turn and should_suppress_duplicate_prompt(message, prompt, "before_video"):
+        if not assembled_turn and should_suppress_duplicate_prompt(
+                message, prompt, "before_video", exact_only=bool(tiktok_url and has_url(prompt))):
             return
         if len(video_jobs) >= 3:
             await message.reply_text("Обробляю інші відеозапити. Спробуй трохи пізніше.")
             return
         video_jobs.add(job)
         try:
-            settings = video_answer_settings(message.chat_id)
+            if tiktok_url:
+                settings = video_answer_settings(message.chat_id, "tiktok")
+                resolve = CHAT_MODEL_SETTINGS.tools.resolve
+                source = TikTokClip(tiktok_url, ChatToolRun(message.chat_id, resolve(message.chat_id), resolve))
+                route = "tiktok_video"
+            else:
+                settings = video_answer_settings(message.chat_id)
+                source = clip[0]
+                route = "telegram_video"
         except Exception:
             video_jobs.discard(job)
             await notify_model_settings_unavailable(message)
@@ -14626,11 +14672,11 @@ async def handle_prompt(
 
         async def process_clip_request():
             token = ACTIVE_MODEL_RUN_ID.set(secrets.token_hex(16))
-            route_token = ACTIVE_MODEL_ROUTE_BUCKET.set("telegram_video")
+            route_token = ACTIVE_MODEL_ROUTE_BUCKET.set(route)
             try:
                 # Clip work owns its own bounded capacity. Neither the dispatch
                 # lock, text-generation lock nor text cooldown belongs to it.
-                if not await respond_to_video_request(message, prompt, clip[0], settings):
+                if not await respond_to_video_request(message, prompt, source, settings):
                     ACTIVE_MODEL_ROUTE_BUCKET.set("pre_route")
                     await run_admitted_prompt(message, context, prompt, allow_pending_wait, assembled_turn, turn_context_messages)
             finally:
@@ -14752,9 +14798,9 @@ async def reject_disabled_randomizer(message: Message) -> bool:
     return True
 
 
-async def video_provider_call(call, *, model, effort, stage_kind, endpoint):
+async def video_provider_call(call, *, model, effort, stage_kind, endpoint, route="telegram_video"):
     stage = begin_model_stage(stage_kind=stage_kind, intended_model=model, reasoning_effort=effort,
-                              endpoint=endpoint, route_bucket="telegram_video")
+                              endpoint=endpoint, route_bucket=route)
     try:
         result = await call
     except asyncio.CancelledError as exc:
@@ -14774,16 +14820,20 @@ async def video_provider_call(call, *, model, effort, stage_kind, endpoint):
 
 async def respond_to_video_request(message, prompt, attachment, settings) -> bool:
     model, effort = settings
+    tiktok = isinstance(attachment, TikTokClip)
+    route = "tiktok_video" if tiktok else "telegram_video"
     try:
         async with asyncio.timeout(110), AsyncOpenAI(
             api_key=CONFIG.openai_api_key, timeout=50, max_retries=0,
         ) as client:
             async def respond(instructions, model_input, *, classify=False):
+                if tiktok:
+                    attachment.check_allowed()
                 options = {"text": VIDEO_INTENT_FORMAT} if classify else {}
                 result = await video_provider_call(client.responses.create(
                     model=model, instructions=instructions, input=model_input, reasoning={"effort": effort},
                     max_output_tokens=512 if classify else CONFIG.max_output_tokens, store=False, **options),
-                    model=model, effort=effort, stage_kind="router" if classify else "vision", endpoint="responses")
+                    model=model, effort=effort, stage_kind="router" if classify else "vision", endpoint="responses", route=route)
                 text = (result.output_text or "").strip()
                 if not text:
                     raise ValueError("empty_video_response")
@@ -14793,36 +14843,50 @@ async def respond_to_video_request(message, prompt, attachment, settings) -> boo
                 return await respond(VIDEO_ANSWER_INSTRUCTIONS, [{"role": "user", "content": content}])
 
             async def transcribe(stream):
+                if tiktok:
+                    attachment.check_allowed()
                 stt = "gpt-transcribe"
                 result = await video_provider_call(client.audio.transcriptions.create(model=stt, file=stream),
-                    model=stt, effort="", stage_kind="transcription", endpoint="audio_transcriptions")
+                    model=stt, effort="", stage_kind="transcription", endpoint="audio_transcriptions", route=route)
                 return result.text.strip()
 
-            decision = json.loads(await respond(VIDEO_INTENT_INSTRUCTIONS, prompt, classify=True)).get("inspect")
+            question = URL_TOKEN_RE.sub("[відео]", prompt) if tiktok else prompt
+            decision = json.loads(await respond(VIDEO_INTENT_INSTRUCTIONS, question, classify=True)).get("inspect")
             if decision not in {"frames", "speech", "both"}:
                 return False
-            ACTIVE_MODEL_ROUTE_BUCKET.set("telegram_video")
+            ACTIVE_MODEL_ROUTE_BUCKET.set(route)
             histories[message.chat_id].append(f"{user_label(message)}: {prompt[:500]}")
             presence = activity_presence_for_message(message, action=ChatAction.TYPING)
             try:
                 await presence.start()
-                response = await inspect_clip(attachment, request=prompt, mode=decision,
+                options = dict(request=question, mode=decision,
                     adapter=runtime_media_frame_adapter(), max_bytes=CONFIG.media_frame_max_bytes,
                     max_duration=min(CONFIG.media_frame_max_duration_seconds, 180),
                     ffmpeg=CONFIG.media_frame_ffmpeg_path, answer=answer, transcribe=transcribe)
+                if tiktok:
+                    attachment.check_allowed()
+                    with tempfile.TemporaryDirectory(prefix="aigan-tiktok-") as tmp:
+                        source = Path(tmp) / "clip.mp4"
+                        await fetch_tiktok_video(attachment.url, source, max_bytes=options["max_bytes"],
+                                                max_duration=options["max_duration"])
+                        response = await inspect_local_clip(source, source_family="tiktok_clip", **options)
+                else:
+                    response = await inspect_clip(attachment, **options)
             finally:
                 await presence.stop()
     except VideoUnavailable as exc:
         response = str(exc)
+    except TikTokUnavailable:
+        response = "Не вдалося відкрити це публічне відео TikTok. Надішли його відеофайлом у Telegram."
     except Exception as exc:
-        LOGGER.warning("Telegram video request unavailable error=%s", type(exc).__name__)
+        LOGGER.warning("Video request unavailable route=%s error=%s", route, type(exc).__name__)
         response = "Не вдалося перевірити відео. Спробуй пізніше або надішли коротший фрагмент."
-    delivery = await send_reply(message, response, memory_label="Aigan", route="telegram_video",
-                                outbound_provenance=provenance_for_message(message, "telegram_video"))
+    delivery = await send_reply(message, response, memory_label="Aigan", route=route,
+                                outbound_provenance=provenance_for_message(message, route))
     if delivered := delivered_text(delivery):
         histories[message.chat_id].append(f"Aigan: {delivered[:500]}")
         passive_contexts[message.chat_id].append(f"Aigan: {clip_text(delivered, 700)}")
-        record_chat_answer(message, prompt, "telegram_video")
+        record_chat_answer(message, prompt, route)
     return True
 
 

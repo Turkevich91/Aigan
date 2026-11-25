@@ -133,6 +133,7 @@ class ChatModelUI:
         chat_allowed: Callable[[int, str, int], bool],
         is_owner: Callable[[int], bool] = lambda _: False,
         spark_available: Callable[[], bool] = lambda: False,
+        tool_available: Callable[[str], bool] = lambda key: key != "tiktok",
         get_catalog: Callable[[], Awaitable[tuple[ModelCapability, ...]]] | None = None,
         get_media_catalog: Callable[[], Awaitable[tuple[str, ...]]] | None = None,
         media_default: Callable[[str], str] = MEDIA_MODEL_DEFAULTS.__getitem__,
@@ -147,6 +148,7 @@ class ChatModelUI:
         self.is_owner = is_owner
         self.chat_allowed = chat_allowed
         self.spark_available = spark_available
+        self.tool_available = tool_available
         self.get_catalog = get_catalog
         self.get_media_catalog = get_media_catalog
         self.media_default = media_default
@@ -310,7 +312,8 @@ class ChatModelUI:
         rows = []
         if panel.stage in {"media", "media_models"}:
             if panel.stage == "media":
-                rows = [[button(label, "i", index)] for index, label in enumerate(MEDIA_TOOL_LABELS.values())]
+                rows = [[button(label, "i", index)] for index, (key, label) in enumerate(MEDIA_TOOL_LABELS.items())
+                        if self.tool_available(key)]
             else:
                 current = panel.media_selected or self.media_default(panel.media_tool)
                 rows = [[button(("✓ " if model == current else "") + model, "s", index)]
@@ -321,7 +324,7 @@ class ChatModelUI:
         if panel.stage == "tools":
             policy = panel.tool_policy
             rows = [[button(("🚫 " if tool.key in policy.disabled else "✅ ") + tool.label, "v", index)]
-                    for index, tool in enumerate(CHAT_TOOLS)]
+                    for index, tool in enumerate(CHAT_TOOLS) if self.tool_available(tool.key)]
             rows.extend([[button("Відновити дозволи інструментів", "z")],
                          [button("Назад", "b"), button("Оновити", "f"), button("Закрити", "x")]])
             return InlineKeyboardMarkup(rows)
@@ -569,12 +572,18 @@ class ChatModelUI:
                     pass
                 elif (action == "i" and panel.stage == "media" and int(option) < len(MEDIA_TOOL_LABELS)
                       or action == "f" and panel.stage == "media_models"):
-                    if action == "i":
-                        panel.media_tool = tuple(MEDIA_TOOL_LABELS)[int(option)]
+                    key = tuple(MEDIA_TOOL_LABELS)[int(option)] if action == "i" else panel.media_tool
+                    if not self.tool_available(key):
+                        await self._answer(query, "Інструмент зараз недоступний.", alert=True)
+                        return
+                    panel.media_tool = key
                     panel.media_options = tuple(m for m in media_catalog if media_model_allowed(panel.media_tool, m, panel.member_ceiling))
                     panel.media_selected, panel.media_revision = self.store.media_selection(chat_id, panel.media_tool)
                     panel.stage = "media_models"
                 elif panel.stage == "media_models" and (action == "u" or action == "s" and int(option) < len(panel.media_options)):
+                    if not self.tool_available(panel.media_tool):
+                        await self._answer(query, "Інструмент зараз недоступний.", alert=True)
+                        return
                     model = None if action == "u" else panel.media_options[int(option)]
                     self.store.set_media_model(chat_id, panel.media_tool, model, expected_revision=panel.media_revision,
                                                role=role, available=media_catalog)
@@ -587,6 +596,9 @@ class ChatModelUI:
                 panel.stage = "tools"
             elif action == "v" and panel.stage == "tools" and int(option) < len(CHAT_TOOLS):
                 tool = CHAT_TOOLS[int(option)]
+                if not self.tool_available(tool.key):
+                    await self._answer(query, "Інструмент зараз недоступний.", alert=True)
+                    return
                 policy = panel.tool_policy
                 panel.tool_policy = self.store.tools.set_enabled(
                     chat_id, tool.key, tool.key in policy.disabled, expected_revision=policy.revision,

@@ -165,12 +165,14 @@ class ChatModelUITests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(self.store.tools.resolve(-1001).disabled)
 
     async def test_media_menu_independent_persistent_models_and_ownership(self):
+        self.ui.tool_available = lambda key: True
         await self.command()
         before = self.profile()
         await self.click("Моделі медіаінструментів")
         for label, key, model in (("Аудіо YouTube", "youtube", "gpt-4o-mini-transcribe"),
                                   ("Фото для пам’яті", "photo", "gpt-6-luna"),
-                                  ("Відео Telegram", "video", "gpt-6.1-terra")):
+                                  ("Відео Telegram", "video", "gpt-6.1-terra"),
+                                  ("Відео TikTok", "tiktok", "gpt-6-luna")):
             await self.click(label)
             wrong_actor = await self.click(model, actor=45)
             self.assertTrue(wrong_actor.answer.await_args.kwargs["show_alert"])
@@ -189,6 +191,36 @@ class ChatModelUITests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(self.store.media_selection(-1001, "youtube")[0])
         self.assertEqual(before, self.profile())
         self.assertEqual("gpt-6-luna", self.store.media_selection(-1001, "photo")[0])
+        self.assertEqual("gpt-6.1-terra", self.store.media_selection(-1001, "video")[0])
+        self.assertEqual("gpt-6-luna", self.store.media_selection(-1001, "tiktok")[0])
+
+    async def test_tiktok_controls_follow_deployment_and_reject_withdrawn_buttons(self):
+        self.ui.tool_available = lambda key: True
+        await self.command()
+        await self.click("Моделі медіаінструментів")
+        enter = self.button("Відео TikTok")
+        self.ui.tool_available = lambda key: key != "tiktok"
+        self.assertTrue((await self.click(data=enter)).answer.await_args.kwargs["show_alert"])
+        self.ui.tool_available = lambda key: True
+        await self.click(data=enter)
+        choose = self.button("gpt-6-luna")
+        reset = self.button("Типова модель інструмента")
+        self.ui.tool_available = lambda key: key != "tiktok"
+        for token in (choose, reset):
+            self.assertTrue((await self.click(data=token)).answer.await_args.kwargs["show_alert"])
+        self.assertEqual((None, 0), self.store.media_selection(-1001, "tiktok"))
+        await self.click("Назад")
+        self.assertFalse(any("TikTok" in b.text for row in self.panel.reply_markup.inline_keyboard for b in row))
+        await self.click("Назад")
+        self.ui.tool_available = lambda key: True
+        await self.click("Інструменти")
+        toggle = self.button("✅ Аналіз відео TikTok")
+        before = self.store.tools.resolve(-1001)
+        self.ui.tool_available = lambda key: key != "tiktok"
+        self.assertTrue((await self.click(data=toggle)).answer.await_args.kwargs["show_alert"])
+        self.assertEqual(before, self.store.tools.resolve(-1001))
+        await self.click("Оновити")
+        self.assertFalse(any("TikTok" in b.text for row in self.panel.reply_markup.inline_keyboard for b in row))
 
     async def test_member_media_menu_filters_persistent_ceiling_and_endpoint(self):
         await self.command(user_id=55)

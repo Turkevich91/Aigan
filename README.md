@@ -344,7 +344,7 @@ Each tool family should provide a small adapter with:
 
 Tool failures must not block message persistence, embeddings, memory recall, `/stat`, `/character`, Telegram routing, or normal replies. Tool outputs that are later saved to memory must be stored as source context, not as user-authored text.
 
-When `MEDIA_FRAME_EXTRACTION_ENABLED=true`, an explicit question about an attached Telegram clip or its direct reply can use bounded frame sampling and speech transcription. Ordinary group uploads stay silent. In `/model`, **Моделі медіаінструментів** selects separate models for video interpretation, saved photo descriptions and YouTube audio transcription.
+When `MEDIA_FRAME_EXTRACTION_ENABLED=true`, an explicit question about an attached Telegram clip or its direct reply can use bounded frame sampling and speech transcription. With `TIKTOK_VIDEO_ENABLED=true`, participants can also ask about one public TikTok video link in their request or in the same chat message they reply to. When the public clip is inaccessible, Aigan asks for a Telegram upload. In `/model`, **Моделі медіаінструментів** selects separate models for TikTok, Telegram video, saved photos and YouTube audio. **Інструменти** controls TikTok access for the chat.
 
 The public media acquisition boundary is registered as `media_acquisition` and is disabled by default. It remains a metadata-only `yt-dlp` telemetry probe and is not wired into chat routing. It records only stable platform/backend/capability fields and sanitized failure categories such as `unsupported_url`, `auth_or_rate_limited`, `challenge_required`, `duration_limit`, or `metadata_failed`; it must not log raw media URLs, provider stderr, source text, transcripts, frame OCR, usernames, tokens, or local paths.
 
