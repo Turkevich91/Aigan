@@ -1,0 +1,195 @@
+"""Real seek positions, visual-track duration, request isolation and extraction budgets."""
+import asyncio
+import json
+from pathlib import Path
+import shutil
+import subprocess
+import tempfile
+import threading
+import unittest
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
+
+from PIL import Image
+from media_frames import CommandOutput, FfmpegMediaFrameAdapter, MediaFrameRequest, parse_ffprobe_metadata, run_command
+from telegram_video import VideoUnavailable, inspect_clip
+
+
+class SparseTelegramTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.directory = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.source = self.directory / "source.mp4"
+        self.requests = []
+
+        def runner(command, timeout):
+            self.requests.append((command, timeout))
+            return run_command(command, timeout)
+
+        self.adapter = FfmpegMediaFrameAdapter(command_runner=runner)
+
+    def media(self, *args):
+        subprocess.run(["ffmpeg", "-nostdin", "-v", "error", *args, str(self.source)],
+                       check=True, timeout=15)
+
+    @unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"), "requires media tools")
+    async def test_sparse_mp4_matches_real_screen_colors_and_five_timestamped_seeks(self):
+        self.media("-f", "lavfi", "-i", "color=red:r=1:s=96x64:d=600",
+                   "-f", "lavfi", "-i", "color=green:r=1:s=96x64:d=600",
+                   "-f", "lavfi", "-i", "color=blue:r=1:s=96x64:d=600",
+                   "-filter_complex", "[0:v][1:v][2:v]concat=n=3:v=1:a=0[v]", "-map", "[v]",
+                   "-g", "20", "-c:v", "mpeg4")
+        req = MediaFrameRequest(self.source, max_duration_seconds=90, sparse_max_duration_seconds=1800)
+        async with self.adapter.frame_session(req) as result:
+            self.assertTrue(result.ok, result.failure_category)
+            self.assertEqual("ffmpeg_sparse", result.backend)
+            self.assertEqual(5, len(result.frames))
+            times = [f.timestamp_seconds for f in result.frames]
+            self.assertEqual([0, 450, 900, 1350, 1799], times)
+            for slot, channel in ((0, 0), (2, 1), (4, 2)):
+                with Image.open(result.frames[slot].path) as im:
+                    rgb = im.getpixel((16, 16))
+                    self.assertEqual(rgb.index(max(rgb)), channel)
+            workdir = result.frames[0].path.parent
+        self.assertFalse(workdir.exists())
+        seeks = self.requests[1:]
+        self.assertEqual(5, len(seeks))
+        for command, timeout in seeks:
+            self.assertLess(command.index("-ss"), command.index("-i"))
+            self.assertEqual("1", command[command.index("-frames:v") + 1])
+            self.assertLessEqual(timeout, 30)
+        self.assertLess(seeks[-1][1], seeks[0][1])
+        for cap in (0, 120):
+            async with self.adapter.frame_session(MediaFrameRequest(self.source, sparse_max_duration_seconds=cap)) as failure:
+                self.assertEqual("duration_too_long", failure.failure_category)
+
+    @unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"), "requires media tools")
+    async def test_video_document_with_short_picture_and_long_audio_uses_only_visual_track(self):
+        self.media("-itsoffset", "10", "-f", "lavfi", "-i", "color=green:r=1:s=96x64:d=5", "-f", "lavfi", "-i",
+                   "anullsrc=r=8000:cl=mono:d=140", "-c:v", "mpeg4", "-fps_mode:v", "passthrough", "-c:a", "aac")
+        # Telegram documents have a size and no duration field.
+        remote = AsyncMock()
+        remote.file_size = self.source.stat().st_size
+        async def download(custom_path):
+            shutil.copyfile(self.source, custom_path)
+        remote.download_to_drive.side_effect = download
+        attachment = SimpleNamespace(file_size=remote.file_size, get_file=AsyncMock(return_value=remote))
+        answer = AsyncMock(return_value="green")
+        transcribe = AsyncMock()
+        opts = dict(request="Describe the clip", max_bytes=20_000_000, max_duration=90, ffmpeg="ffmpeg",
+                    answer=answer, transcribe=transcribe, adapter=self.adapter, sparse_max_duration=120)
+        response = await inspect_clip(attachment, mode="frames", **opts)
+        self.assertEqual("green\n🎞 0:00:10 · 0:00:11 · 0:00:12 · 0:00:13 · 0:00:14", response)
+        content = answer.await_args.args[0]
+        timestamps = [float(part["text"].split()[1]) for part in content if part.get("text", "").startswith("Approx.")]
+        self.assertEqual([10, 11, 12, 13, 14], timestamps)
+        for mode in ("speech", "both"):
+            with self.assertRaisesRegex(VideoUnavailable, "90 с"):
+                await inspect_clip(attachment, mode=mode, **opts)
+        transcribe.assert_not_awaited()
+
+    @unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"), "requires media tools")
+    async def test_short_container_with_offset_picture_uses_actual_visual_times(self):
+        self.media("-itsoffset", "10", "-f", "lavfi", "-i", "color=blue:r=1:s=64x48:d=5",
+                   "-f", "lavfi", "-i", "anullsrc=r=8000:cl=mono:d=60", "-c:v", "mpeg4", "-fps_mode:v",
+                   "passthrough", "-c:a", "aac")
+        req = MediaFrameRequest(self.source, max_duration_seconds=90, sparse_max_duration_seconds=1800)
+        async with self.adapter.frame_session(req) as result:
+            self.assertTrue(result.ok, result.failure_category)
+            self.assertEqual([10, 11, 12, 13, 14], [f.timestamp_seconds for f in result.frames])
+
+    @unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"), "requires media tools")
+    async def test_slow_slide_cadence_deduplicates_the_real_presentation_times(self):
+        self.media("-f", "lavfi", "-i", "color=blue:r=1/60:s=64x48:d=180", "-c:v", "mpeg4")
+        req = MediaFrameRequest(self.source, max_duration_seconds=90, sparse_max_duration_seconds=1800)
+        async with self.adapter.frame_session(req) as result:
+            self.assertTrue(result.ok, result.failure_category)
+            self.assertEqual([0, 60, 120], [f.timestamp_seconds for f in result.frames])
+
+    @unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"), "requires media tools")
+    async def test_matroska_and_webm_with_audio_read_bounded_video_packet_timing(self):
+        for ext in ("mkv", "webm"):
+            with self.subTest(ext=ext):
+                self.source = self.directory / f"fixture.{ext}"
+                self.media("-f", "lavfi", "-i", "color=green:r=1:s=64x48:d=121",
+                           "-f", "lavfi", "-i", "anullsrc=r=16000:cl=mono:d=140", "-c:v", "libvpx-vp9",
+                           "-deadline", "realtime", "-cpu-used", "8", "-threads", "1", "-c:a", "libopus")
+                req = MediaFrameRequest(self.source, max_duration_seconds=90, sparse_max_duration_seconds=1800)
+                async with self.adapter.frame_session(req) as result:
+                    self.assertTrue(result.ok, result.failure_category)
+                    times = [frame.timestamp_seconds for frame in result.frames]
+                    self.assertEqual(len(times), 5)
+                    self.assertLess(times[0], 0.1)
+                    self.assertAlmostEqual(times[-1], 120, delta=.1)
+
+    @unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"), "requires media tools")
+    async def test_default_video_track_supplies_both_duration_and_pixels(self):
+        self.media("-f", "lavfi", "-i", "color=red:r=1:s=128x96:d=2",
+                   "-f", "lavfi", "-i", "color=blue:r=1:s=64x48:d=121",
+                   "-map", "0:v", "-map", "1:v", "-c:v", "mpeg4", "-disposition:v:0", "0",
+                   "-disposition:v:1", "default")
+        req = MediaFrameRequest(self.source, sparse_max_duration_seconds=1800, sparse_frame_count=3)
+        async with self.adapter.frame_session(req) as result:
+            self.assertTrue(result.ok, result.failure_category)
+            self.assertEqual([0, 60, 120], [f.timestamp_seconds for f in result.frames])
+            for frame in result.frames:
+                with Image.open(frame.path) as im:
+                    rgb = im.getpixel((10, 10))
+                self.assertEqual(2, rgb.index(max(rgb)))
+
+    async def test_cancellation_keeps_input_alive_until_each_bounded_probe_exits(self):
+        for hold_on in (1, 2):
+            with self.subTest(hold_on=hold_on):
+                started, release = threading.Event(), threading.Event()
+                paths = []
+                def runner(command, timeout):
+                    paths.append(Path(command[-1]))
+                    if len(paths) == hold_on:
+                        started.set()
+                        if not release.wait(3):
+                            raise TimeoutError("test release")
+                        self.assertTrue(paths[-1].is_file())
+                    return CommandOutput(0, json.dumps({"streams": [{"codec_type":"video", "start_time":10,
+                        "width":0, "height":0, "duration":5}], "format":{"duration":140}}), "")
+                async def download(custom_path):
+                    custom_path.write_bytes(b"fixture")
+                attachment = SimpleNamespace(file_size=7, get_file=AsyncMock(return_value=SimpleNamespace(
+                    file_size=7, download_to_drive=download)))
+                work = asyncio.create_task(inspect_clip(attachment, request="Describe", mode="frames",
+                    adapter=FfmpegMediaFrameAdapter(command_runner=runner), max_bytes=1024, max_duration=90,
+                    sparse_max_duration=1800, ffmpeg="ffmpeg", answer=AsyncMock(), transcribe=AsyncMock()))
+                try:
+                    self.assertTrue(await asyncio.to_thread(started.wait, 2))
+                    for _ in range(2):
+                        work.cancel()
+                        await asyncio.sleep(0)
+                        self.assertFalse(work.done())
+                        self.assertTrue(paths[-1].exists())
+                finally:
+                    release.set()
+                    with self.assertRaises(asyncio.CancelledError):
+                        await work
+                self.assertFalse(paths[-1].exists())
+
+    async def test_missing_video_duration_and_seek_timeout_leave_no_frames(self):
+        self.source.write_bytes(b"local input")
+        def probe(duration):
+            return CommandOutput(0, json.dumps({"streams": [{"codec_type": "video", "width":64, "height":48,
+                "duration":duration, "index":0},{"codec_type":"audio"}], "format":{"duration":"150"}}), "")
+        for value in ("inf", "nan"):
+            with self.assertRaises(RuntimeError):
+                parse_ffprobe_metadata(probe(value).stdout)
+        for duration, expected in ((None, "video_timing_unknown"), ("1801", "duration_too_long"), ("150", "timeout")):
+            workdirs = []
+            def run(command, timeout):
+                self.assertGreater(timeout, 0)
+                self.assertLessEqual(timeout, 30)
+                if command[0] == "ffprobe":
+                    return probe(duration)
+                workdirs.append(Path(command[-1]).parent)
+                raise subprocess.TimeoutExpired("ffmpeg", timeout)
+            adapter = FfmpegMediaFrameAdapter(command_runner=run)
+            req = MediaFrameRequest(self.source, sparse_max_duration_seconds=1800, timeout_seconds=120)
+            async with adapter.frame_session(req) as result:
+                self.assertEqual(expected, result.failure_category)
+                self.assertFalse(result.frames)
+            self.assertFalse(any(d.exists() for d in workdirs))

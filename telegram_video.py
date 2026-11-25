@@ -82,7 +82,8 @@ def duration_seconds(value):
 
 
 async def inspect_clip(attachment, *, request: str, mode: str, adapter, max_bytes: int,
-                       max_duration: int, ffmpeg: str, answer, transcribe, speech_scope=None) -> str:
+                       max_duration: int, ffmpeg: str, answer, transcribe, speech_scope=None,
+                       sparse_max_duration: int = 0, sparse_frame_count: int = 5) -> str:
     # Telegram's hosted Bot API limits downloads to 20 MB. Check a known
     # size before letting its client buffer the file and verify actual bytes.
     limit = min(max_bytes, TELEGRAM_VIDEO_MAX_BYTES)
@@ -90,8 +91,9 @@ async def inspect_clip(attachment, *, request: str, mode: str, adapter, max_byte
     size = int(getattr(attachment, "file_size", 0) or 0)
     if size > limit:
         raise VideoUnavailable(too_large)
-    if duration_seconds(getattr(attachment, "duration", 0)) > max_duration:
-        raise VideoUnavailable("Відео задовге для аналізу. Надішли коротший фрагмент.")
+    sparse_cap = sparse_max_duration if mode == "frames" else 0
+    if sparse_cap <= max_duration and duration_seconds(getattr(attachment, "duration", 0)) > max_duration:
+        raise VideoUnavailable(duration_limit_message(mode, max_duration))
     remote = await attachment.get_file()
     known_size = max(size, int(getattr(remote, "file_size", 0) or 0))
     if known_size <= 0:
@@ -103,22 +105,34 @@ async def inspect_clip(attachment, *, request: str, mode: str, adapter, max_byte
         await remote.download_to_drive(custom_path=source)
         return await inspect_local_clip(source, request=request, mode=mode, adapter=adapter, max_bytes=limit,
             max_duration=max_duration, ffmpeg=ffmpeg, answer=answer, transcribe=transcribe, source_family="telegram_clip",
-            speech_scope=speech_scope)
+            speech_scope=speech_scope, sparse_max_duration=sparse_cap, sparse_frame_count=sparse_frame_count)
+
+
+def duration_limit_message(mode, limit):
+    if mode in ("speech", "both"):
+        return f"Для розбору мовлення ліміт — {limit} с на файл. Надішли коротший фрагмент."
+    return f"Відео задовге для аналізу (ліміт {limit} с). Надішли коротший фрагмент."
 
 
 async def inspect_local_clip(source: Path, *, request: str, mode: str, adapter, max_bytes: int,
-                             max_duration: int, ffmpeg: str, answer, transcribe, source_family: str, speech_scope=None) -> str:
+                             max_duration: int, ffmpeg: str, answer, transcribe, source_family: str, speech_scope=None,
+                             sparse_max_duration: int = 0, sparse_frame_count: int = 5) -> str:
     too_large = "Відео перевищує ліміт розміру. Надішли коротший фрагмент."
-    too_long = "Відео задовге для аналізу. Надішли коротший фрагмент."
+    if source_family != "telegram_clip" or mode != "frames":
+        sparse_max_duration = 0
+    too_long = duration_limit_message(mode, max(max_duration, sparse_max_duration))
     unreadable = "Не вдалося безпечно прочитати це відео. Надішли короткий відеофайл."
     size = source.stat().st_size
     if size > max_bytes:
         raise VideoUnavailable(too_large)
     frame_request = MediaFrameRequest(source_path=source, source_family=source_family,
-        declared_size_bytes=size, max_bytes=max_bytes, max_duration_seconds=max_duration)
+        declared_size_bytes=size, max_bytes=max_bytes, max_duration_seconds=max_duration,
+        sparse_max_duration_seconds=sparse_max_duration, sparse_frame_count=sparse_frame_count)
     async with adapter.frame_session(frame_request) as result:
         if not result.ok:
-            raise VideoUnavailable({"duration_too_long": too_long, "input_too_large": too_large}
+            raise VideoUnavailable({"duration_too_long": too_long, "input_too_large": too_large,
+                                    "video_timing_unknown": "Не вдалося визначити часові межі відеодоріжки. Надішли короткий MP4.",
+                                    "no_frames_selected": "Не вдалося отримати кадри у вибрані моменти. Надішли короткий MP4."}
                                    .get(result.failure_category, unreadable))
         speech = ("Audio was not inspected. The audio tool only transcribes spoken words."
                   if speech_scope else "Speech was not inspected.")
@@ -144,9 +158,18 @@ async def inspect_local_clip(source: Path, *, request: str, mode: str, adapter, 
                 speech = "The clip has no audio track."
             else:
                 speech = await transcribe_clip(source, ffmpeg, max_duration, transcribe)
-        content.insert(0, {"type": "input_text", "text": json.dumps(
-            {"request": request, "speech_evidence": speech}, ensure_ascii=False)})
-        return await answer(content)
+        evidence = {"request": request, "speech_evidence": speech}
+        if result.backend == "ffmpeg_sparse":
+            evidence["coverage"] = "Describe only the listed samples. Events and movement between them are unknown."
+        content.insert(0, {"type": "input_text", "text": json.dumps(evidence, ensure_ascii=False)})
+        response = await answer(content)
+        if result.backend == "ffmpeg_sparse":
+            times = []
+            for frame in result.frames:
+                stamp = str(timedelta(milliseconds=round(frame.timestamp_seconds * 1000)))
+                times.append(stamp.rstrip("0").rstrip(".") if "." in stamp else stamp)
+            response += "\n🎞 " + " · ".join(times)
+        return response
 
 
 async def transcribe_clip(source, ffmpeg, max_duration, transcribe):
