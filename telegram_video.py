@@ -130,7 +130,9 @@ async def inspect_local_clip(source: Path, *, request: str, mode: str, adapter, 
         sparse_max_duration_seconds=sparse_max_duration, sparse_frame_count=sparse_frame_count)
     async with adapter.frame_session(frame_request) as result:
         if not result.ok:
-            raise VideoUnavailable({"duration_too_long": too_long, "input_too_large": too_large}
+            raise VideoUnavailable({"duration_too_long": too_long, "input_too_large": too_large,
+                                    "video_timing_unknown": "Не вдалося визначити часові межі відеодоріжки. Надішли короткий MP4.",
+                                    "no_frames_selected": "Не вдалося отримати кадри у вибрані моменти. Надішли короткий MP4."}
                                    .get(result.failure_category, unreadable))
         speech = ("Audio was not inspected. The audio tool only transcribes spoken words."
                   if speech_scope else "Speech was not inspected.")
@@ -158,9 +160,16 @@ async def inspect_local_clip(source: Path, *, request: str, mode: str, adapter, 
                 speech = await transcribe_clip(source, ffmpeg, max_duration, transcribe)
         evidence = {"request": request, "speech_evidence": speech}
         if result.backend == "ffmpeg_sparse":
-            evidence["coverage"] = "Only the listed timestamps were inspected. Describe those samples."
+            evidence["coverage"] = "Describe only the listed samples. Events and movement between them are unknown."
         content.insert(0, {"type": "input_text", "text": json.dumps(evidence, ensure_ascii=False)})
-        return await answer(content)
+        response = await answer(content)
+        if result.backend == "ffmpeg_sparse":
+            times = []
+            for frame in result.frames:
+                stamp = str(timedelta(milliseconds=round(frame.timestamp_seconds * 1000)))
+                times.append(stamp.rstrip("0").rstrip(".") if "." in stamp else stamp)
+            response += "\n🎞 " + " · ".join(times)
+        return response
 
 
 async def transcribe_clip(source, ffmpeg, max_duration, transcribe):

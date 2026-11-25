@@ -22,6 +22,7 @@ from system_log import sanitize_text
 # concatenation demuxers are outside the Telegram attachment boundary.
 LOCAL_MEDIA_OPTIONS = ("-protocol_whitelist", "file", "-format_whitelist", "mov,matroska,webm,avi,gif,mpeg,mpegts")
 SPARSE_FRAME_MAX_SECONDS = 1800
+MAX_TIMING_PACKETS = 65_536
 
 
 MEDIA_FRAME_FAILURE_CATEGORIES = {
@@ -31,6 +32,7 @@ MEDIA_FRAME_FAILURE_CATEGORIES = {
     "input_missing",
     "input_too_large",
     "duration_too_long",
+    "video_timing_unknown",
     "resolution_too_large",
     "decode_failed",
     "scene_detection_failed",
@@ -294,8 +296,17 @@ class FfmpegMediaFrameAdapter:
             probe_timeout = min(limits.timeout_seconds, 30) if sparse_enabled else limits.timeout_seconds
             deadline = time.monotonic() + probe_timeout
             metadata = await finish_media_worker(self._probe_metadata, source_path, probe_timeout)
+            packet_timing = None
+            if sparse_enabled and metadata.get("matroska_timing") and (
+                    metadata["has_audio"] or metadata["duration_seconds"] > limits.max_duration_seconds):
+                # Matroska may leave track duration unset or estimate it from the complete audio timeline.
+                packet_timing = await finish_media_worker(self._probe_video_packets, source_path, metadata, deadline)
+                metadata.update(packet_timing)
             validation_failure = validate_metadata(metadata, limits)
-            sparse = validation_failure == "duration_too_long" and sparse_enabled
+            track_duration = metadata["video_duration_seconds"]
+            separate_picture = track_duration > 0 and (
+                metadata["video_start_seconds"] > 0.5 or abs(metadata["duration_seconds"] - track_duration) > 0.5)
+            sparse = sparse_enabled and (validation_failure == "duration_too_long" or separate_picture)
             if sparse:
                 backend = "ffmpeg_sparse"
                 sparse_cap = min(request.sparse_max_duration_seconds, SPARSE_FRAME_MAX_SECONDS)
@@ -305,9 +316,16 @@ class FfmpegMediaFrameAdapter:
                     if remaining <= 0:
                         raise subprocess.TimeoutExpired("ffprobe", limits.timeout_seconds)
                     analyze_us = int(min(metadata["video_start_seconds"] + 2, SPARSE_FRAME_MAX_SECONDS) * 1_000_000)
+                    stream_index = metadata["video_stream_index"]
                     metadata = await finish_media_worker(self._probe_metadata, source_path, remaining, analyze_us)
+                    if metadata["video_stream_index"] != stream_index:
+                        raise RuntimeError("video_timing_unknown")
+                    if packet_timing:
+                        metadata.update(packet_timing)
                 track = {**metadata, "duration_seconds": metadata.get("video_duration_seconds")}
                 validation_failure = validate_metadata(track, replace(limits, max_duration_seconds=sparse_cap))
+                if not metadata["video_duration_seconds"]:
+                    validation_failure = "video_timing_unknown"
             if validation_failure:
                 return self._failure(
                     request,
@@ -470,6 +488,29 @@ class FfmpegMediaFrameAdapter:
             raise RuntimeError("metadata_failed")
         return parse_ffprobe_metadata(output.stdout)
 
+    def _probe_video_packets(self, source_path, metadata, deadline):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise subprocess.TimeoutExpired("ffprobe", 30)
+        result = self.command_runner([self.ffprobe_path, "-v", "error", "-select_streams",
+            str(metadata["video_stream_index"]), "-read_intervals", f"%+#{MAX_TIMING_PACKETS + 1}",
+            "-show_entries", "packet=pts_time,duration_time", "-of", "csv=p=0", *LOCAL_MEDIA_OPTIONS,
+            str(source_path)], remaining)
+        lines = result.stdout.splitlines()
+        if result.returncode or not 0 < len(lines) <= MAX_TIMING_PACKETS:
+            raise RuntimeError("video_timing_unknown")
+        first, end = math.inf, -math.inf
+        for line in lines:
+            columns = line.split(",")
+            if len(columns) < 2:
+                raise RuntimeError("video_timing_unknown")
+            start, length = parse_float(columns[0]), parse_float(columns[1])
+            if start is None or length is None or not math.isfinite(start + length) or length <= 0:
+                raise RuntimeError("video_timing_unknown")
+            first, end = min(first, start), max(end, start + length)
+        return {"video_start_seconds": max(0., first - metadata["container_start_seconds"]),
+                "video_duration_seconds": end - first}
+
     def _extract_interval_frames(
         self,
         source_path: Path,
@@ -522,7 +563,7 @@ class FfmpegMediaFrameAdapter:
                 "-vf", f"scale={limits.output_width}:{limits.output_width}:force_original_aspect_ratio=decrease",
                 "-frames:v", "1", "-threads", "1", "-fps_mode", "passthrough", "-enc_time_base", "1:1000", "-frame_pts", "1",
                 str(pattern)], remaining)
-            if output.returncode or not any(directory.glob(f"frame_{i:02d}_*.jpg")):
+            if output.returncode:
                 raise RuntimeError("decode_failed")
 
     def _failure(
@@ -638,13 +679,15 @@ def parse_ffprobe_metadata(payload: str) -> dict[str, Any]:
         "duration_seconds": round(duration, 3) if duration else 0,
         "width": width,
         "height": height,
-        "fps": round(fps, 3) if fps and math.isfinite(fps) and fps > 0 else 0,
+        "fps": fps if math.isfinite(fps) and fps > 0 else 0,
         "frame_count": frame_count,
         "codec": safe_code_label(stream.get("codec_name") or "", default="unknown"),
         "has_audio": any(item.get("codec_type") == "audio" for item in streams),
         "video_duration_seconds": video_duration,
         "video_start_seconds": max(0., video_start),
         "video_stream_index": parse_int(stream.get("index")) or 0,
+        "matroska_timing": "matroska" in str(fmt.get("format_name", "")).split(","),
+        "container_start_seconds": parse_float(fmt.get("start_time")) or 0,
     }
 
 

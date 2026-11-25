@@ -77,7 +77,8 @@ class SparseTelegramTests(unittest.IsolatedAsyncioTestCase):
         transcribe = AsyncMock()
         opts = dict(request="Describe the clip", max_bytes=20_000_000, max_duration=90, ffmpeg="ffmpeg",
                     answer=answer, transcribe=transcribe, adapter=self.adapter, sparse_max_duration=120)
-        self.assertEqual("green", await inspect_clip(attachment, mode="frames", **opts))
+        response = await inspect_clip(attachment, mode="frames", **opts)
+        self.assertEqual("green\n🎞 0:00:10 · 0:00:11 · 0:00:12 · 0:00:13 · 0:00:14", response)
         content = answer.await_args.args[0]
         timestamps = [float(part["text"].split()[1]) for part in content if part.get("text", "").startswith("Approx.")]
         self.assertEqual([10, 11, 12, 13, 14], timestamps)
@@ -85,6 +86,40 @@ class SparseTelegramTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaisesRegex(VideoUnavailable, "90 с"):
                 await inspect_clip(attachment, mode=mode, **opts)
         transcribe.assert_not_awaited()
+
+    @unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"), "requires media tools")
+    async def test_short_container_with_offset_picture_uses_actual_visual_times(self):
+        self.media("-itsoffset", "10", "-f", "lavfi", "-i", "color=blue:r=1:s=64x48:d=5",
+                   "-f", "lavfi", "-i", "anullsrc=r=8000:cl=mono:d=60", "-c:v", "mpeg4", "-fps_mode:v",
+                   "passthrough", "-c:a", "aac")
+        req = MediaFrameRequest(self.source, max_duration_seconds=90, sparse_max_duration_seconds=1800)
+        async with self.adapter.frame_session(req) as result:
+            self.assertTrue(result.ok, result.failure_category)
+            self.assertEqual([10, 11, 12, 13, 14], [f.timestamp_seconds for f in result.frames])
+
+    @unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"), "requires media tools")
+    async def test_slow_slide_cadence_deduplicates_the_real_presentation_times(self):
+        self.media("-f", "lavfi", "-i", "color=blue:r=1/60:s=64x48:d=180", "-c:v", "mpeg4")
+        req = MediaFrameRequest(self.source, max_duration_seconds=90, sparse_max_duration_seconds=1800)
+        async with self.adapter.frame_session(req) as result:
+            self.assertTrue(result.ok, result.failure_category)
+            self.assertEqual([0, 60, 120], [f.timestamp_seconds for f in result.frames])
+
+    @unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"), "requires media tools")
+    async def test_matroska_and_webm_with_audio_read_bounded_video_packet_timing(self):
+        for ext in ("mkv", "webm"):
+            with self.subTest(ext=ext):
+                self.source = self.directory / f"fixture.{ext}"
+                self.media("-f", "lavfi", "-i", "color=green:r=1:s=64x48:d=121",
+                           "-f", "lavfi", "-i", "anullsrc=r=16000:cl=mono:d=140", "-c:v", "libvpx-vp9",
+                           "-deadline", "realtime", "-cpu-used", "8", "-threads", "1", "-c:a", "libopus")
+                req = MediaFrameRequest(self.source, max_duration_seconds=90, sparse_max_duration_seconds=1800)
+                async with self.adapter.frame_session(req) as result:
+                    self.assertTrue(result.ok, result.failure_category)
+                    times = [frame.timestamp_seconds for frame in result.frames]
+                    self.assertEqual(len(times), 5)
+                    self.assertLess(times[0], 0.1)
+                    self.assertAlmostEqual(times[-1], 120, delta=.1)
 
     @unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"), "requires media tools")
     async def test_default_video_track_supplies_both_duration_and_pixels(self):
@@ -143,7 +178,7 @@ class SparseTelegramTests(unittest.IsolatedAsyncioTestCase):
         for value in ("inf", "nan"):
             with self.assertRaises(RuntimeError):
                 parse_ffprobe_metadata(probe(value).stdout)
-        for duration, expected in ((None, "metadata_failed"), ("1801", "duration_too_long"), ("150", "timeout")):
+        for duration, expected in ((None, "video_timing_unknown"), ("1801", "duration_too_long"), ("150", "timeout")):
             workdirs = []
             def run(command, timeout):
                 self.assertGreater(timeout, 0)
