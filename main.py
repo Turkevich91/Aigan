@@ -69,6 +69,8 @@ from image_candidate_review import (
     normalize_image_candidate_reviews,
     selected_candidate_indices,
 )
+from landmark_intent import landmark_request_language
+from public_landmarks import analyze_public_landmark
 from image_intent import (
     IMAGE_INTENT_ROUTER_SYSTEM_PROMPT,
     IMAGE_INTENT_TRUSTED_TEXT_MAX_CHARS,
@@ -6333,6 +6335,10 @@ async def classify_request_with_intent(message: Message, prompt: str) -> Request
     has_reply_image = bool(referenced_image_messages(message))
     if is_translate_request(prompt) and (has_reference or inline_translation_source(prompt)):
         return RequestClassification("translate_reference")
+
+    if (CONFIG.image_intent_routing_mode != "enforce" and has_reply_image
+            and photo_landmark_language(message, prompt) is not None):
+        return RequestClassification("referenced_visual_analysis")
 
     image_decision: ImageIntentDecision | None = None
     image_policy: ImageRoutePolicy | None = None
@@ -15786,6 +15792,55 @@ async def handle_image_prompt_generation(
         ACTIVE_RANDOMIZER.reset(token)
 
 
+def photo_landmark_language(message: Message, prompt: str) -> str | None:
+    # An existing pending request may select a forwarded photo. Its caption is source material.
+    if is_forwarded_message(message):
+        caption = message_text(message)
+        if prompt in (caption, strip_trigger(caption, BOT_USERNAME)):
+            return None
+    return landmark_request_language(strip_trigger(prompt, BOT_USERNAME) or prompt)
+
+
+def image_source_in_turn(message: Message, source: Message, admitted_parts: Sequence[Message]) -> bool:
+    # The first message can anchor a burst containing later, explicitly admitted photos.
+    source_id = getattr(source, "message_id", None)
+    return (getattr(source, "chat_id", None) == message.chat_id and type(source_id) is int and source_id > 0
+            and (source_id <= message.message_id or any(source is part for part in admitted_parts)))
+
+
+async def landmark_photo_answer(
+    message: Message, image_messages: Sequence[Message], language: str, provenance: OutboundProvenance,
+    *, admitted_parts: Sequence[Message],
+) -> str:
+    english = language == "en"
+    if len(image_messages) != 1:
+        return ("Send one photo at a time so I can check its landmark." if english else
+                "Надішли одне фото, щоб я міг перевірити зображену пам’ятку.")
+    source = image_messages[0]
+    ref = image_file_ref_from(source)
+    if (not image_source_in_turn(message, source, admitted_parts) or ref is None or ref[2] == "sticker"
+            or ref[1].lower() not in {"image/jpeg", "image/png", "image/webp"}):
+        return ("Send a still photo, or a JPEG, PNG or WebP image." if english else
+                "Надішли звичайне фото або зображення JPEG, PNG чи WebP.")
+    if (getattr(ref[0], "file_size", None) or 0) > CONFIG.image_max_bytes:
+        return ("This photo exceeds the image size limit." if english else "Це фото перевищує ліміт розміру.")
+    urls = await extract_image_data_urls(source)
+    if len(urls) != 1:
+        return ("I couldn't read that photo." if english else "Не вдалося прочитати це фото.")
+    model, effort = primary_answer_settings(images=True)
+    hooks = AiganRunHooks(provenance.run_id, route_bucket="vision", intended_model=model, reasoning_effort=effort)
+    try:
+        answer = await asyncio.wait_for(analyze_public_landmark(
+            urls[0], model=configured_agents_model(model), effort=effort, english=english, hooks=hooks,
+        ), timeout=120)
+    except asyncio.CancelledError as exc:
+        hooks.finalize_pending("cancelled", exc)
+        raise
+    finally:
+        hooks.finalize_pending("failed", "landmark_run_ended_with_pending_turn")
+    return answer
+
+
 async def _handle_image_prompt_generation(
     message: Message,
     prompt: str,
@@ -15808,11 +15863,32 @@ async def _handle_image_prompt_generation(
     mark_cooldown(message)
     remember_observed_message(message, label=f"{user_label(message)} (image request)")
     outbound_provenance = provenance_for_message(message, "vision")
-    capabilities = primary_capabilities_for_message(message, prompt)
-    recovery_claimed = False
-    citation_token = None
+    language = photo_landmark_language(message, prompt)
+    capabilities = primary_capabilities_for_message(message, prompt) if language is None else None
     presence = activity_presence_for_message(message, action=ChatAction.TYPING)
     await presence.start()
+    if language is not None:
+        web_disabled = ("Web access is disabled in this chat, so I can’t check a landmark reference." if language == "en"
+                        else "У цьому чаті вимкнено вебдоступ, тому я не можу перевірити пам’ятку за джерелом.")
+        try:
+            response = web_disabled
+            if tool_allowed("web", before_call=True):
+                response = await landmark_photo_answer(
+                    message, image_messages, language, outbound_provenance, admitted_parts=admitted_parts,
+                )
+        except Exception as exc:
+            LOGGER.warning("Landmark inspection unavailable error=%s", type(exc).__name__)
+            response = ("I couldn't verify this landmark. Please try again later." if language == "en" else
+                        "Не вдалося перевірити цю пам’ятку. Спробуй пізніше.")
+        finally:
+            await presence.stop()
+        if not tool_allowed("web", before_call=True):
+            response = web_disabled
+        await deliver_photo_answer(message, prompt, dedupe_prompt, response, outbound_provenance, literal_text=True)
+        return
+
+    recovery_claimed = False
+    citation_token = None
 
     try:
         image_data_urls: list[str] = []
@@ -15821,14 +15897,7 @@ async def _handle_image_prompt_generation(
         for part_index, part in enumerate(image_messages):
             try:
                 if resolve_sticker(part) is not None:
-                    if getattr(part, "chat_id", None) != message.chat_id:
-                        raise StickerUnavailable("sticker_source_not_authorized")
-                    source_id = getattr(part, "message_id", None)
-                    # An admitted assembled turn may anchor on its first part.
-                    # Later authored parts are allowed; a future reply reference is not.
-                    admitted_part = any(part is authored for authored in admitted_parts)
-                    if (type(source_id) is not int or source_id <= 0
-                            or (source_id > message.message_id and not admitted_part)):
+                    if not image_source_in_turn(message, part, admitted_parts):
                         raise StickerUnavailable("sticker_source_not_authorized")
                     run_token = ACTIVE_MODEL_RUN_ID.set(outbound_provenance.run_id)
                     try:
@@ -15950,6 +16019,13 @@ Explain the image(s) according to the current request. Ukrainian by default; Eng
             ACTIVE_HISTORY_CITATIONS.reset(citation_token)
         await presence.stop()
 
+    await deliver_photo_answer(message, prompt, dedupe_prompt, response, outbound_provenance)
+
+
+async def deliver_photo_answer(
+    message: Message, prompt: str, dedupe_prompt: str, response: str, outbound_provenance: OutboundProvenance,
+    *, literal_text: bool = False,
+) -> None:
     histories[message.chat_id].append(f"{user_label(message)}: {prompt[:500]}")
     # Interactive answers belong to the bot output. Neutral source descriptions
     # are owned by ensure_recent_image_summaries, independent of this request.
@@ -15959,6 +16035,7 @@ Explain the image(s) according to the current request. Ukrainian by default; Eng
         memory_label="Aigan",
         route="vision",
         outbound_provenance=outbound_provenance,
+        **({"literal_text": True} if literal_text else {}),
     )
     if delivered := delivered_text(delivery):
         histories[message.chat_id].append(f"Aigan: {delivered[:500]}")
