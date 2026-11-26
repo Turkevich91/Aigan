@@ -14,7 +14,8 @@ class PublicMediaTransferError(Exception):
 
 
 @asynccontextmanager
-async def pinned_get(url: str, referrer: str | None = None, *, cookie_header: str | None = None):
+async def pinned_get(url: str, referrer: str | None = None, *, cookie_header: str | None = None,
+                     byte_range: tuple[int, int] | None = None):
     target = httpx.URL(url)
     if target.scheme != "https" or target.port not in (None, 443):
         raise PublicMediaTransferError("address")
@@ -30,6 +31,11 @@ async def pinned_get(url: str, referrer: str | None = None, *, cookie_header: st
     headers = {"Host": hostname, "Accept-Encoding": "identity"}
     if referrer:
         headers["Referer"] = referrer
+    if byte_range is not None:
+        start, end = byte_range
+        if type(start) is not int or type(end) is not int or not 0 <= start <= end:
+            raise PublicMediaTransferError("invalid_range")
+        headers["Range"] = f"bytes={start}-{end}"
     if cookie_header:
         headers["Cookie"] = cookie_header
     request = httpx.Request(
