@@ -277,6 +277,8 @@ class MemoryStore:
             );
             CREATE INDEX IF NOT EXISTS idx_messages_chat_order
                 ON messages(chat_id, created_at, id);
+            CREATE INDEX IF NOT EXISTS idx_messages_media_path
+                ON messages(local_media_path) WHERE local_media_path != '';
             CREATE INDEX IF NOT EXISTS idx_messages_chat_user_order
                 ON messages(chat_id, user_id, created_at, id);
             CREATE INDEX IF NOT EXISTS idx_messages_chat_username_order
@@ -1908,13 +1910,17 @@ class MemoryStore:
                 self._conn.execute("DELETE FROM message_fts WHERE rowid = ?", (item_id,))
             self._conn.commit()
 
-            media_paths = {Path(row["local_media_path"]) for row in rows if row["local_media_path"]}
-            if media_paths:
-                surviving = self._conn.execute(
-                    "SELECT DISTINCT local_media_path FROM messages WHERE local_media_path != ''"
-                )
-                media_paths.difference_update(Path(row[0]) for row in surviving)
-                for path in media_paths:
+        media_paths = {row["local_media_path"] for row in rows if row["local_media_path"]}
+        for media_path in media_paths:
+            # Recheck one file at a time. A concurrent importer can add a reference after row cleanup.
+            with self._lock, self._conn:
+                self._conn.execute("BEGIN IMMEDIATE")
+                referenced = self._conn.execute(
+                    "SELECT 1 FROM messages WHERE local_media_path != '' AND local_media_path = ? LIMIT 1",
+                    (media_path,),
+                ).fetchone()
+                if referenced is None:
+                    path = Path(media_path)
                     try:
                         if path.is_file():
                             path.unlink()
