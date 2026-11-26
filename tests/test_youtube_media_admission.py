@@ -31,3 +31,13 @@ class YoutubeAdmissionTests(unittest.TestCase):
         message.text = "Transcribe " + self.link
         with patch.dict(os.environ, {"AIGAN_MEDIA_LIBRARY": ""}):
             self.assertIsNone(main.requested_youtube_media(message, message.text))
+
+    def test_discussion_cannot_activate_paid_speech_in_the_ordinary_agent(self):
+        token = main.YOUTUBE_CAPTION_READ_ONLY.set(True)
+        try:
+            with patch.dict(os.environ, {"YOUTUBE_AUDIO_FALLBACK": "true"}):
+                env = main.youtube_mcp_environment(run_id="", route_bucket="")
+        finally:
+            main.YOUTUBE_CAPTION_READ_ONLY.reset(token)
+        self.assertEqual(env["YOUTUBE_AUDIO_FALLBACK"], "false")
+        self.assertNotIn("OPENAI_API_KEY", env)

@@ -1,10 +1,9 @@
-"""Timestamped stills from the official storyboard of one public YouTube video."""
+"""Timestamped stills decoded from a public YouTube video or its labeled storyboard."""
 from __future__ import annotations
 
 import asyncio
 from bisect import bisect_left
 import logging
-import os
 import struct
 import sys
 import time
@@ -21,6 +20,7 @@ from PIL import Image
 
 from public_media_http import PublicMediaTransferError, bounded_chunks, pinned_get
 from youtube_long_audio import LongAudioUnavailable, MAX_DURATION_MS, _command, _disk, _outbound
+from youtube_media_cache import CacheUnavailable
 
 
 class YouTubePreviewUnavailable(Exception):
@@ -156,6 +156,8 @@ async def youtube_preview_frames(video_id: str, timestamp_ms: int, cache, *, bef
                 sheet = await _read(url, "image/jpeg", 2_000_000, before_call)
                 found.update(await _disk(_save_sheet, sheet, level, indices, cache))
             return tuple(PreviewFrame(i * level.interval_ms, found[i]) for i in sorted(found))
+    except (PermissionError, CacheUnavailable):
+        raise
     except (PublicMediaTransferError, httpx.HTTPError, OSError, ValueError, KeyError,
             TypeError, AttributeError, OverflowError, RecursionError, Image.DecompressionBombError) as exc:
         raise YouTubePreviewUnavailable("could not read video previews") from exc
@@ -278,7 +280,7 @@ async def _decode_targets(directory, source, targets):
 async def _section_frames(directory, video_id, timestamp, before_call):
     if before_call:
         before_call()
-    raw = await _command([sys.executable, str(Path(__file__).resolve()), video_id], timeout=18, directory=directory)
+    raw = await _command([sys.executable, str(Path(__file__).resolve()), video_id], timeout=80, directory=directory)
     track = json.loads(raw)
     duration = track["duration"]
     if timestamp > duration:
@@ -329,14 +331,16 @@ async def youtube_frames(video_id: str, timestamp_ms: int, cache, *, before_call
         if saved:
             return tuple(PreviewFrame(ms, path, label) for ms, path in saved)
     try:
-        async with asyncio.timeout(55):
+        async with asyncio.timeout(125):
             with TemporaryDirectory(dir=cache.directory, prefix=".video-job-") as tmp:
                 pairs = await _section_frames(Path(tmp), video_id, timestamp_ms, before_call)
                 if before_call:
                     before_call()
                 saved = await _disk(_persist_set, cache, timestamp_ms, pairs, "decoded")
                 return tuple(PreviewFrame(ms, path, "YouTube video frame") for ms, path in saved)
-    except (_SectionUnavailable, LongAudioUnavailable, PublicMediaTransferError, httpx.HTTPError, TimeoutError,
+    except (PermissionError, CacheUnavailable):
+        raise
+    except (TimeoutError, _SectionUnavailable, LongAudioUnavailable, PublicMediaTransferError, httpx.HTTPError,
             struct.error, KeyError, ArithmeticError, IndexError, ValueError):
         pass
     previews = await youtube_preview_frames(video_id, timestamp_ms, cache, before_call=before_call)

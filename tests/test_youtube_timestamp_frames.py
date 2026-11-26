@@ -3,10 +3,13 @@ from contextlib import asynccontextmanager
 import io
 import json
 import os
+import shutil
+import struct
+import subprocess
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import httpx
 from PIL import Image
@@ -127,3 +130,80 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
                     module.YouTubePreviewUnavailable, module.PublicMediaTransferError)):
                 await module._read(TEMPLATE, "image/jpeg", 2000000, None)
             self.assertEqual(calls, [TEMPLATE])
+
+
+@unittest.skipUnless(os.name == "posix" and shutil.which("ffmpeg"), "requires POSIX media tools")
+class DecodedFrameTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.root = Path(self.enterContext(TemporaryDirectory()))
+        (self.root / ".aigan-media-cache").touch()
+
+    async def test_decodes_selected_fragments_on_original_clock_and_reopens_offline(self):
+        source = self.root / "generated.mp4"
+        await module.asyncio.to_thread(subprocess.run, ["ffmpeg", "-nostdin", "-loglevel", "error", "-f", "lavfi", "-i",
+                        "testsrc2=size=320x180:rate=25:duration=24", "-an", "-c:v", "libx264",
+                        "-threads", "1", "-g", "50", "-keyint_min", "50", "-sc_threshold", "0",
+                        "-movflags", "dash+global_sidx", str(source)], check=True)
+        media = source.read_bytes()
+        remote = "https://fixture.googlevideo.com/videoplayback"
+        reads = []
+        async def read(url, first, last, expected_size, before):
+            self.assertEqual(url, remote)
+            reads.append((first, last))
+            self.assertIn(expected_size, (None, len(media)))
+            return media[first:last + 1], len(media)
+        native = module._command
+        async def command(args, **kwargs):
+            if args[0] == module.sys.executable:
+                return json.dumps({"url": remote, "available": 0, "duration": 24000}).encode()
+            return await native(args, **kwargs)
+        with open_video(self.root, 5, VIDEO) as cache, patch.object(module, "_range", read), \
+                patch.object(module, "_command", command), patch.object(module, "_read", side_effect=AssertionError):
+            result = await module.youtube_frames(VIDEO, 16000, cache)
+            self.assertEqual([f.timestamp_ms for f in result], [12000, 14000, 16000, 18000, 20000])
+            self.assertEqual({f.origin_label for f in result}, {"YouTube video frame"})
+            self.assertEqual(len(reads), 2)
+            self.assertGreater(reads[1][0], 1000)
+            self.assertLess(reads[1][1] - reads[1][0], len(media))
+            for frame in result:
+                with Image.open(frame.path) as img:
+                    self.assertEqual(img.size, (320, 180))
+            self.assertFalse(list(cache.directory.glob(".video-job-*")))
+        with open_video(self.root, 5, VIDEO) as cache, patch.object(module, "_section_frames", side_effect=AssertionError), \
+                patch.object(module, "_read", side_effect=AssertionError):
+            self.assertEqual(await module.youtube_frames(VIDEO, 16000, cache), result)
+
+    async def test_unavailable_native_media_caches_explicit_preview_set(self):
+        with open_video(self.root, 8, VIDEO) as cache:
+            source = self.root / "test.jpg"
+            source.write_bytes(sheet())
+            path = cache.save_frame(10000, source, kind="preview")
+            previews = (module.PreviewFrame(10000, path),)
+            with patch.object(module, "_section_frames", side_effect=module._SectionUnavailable), \
+                    patch.object(module, "youtube_preview_frames", AsyncMock(return_value=previews)):
+                self.assertEqual(await module.youtube_frames(VIDEO, 15000, cache), previews)
+            self.assertIsNone(cache.frame_set(15000, kind="decoded"))
+            with patch.object(module, "_section_frames", side_effect=AssertionError), \
+                    patch.object(module, "youtube_preview_frames", side_effect=AssertionError):
+                self.assertEqual(await module.youtube_frames(VIDEO, 15000, cache), previews)
+                with self.assertRaises(PermissionError):
+                    await module.youtube_frames(VIDEO, 15000, cache, before_call=lambda: self._deny())
+
+    async def test_revoked_permission_in_a_native_call_cannot_downgrade_to_previews(self):
+        with open_video(self.root, 5, VIDEO) as cache, patch.object(module, "_section_frames", side_effect=PermissionError), \
+                patch.object(module, "youtube_preview_frames", side_effect=AssertionError):
+            with self.assertRaises(PermissionError):
+                await module.youtube_frames(VIDEO, 15000, cache)
+
+    @staticmethod
+    def _deny():
+        raise PermissionError("revoked")
+
+    def test_rejects_hierarchical_or_oversized_media_indexes(self):
+        def idx(span):
+            payload = (bytes(4) + struct.pack(">II", 1, 1000) + struct.pack(">IIHH", 0, 0, 0, 1) +
+                       struct.pack(">III", span, 1000, 0))
+            return struct.pack(">I4s", 8, b"ftyp") + struct.pack(">I4s", len(payload) + 8, b"sidx") + payload
+        for span in (0, 20_000_000, 0x80000001):
+            with self.subTest(span=span), self.assertRaises(module._SectionUnavailable):
+                module._section_index(idx(span), 30_000_000, 1000, [0])
