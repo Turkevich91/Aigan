@@ -241,6 +241,7 @@ MEMORY_CONTEXT_MESSAGES=10
 MEMORY_FOLLOWUP_CONTEXT_MESSAGES=40
 MEMORY_THREAD_CONTEXT_DEPTH=6
 MEMORY_RETENTION_DAYS=30
+MEMORY_FULL_HISTORY_CHAT_IDS=
 MEMORY_IMAGE_SUMMARY_LIMIT=3
 MEMORY_EAGER_IMAGE_SUMMARY=false
 WEB_IMAGE_SEARCH_ENABLED=true
@@ -274,7 +275,7 @@ Scheduled reminders durably mark a delivery attempt before calling Telegram. A t
 
 Run provenance stores only route names, tool kinds, low-cardinality result status/digests, and keyed fingerprints derived from allowlisted source fields. It never stores raw prompts, tool arguments, search queries, URLs, transcripts, pages, or model output. Set a private `PROVENANCE_HASH_SALT` to keep fingerprints stable across Telegram token rotation; never commit its real value. Agents SDK hosted tracing has a separate operator-controlled policy described under system health.
 
-`MEMORY_RETENTION_DAYS` deletes older rows and cached media. `MEMORY_IMAGE_SUMMARY_LIMIT` limits how many recent unsummarized images can be lazily sent to vision for one answer. `WEB_SEARCH_TIMEOUT_SECONDS` controls DDGS web/image search network timeout, while `MCP_TOOL_TIMEOUT_SECONDS` controls the Agents SDK MCP session timeout for web and YouTube tools. For explicit URL checks, Aigan should fetch the current URL first, use search as secondary evidence, and report timeout/fetch/search failures as incomplete validation instead of guessing.
+`MEMORY_RETENTION_DAYS` sets the age limit for messages and cached media. Add comma-separated chat IDs to `MEMORY_FULL_HISTORY_CHAT_IDS` to keep their saved history indefinitely. Removing a chat from this list subjects its older messages to the next cleanup. `MEMORY_IMAGE_SUMMARY_LIMIT` limits how many recent unsummarized images can be lazily sent to vision for one answer. `WEB_SEARCH_TIMEOUT_SECONDS` controls DDGS web/image search network timeout, while `MCP_TOOL_TIMEOUT_SECONDS` controls the Agents SDK MCP session timeout for web and YouTube tools. For explicit URL checks, Aigan should fetch the current URL first, use search as secondary evidence, and report timeout/fetch/search failures as incomplete validation instead of guessing.
 
 Semantic memory adds a local SQLite hybrid index: FTS5 for keyword fallback plus OpenAI embeddings for meaning-based retrieval over the retained lookback window. It is only used after explicit bot invocation, never for ordinary group chatter. `/memory_search query` is admin-only and shows the retrieved snippets without asking the main model to answer; aliases `/память`, `/памʼять`, and `/пошук_памяті` call the same hybrid search. The command automatically uses embeddings when indexed, always attempts FTS fallback, and reports `embeddings_used`, fallback status, and per-result sources. Natural prompts that semantically ask for old chat context, such as `@bot що ми казали про Pragmata?` or `@bot а про 170 тис в казино ми щось обговорювали?`, route to the same recall backend automatically. `MEMORY_RECALL_INTENT_THRESHOLD` and `MEMORY_RECALL_INTENT_AMBIGUOUS_THRESHOLD` control that intent detector. Recall search also runs exact rescue with numeric terms such as `170`, `5к`, `4070`, or `$250`, and excludes the current prompt so it does not become its own top memory result.
 
