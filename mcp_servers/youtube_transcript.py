@@ -1,5 +1,7 @@
+import json
 import logging
 import os
+import re
 import sys
 import tempfile
 import threading
@@ -12,9 +14,9 @@ if __package__ in {None, ""}:
 from mcp.server.fastmcp import FastMCP
 from model_telemetry import ModelTelemetryStore, StageHandle
 from provenance import canonical_source
-from youtube_media_cache import caption_text_digest
+from youtube_media_cache import cached_caption_window, caption_text_digest, format_caption_window
 from youtube_caption_source import classify_cues
-from youtube_caption_tracks import lookup_original_track
+from youtube_caption_tracks import lookup_original_track, window_coverage
 from youtube_transcript_api import NoTranscriptFound, TranscriptsDisabled
 
 
@@ -246,16 +248,84 @@ def _library_result(video_id, max_chars, include_timestamps, *, allow_asr=False,
     return f"{descriptions[source]} for {video_id}:\n\n{text}"
 
 
-def _transcript_result(video, languages, include_timestamps, max_chars):
+def _requested_window(video_id, start, end):
+    authored = os.getenv("AIGAN_YOUTUBE_WINDOW")
+    if authored:
+        bound = json.loads(authored)
+        if (not isinstance(bound, list) or len(bound) != 3 or not isinstance(bound[0], str)
+                or not re.fullmatch(r"[A-Za-z0-9_-]{11}", bound[0])
+                or type(bound[1]) is not int or type(bound[2]) is not int or not 0 <= bound[1] < bound[2]):
+            raise ValueError("invalid authored interval")
+        if bound[0] == video_id:
+            _, start, end = bound
+    if start is None and end is None:
+        return None
+    if type(start) is not int or type(end) is not int or not 0 <= start < end:
+        raise ValueError("invalid time interval")
+    return start * 1000, end * 1000
+
+
+def _asr_in_caption_gaps(captions, speech):
+    """Add ASR only when its entire chunk falls in a gap between caption cues."""
+    supplemental = []
+    cue = 0
+    for start, end, text in speech:
+        while cue < len(captions) and captions[cue][1] <= start:
+            cue += 1
+        if cue == len(captions) or captions[cue][0] >= end:
+            supplemental.append((start, end, f"[Saved audio transcription] {text}"))
+    return supplemental
+
+
+def _timed_transcript(video_id, languages, window, include_timestamps, max_chars):
+    location = _library_location()
+    left, right = window
+    rows = cached_caption_window(*location, video_id, window) if location else []
+    coverage = window_coverage(rows, left, right)
+    width = right - left
+    source = "Saved YouTube captions" if rows else "YouTube transcript"
+    if coverage < width or languages != ["uk", "en", "ru"]:
+        try:
+            track = lookup_original_track(video_id, languages, window_ms=window)
+        except (TranscriptsDisabled, NoTranscriptFound):
+            track = None
+        except Exception as exc:
+            track = None
+            if not rows:
+                source = f"Caption lookup failed ({type(exc).__name__})"
+        if track is not None:
+            fresh = [cue for cue in track.cues if cue[0] < right and cue[1] > left]
+            fresh_coverage = window_coverage(fresh, left, right)
+            if fresh and fresh_coverage >= coverage:
+                rows, coverage, source = fresh, fresh_coverage, f"YouTube captions ({track.language_code})"
+    if location and coverage < width:
+        spoken = cached_caption_window(*location, video_id, window, speech=True)
+        if rows:
+            additional = _asr_in_caption_gaps(rows, spoken)
+            if additional:
+                rows = sorted([*rows, *additional], key=lambda row: row[0])
+                source += " supplemented by saved audio transcription"
+        elif spoken:
+            rows, source = spoken, "Saved audio transcription"
+        coverage = window_coverage(rows, left, right)
+    if rows and coverage < width:
+        source += " (only partial coverage of the requested interval)"
+    return f"{source} for {video_id}:\n" + format_caption_window(rows, window, max_chars, include_timestamps)
+
+
+def _transcript_result(video, languages, include_timestamps, max_chars, start_seconds=None, end_seconds=None):
     max_chars = max(1000, min(int(max_chars), 40000))
     try:
         video_id = _video_id(video)
+        window = _requested_window(video_id, start_seconds, end_seconds)
     except ValueError as exc:
         return str(exc)
 
     lang_list = [item.strip() for item in languages.split(",") if item.strip()]
     if not lang_list:
         lang_list = ["uk", "en", "ru"]
+    if window is not None:
+        return _timed_transcript(video_id, lang_list, window, include_timestamps, max_chars)
     # A caller requesting a particular track can select it even if this chat
     # previously cached a different language for ordinary summaries.
     if lang_list == ["uk", "en", "ru"]:
@@ -316,10 +386,12 @@ def get_youtube_transcript(
     languages: str = "uk,en,ru",
     include_timestamps: bool = True,
     max_chars: int = 16000,
+    start_seconds: int | None = None,
+    end_seconds: int | None = None,
 ) -> str:
-    """Read captions or a transcript for a YouTube video."""
+    """Read YouTube captions. For a specific interval supply both start_seconds and end_seconds."""
     guidance = (Path(__file__).resolve().parents[1] / "prompts" / "youtube_transcript.md").read_text(encoding="utf-8")
-    result = _transcript_result(video, languages, include_timestamps, max_chars)
+    result = _transcript_result(video, languages, include_timestamps, max_chars, start_seconds, end_seconds)
     return f"{guidance.strip()}\n\n--- YouTube tool result ---\n{result}"
 
 

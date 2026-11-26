@@ -401,6 +401,40 @@ def caption_text_digest(cues):
     return digest.digest()
 
 
+def format_caption_window(cues, window_ms, max_chars, include_timestamps):
+    """Only caption cues intersecting the half-open interval are evidence for this question."""
+    left, right = window_ms
+    lines = [(f"[{_stamp(start)} – {_stamp(end)}] " if include_timestamps else "") + text
+             for start, end, text in cues if start < right and end > left and text.strip()]
+    title = f"Requested interval [{_stamp(left)} – {_stamp(right)}). "
+    if not lines:
+        return title + "No overlapping caption cues found. This does not establish silence."
+    evidence = "\n".join(lines)
+    title += f"{len(lines)} overlapping cues:\n"
+    if len(title) + len(evidence) <= max_chars:
+        return title + evidence
+    title += "Output shortened to the character limit.\n"
+    return title + evidence[:max(0, max_chars - len(title) - 1)] + "…"
+
+
+def cached_caption_window(root, chat_id, video_id, window_ms, *, speech=False):
+    """Read the evidence this chat already owns inside one interval, without touching storage."""
+    left, right = window_ms
+    try:
+        cache = _VideoCache(_entry_directory(root, chat_id, video_id))
+        if speech:
+            # ASR has no per-word timings. Boundary-crossing chunks cannot locate
+            # words inside the interval; whole chunks inside it remain useful.
+            return [(a, b, text or "[no speech recognized]") for a, b, text in cache._speech_ranges()
+                    if left <= a and b <= right]
+        track = cache._public_track()
+        if track:
+            return [row for row in track["cues"] if row[0] < right and row[1] > left]
+    except (OSError, ValueError):
+        pass
+    return []
+
+
 def cached_transcript_read(root: Path, chat_id: int, video_id: str, max_chars: int,
                            include_timestamps: bool = True, *, prefer_native: bool = True,
                            official_digest: bytes | None = None,

@@ -1,11 +1,23 @@
 import json
 import unittest
 
-from youtube_media_request import confirmed_audio_source, parse_youtube_media_request
+from youtube_media_request import confirmed_audio_source, explicit_time_range, parse_youtube_media_request
 
 
 class YoutubeMediaRequestTests(unittest.TestCase):
     url = "https://youtu.be/A1b2C3d4E5F?t=368"
+
+    def test_explicit_authored_window_requires_two_ordered_clocks_and_a_range_connector(self):
+        for question in ("поясни приклад 1:12:00 - 1:13:00", "з 72:00 до 73:00", "с 72:00 по 73:00",
+                         "from 72:00 to 1:13:00", "1:12:00–1:13:00", "72:00—73:00",
+                         "between 72:00 and 73:00", "між 72:00 і 73:00", "между 72:00 и 73:00"):
+            with self.subTest(question=question):
+                self.assertEqual(explicit_time_range(question), (4320, 4380))
+        for question in ("at 1:12:00", "1:13:00–1:12:00", "3:22–3:22", "3:72–4:00",
+                         "at 3:22 or at 4:00", "at 3:22 and 4:00", "3:22–4:00.500",
+                         "3:22–4:00, 4:30", "quote «3:22–4:00»"):
+            with self.subTest(question=question):
+                self.assertIsNone(explicit_time_range(question))
 
     def test_full_transcription_and_timestamp_in_user_language(self):
         for prompt in ("Розшифруй усе відео повністю і покажи кадри на 2:30:00",
