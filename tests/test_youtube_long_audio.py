@@ -128,3 +128,95 @@ class LongAudioTests(unittest.IsolatedAsyncioTestCase):
         path = await audio.ensure_transcript(self.cache, ID, transcribe=transcribe, before_call=self.gate)
         self.assertIn("synthetic answer", path.read_text())
         transcribe.assert_awaited_once()
+
+    async def test_full_native_needs_no_audio_and_forced_asr_remains_independent(self):
+        self.cache.save_public_transcript([(0, 600, "native words")], duration_ms=620,
+                                          covered_ms=600, complete=True, track_id="fixture-uk")
+        self.assertIsNone(self.cache.audio())
+        self.assertIsNone(self.cache.transcript_path())
+        transcribe = AsyncMock(return_value="own words")
+        with patch.object(audio, "_download", new_callable=AsyncMock) as download, patch.object(audio, "_decode", self.decode):
+            path = await audio.ensure_transcript(self.cache, ID, transcribe=transcribe, before_call=self.gate)
+            self.assertIn("native words", path.read_text())
+            download.assert_not_awaited()
+            transcribe.assert_not_awaited()
+            self.cache.save_audio(self.source, 620)
+            own = await audio.ensure_transcript(self.cache, ID, transcribe=transcribe, before_call=self.gate,
+                                                prefer_native=False)
+            self.assertIn("own words", own.read_text())
+            self.assertNotIn("native", own.read_text())
+            self.assertNotEqual(path, own)
+            self.assertEqual(self.cache.saved_public_transcript(), (path, "native"))
+            self.assertEqual(self.cache.transcript_path(), own)
+            transcribe.assert_awaited_once()
+
+    async def test_partial_native_transcribes_only_tail_pins_prefix_and_reuses_tail_for_forced_asr(self):
+        self.cache.save_audio(self.source, 1020)
+        self.cache.save_public_transcript([(50, 390, "original prefix")], duration_ms=1020,
+                                          covered_ms=390, complete=False, track_id="original")
+        one = AsyncMock(side_effect=["tail one", TimeoutError()])
+        with patch.object(audio, "CHUNK_MS", 300), patch.object(audio, "_decode", self.decode):
+            with self.assertRaises(TimeoutError):
+                await audio.ensure_transcript(self.cache, ID, transcribe=one, before_call=self.gate)
+            self.assertEqual(self.ranges, [(390, 690), (690, 990)])
+            self.cache.save_public_transcript([(0, 800, "changed partial")], duration_ms=1020,
+                                               covered_ms=800, complete=False, track_id="different")
+            self.assertEqual(self.cache.segments(), [])
+            self.assertIsNone(self.cache.transcript_path())
+            two = AsyncMock(side_effect=["tail two", "last"])
+            path = await audio.ensure_transcript(self.cache, ID, transcribe=two, before_call=self.gate)
+            self.assertEqual(self.ranges[-2:], [(690, 990), (990, 1020)])
+            self.assertIn("original prefix", path.read_text())
+            self.assertNotIn("changed partial", path.read_text())
+            self.assertIn("last", path.read_text())
+            self.assertEqual(self.cache.saved_public_transcript(), (path, "mixed"))
+            self.assertIsNone(self.cache.transcript_path())
+            own = await audio.ensure_transcript(self.cache, ID, transcribe=AsyncMock(side_effect=["self A","self B"]),
+                                                before_call=self.gate, prefer_native=False)
+            self.assertEqual(self.ranges[-2:], [(0,300),(300,390)])
+            self.assertEqual([row[2] for row in self.cache.segments()], ["self A","self B","tail one","tail two","last"])
+            self.assertNotIn("original prefix", own.read_text())
+            before = own.read_bytes()
+            self.cache.save_public_transcript([(0, 1020, "complete native")], duration_ms=1020,
+                                              covered_ms=1020, complete=True, track_id="complete")
+            unexpected = AsyncMock(side_effect=AssertionError("duplicate transcription"))
+            native = await audio.ensure_transcript(self.cache, ID, transcribe=unexpected, before_call=self.gate)
+            self.assertIn("complete native", native.read_text())
+            self.assertEqual(self.cache.transcript_path().read_bytes(), before)
+            unexpected.assert_not_awaited()
+
+    async def test_native_over_existing_full_asr_keeps_crossing_chunk_truthful_without_a_new_call(self):
+        from youtube_media_cache import cached_excerpt
+        self.cache.save_audio(self.source, 1000)
+        self.cache.append_segment(0, 500, "previous start")
+        self.cache.append_segment(500, 1000, "original crossing block")
+        pure = self.cache.transcript_path().read_bytes()
+        self.cache.save_public_transcript([(5, 730, "preferred caption")], duration_ms=1000,
+                                          covered_ms=730, complete=False, track_id="sample")
+        no_stt = AsyncMock(side_effect=AssertionError("unexpected provider"))
+        path = await audio.ensure_transcript(self.cache, ID, transcribe=no_stt, before_call=self.gate)
+        self.assertIn("preferred caption", path.read_text())
+        self.assertNotIn("previous start", path.read_text())
+        self.assertIn("ASR overlaps captions", path.read_text())
+        self.assertIn("original crossing block", path.read_text())
+        caption_path, complete = self.cache.public_caption_document()
+        self.assertFalse(complete)
+        self.assertIn("preferred caption", caption_path.read_text())
+        self.assertNotIn("original crossing block", caption_path.read_text())
+        untimed = cached_excerpt(self.root, 123, ID, 500, include_timestamps=False)
+        self.assertIn("ASR overlaps captions", untimed)
+        self.assertNotIn("00:00", untimed)
+        self.assertEqual(self.cache.transcript_path().read_bytes(), pure)
+        self.assertIn("preferred caption", cached_excerpt(self.root, 123, ID, 500))
+        self.assertNotIn("preferred caption", cached_excerpt(self.root, 123, ID, 500, prefer_native=False))
+        no_stt.assert_not_awaited()
+
+    async def test_partial_native_mismatched_timeline_never_starts_paid_speech(self):
+        self.cache.save_audio(self.source, 8000)
+        self.cache.save_public_transcript([(0, 1500, "caption prefix")], duration_ms=12000,
+                                          covered_ms=1500, complete=False, track_id="example")
+        transcribe = AsyncMock()
+        with patch.object(audio, "_decode", self.decode), self.assertRaisesRegex(OSError, "timelines disagree"):
+            await audio.ensure_transcript(self.cache, ID, transcribe=transcribe, before_call=self.gate)
+        self.assertEqual(self.ranges, [])
+        transcribe.assert_not_awaited()

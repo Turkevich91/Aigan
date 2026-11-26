@@ -180,8 +180,8 @@ def _silent_chunk(wav, length_ms):
     return silent
 
 
-async def _disk(func, *args):
-    task = asyncio.create_task(asyncio.to_thread(func, *args))
+async def _disk(func, *args, **kwargs):
+    task = asyncio.create_task(asyncio.to_thread(func, *args, **kwargs))
     try:
         return await asyncio.shield(task)
     except asyncio.CancelledError:
@@ -190,13 +190,18 @@ async def _disk(func, *args):
         raise
 
 
-async def ensure_transcript(cache, video_id: str, *, transcribe, before_call) -> Path:
+async def ensure_transcript(cache, video_id: str, *, transcribe, before_call, prefer_native=True) -> Path:
     """Return the complete UTF-8 transcript. The caller holds the chat/video cache lock."""
     if (not isinstance(video_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{11}", video_id)
             or cache.directory.name != video_id):
         raise LongAudioUnavailable("invalid video")
     before_call()
-    ready = await _disk(cache.transcript_path)
+    def complete():
+        if prefer_native and (public := cache.saved_public_transcript()):
+            return public[0]
+        return cache.transcript_path()
+
+    ready = await _disk(complete)
     if ready is not None:
         return ready
     with tempfile.TemporaryDirectory(dir=cache.directory, prefix=".audio-job-") as tmp:
@@ -215,12 +220,10 @@ async def ensure_transcript(cache, video_id: str, *, transcribe, before_call) ->
             source, duration = audio
         if not 0 < duration <= MAX_DURATION_MS or not 0 < source.stat().st_size <= MAX_AUDIO_BYTES:
             raise LongAudioUnavailable("cached audio exceeds limits")
-        history = await _disk(cache.segments)
-        cursor = history[-1][1] if history else 0
         wav = directory / "chunk.wav"
-        while cursor < duration:
+        while window := await _disk(cache.next_speech_range, CHUNK_MS, prefer_native):
             before_call()
-            end = min(cursor + CHUNK_MS, duration)
+            cursor, end = window
             await _decode(source, cursor, end, wav)
             silent = await _disk(_silent_chunk, wav, end-cursor)
             text = ""
@@ -231,9 +234,8 @@ async def ensure_transcript(cache, video_id: str, *, transcribe, before_call) ->
                 if not isinstance(text, str) or not text.strip():
                     raise LongAudioUnavailable("no words recognized in audible chunk")
                 text = text.strip()
-            await _disk(cache.append_segment, cursor, end, text)
-            cursor = end
-    ready = await _disk(cache.transcript_path)
+            await _disk(cache.append_segment, cursor, end, text, prefer_native=prefer_native)
+    ready = await _disk(complete)
     if ready is None:
         raise LongAudioUnavailable("transcript incomplete")
     return ready

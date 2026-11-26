@@ -46,6 +46,11 @@ class VideoCacheTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 cache.append_segment(120500, 140000, "outside media")
 
+    def test_smb_lock_contention_signals_an_existing_job(self):
+        with patch("fcntl.flock", side_effect=PermissionError(13, "denied")), self.assertRaises(CacheBusy):
+            with self.entry():
+                self.fail("conflicting cache entry opened")
+
     def test_immutable_audio_and_integrity(self):
         with self.entry() as cache:
             saved = cache.save_audio(self.audio, 1000)
