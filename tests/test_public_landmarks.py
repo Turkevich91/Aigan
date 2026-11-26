@@ -72,6 +72,15 @@ class PublicLandmarksTests(unittest.IsolatedAsyncioTestCase):
             with patch("public_landmarks.tool_allowed", return_value=False):
                 self.assertNotIn("Example Bay", await refs.read("Test Bridge"))
 
+    async def test_article_without_page_properties_is_ineligible(self):
+        row = page()
+        del row["pageprops"]
+        transport = httpx.MockTransport(lambda _: httpx.Response(200, json=response(row)))
+        async with httpx.AsyncClient(transport=transport) as client:
+            refs = landmarks._References(client)
+            self.assertEqual("No eligible public reference.", await refs.read("Test Bridge"))
+            self.assertFalse(refs.unavailable)
+
     async def test_rate_limit_and_oversized_response_report_source_outage(self):
         for remote in (httpx.Response(429), httpx.Response(200, content=b"x" * 65536),
                        httpx.Response(200, json={"error": "unexpected"})):

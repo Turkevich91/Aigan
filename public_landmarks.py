@@ -94,8 +94,8 @@ def _record(payload: dict) -> LandmarkRecord | None:
     page = pages[0]
     if type(page.get("ns")) is not int or page["ns"] != 0 or "missing" in page or "invalid" in page:
         return None
-    title, properties = page["title"], page["pageprops"]
-    if (not _title(title) or "disambiguation" in properties
+    title, properties = page.get("title"), page.get("pageprops")
+    if (not _title(title) or not isinstance(properties, dict) or "disambiguation" in properties
             or not re.fullmatch(r"Q[1-9]\d*", properties.get("wikibase_item", ""))):
         return None
     intro = page.get("extract")
