@@ -31,6 +31,29 @@ class ToolPolicyTests(unittest.IsolatedAsyncioTestCase):
         revision = self.store.tools.resolve(self.chat).revision
         return self.store.tools.set_enabled(self.chat, key, enabled, expected_revision=revision)
 
+    async def test_sensity_command_uses_live_chat_policy(self):
+        update = SimpleNamespace(message=self.message)
+
+        async def check_policy(_update, _context, *, api_key, is_allowed):
+            self.assertTrue(is_allowed())
+            self.switch("sensity", False)
+            self.switch("sensity", True)
+            self.assertFalse(is_allowed())
+
+        with patch.object(main, "handle_sensity_command", side_effect=check_policy) as handler:
+            await main.sensity_command(update, None)
+            handler.assert_awaited_once()
+
+    async def test_export_and_submission_ignore_edits_and_unadmitted_chats(self):
+        for command, handler_name in (
+            (main.sensity_command, "handle_sensity_command"),
+            (main.maltego_command, "handle_maltego_export"),
+        ):
+            with self.subTest(handler=handler_name), patch.object(main, handler_name) as handler:
+                await command(SimpleNamespace(message=None, edited_message=self.message), None)
+                await command(SimpleNamespace(message=FakeMessage(chat_id=-2002)), None)
+                handler.assert_not_awaited()
+
     def test_persistence_and_separate_settings_lifetimes(self):
         self.assertFalse(self.store.tools.resolve(self.chat).disabled)
         self.store.apply(self.chat, "astra", "low", 900, now=100)

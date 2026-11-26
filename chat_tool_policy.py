@@ -21,6 +21,7 @@ CHAT_TOOLS = (
     ChatTool("randomizer", "Випадковий вибір"),
     ChatTool("tiktok", "Аналіз відео TikTok"),
     ChatTool("public_video", "Аналіз відео за посиланням"),
+    ChatTool("sensity", "Перевірка медіа через Sensity"),
 )
 TOOL_KEYS = frozenset(tool.key for tool in CHAT_TOOLS)
 
