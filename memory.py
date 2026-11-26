@@ -10,7 +10,7 @@ import threading
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Sequence
+from typing import Collection, Sequence
 
 from sticker_cache import StickerCache
 
@@ -224,9 +224,11 @@ class DeliveryReceipt:
 
 
 class MemoryStore:
-    def __init__(self, db_path: Path | str, retention_days: int = 30) -> None:
+    def __init__(self, db_path: Path | str, retention_days: int = 30, *,
+                 full_history_chat_ids: Collection[int] = ()) -> None:
         self.db_path = Path(db_path)
         self.retention_days = max(1, int(retention_days))
+        self.full_history_chat_ids = frozenset(full_history_chat_ids)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self.media_dir = self.db_path.parent / "media"
         self.media_dir.mkdir(parents=True, exist_ok=True)
@@ -1874,22 +1876,23 @@ class MemoryStore:
 
     def cleanup(self) -> int:
         cutoff = datetime.now(timezone.utc) - timedelta(days=self.retention_days)
-        cutoff_text = self._format_datetime(cutoff)
+        excluded = ",".join("?" for _ in self.full_history_chat_ids)
+        retention_filter = f"AND chat_id NOT IN ({excluded})" if excluded else ""
         with self._lock:
             rows = self._conn.execute(
-                """
-                SELECT DISTINCT m.id, m.local_media_path
-                FROM messages AS m
-                LEFT JOIN provenance_outputs AS own_output ON own_output.memory_id = m.id
-                WHERE m.created_at < ?
-                   OR own_output.run_id IN (
-                       SELECT old_output.run_id
-                       FROM provenance_outputs AS old_output
-                       JOIN messages AS old_message ON old_message.id = old_output.memory_id
-                       WHERE old_message.created_at < ?
-                   )
+                f"""
+                WITH expired AS (
+                    SELECT id, chat_id, local_media_path FROM messages
+                    WHERE created_at < ? {retention_filter}
+                )
+                SELECT id, local_media_path FROM expired
+                UNION
+                SELECT sibling.id, sibling.local_media_path FROM expired
+                JOIN provenance_outputs AS old_output ON old_output.memory_id = expired.id
+                JOIN provenance_outputs AS part ON part.run_id = old_output.run_id
+                JOIN messages AS sibling ON sibling.id = part.memory_id AND sibling.chat_id = expired.chat_id
                 """,
-                (cutoff_text, cutoff_text),
+                (self._format_datetime(cutoff), *self.full_history_chat_ids),
             ).fetchall()
             deleted_ids = [int(row["id"]) for row in rows]
             deleted_count = 0
@@ -1905,13 +1908,18 @@ class MemoryStore:
                 self._conn.execute("DELETE FROM message_fts WHERE rowid = ?", (item_id,))
             self._conn.commit()
 
-        for row in rows:
-            path = Path(row["local_media_path"])
-            try:
-                if row["local_media_path"] and path.is_file():
-                    path.unlink()
-            except OSError:
-                pass
+            media_paths = {Path(row["local_media_path"]) for row in rows if row["local_media_path"]}
+            if media_paths:
+                surviving = self._conn.execute(
+                    "SELECT DISTINCT local_media_path FROM messages WHERE local_media_path != ''"
+                )
+                media_paths.difference_update(Path(row[0]) for row in surviving)
+                for path in media_paths:
+                    try:
+                        if path.is_file():
+                            path.unlink()
+                    except OSError:
+                        pass
         return deleted_count
 
     def clear_all(self) -> None:

@@ -418,6 +418,7 @@ class Config:
     memory_followup_context_messages: int
     memory_thread_context_depth: int
     memory_retention_days: int
+    memory_full_history_chat_ids: set[int]
     memory_image_summary_limit: int
     memory_eager_image_summary: bool
     memory_vector_enabled: bool
@@ -953,6 +954,7 @@ class Config:
             memory_followup_context_messages=int(os.getenv("MEMORY_FOLLOWUP_CONTEXT_MESSAGES", "40")),
             memory_thread_context_depth=int(os.getenv("MEMORY_THREAD_CONTEXT_DEPTH", "6")),
             memory_retention_days=int(os.getenv("MEMORY_RETENTION_DAYS", "30")),
+            memory_full_history_chat_ids=_csv_ints(os.getenv("MEMORY_FULL_HISTORY_CHAT_IDS", "")),
             memory_image_summary_limit=int(os.getenv("MEMORY_IMAGE_SUMMARY_LIMIT", "3")),
             memory_eager_image_summary=_env_bool("MEMORY_EAGER_IMAGE_SUMMARY", False),
             memory_vector_enabled=_env_bool("MEMORY_VECTOR_ENABLED", True),
@@ -1144,7 +1146,11 @@ except Exception as exc:
     LOGGER.error("Chat model settings unavailable error=%s", type(exc).__name__)
     CHAT_MODEL_SETTINGS = None
 
-MEMORY = MemoryStore(CONFIG.memory_db_path, CONFIG.memory_retention_days) if CONFIG.memory_enabled else None
+MEMORY = (
+    MemoryStore(CONFIG.memory_db_path, CONFIG.memory_retention_days,
+                full_history_chat_ids=CONFIG.memory_full_history_chat_ids)
+    if CONFIG.memory_enabled else None
+)
 REMINDERS = ReminderStore(CONFIG.memory_db_path) if CONFIG.reminders_enabled else None
 SYSTEM_LOG = (
     SystemLogStore(CONFIG.memory_db_path, CONFIG.system_log_retention_days) if CONFIG.system_log_enabled else None
