@@ -1,0 +1,5 @@
+{
+  "short": "Chat preference for ordinary replies. Give the direct answer in one or two sentences when possible. Keep information necessary for a correct answer. Follow any explicit length or format requested in the current user message. Preserve required facts, evidence and citations.",
+  "normal": "Chat preference for ordinary replies. Give the direct answer and the most useful supporting reason, usually in one short paragraph. Follow any explicit length or format requested in the current user message. Preserve required facts, evidence and citations.",
+  "detailed": "Chat preference for ordinary replies. When explaining a topic, develop the answer in several short paragraphs with the relevant reasoning and a concrete example where useful. Simple social exchanges can still be brief. Follow any explicit length or format requested in the current user message. Preserve required facts, evidence and citations."
+}

@@ -148,6 +148,50 @@ class ChatModelUITests(unittest.IsolatedAsyncioTestCase):
         await self.ui.handle_callback(SimpleNamespace(callback_query=query), self.context)
         return query
 
+    async def test_compact_menu_two_taps_save_and_one_tap_undo_to_inherited(self):
+        self.ui.get_catalog = AsyncMock(side_effect=AssertionError("unexpected catalog request"))
+        inherited = "Довжина відповіді · Як у бота (типово)"
+        await self.command("/settings", user_id=43)
+        self.assertIn(inherited, self.panel.text)
+        self.assertTrue(is_settings_panel_message(self.panel))
+        await self.click(inherited, actor=43)
+        await self.click("Докладно", actor=43)
+        self.assertEqual("detailed", self.store.reply_length(-1001).value)
+        self.assertIsNone(self.store.reply_length(-1002).value)
+        self.assertIn("Довжина відповіді · Докладно", self.panel.text)
+        undo = self.button("Повернути · Довжина відповіді — Як у бота (типово)")
+        await self.click(data=undo, actor=43)
+        self.assertIsNone(self.store.reply_length(-1001).value)
+        duplicate = await self.click(data=undo, actor=43)
+        duplicate.edit_message_text.assert_not_awaited()
+        self.assertIn(inherited, self.panel.text)
+        self.ui.get_catalog.assert_not_awaited()
+
+    async def test_reset_one_field_and_stale_undo_keeps_other_admin_choice(self):
+        self.store.set_reply_length(-1001, "short", role="admin", expected_revision=0)
+        await self.command("/settings")
+        await self.click("Довжина відповіді · Стисло")
+        await self.click("Повернути типову довжину")
+        current = self.store.reply_length(-1001)
+        self.assertIsNone(current.value)
+        undo = self.button("Повернути · Довжина відповіді — Стисло")
+        self.store.set_reply_length(-1001, "normal", role="admin", expected_revision=current.revision)
+        await self.click(data=undo)
+        self.assertEqual("normal", self.store.reply_length(-1001).value)
+        self.assertIn("Довжина відповіді · Звичайно", self.panel.text)
+        self.assertFalse(any("Повернути ·" in b.text for row in self.panel.reply_markup.inline_keyboard for b in row))
+
+    async def test_compact_subpanels_return_to_their_own_parent(self):
+        await self.command("/settings")
+        await self.click("Моделі медіаінструментів")
+        await self.click("Назад")
+        await self.click("Модель")
+        await self.click("Моделі медіаінструментів")
+        await self.click("Назад")
+        self.assertIn("1/3", self.panel.text)
+        await self.click("Назад")
+        self.assertIn("Довжина відповіді", self.panel.text)
+
     async def test_tool_page_toggle_persists_after_model_reset_and_in_one_chat(self):
         from chat_tool_policy import CHAT_TOOLS
         web = next(t for t in CHAT_TOOLS if t.key == "web")
@@ -157,6 +201,7 @@ class ChatModelUITests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("web", self.store.tools.resolve(-1001).disabled)
         self.assertFalse(self.store.tools.resolve(-1002).disabled)
         await self.click("Назад")
+        await self.click("Модель")
         await self.choose()
         await self.click("Застосувати")
         await self.click("Скинути до типових")
@@ -322,6 +367,7 @@ class ChatModelUITests(unittest.IsolatedAsyncioTestCase):
         await self.command("/select_model sol-mid persistent", user_id=77)
         self.assertEqual(sol.model, self.profile().model)
         await self.command("/settings", user_id=77)
+        await self.click("Модель", actor=77)
         await self.click("Astra/low · 15 хв", actor=77)
         await self.click("Застосувати", actor=77)
         self.assertEqual(astra.model, self.profile().model)
@@ -512,12 +558,16 @@ class ChatModelUITests(unittest.IsolatedAsyncioTestCase):
         await self.command("/settings", user_id=77)
         buttons = [b for row in self.panel.reply_markup.inline_keyboard for b in row]
         self.assertNotIn("Інструменти", [b.text for b in buttons])
-        prefix = self.button("gpt-6-astra").rsplit(":", 2)[0]
-        for ending in ("t:-", "v:0", "z:-"):
+        self.assertFalse(any("Довжина відповіді" in b.text for b in buttons))
+        self.assertIn("Довжина відповіді", self.panel.text)
+        prefix = self.button("Модель").rsplit(":", 2)[0]
+        for ending in ("t:-", "v:0", "z:-", "l:-", "j:-", "y:-", "n:0", "r:-"):
             query = await self.click(data=f"{prefix}:{ending}", actor=77)
             self.assertTrue(query.answer.await_args.kwargs["show_alert"])
             query.edit_message_text.assert_not_awaited()
+        await self.click("Модель", actor=77)
         await self.click("Повернути базовий профіль", actor=77)
+        self.assertIsNone(self.store.reply_length(-1001).value)
         self.assertEqual(disabled, self.store.tools.resolve(-1001))
 
     async def test_member_cannot_forge_reasoning_or_duration_or_promote_timed_profile(self):

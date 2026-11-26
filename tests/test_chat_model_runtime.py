@@ -41,6 +41,41 @@ class ChatModelRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.token = main.ACTIVE_CHAT_MODEL.set(None)
         self.addCleanup(main.ACTIVE_CHAT_MODEL.reset, self.token)
 
+    def test_reply_length_snapshot_reaches_cloud_and_local_conversation(self):
+        inherited = "Keep it concise unless the user asks for detail."
+        msg = FakeMessage("Explain seasons")
+        def input_text():
+            return main.build_agent_input(msg, msg.text, memory_context="(none)")
+
+        self.stack.enter_context(patch.object(main, "current_model_route_bucket", return_value="normal"))
+        self.store.set_reply_length(-1001, "detailed", role="admin", expected_revision=0)
+        with main.chat_model_scope(-1001):
+            self.store.set_reply_length(-1001, "short", role="admin", expected_revision=1)
+            for model in (self.config.openai_model, main.SPARK_MODEL):
+                agent = main.make_agent([], model=model)
+                self.assertIn(main.REPLY_LENGTH_GUIDANCE["detailed"], agent.instructions)
+                self.assertEqual(self.config.max_output_tokens, agent.model_settings.max_tokens)
+            self.assertNotIn(inherited, input_text())
+            with main.chat_model_scope(-2002):
+                self.assertIn(inherited, main.build_agent_input(FakeMessage(chat_id=-2002), "Explain",
+                                                               memory_context="(none)"))
+                self.assertNotIn(main.REPLY_LENGTH_GUIDANCE["detailed"], main.make_agent([]).instructions)
+            self.assertIn(main.REPLY_LENGTH_GUIDANCE["detailed"], main.make_agent([]).instructions)
+        with main.chat_model_scope(-1001):
+            self.assertIn(main.REPLY_LENGTH_GUIDANCE["short"], main.make_agent([]).instructions)
+            self.assertEqual("", main.conversational_reply_length("translate_reference"))
+
+    def test_interactive_photo_observes_length_and_background_summary_ignores_it(self):
+        self.store.set_reply_length(-1001, "normal", role="owner", expected_revision=0)
+        with main.chat_model_scope(-1001), patch.object(main, "OpenAI") as client:
+            create = client.return_value.responses.create
+            create.return_value = SimpleNamespace(output_text="Synthetic", status="completed", usage=None)
+            for purpose, route, applies in (("interactive", "vision", True), ("background", "memory_index", False)):
+                main.run_vision_sync("Describe", ["data:image/png;base64,synthetic"], purpose=purpose, route_bucket=route)
+                request = create.call_args.kwargs
+                self.assertEqual(applies, main.REPLY_LENGTH_GUIDANCE["normal"] in request["input"][0]["content"][0]["text"])
+                self.assertEqual(self.config.max_output_tokens, request["max_output_tokens"])
+
     def test_greedy_sampling_only_for_normal_local_conversation(self):
         for route, model, expected in (("normal", main.SPARK_MODEL, 0.0),
                                        ("memory_recall", main.SPARK_MODEL, None),

@@ -115,6 +115,15 @@ def catalog_from_provider_ids(ids: Iterable[str]) -> tuple[ModelCapability, ...]
     ) + (MODEL_CATALOG[-1],)
 
 
+REPLY_LENGTH_LABELS = {"short": "Стисло", "normal": "Звичайно", "detailed": "Докладно"}
+
+
+@dataclass(frozen=True)
+class ReplyLengthSetting:
+    value: str | None = None
+    revision: int = 0
+
+
 @dataclass(frozen=True)
 class AnswerProfile:
     model: str
@@ -122,6 +131,7 @@ class AnswerProfile:
     overridden: bool
     expires_at: float | None
     revision: int
+    reply_length: str | None = None
 
 
 @dataclass(frozen=True)
@@ -340,9 +350,9 @@ class _ChatSettings:
         previous = self.persistent if self.temporary else None
         return (*active, self.expires_at, *(self.owner or (None, None)), *(previous or (None, None)))
 
-    def answer(self, default: tuple[str, str]) -> AnswerProfile:
+    def answer(self, default: tuple[str, str], reply_length: str | None) -> AnswerProfile:
         selected = self.temporary or self.persistent
-        return AnswerProfile(*(selected or default), selected is not None, self.expires_at, self.revision or 0)
+        return AnswerProfile(*(selected or default), selected is not None, self.expires_at, self.revision or 0, reply_length)
 
 
 def _stored_profile(model, effort) -> tuple[str, str] | None:
@@ -367,6 +377,11 @@ class ChatModelSettingsStore:
         self.tools = ChatToolSettingsStore(self._connect)
         with closing(self._connect()) as connection, connection:
             connection.execute("BEGIN IMMEDIATE")
+            connection.execute("""
+                CREATE TABLE IF NOT EXISTS chat_reply_lengths (
+                    chat_id INTEGER PRIMARY KEY, value TEXT, revision INTEGER NOT NULL
+                )
+            """)
             connection.execute("""
                 CREATE TABLE IF NOT EXISTS chat_media_models (
                     chat_id INTEGER NOT NULL, tool TEXT NOT NULL, model TEXT,
@@ -402,6 +417,43 @@ class ChatModelSettingsStore:
 
     def close(self) -> None:
         """Compatibility lifecycle hook; no connection is retained between calls."""
+
+    @staticmethod
+    def _reply_length(connection: sqlite3.Connection, chat_id: int) -> ReplyLengthSetting:
+        row = connection.execute("SELECT value, revision FROM chat_reply_lengths WHERE chat_id=?", (chat_id,)).fetchone()
+        if row is None:
+            return ReplyLengthSetting()
+        setting = ReplyLengthSetting(*row)
+        if setting.value is not None and setting.value not in REPLY_LENGTH_LABELS:
+            raise InvalidModelSelection("invalid_stored_reply_length")
+        if type(setting.revision) is not int or not 0 < setting.revision <= _MAX_INTEGER:
+            raise InvalidModelSelection("invalid_stored_reply_length_revision")
+        return setting
+
+    def reply_length(self, chat_id: int) -> ReplyLengthSetting:
+        with closing(self._connect()) as connection:
+            return self._reply_length(connection, _chat_id(chat_id))
+
+    def set_reply_length(self, chat_id: int, value: str | None, *, role: str,
+                         expected_revision: int) -> ReplyLengthSetting:
+        chat_id = _chat_id(chat_id)
+        if role not in ("admin", "owner") or value not in (None, *REPLY_LENGTH_LABELS):
+            raise InvalidModelSelection("invalid_reply_length_selection")
+        _expected_revision(expected_revision)
+        with closing(self._connect()) as connection, connection:
+            connection.execute("BEGIN IMMEDIATE")
+            current = self._reply_length(connection, chat_id)
+            if current.revision != expected_revision:
+                raise StaleSettingsRevision("reply_length_changed")
+            if current.value == value:
+                return current
+            updated = ReplyLengthSetting(value, _next_revision(current.revision))
+            # Keep the revision when restoring inheritance so older panels cannot write again.
+            connection.execute("""
+                INSERT INTO chat_reply_lengths(chat_id, value, revision) VALUES (?, ?, ?)
+                ON CONFLICT(chat_id) DO UPDATE SET value=excluded.value, revision=excluded.revision
+            """, (chat_id, updated.value, updated.revision))
+            return updated
 
     def media_selection(self, chat_id: int, tool: str) -> tuple[str | None, int]:
         if tool not in MEDIA_TOOL_LABELS:
@@ -494,7 +546,7 @@ class ChatModelSettingsStore:
         with closing(self._connect()) as connection, connection:
             connection.execute("BEGIN IMMEDIATE")
             state = self._state(connection, _chat_id(chat_id), self._now(now))
-            return state.answer((default_model, default_effort))
+            return state.answer((default_model, default_effort), self._reply_length(connection, chat_id).value)
 
     @staticmethod
     def _check_mutation(
@@ -544,7 +596,7 @@ class ChatModelSettingsStore:
             if changed != state:
                 changed = replace(changed, revision=_next_revision(state.revision))
                 self._write(connection, chat_id, changed, timestamp)
-            return changed.answer(requested)
+            return changed.answer(requested, self._reply_length(connection, chat_id).value)
 
     def reset(
         self, chat_id: int, *, expected_revision: int | None = None,
