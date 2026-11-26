@@ -35,7 +35,8 @@ _UNIT = re.compile(r"\b(?:apartment|apt|unit|suite|квартира|кв)\.?\s+(
 
 
 def _address_like(value: str) -> bool:
-    # A bare number can precede or follow a street or apartment in many languages.
+    # Withhold every numeral in titles and clues, including numbered landmarks.
+    # Street and unit formats vary, and an external lookup would disclose the input.
     return (any(c.isnumeric() for c in value) or bool(_UNIT.search(value))
             or bool(_NUMBER_WORD.search(value) and _STREET_WORD.search(value)))
 

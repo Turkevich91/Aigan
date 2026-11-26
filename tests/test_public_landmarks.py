@@ -101,6 +101,7 @@ class PublicLandmarksTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual([], attempted)
             self.assertTrue(landmarks._title("Sydney Opera House"))
             self.assertTrue(landmarks._title("One World Trade Center"))
+            self.assertFalse(landmarks._title("Taipei 101"))
 
     async def test_render_corroborates_only_a_direct_colocated_pair(self):
         requests = []

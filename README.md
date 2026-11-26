@@ -185,7 +185,7 @@ IMAGE_MAX_BYTES=6000000
 
 Explicit direct, replied, and found-image explanations use the interactive model.
 
-For a public landmark, attach one still photo or reply to it and ask `Що це за місце на фото?`, `Где сделано это фото?`, or `What landmark is this?`. `GEOINT` works as a short request. The selected interactive vision model checks visible clues and uses the chat’s web access to read English Wikipedia. Aigan names possible landmarks and links the reference articles it found. To name a nearby city, Aigan checks two distinct landmarks against their articles and compares their coordinates with the city’s own record. Add `in English` for an English answer.
+For a public landmark, attach one still photo or reply to it and ask `Що це за місце на фото?`, `Где сделано это фото?`, or `What landmark is this?`. `GEOINT` works as a short request. The selected interactive vision model checks visible clues and uses the chat’s web access to read English Wikipedia. Aigan names possible landmarks and links the reference articles it found. To name a nearby city, Aigan checks two distinct landmarks against their articles and compares their coordinates with the city’s own record. Add `in English` for an English answer. The address filter also withholds titles and clues containing numerals, including names such as Taipei 101.
 
 Saved photo descriptions use the chat's photo model (default `gpt-6-luna`).
 Requested Telegram clips use the chat's video model (default `gpt-6.1-terra`).
