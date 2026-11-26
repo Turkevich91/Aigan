@@ -22,7 +22,7 @@ import time
 import warnings
 from collections import Counter, defaultdict, deque
 from contextlib import AsyncExitStack, ExitStack, contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from functools import lru_cache, partial
 from itertools import count
@@ -179,6 +179,8 @@ from provenance import (
 from reaction_memory import ReactionAsset, ReactionMemoryStore, ReactionPreference, ReactionSpec
 from reminders import ClaimedReminderFire, Reminder, ReminderStore, parse_datetime as parse_reminder_datetime
 from github_reporting import GitHubReporter
+from maltego_export import handle_maltego_export
+from sensity_command import handle_sensity_command
 from self_analysis import REACTION_HEALTH_CATEGORIES, SelfAnalysisService, has_reaction_complaint_hint, safe_detail_code
 from social_memory import SocialMemoryStore, SocialObservation
 from system_log import SystemEvent, SystemLogStore, sanitize_text
@@ -300,6 +302,7 @@ def optional_int(value: str | None) -> int | None:
 class Config:
     telegram_token: str
     openai_api_key: str
+    sensity_api_key: str = field(repr=False)
     bot_username: str | None
     openai_model: str
     model_reasoning_effort: str
@@ -740,6 +743,7 @@ class Config:
         return cls(
             telegram_token=token,
             openai_api_key=api_key,
+            sensity_api_key=os.getenv("SENSITY_API_KEY", "").strip(),
             bot_username=os.getenv("BOT_USERNAME", "").strip().lstrip("@") or None,
             openai_model=openai_model,
             model_reasoning_effort=model_reasoning_effort,
@@ -13115,9 +13119,30 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     )
     if is_admin_user(message):
         model_help += " У панелі також можна змінити дозволи інструментів."
+    model_help += "\n/sensity — перевірити власне медіа через Sensity. /maltego — експортувати вказані зв’язки у CSV."
     await message.reply_text(
         f"У групі клич мене так: {CONFIG.bot_trigger} питання, /ai, /питай, /п, /а, згадка або reply. Сервісні: /ids (/айді), /context (/контекст), /version (/версія), /stat (/стат), /character (/характер), /interests (/інтереси), /health (/самопочуття), /tools (/тулзи), /tool_health (/стан_тулзів), /logs (/логи), /selfcheck (/самоаналіз), /complaints (/скарги), /memory_search (/память, /памʼять, /пошук_памяті), /proactive_now (/проактив), /remind, /reminders." + model_help
     )
+
+
+async def sensity_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.message
+    if message is None or not allow_command(message, "sensity"):
+        return
+    try:
+        with chat_model_scope(message.chat_id):
+            await handle_sensity_command(
+                update, context, api_key=CONFIG.sensity_api_key,
+                is_allowed=partial(tool_allowed, "sensity", before_call=True),
+            )
+    except ChatModelSettingsUnavailable:
+        await message.reply_text("Не вдалося перевірити дозволи цього чату для Sensity.")
+
+
+async def maltego_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.message
+    if message is not None and allow_command(message, "maltego"):
+        await handle_maltego_export(message)
 
 
 async def ids_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -17268,6 +17293,8 @@ def main() -> None:
     application.add_handler(CommandHandler(["model", "settings", "select_model"], CHAT_MODEL_UI.handle_command))
     application.add_handler(CallbackQueryHandler(CHAT_MODEL_UI.handle_callback, pattern=r"^cm:"))
     application.add_handler(CommandHandler(["start", "help"], help_command))
+    application.add_handler(CommandHandler("sensity", sensity_command, block=False))
+    application.add_handler(CommandHandler("maltego", maltego_command))
     application.add_handler(CommandHandler(["ids"], ids_command))
     application.add_handler(CommandHandler(["ping"], ping_command))
     application.add_handler(CommandHandler(["version"], version_command))

@@ -85,7 +85,7 @@ YouTube uses public captions first. The audio menu offers file transcription mod
 **Spark / Qwen · локально** appears under **Фото для пам’яті**, **Відео Telegram** and **Відео TikTok** after a background check reads a random number from a synthetic image. Use **Оновити** if the check was still running when the panel opened. Selecting the local model for photos sends one bounded still image with a fixed description request. For an available clip it answers the current question from up to four numbered samples in one image. Speech recognition, when requested, uses the configured cloud transcription route. The choices apply independently to future work in the current chat. **Типова модель інструмента** resets one choice.
 
 Open **Інструменти** to allow or block web search and page reading, YouTube
-transcripts, sending public internet images, random draws or TikTok video inspection independently.
+transcripts, sending public internet images, random draws, video inspection or Sensity media checks independently.
 Tapping a tool saves its new permission immediately. A check means the chat
 permits it; deployment configuration and the selected model can still restrict
 it. The YouTube control reads transcripts, not video frames.
