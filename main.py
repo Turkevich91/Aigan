@@ -138,7 +138,8 @@ from media_acquisition import (
 )
 from media_frames import FfmpegMediaFrameAdapter, MediaFrameAdapter, MediaFrameLimits, NullMediaFrameAdapter, SPARSE_FRAME_MAX_SECONDS
 from telegram_video import (
-    VIDEO_ANSWER_INSTRUCTIONS, VIDEO_INTENT_FORMAT, VIDEO_INTENT_INSTRUCTIONS, VideoUnavailable, inspect_clip,
+    VIDEO_ANSWER_INSTRUCTIONS, VIDEO_INTENT_FORMAT, VIDEO_INTENT_INSTRUCTIONS, TIKTOK_INTENT_INSTRUCTIONS,
+    TIKTOK_SPEECH_SCOPE_INSTRUCTIONS, VideoUnavailable, inspect_clip,
     inspect_local_clip, TELEGRAM_VIDEO_MAX_BYTES, SPEECH_SCOPE_INSTRUCTIONS, SPEECH_SCOPE_FORMAT, confirmed_speech_scope,
 )
 from tiktok_acquisition import TIKTOK_MAX_BYTES, TikTokUnavailable, fetch_tiktok_video, normalize_tiktok_video_url
@@ -15010,10 +15011,12 @@ async def respond_to_video_request(message, prompt, attachment, settings) -> boo
 
             question = URL_TOKEN_RE.sub("[відео]", prompt) if linked else prompt
             async def speech_scope():
-                raw = await respond(SPEECH_SCOPE_INSTRUCTIONS, question, schema=SPEECH_SCOPE_FORMAT)
+                instructions = TIKTOK_SPEECH_SCOPE_INSTRUCTIONS if tiktok else SPEECH_SCOPE_INSTRUCTIONS
+                raw = await respond(instructions, question, schema=SPEECH_SCOPE_FORMAT)
                 return confirmed_speech_scope(raw, question)
 
-            decision = json.loads(await respond(VIDEO_INTENT_INSTRUCTIONS, question, schema=VIDEO_INTENT_FORMAT["format"])).get("inspect")
+            instructions = TIKTOK_INTENT_INSTRUCTIONS if tiktok else VIDEO_INTENT_INSTRUCTIONS
+            decision = json.loads(await respond(instructions, question, schema=VIDEO_INTENT_FORMAT["format"])).get("inspect")
             if linked:
                 attachment.check_allowed()
             if decision == "unrelated":
