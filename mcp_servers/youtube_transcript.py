@@ -12,7 +12,8 @@ if __package__ in {None, ""}:
 from mcp.server.fastmcp import FastMCP
 from model_telemetry import ModelTelemetryStore, StageHandle
 from provenance import canonical_source
-from youtube_transcript_api import NoTranscriptFound, TranscriptsDisabled, YouTubeTranscriptApi
+from youtube_caption_tracks import lookup_original_track
+from youtube_transcript_api import NoTranscriptFound, TranscriptsDisabled
 
 
 mcp = FastMCP("aigan-youtube-transcript")
@@ -128,16 +129,11 @@ def _format_entries(entries: list[dict], include_timestamps: bool, max_chars: in
 
 
 def _fetch_caption_transcript(video_id: str, languages: list[str]) -> list[dict]:
-    tracks = YouTubeTranscriptApi().list(video_id)
-    # A manual en-US track is also usable when the caller requests en.
-    regional_codes = [
-        track.language_code
-        for lang in languages
-        for track in tracks
-        if track.language_code.casefold().startswith(lang.casefold() + "-")
-    ]
-    track = tracks.find_transcript(languages + regional_codes)
-    return track.fetch().to_raw_data()
+    track = lookup_original_track(video_id, languages)
+    if track is None:
+        return []
+    return [{"text": text, "start": begin / 1000, "duration": (end - begin) / 1000}
+            for begin, end, text in track.cues]
 
 
 def _audio_fallback_enabled() -> bool:
@@ -205,30 +201,34 @@ def _transcribe_audio_fallback(video_url: str, max_chars: int) -> str:
         return text[:max_chars]
 
 
-@mcp.tool()
-def get_youtube_transcript(
-    video: str,
-    languages: str = "uk,en,ru",
-    include_timestamps: bool = True,
-    max_chars: int = 16000,
-) -> str:
-    """Get captions/transcript for YouTube; prefer Ukrainian/English captions, with Russian only as source material."""
+def _library_result(video_id, max_chars, include_timestamps, *, allow_asr=False,
+                    official_text=None, official_end_ms=None):
+    library = os.getenv("AIGAN_MEDIA_LIBRARY")
+    chat = os.getenv("AIGAN_MEDIA_CHAT")
+    if not library or not chat:
+        return None
+    from youtube_media_cache import cached_transcript_read
+    try:
+        record = cached_transcript_read(Path(library), int(chat), video_id, max_chars, include_timestamps,
+                                        official_text=official_text, official_end_ms=official_end_ms)
+    except (OSError, ValueError):
+        return None
+    if not record:
+        return None
+    source, text = record
+    if source == "asr" and not allow_asr:
+        return None
+    descriptions = {"native": "Saved official YouTube captions", "asr": "Saved audio transcription",
+                    "mixed": "Official YouTube captions supplemented by saved audio transcription"}
+    return f"{descriptions[source]} for {video_id}:\n\n{text}"
+
+
+def _transcript_result(video, languages, include_timestamps, max_chars):
     max_chars = max(1000, min(int(max_chars), 40000))
     try:
         video_id = _video_id(video)
     except ValueError as exc:
         return str(exc)
-
-    library = os.getenv("AIGAN_MEDIA_LIBRARY")
-    chat = os.getenv("AIGAN_MEDIA_CHAT")
-    if library and chat:
-        from youtube_media_cache import cached_excerpt
-        try:
-            cached = cached_excerpt(Path(library), int(chat), video_id, max_chars, include_timestamps)
-        except (OSError, ValueError):
-            cached = None
-        if cached:
-            return f"Saved YouTube audio transcription for {video_id}:\n\n{cached}"
 
     lang_list = [item.strip() for item in languages.split(",") if item.strip()]
     if not lang_list:
@@ -238,16 +238,32 @@ def get_youtube_transcript(
         entries = _fetch_caption_transcript(video_id, lang_list)
         transcript = _format_entries(entries, include_timestamps, max_chars)
         if transcript:
+            # Reuse a saved supplement only for the actual official track just fetched.
+            # A changed track or a newly complete native transcript takes precedence.
+            words = " ".join(str(item.get("text") or "") for item in entries)
+            last = max((float(item["start"]) + float(item.get("duration") or 0)
+                        for item in entries if item.get("text") and "start" in item), default=0)
+            saved = _library_result(video_id, max_chars, include_timestamps, official_text=words,
+                                    official_end_ms=round(last * 1000))
+            if saved:
+                return saved
             return (
                 f"YouTube video id: {video_id}\n"
-                "Transcript/captions. If the transcript is Russian, summarize or explain it in Ukrainian, not Russian:\n\n"
+                "Original YouTube captions:\n\n"
                 f"{transcript}"
             )
+        if entries:
+            return f"Caption lookup returned no usable text for {video_id}."
     except (TranscriptsDisabled, NoTranscriptFound):
         pass
     except Exception as exc:
-        return f"Caption lookup failed for {video_id}: {type(exc).__name__}."
+        saved = _library_result(video_id, max_chars, include_timestamps)
+        return saved or f"Caption lookup failed for {video_id}: {type(exc).__name__}."
 
+    # A confirmed missing track can use prior recognition before starting a paid call.
+    saved = _library_result(video_id, max_chars, include_timestamps, allow_asr=True)
+    if saved:
+        return saved
     if not _audio_fallback_enabled():
         return f"No caption transcript available for {video_id}. Audio fallback is disabled."
 
@@ -256,13 +272,26 @@ def get_youtube_transcript(
         transcript = _transcribe_audio_fallback(video_url, max_chars)
         return (
             f"YouTube video id: {video_id}\n"
-            "Audio transcription. If the transcription is Russian, summarize or explain it in Ukrainian, not Russian:\n\n"
+            "Audio transcription:\n\n"
             f"{transcript}"
         )
     except AudioFallbackUnavailable as exc:
         return f"Audio transcription unavailable for {video_id}: {exc}"
     except Exception as exc:
         return f"Audio transcription failed for {video_id}: {type(exc).__name__}."
+
+
+@mcp.tool()
+def get_youtube_transcript(
+    video: str,
+    languages: str = "uk,en,ru",
+    include_timestamps: bool = True,
+    max_chars: int = 16000,
+) -> str:
+    """Read captions or a transcript for a YouTube video."""
+    guidance = (Path(__file__).resolve().parents[1] / "prompts" / "youtube_transcript.md").read_text(encoding="utf-8")
+    result = _transcript_result(video, languages, include_timestamps, max_chars)
+    return f"{guidance.strip()}\n\n--- YouTube tool result ---\n{result}"
 
 
 if __name__ == "__main__":

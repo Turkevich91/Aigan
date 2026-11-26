@@ -4,13 +4,9 @@ from __future__ import annotations
 from pathlib import Path
 
 from youtube_long_audio import _disk, ensure_transcript
+from youtube_caption_source import fetch_caption_evidence
 from youtube_media_cache import CacheBusy, open_video
 from youtube_timestamp_frames import youtube_frames
-
-
-async def fetch_caption_evidence(video_id, *, before_call):
-    from youtube_caption_source import fetch_caption_evidence as probe
-    return await probe(video_id, before_call=before_call)
 
 
 async def _transcript(cache, video_id, source, *, check_allowed, check_speech, transcribe, send_text, send_transcript):
@@ -31,10 +27,18 @@ async def _transcript(cache, video_id, source, *, check_allowed, check_speech, t
         check_allowed()
         evidence = await fetch_caption_evidence(video_id, before_call=check_allowed)
         check_allowed()
-        if evidence.status in {"complete", "partial"}:
+        if evidence.status in {"complete", "partial", "partial_unverified"}:
             await _disk(cache.save_public_transcript, evidence.cues, duration_ms=evidence.duration_ms,
                         covered_ms=evidence.covered_ms, complete=evidence.status == "complete", track_id=evidence.track_id)
             native = await _disk(cache.public_caption_document)
+            if evidence.status == "partial_unverified":
+                if ready and source == "native_first":
+                    await document(*ready)
+                else:
+                    check_allowed()
+                    await send_text("Отримав частину субтитрів. Інші доріжки YouTube зараз недоступні для перевірки.")
+                    await document(native[0], "native" if native[1] else "partial")
+                return
         elif evidence.status != "absent":
             if ready and source == "native_first":
                 await document(*ready)

@@ -1,3 +1,4 @@
+import asyncio
 import contextlib
 import io
 import os
@@ -9,6 +10,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import youtube_caption_tracks
 from mcp_servers import youtube_transcript
 from model_telemetry import ModelTelemetryStore
 
@@ -85,18 +87,16 @@ class YoutubeTranscriptTelemetryTests(unittest.TestCase):
             contextlib.redirect_stdout(io.StringIO()) as out,
         ):
             result = youtube_transcript.get_youtube_transcript("abcdefghijk")
-        self.assertEqual("Audio transcription failed for abcdefghijk: RuntimeError.", result)
+        self.assertTrue(result.endswith("Audio transcription failed for abcdefghijk: RuntimeError."))
         self.assertEqual("", out.getvalue())
         self.assertEqual("", err.getvalue())
 
     def test_regional_captions_need_one_listing_and_no_audio(self):
-        tracks = MagicMock()
-        regional = SimpleNamespace(language_code="en-US")
-        tracks.__iter__.side_effect = lambda: iter([regional])
-        track = tracks.find_transcript.return_value
-        track.fetch.return_value.to_raw_data.return_value = [{"text": "caption", "start": 2}]
+        track = MagicMock(language_code="en-US", is_generated=False)
+        track.fetch.return_value.to_raw_data.return_value = [{"text": "caption", "start": 2, "duration": 3}]
+        tracks = [track]
         with (
-            patch.object(youtube_transcript, "YouTubeTranscriptApi") as api,
+            patch.object(youtube_caption_tracks, "YouTubeTranscriptApi") as api,
             patch.object(youtube_transcript, "_transcribe_audio_fallback") as audio,
             patch.dict(os.environ, {"YOUTUBE_AUDIO_FALLBACK": "true"}),
         ):
@@ -104,7 +104,7 @@ class YoutubeTranscriptTelemetryTests(unittest.TestCase):
             result = youtube_transcript.get_youtube_transcript("abcdefghijk", languages="en")
         self.assertIn("[00:02] caption", result)
         api.return_value.list.assert_called_once_with("abcdefghijk")
-        tracks.find_transcript.assert_called_once_with(["en", "en-US"])
+        track.fetch.assert_called_once_with()
         audio.assert_not_called()
 
     def test_only_missing_captions_allow_a_canonical_audio_request(self):
@@ -126,6 +126,177 @@ class YoutubeTranscriptTelemetryTests(unittest.TestCase):
                 result = youtube_transcript.get_youtube_transcript("abcdefghijk")
                 self.assertIn("fallback is disabled", result)
             self.assertEqual(1, audio.call_count)
+
+    def test_other_caption_language_precedes_paid_recognition(self):
+        alternative = MagicMock(language_code="pl", is_generated=True)
+        alternative.fetch.return_value.to_raw_data.return_value = [{"start": 0, "duration": 4, "text": "source"}]
+        tracks = [alternative]
+        with (
+            patch.object(youtube_caption_tracks, "YouTubeTranscriptApi") as api,
+            patch.object(youtube_transcript, "_transcribe_audio_fallback") as audio,
+        ):
+            api.return_value.list.return_value = tracks
+            result = youtube_transcript.get_youtube_transcript("abcdefghijk", languages="uk")
+        self.assertIn("source", result)
+        alternative.translate.assert_not_called()
+        audio.assert_not_called()
+
+    def test_exhausts_listed_originals_and_never_treats_unreadable_tracks_as_absent(self):
+        from youtube_transcript_api._transcripts import Transcript, TranscriptList
+        http = MagicMock()
+        def track(code, generated):
+            return Transcript(http, "abcdefghijk", f"https://example.invalid/captions/{code}", code, code,
+                              generated, [])
+        spanish, polish, italian = track("es", False), track("pl", False), track("it", True)
+        tracks = TranscriptList("abcdefghijk", {"es": spanish, "pl": polish}, {"it": italian}, [])
+        cue = {"start": 0, "duration": 3, "text": "testo originale"}
+        with (
+            patch.object(youtube_caption_tracks, "YouTubeTranscriptApi") as api,
+            patch.object(spanish, "fetch", side_effect=ConnectionError("private")),
+            patch.object(polish, "fetch") as empty,
+            patch.object(italian, "fetch") as readable,
+            patch.object(Transcript, "translate") as translate,
+            patch.object(youtube_transcript, "_transcribe_audio_fallback") as audio,
+            patch.dict(os.environ, {"YOUTUBE_AUDIO_FALLBACK": "true"}),
+        ):
+            api.return_value.list.return_value = tracks
+            empty.return_value.to_raw_data.return_value = []
+            readable.return_value.to_raw_data.return_value = [cue]
+            result = youtube_transcript.get_youtube_transcript("abcdefghijk", languages="uk,en,ru")
+            self.assertIn("testo originale", result)
+            self.assertIn("--- YouTube tool result ---", result)
+            api.return_value.list.assert_called_once()
+            readable.return_value.to_raw_data.return_value = [{"text": " "}]
+            result = youtube_transcript.get_youtube_transcript("abcdefghijk", languages="uk,en,ru")
+            self.assertIn("Caption lookup failed", result)
+            self.assertNotIn("private", result)
+            translate.assert_not_called()
+            audio.assert_not_called()
+
+    @unittest.skipUnless(os.name == "posix", "media cache uses POSIX locks")
+    def test_live_captions_first_and_reuse_only_matching_completed_supplement(self):
+        from youtube_media_cache import open_video
+        video_id = "abcdefghijk"
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        (root / ".aigan-media-cache").touch()
+        fake_audio = root / "fixture"
+        fake_audio.write_bytes(b"source")
+        with open_video(root, 1234, video_id) as cache:
+            cache.save_audio(fake_audio, 90000)
+            cache.append_segment(0, 30000, "previous own start")
+            cache.append_segment(30000, 90000, "previous own ending")
+        with (
+            patch.dict(os.environ, {"AIGAN_MEDIA_LIBRARY": str(root), "AIGAN_MEDIA_CHAT": "1234",
+                                    "YOUTUBE_AUDIO_FALLBACK": "true"}),
+            patch.object(youtube_transcript, "_fetch_caption_transcript") as captions,
+            patch.object(youtube_transcript, "_transcribe_audio_fallback") as audio,
+        ):
+            captions.side_effect = ConnectionError("private detail")
+            result = youtube_transcript.get_youtube_transcript(video_id)
+            self.assertIn("Caption lookup failed", result)
+            self.assertNotIn("previous own", result)
+            self.assertNotIn("private detail", result)
+            captions.side_effect = youtube_transcript.TranscriptsDisabled(video_id)
+            result = youtube_transcript.get_youtube_transcript(video_id)
+            self.assertIn("Saved audio transcription", result)
+            self.assertIn("previous own start", result)
+            captions.side_effect = None
+            track = [{"start": 0, "duration": 30, "text": "native prefix"}]
+            captions.return_value = track
+            result = youtube_transcript.get_youtube_transcript(video_id)
+            self.assertIn("native prefix", result)
+            self.assertNotIn("previous own", result)
+            with open_video(root, 1234, video_id) as cache:
+                cache.save_public_transcript([(0, 30000, "native prefix")], duration_ms=90000,
+                                            covered_ms=30000, complete=False, track_id="sample")
+            result = youtube_transcript.get_youtube_transcript(video_id)
+            self.assertIn("Official YouTube captions supplemented by saved audio transcription", result)
+            self.assertIn("previous own ending", result)
+            self.assertNotIn("previous own start", result)
+            for replacement in ([{"start": 0, "duration": 90, "text": "native prefix"}],
+                                [*track, {"start": 30, "duration": 60, "text": "new official ending"}]):
+                captions.return_value = replacement
+                result = youtube_transcript.get_youtube_transcript(video_id)
+                self.assertNotIn("previous own", result)
+                self.assertIn(replacement[-1]["text"], result)
+            captions.side_effect = ConnectionError("private")
+            self.assertIn("supplemented by saved", youtube_transcript.get_youtube_transcript(video_id))
+            captions.side_effect = None
+            captions.return_value = []
+            with patch.dict(os.environ, {"AIGAN_MEDIA_CHAT": "4321", "YOUTUBE_AUDIO_FALLBACK": "false"}):
+                result = youtube_transcript.get_youtube_transcript(video_id)
+                self.assertNotIn("previous own", result)
+                self.assertIn("fallback is disabled", result)
+            audio.assert_not_called()
+
+    def test_fuller_original_track_can_beat_a_truncated_preferred_language(self):
+        preferred = MagicMock(language_code="uk", is_generated=False)
+        preferred.fetch.return_value.to_raw_data.return_value = [
+            {"start": 0, "duration": 5, "text": "pref one"}, {"start": 9, "duration": 2, "text": "pref end"}]
+        other = MagicMock(language_code="de", is_generated=False)
+        other.fetch.return_value.to_raw_data.return_value = [
+            {"start": 0, "duration": 4, "text": "other one"}, {"start": 120, "duration": 2, "text": "other end"}]
+        with patch.object(youtube_caption_tracks, "YouTubeTranscriptApi") as api:
+            api.return_value.list.return_value = [other, preferred]
+            result = youtube_transcript.get_youtube_transcript("abcdefghijk", languages="uk,en")
+            self.assertIn("other end", result)
+            self.assertNotIn("pref end", result)
+            other.fetch.return_value.to_raw_data.return_value[-1]["start"] = 10
+            result = youtube_transcript.get_youtube_transcript("abcdefghijk", languages="uk,en")
+            self.assertIn("pref end", result)
+            self.assertNotIn("other end", result)
+        preferred.translate.assert_not_called()
+        other.translate.assert_not_called()
+
+    def test_complete_preferred_track_stops_after_the_existing_player_response(self):
+        video_id = "abcdefghijk"
+        preferred = MagicMock(language_code="uk", is_generated=False)
+        preferred.fetch.return_value.to_raw_data.return_value = [
+            {"start": 0, "duration": 2, "text": "first"}, {"start": 115, "duration": 4, "text": "ending"}]
+        other = MagicMock(language_code="es", is_generated=True)
+        def listed(*, http_client):
+            def list_tracks(requested_id):
+                self.assertEqual(requested_id, video_id)
+                player = MagicMock(status_code=200, url="https://www.youtube.com/youtubei/v1/player")
+                player.json.return_value = {"videoDetails": {"videoId": video_id, "lengthSeconds": "120"}}
+                http_client.hooks["response"][0](player)
+                return [other, preferred]
+            return SimpleNamespace(list=list_tracks)
+        with patch.object(youtube_caption_tracks, "YouTubeTranscriptApi", side_effect=listed) as api:
+            record = youtube_caption_tracks.lookup_original_track(video_id)
+        self.assertEqual((record.language_code, record.duration_ms), ("uk", 120000))
+        self.assertIn("ending", [row[2] for row in record.cues])
+        api.assert_called_once()
+        preferred.fetch.assert_called_once()
+        other.fetch.assert_not_called()
+
+    def test_player_duration_of_another_video_or_endpoint_is_ignored(self):
+        with youtube_caption_tracks._CaptionSession("abcdefghijk") as session:
+            reply = MagicMock(status_code=200, url="https://www.youtube.com/youtubei/v1/player")
+            reply.json.return_value = {"videoDetails": {"videoId": "ABCDEFGHIJK", "lengthSeconds": "15"}}
+            session._capture_duration(reply)
+            self.assertIsNone(session.duration_ms)
+            reply.url = "https://www.youtube.com/api/timedtext"
+            reply.json.return_value["videoDetails"]["videoId"] = "abcdefghijk"
+            session._capture_duration(reply)
+            self.assertIsNone(session.duration_ms)
+
+    def test_skill_guidance_is_confined_to_the_actual_tool_result(self):
+        from tests.support import configure_test_environment
+        configure_test_environment()
+        import main
+        hint = (Path(youtube_transcript.__file__).resolve().parents[1] /
+                "prompts" / "youtube_transcript.md").read_text(encoding="utf-8").strip()
+        self.assertTrue(hint)
+        schema = next(tool for tool in asyncio.run(youtube_transcript.mcp.list_tools())
+                      if tool.name == "get_youtube_transcript")
+        self.assertNotIn(hint, schema.model_dump_json())
+        self.assertNotIn(hint, main.SYSTEM_PROMPT)
+        with patch.object(youtube_transcript, "_fetch_caption_transcript", return_value=[]), \
+             patch.dict(os.environ, {"YOUTUBE_AUDIO_FALLBACK":"false"}):
+            result = youtube_transcript.get_youtube_transcript("abcdefghijk")
+        self.assertTrue(result.startswith(hint + "\n\n--- YouTube tool result ---\n"))
+        self.assertIn("No caption transcript", result)
 
     def test_unavailable_audio_is_not_reported_as_transcribed(self):
         for duration in (None, 0, 61):

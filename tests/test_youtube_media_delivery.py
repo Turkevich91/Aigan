@@ -133,3 +133,11 @@ class YoutubeDeliveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("кадрів", self.text.await_args.args[0])
         self.describe.assert_not_awaited()
         self.speech.assert_not_awaited()
+
+    async def test_unread_alternate_captions_do_not_trigger_paid_speech(self):
+        self.captions(complete=False)
+        self.probe.return_value.status = "partial_unverified"
+        with patch("youtube_media_delivery.ensure_transcript", new_callable=AsyncMock) as ensure:
+            await self.run_job()
+            self.assertEqual(self.doc.await_args.args[1], "partial")
+            ensure.assert_not_awaited()
