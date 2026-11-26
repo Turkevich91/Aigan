@@ -43,7 +43,7 @@ from agents.models.openai_chatcompletions import OpenAIChatCompletionsModel
 from agents.models.openai_responses import OpenAIResponsesModel
 from openai import AsyncOpenAI, OpenAI
 from PIL import Image, UnidentifiedImageError
-from telegram import Bot, InputMediaPhoto, Message, MessageEntity, Update
+from telegram import Bot, InputFile, InputMediaPhoto, Message, MessageEntity, Update
 from telegram.constants import ChatAction, ChatType, ParseMode
 from telegram.error import RetryAfter, Forbidden, BadRequest, NetworkError
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, MessageReactionHandler, filters
@@ -14910,15 +14910,18 @@ async def respond_to_youtube_media(message, prompt, request, policy, job_key, or
             raise PermissionError("video_disabled")
 
     async def send_transcript(path, source):
-        text = await asyncio.to_thread(path.read_bytes)
-        check_allowed()
-        await message.reply_document(document=io.BytesIO(text), filename=f"youtube-{request.video_id}.txt",
-                                     caption={
-                                         "native": "Повні субтитри YouTube з часовими мітками.",
-                                         "partial": "Доступна частина субтитрів YouTube з часовими мітками.",
-                                         "mixed": "Субтитри YouTube, доповнені розпізнаванням решти аудіо.",
-                                         "own_audio": "Власна повна розшифровка Айгана з аудіодоріжки.",
-                                     }[source] + f"\nhttps://www.youtube.com/watch?v={request.video_id}")
+        labels = {
+            "native": "Повні субтитри YouTube з часовими мітками.",
+            "partial": "Доступна частина субтитрів YouTube з часовими мітками.",
+            "mixed": "Субтитри YouTube, доповнені розпізнаванням решти аудіо.",
+            "own_audio": "Власна повна розшифровка Айгана з аудіодоріжки.",
+        }
+        filename = f"youtube-{request.video_id}.txt"
+        with await asyncio.to_thread(path.open, "rb") as stream:
+            check_allowed()
+            document = InputFile(stream, filename=filename, read_file_handle=False)
+            await message.reply_document(document=document, filename=filename,
+                caption=f"{labels[source]}\nhttps://www.youtube.com/watch?v={request.video_id}")
 
     try:
         check_allowed()

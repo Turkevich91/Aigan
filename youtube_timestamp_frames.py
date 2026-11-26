@@ -202,7 +202,7 @@ async def _range(url, first, last, expected_size, before_call):
         before_call()
     async with pinned_get(url, byte_range=(first, last)) as response:
         span = re.fullmatch(r"bytes ([0-9]{1,12})-([0-9]{1,12})/([0-9]{1,12})", response.headers.get("content-range", ""))
-        if response.status_code != 206 or not span or response.headers.get("content-encoding", "identity") != "identity":
+        if response.status_code != 206 or not span or response.headers.get("content-encoding", "identity").strip().lower() != "identity":
             raise _SectionUnavailable()
         start, end, total = map(int, span.groups())
         if (not total or start != first or end != min(last, total - 1) or

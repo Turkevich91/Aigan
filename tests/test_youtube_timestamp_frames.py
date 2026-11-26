@@ -118,6 +118,15 @@ class PreviewTests(unittest.IsolatedAsyncioTestCase):
 
 
 class TransportTests(unittest.IsolatedAsyncioTestCase):
+    async def test_range_accepts_mixed_case_identity_encoding(self):
+        @asynccontextmanager
+        async def get(url, *, byte_range):
+            self.assertEqual(byte_range, (0, 2))
+            yield httpx.Response(206, headers={"Content-Range": "bytes 0-2/8", "Content-Encoding": "Identity"},
+                                 stream=httpx.ByteStream(b"abc"))
+        with patch.object(module, "pinned_get", get):
+            self.assertEqual(await module._range(TEMPLATE, 0, 2, 8, None), (b"abc", 8))
+
     async def test_redirects_and_large_bodies_are_rejected_without_second_request(self):
         for code, headers in ((302, {"location": "https://example.invalid/"}),
                               (200, {"content-type": "image/jpeg", "content-length": "3000000"})):
