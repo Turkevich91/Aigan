@@ -19,7 +19,7 @@ from telegram.error import TelegramError
 
 from chat_model_settings import (
     MEDIA_MODEL_DEFAULTS, MEDIA_TOOL_LABELS, MINI_VISION_MODEL, TRANSCRIPTION_MODELS, media_model_allowed,
-    MODEL_CATALOG,
+    MODEL_CATALOG, REPLY_LENGTH_LABELS, ReplyLengthSetting,
     SPARK_MODEL,
     ChatModelSettingsStore,
     InvalidModelSelection,
@@ -33,6 +33,8 @@ from chat_model_settings import (
 from chat_tool_policy import CHAT_TOOLS, ChatToolPolicy
 
 PANEL_TITLE = "Налаштування моделі · цей чат"
+HUB_TITLE = "Налаштування чату"
+INHERITED_REPLY_LENGTH = "Як у бота (типово)"
 CALLBACK_PREFIX = "cm:"
 CONTROL_NAMES = ("model", "settings", "select_model")
 _CONTROL_RE = re.compile(r"^/(model|settings|select_model)(?:@([A-Za-z0-9_]+))?(?:\s+|$)", re.IGNORECASE)
@@ -88,7 +90,7 @@ def is_settings_panel_message(message: Any) -> bool:
     user = getattr(message, "from_user", None)
     if user is None or not getattr(user, "is_bot", False):
         return False
-    if str(getattr(message, "text", "") or "").startswith(PANEL_TITLE):
+    if str(getattr(message, "text", "") or "").startswith((PANEL_TITLE, HUB_TITLE)):
         return True
     markup = getattr(message, "reply_markup", None)
     return any(
@@ -114,6 +116,11 @@ class _Panel:
     catalog: tuple[ModelCapability, ...]
     duration_seconds: int | None = 900
     stage: str = "model"
+    has_hub: bool = False
+    chat_title: str = ""
+    submenu_parent: str = "model"
+    reply_length: ReplyLengthSetting = ReplyLengthSetting()
+    undo_length: ReplyLengthSetting | None = None
     tool_policy: ChatToolPolicy | None = None
     media_tool: str = ""
     media_revision: int = 0
@@ -235,6 +242,15 @@ class ChatModelUI:
         return f"{seconds // 60} хв" if seconds % 60 == 0 else f"{seconds} с"
 
     def _text(self, panel: _Panel, profile: Any, *, notice: str = "") -> str:
+        if panel.stage in {"hub", "length"}:
+            label = REPLY_LENGTH_LABELS.get(panel.reply_length.value, INHERITED_REPLY_LENGTH)
+            lines = [f"<b>{HUB_TITLE} · {html.escape(panel.chat_title)}</b>",
+                     f"Довжина відповіді · {label}"]
+            if panel.stage == "length":
+                lines.append("Обери, наскільки докладно Айган відповідатиме в цьому чаті.")
+            if notice:
+                lines.append(html.escape(notice))
+            return "\n".join(lines)
         if panel.stage in {"media", "media_models"}:
             lines = [f"<b>{PANEL_TITLE}</b>", "<b>Моделі медіаінструментів</b>"]
             if panel.stage == "media":
@@ -324,6 +340,27 @@ class ChatModelUI:
         def button(label: str, action: str, index: int | None = None):
             return InlineKeyboardButton(label, callback_data=self._data(panel, action, index))
         rows = []
+        if panel.stage in {"hub", "length"}:
+            if panel.stage == "hub":
+                if panel.role != "member":
+                    label = REPLY_LENGTH_LABELS.get(panel.reply_length.value, INHERITED_REPLY_LENGTH)
+                    rows.append([button(f"Довжина відповіді · {label}", "l")])
+                links = [button("Модель", "g")]
+                if panel.role != "member":
+                    links.append(button("Інструменти", "t"))
+                rows.extend([links, [button("Моделі медіаінструментів", "h")]])
+                if panel.role != "member" and panel.undo_length is not None:
+                    old_label = REPLY_LENGTH_LABELS.get(panel.undo_length.value, INHERITED_REPLY_LENGTH)
+                    rows.append([button(f"Повернути · Довжина відповіді — {old_label}", "j")])
+            else:
+                for index, (value, label) in enumerate(REPLY_LENGTH_LABELS.items()):
+                    rows.append([button(("✓ " if value == panel.reply_length.value else "") + label, "n", index)])
+                rows.append([button("Повернути типову довжину", "y")])
+            footer = [button("Оновити", "f"), button("Закрити", "x")]
+            if panel.stage == "length":
+                footer.insert(0, button("Назад", "b"))
+            rows.append(footer)
+            return InlineKeyboardMarkup(rows)
         if panel.stage in {"media", "media_models"}:
             if panel.stage == "media":
                 rows = [[button(label, "i", index)] for index, label in enumerate(MEDIA_TOOL_LABELS.values())]
@@ -368,13 +405,37 @@ class ChatModelUI:
             rows.append([button("Інструменти", "t")])
         if panel.stage == "model":
             rows.append([button("Моделі медіаінструментів", "h")])
-        if panel.stage != "model":
+        if panel.stage != "model" or panel.has_hub:
             rows.append([button("Назад", "b")])
         rows.extend([
             [button("Скинути до типових" if panel.role == "owner" else "Повернути базовий профіль", "r")],
             [button("Оновити", "f"), button("Закрити", "x")],
         ])
         return InlineKeyboardMarkup(rows)
+
+    def _refresh_length(self, panel: _Panel) -> None:
+        current = self.store.reply_length(panel.chat_id)
+        if current.revision != panel.reply_length.revision:
+            panel.undo_length = None
+        panel.reply_length = current
+
+    def _save_reply_length(self, panel: _Panel, value: str | None, *, undo: bool = False) -> str:
+        previous = panel.reply_length
+        try:
+            current = self.store.set_reply_length(panel.chat_id, value, role=panel.role,
+                                                  expected_revision=previous.revision)
+        except StaleSettingsRevision:
+            self._refresh_length(panel)
+            panel.stage = "hub"
+            return "Довжину відповіді вже змінили. Показано чинне значення."
+        panel.reply_length = current
+        panel.stage = "hub"
+        if undo:
+            panel.undo_length = None
+            return "Попередню довжину відповіді відновлено."
+        if previous.value != current.value:
+            panel.undo_length = previous
+        return "Збережено для наступних відповідей у цьому чаті."
 
     async def _delete_command(self, message: Any) -> None:
         if not self.delete_commands:
@@ -396,12 +457,18 @@ class ChatModelUI:
         )
 
     async def _open(self, message: Any, owner_id: int, chat_id: int, role: str,
-                    catalog: tuple[ModelCapability, ...]) -> None:
+                    catalog: tuple[ModelCapability, ...], *, hub: bool = False) -> None:
         profile = self._profile(chat_id)
         ceiling = self.store.member_ceiling(chat_id) if role == "member" else None
         model, effort = self._draft(profile, ceiling, catalog)
         panel = _Panel(secrets.token_urlsafe(12), owner_id, chat_id, 0, profile.revision,
                        0, self.clock() + self.panel_ttl_seconds, model, effort, role, ceiling, catalog)
+        if hub:
+            panel.has_hub = True
+            chat = message.chat
+            panel.chat_title = getattr(chat, "title", None) or ("Особистий чат" if chat.type == "private" else "Цей чат")
+            panel.reply_length = self.store.reply_length(chat_id)
+            panel.stage = "hub"
         sent = await message.reply_text(
             self._text(panel, profile), reply_markup=self._markup(panel), parse_mode="HTML", do_quote=False,
         )
@@ -435,7 +502,7 @@ class ChatModelUI:
         select = control.name == "select_model" and bool(control.arguments) and not reset
         try:
             if open_panel or select:
-                catalog = await self._catalog()
+                catalog = MODEL_CATALOG if control.name == "settings" else await self._catalog()
             if role == "member" and chat_type != "private" and (select or reset):
                 if not await self._is_current_member(context.bot, chat_id, user_id):
                     await self._notice(message, "Не вдалося підтвердити участь у цьому чаті.")
@@ -443,7 +510,7 @@ class ChatModelUI:
             if not self.chat_allowed(chat_id, chat_type, user_id) or self._role(user_id) != role:
                 return True
             if open_panel:
-                await self._open(message, user_id, chat_id, role, self._panel_models(catalog))
+                await self._open(message, user_id, chat_id, role, self._panel_models(catalog), hub=control.name == "settings")
             elif reset:
                 profile = self._profile(chat_id)
                 self.store.reset(chat_id, role=role, default_profile=self.defaults(), expected_revision=profile.revision)
@@ -516,11 +583,13 @@ class ChatModelUI:
             or panel.message_id != getattr(message, "message_id", None)
             or panel.role != role or panel.expires_at <= self.clock() or panel.panel_revision != int(revision_text)
         ):
-            await self._answer(query, "Панель застаріла або належить іншому учаснику. Відкрий /model.", alert=True)
+            await self._answer(query, "Панель застаріла або належить іншому учаснику. Відкрий власну через /settings або /model.", alert=True)
             return
         catalog = panel.catalog
         media_stage = panel.stage in {"media", "media_models"}
-        if option == "-" and ((action == "f" and panel.stage != "tools" and not media_stage) or (action == "a" and panel.stage == "confirm")):
+        length_stage = panel.stage in {"hub", "length"}
+        if option == "-" and ((action == "f" and panel.stage != "tools" and not media_stage and not length_stage)
+                              or (action == "a" and panel.stage == "confirm") or (action == "g" and panel.stage == "hub")):
             catalog = await self._catalog()
         media_catalog = ()
         if media_stage and action in {"i", "s", "f"}:
@@ -541,10 +610,13 @@ class ChatModelUI:
                 or not self.chat_allowed(chat_id, chat_type, user_id)):
             await self._answer(query, "Панель застаріла. Відкрий /model.", alert=True)
             return
-        indexed = action in {"m", "e", "d", "v", "i", "s"}
+        indexed = action in {"m", "e", "d", "v", "i", "s", "n"}
         if ((indexed and (not option.isascii() or not option.isdigit() or len(option) > 3))
-                or (not indexed and (option != "-" or action not in {"a", "r", "f", "b", "x", "t", "z", "q", "h", "u"}))):
+                or (not indexed and (option != "-" or action not in {"a", "r", "f", "b", "x", "t", "z", "q", "h", "u", "l", "j", "g", "y"}))):
             await self._answer(query, "Невідома дія.", alert=True)
+            return
+        if role == "member" and (panel.stage == "length" or action in {"l", "j", "n", "y"}):
+            await self._answer(query, "Довжину відповіді можуть змінювати тільки адміністратори.", alert=True)
             return
         if role == "member" and (panel.stage == "tools" or action in {"t", "v", "z"}):
             await self._answer(query, "Дозволи інструментів можуть змінювати тільки адміністратори.", alert=True)
@@ -574,16 +646,45 @@ class ChatModelUI:
         if media_stage and action not in {"i", "s", "u", "b", "f"}:
             await self._answer(query, "Недоступна дія.", alert=True)
             return
-        if not media_stage and panel.stage != "tools" and action not in {"f", "t", "h"} and profile.revision != panel.settings_revision:
+        if ((panel.stage == "hub" and action not in {"l", "j", "g", "t", "h", "f"})
+                or (panel.stage == "length" and action not in {"n", "y", "b", "f"})):
+            await self._answer(query, "Недоступна дія.", alert=True)
+            return
+        if not length_stage and not media_stage and panel.stage != "tools" and action not in {"f", "t", "h"} and profile.revision != panel.settings_revision:
             await self._answer(query, "Налаштування вже змінилися. Натисни «Оновити» або відкрий /model.", alert=True)
             return
         notice = ""
         try:
-            if action == "h" and panel.stage == "model":
+            if action == "l" and panel.stage == "hub":
+                self._refresh_length(panel)
+                panel.stage = "length"
+            elif panel.stage == "length" and action in {"n", "y"}:
+                values = tuple(REPLY_LENGTH_LABELS)
+                if action == "n" and int(option) >= len(values):
+                    raise InvalidModelSelection("invalid_reply_length")
+                value = values[int(option)] if action == "n" else None
+                notice = self._save_reply_length(panel, value)
+            elif action == "j" and panel.stage == "hub" and panel.undo_length is not None:
+                notice = self._save_reply_length(panel, panel.undo_length.value, undo=True)
+            elif length_stage and action in {"f", "b"}:
+                self._refresh_length(panel)
+                if action == "b":
+                    panel.stage = "hub"
+                else:
+                    panel.undo_length = None
+            elif action == "g" and panel.stage == "hub":
+                panel.catalog = self._panel_models(catalog)
+                panel.settings_revision = profile.revision
+                panel.model, panel.effort = self._draft(profile, panel.member_ceiling, panel.catalog)
+                panel.stage = "model"
+            elif action == "h" and panel.stage in {"model", "hub"}:
+                panel.submenu_parent = panel.stage
                 panel.stage = "media"
             elif media_stage:
                 if action == "b":
-                    panel.stage = "media" if panel.stage == "media_models" else "model"
+                    panel.stage = "media" if panel.stage == "media_models" else panel.submenu_parent
+                    if panel.stage == "hub":
+                        self._refresh_length(panel)
                     panel.settings_revision = profile.revision
                     if panel.stage == "model":
                         panel.model, panel.effort = self._draft(profile, panel.member_ceiling, panel.catalog)
@@ -604,7 +705,9 @@ class ChatModelUI:
                     notice = "Збережено для цього інструмента."
                 else:
                     raise InvalidModelSelection("invalid_media_action")
-            elif (action == "t" and panel.stage == "model") or (action == "f" and panel.stage == "tools"):
+            elif (action == "t" and panel.stage in {"model", "hub"}) or (action == "f" and panel.stage == "tools"):
+                if action == "t":
+                    panel.submenu_parent = panel.stage
                 panel.tool_policy = self.store.tools.resolve(chat_id)
                 panel.stage = "tools"
             elif action == "v" and panel.stage == "tools" and int(option) < len(CHAT_TOOLS):
@@ -620,7 +723,9 @@ class ChatModelUI:
                 panel.tool_policy = self.store.tools.reset(chat_id, expected_revision=panel.tool_policy.revision)
                 notice = "Відновлено типові дозволи інструментів для цього чату."
             elif action == "b" and panel.stage == "tools":
-                panel.stage = "model"
+                if panel.submenu_parent == "hub":
+                    self._refresh_length(panel)
+                panel.stage = panel.submenu_parent
                 panel.settings_revision = profile.revision
                 panel.model, panel.effort = self._draft(profile, panel.member_ceiling, panel.catalog)
             elif action == "q" and panel.stage == "model" and panel.member_ceiling is not None:
@@ -684,19 +789,22 @@ class ChatModelUI:
                 panel.model, panel.effort = self._draft(profile, panel.member_ceiling, panel.catalog)
                 panel.duration_seconds = 900
                 panel.stage = "model"
+            elif action == "b" and panel.stage == "model" and panel.has_hub:
+                self._refresh_length(panel)
+                panel.stage = "hub"
             elif action == "b" and panel.stage != "model":
                 previous_to_duration = "model" if panel.model == SPARK_MODEL else "effort"
                 panel.stage = {"effort": "model", "duration": previous_to_duration, "confirm": "duration"}[panel.stage]
             else:
                 raise InvalidModelSelection("invalid_panel_action")
         except InvalidModelSelection:
-            await self._answer(query, "Недоступний варіант. Відкрий /model.", alert=True)
+            await self._answer(query, "Недоступний варіант. Натисни «Оновити».", alert=True)
             return
         except StaleSettingsRevision:
             await self._answer(query, "Налаштування вже змінилися. Натисни «Оновити».", alert=True)
             return
         except (OSError, sqlite3.Error):
-            await self._answer(query, "Не вдалося зберегти налаштування. Відкрий /model.", alert=True)
+            await self._answer(query, "Не вдалося зберегти налаштування. Натисни «Оновити».", alert=True)
             return
         # No await occurs between validation, mutation and revision increment.
         # Concurrent/repeated clicks therefore cannot reuse the same panel step.

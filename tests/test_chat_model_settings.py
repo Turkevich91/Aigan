@@ -14,6 +14,7 @@ from chat_model_settings import (
     InvalidModelSelection,
     MAX_DURATION_SECONDS,
     MODEL_CATALOG,
+    ReplyLengthSetting,
     StaleSettingsRevision,
     catalog_from_provider_ids,
     get_model_capability,
@@ -80,6 +81,27 @@ class ModelSelectionTests(unittest.TestCase):
 
 
 class ChatSettingsStoreTests(unittest.TestCase):
+    def test_reply_length_survives_restart_and_resets_to_inherited_with_fresh_revision(self):
+        first, second = -101, -102
+        self.assertEqual(self.store.reply_length(first), ReplyLengthSetting())
+        picked = self.store.set_reply_length(first, "short", role="admin", expected_revision=0)
+        self.assertEqual(self.store.resolve(first, "sol", "low").reply_length, "short")
+        other = ChatModelSettingsStore(self.path)
+        self.assertEqual(other.reply_length(first), picked)
+        self.assertEqual(other.reply_length(second), ReplyLengthSetting())
+        self.assertEqual(other.set_reply_length(first, "short", role="owner", expected_revision=picked.revision), picked)
+        reset = other.set_reply_length(first, None, role="owner", expected_revision=picked.revision)
+        self.assertEqual(reset, ReplyLengthSetting(None, picked.revision + 1))
+        with self.assertRaises(StaleSettingsRevision):
+            self.store.set_reply_length(first, "detailed", role="admin", expected_revision=picked.revision)
+        self.assertEqual(self.store.reply_length(first), reset)
+
+    def test_reply_length_requires_admin_and_known_value(self):
+        for role, value in (("member", "detailed"), ("guest", None), ("admin", "unlimited")):
+            with self.subTest(role=role, value=value), self.assertRaises(InvalidModelSelection):
+                self.store.set_reply_length(-101, value, role=role, expected_revision=0)
+        self.assertEqual(self.store.reply_length(-101), ReplyLengthSetting())
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
