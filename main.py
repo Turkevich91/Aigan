@@ -145,7 +145,10 @@ from telegram_video import (
     TIKTOK_SPEECH_SCOPE_INSTRUCTIONS, VideoUnavailable, inspect_clip,
     inspect_local_clip, TELEGRAM_VIDEO_MAX_BYTES, SPEECH_SCOPE_INSTRUCTIONS, SPEECH_SCOPE_FORMAT, confirmed_speech_scope,
 )
-from youtube_media_request import SOURCE_FORMAT, SOURCE_INSTRUCTIONS, confirmed_audio_source, parse_youtube_media_request
+from youtube_media_request import (
+    SOURCE_FORMAT, SOURCE_INSTRUCTIONS, confirmed_audio_source, explicit_time_range,
+    parse_youtube_media_request, youtube_video_id,
+)
 from youtube_media_delivery import deliver_youtube_media
 from tiktok_acquisition import TIKTOK_MAX_BYTES, TikTokUnavailable, fetch_tiktok_video, normalize_tiktok_video_url
 from public_video_acquisition import PublicVideoUnavailable, fetch_public_video, normalize_public_video_url
@@ -7752,6 +7755,7 @@ Task:
 """
 
 
+YOUTUBE_WINDOW: contextvars.ContextVar[tuple[str, int, int] | None] = contextvars.ContextVar("youtube_window", default=None)
 YOUTUBE_CAPTION_READ_ONLY = contextvars.ContextVar("youtube_caption_read_only", default=False)
 
 
@@ -7765,7 +7769,9 @@ def youtube_mcp_environment(*, run_id: str, route_bucket: str) -> dict[str, str]
         )
         if (value := os.getenv(key, "").strip())
     }
-    if YOUTUBE_CAPTION_READ_ONLY.get():
+    if (window := YOUTUBE_WINDOW.get()) is not None:
+        child_env["AIGAN_YOUTUBE_WINDOW"] = json.dumps(window)
+    if window is not None or YOUTUBE_CAPTION_READ_ONLY.get():
         child_env["YOUTUBE_AUDIO_FALLBACK"] = "false"
     audio_fallback_enabled = child_env.get("YOUTUBE_AUDIO_FALLBACK", "").casefold() in {
         "1",
@@ -14696,8 +14702,8 @@ def authored_urls(text, part):
     return list(dict.fromkeys(urls))
 
 
-def requested_youtube_media(message, prompt):
-    if not os.getenv("AIGAN_MEDIA_LIBRARY") or not message.from_user or message.from_user.is_bot:
+def single_youtube_request_url(message, prompt):
+    if not message.from_user or message.from_user.is_bot:
         return None
     if is_forwarded_message(message) or is_generated_or_channel_sender(message):
         return None
@@ -14705,9 +14711,21 @@ def requested_youtube_media(message, prompt):
     urls = authored_urls(prompt, message)
     if not urls and reply and reply.chat_id == message.chat_id:
         urls = authored_urls(message_text(reply), reply)
-    if len(urls) != 1:
-        return None
-    return parse_youtube_media_request(urls[0], URL_TOKEN_RE.sub(" ", prompt))
+    return urls[0] if len(urls) == 1 else None
+
+
+def requested_youtube_media(message, prompt):
+    if os.getenv("AIGAN_MEDIA_LIBRARY") and (url := single_youtube_request_url(message, prompt)):
+        return parse_youtube_media_request(url, URL_TOKEN_RE.sub(" ", prompt))
+    return None
+
+
+def requested_youtube_window(message, prompt):
+    if ":" in prompt and (bounds := explicit_time_range(URL_TOKEN_RE.sub(" ", prompt))):
+        url = single_youtube_request_url(message, prompt)
+        if url and (video_id := youtube_video_id(url)):
+            return (video_id, *bounds)
+    return None
 
 
 def requested_video_link(message: Message, prompt: str) -> tuple[str, str] | None:
@@ -15119,6 +15137,7 @@ async def run_admitted_prompt(message, context, prompt, allow_pending_wait, asse
         return
     async def generate():
         token = ACTIVE_TRANSCRIPT_READ.set(window)
+        time_window = YOUTUBE_WINDOW.set(requested_youtube_window(message, prompt))
         try:
             waited = bool(lock and lock.locked())
             await window.acquire()
@@ -15135,6 +15154,7 @@ async def run_admitted_prompt(message, context, prompt, allow_pending_wait, asse
             if window.released.done():
                 detached_transcripts.pop(window.key, None)
             window.unlock()
+            YOUTUBE_WINDOW.reset(time_window)
             ACTIVE_TRANSCRIPT_READ.reset(token)
 
     task = asyncio.create_task(generate())

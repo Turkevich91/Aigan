@@ -113,7 +113,20 @@ def _cue_rows(entries, duration_ms):
     return tuple(sorted(cues, key=lambda cue: cue[0]))
 
 
-def lookup_original_track(video_id: str, languages=("uk", "en", "ru")) -> OriginalCaptionTrack | None:
+def window_coverage(cues, left, right):
+    """Captioned milliseconds inside the window, taking the union of overlapping cues."""
+    covered, cursor = 0, left
+    for start, end, _ in cues:
+        if start >= right:
+            break
+        stop = min(end, right)
+        if stop > cursor:
+            covered += stop - max(cursor, start)
+            cursor = stop
+    return covered
+
+
+def lookup_original_track(video_id: str, languages=("uk", "en", "ru"), *, window_ms=None) -> OriginalCaptionTrack | None:
     """Return a readable original track; None means the platform confirmed there are none."""
     if not isinstance(video_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{11}", video_id):
         raise ValueError("canonical YouTube ID required")
@@ -145,8 +158,15 @@ def lookup_original_track(video_id: str, languages=("uk", "en", "ru")) -> Origin
             if not cues:
                 checked = False
                 continue
+            if window_ms is not None:
+                left, right = window_ms
+                width = window_coverage(cues, left, right)
+                if width < right - left:
+                    if best_score is None or width > best_score:
+                        best, best_score = (track, cues), width
+                    continue
             status, covered = classify_cues(cues, duration) if duration else ("unavailable", 0)
-            if status == "complete":
+            if window_ms is not None or status == "complete":
                 return OriginalCaptionTrack(track.language_code, track.is_generated, duration, cues,
                                             checked and index + 1 == len(ordered))
             span = max(row[1] for row in cues) - cues[0][0]

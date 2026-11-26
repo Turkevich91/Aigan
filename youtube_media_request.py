@@ -98,14 +98,43 @@ def confirmed_audio_source(raw: str, question: str) -> str:
     return "other"
 
 
-def parse_youtube_media_request(url: str, question: str) -> YoutubeMediaRequest | None:
+def _seconds(mark: re.Match) -> int:
+    hour, minute, second, short_min, short_sec = mark.groups()
+    return (3600 * int(hour) + 60 * int(minute) + int(second)) if hour else 60 * int(short_min) + int(short_sec)
+
+
+def explicit_time_range(question: str) -> tuple[int, int] | None:
+    if ":" not in question:
+        return None
+    authored = _QUOTED.sub(" ", question)
+    marks = list(_CLOCK.finditer(authored))
+    if len(marks) != 2:
+        return None
+    first, last = marks
+    connector = authored[first.end():last.start()].strip().casefold()
+    if connector in {"and", "і", "й", "та", "и"}:
+        if not re.search(r"\b(?:between|між|между)\s*$", authored[:first.start()], re.I):
+            return None
+    elif connector not in {"-", "–", "—", "−", "до", "по", "to", "until", "through"}:
+        return None
+    if re.match(r"[.,]\d", authored[last.end():]):
+        return None
+    start, end = _seconds(first), _seconds(last)
+    return (start, end) if start < end else None
+
+
+def youtube_video_id(url: str) -> str | None:
     try:
         parts = urlsplit(url)
         if parts.scheme != "https" or parts.netloc.lower() != parts.hostname or len(url) > 2048:
             return None
     except ValueError:
         return None
-    video_id = canonical_source("get_youtube_transcript", {"video": url})
+    return canonical_source("get_youtube_transcript", {"video": url}) or None
+
+
+def parse_youtube_media_request(url: str, question: str) -> YoutubeMediaRequest | None:
+    video_id = youtube_video_id(url)
     if not video_id or not question.strip():
         return None
     authored = _QUOTED.sub(" ", question)
@@ -137,8 +166,7 @@ def parse_youtube_media_request(url: str, question: str) -> YoutubeMediaRequest 
     point = None
     if visual:
         if marks:
-            hour, minute, second, short_min, short_sec = marks[0].groups()
-            point = (3600 * int(hour) + 60 * int(minute) + int(second)) if hour else 60 * int(short_min) + int(short_sec)
+            point = _seconds(marks[0])
         else:
             value = parse_qs(urlsplit(url).query).get("t", [""])[0]
             if re.fullmatch(r"[0-9]{1,5}s?", value):
