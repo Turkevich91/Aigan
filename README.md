@@ -119,6 +119,24 @@ ADMIN_USER_IDS=890218886
 
 `ADMIN_USER_IDS` is also comma-separated. Admin users skip cooldowns and can DM the bot even when `ALLOWED_CHAT_IDS` is locked to group IDs.
 
+### Sensity media checks
+
+Use `/sensity` to see what leaves Telegram. To submit a file, send it yourself and reply directly to that message with `/sensity send`. Aigan sends the selected file to Sensity for an authenticity assessment. The result is the provider's assessment and can be wrong. Forwarded messages and protected content are ineligible. The file limit is 20 MB (20,000,000 bytes).
+
+Set `SENSITY_API_KEY` in the deployment environment to enable checks. Administrators can switch Sensity off for individual chats in `/model` under **Інструменти**. Requests use the operator's Sensity account. [Sensity API](https://docs.sensity.ai/)
+
+### Maltego relationship export
+
+Send `/maltego` with one relationship per line in the same message. Aigan returns a UTF-8 CSV attachment containing the supplied rows.
+
+```text
+/maltego
+City Library | publishes | Annual Report
+Annual Report | cites | Building Survey
+```
+
+In Maltego Graph Desktop, open **Import → Import a 3rd Party Table** and select the CSV. Treat the first row as headers. Map `source` and `target` to entities, connect source to target, and map `relationship` to the link label. Generating the file in Telegram requires no Maltego account. [Maltego table import](https://support.maltego.com/en/support/solutions/articles/15000010797/)
+
 To avoid duplicate answers while a long model call is running, Aigan keeps one in-flight generation per chat and suppresses near-duplicate explicit prompts shortly after an answer:
 
 ```env
