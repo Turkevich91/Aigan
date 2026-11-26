@@ -219,6 +219,17 @@ def get_youtube_transcript(
     except ValueError as exc:
         return str(exc)
 
+    library = os.getenv("AIGAN_MEDIA_LIBRARY")
+    chat = os.getenv("AIGAN_MEDIA_CHAT")
+    if library and chat:
+        from youtube_media_cache import cached_excerpt
+        try:
+            cached = cached_excerpt(Path(library), int(chat), video_id, max_chars, include_timestamps)
+        except (OSError, ValueError):
+            cached = None
+        if cached:
+            return f"Saved YouTube audio transcription for {video_id}:\n\n{cached}"
+
     lang_list = [item.strip() for item in languages.split(",") if item.strip()]
     if not lang_list:
         lang_list = ["uk", "en", "ru"]
