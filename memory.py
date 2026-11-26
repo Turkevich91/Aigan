@@ -1384,6 +1384,20 @@ class MemoryStore:
 
         return [item for group in reversed(groups) for item in group]
 
+    def recent_authored_texts(self, chat_id: int, user_id: int, *, before_message_id: int) -> list[str]:
+        """Return a few prior plain-text turns of exactly this speaker in this chat."""
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT text FROM messages WHERE chat_id = ? AND user_id = ? AND message_id < ?
+                    AND is_bot = 0 AND content_kind = 'text' AND text != ''
+                    AND forward_origin = '' AND source_text = '' AND text NOT LIKE '[message has %'
+                ORDER BY created_at DESC, id DESC LIMIT 3
+                """,
+                (chat_id, user_id, before_message_id),
+            ).fetchall()
+        return [row[0] for row in reversed(rows)]
+
     def user_messages(
         self,
         chat_id: int,

@@ -8861,6 +8861,37 @@ class PersistentMemoryTests(unittest.TestCase):
 
         self.assertEqual(["caption text should count", "plain text should count"], [item.text for item in items])
 
+    def test_reply_uses_only_this_speakers_prior_authored_words_for_style(self) -> None:
+        message = FakeMessage("And now?", message_id=12)
+        author = message.from_user.id
+
+        def save(number, text, *, chat=-1001, actor=author, **fields):
+            main.MEMORY.save_message(chat_id=chat, user_id=actor, sender_label="Same name",
+                                     message_id=number, text=text, **fields)
+
+        for number in range(1, 5):
+            save(number, f"own {number}")
+        save(5, "room fact", actor=author + 1)
+        save(6, "another chat", chat=-2002)
+        save(7, "forwarded", forward_origin="channel")
+        save(8, "quoted source", source_text="source")
+        save(9, "attachment caption", content_kind="attachment")
+        save(10, "bot", is_bot=True)
+        save(12, "this request")
+        save(13, "newer request")
+        self.assertEqual(main.recent_speaker_words(message), ["own 2", "own 3", "own 4"])
+        main.passive_contexts[message.chat_id].append("Another participant: room fact")
+        prompt = main.build_agent_input(message, "And now?", memory_context="(none)")
+        self.assertIn("Another participant: room fact", prompt)
+        self.assertIn('["own 2", "own 3", "own 4"]', prompt)
+        with patch.object(main, "MEMORY", None):
+            self.assertEqual(main.recent_speaker_words(message), [])
+        with patch.object(main.MEMORY, "recent_authored_texts") as read_words:
+            main.build_agent_input(message, "And now?", memory_context="(none)", route="time_sensitive")
+            read_words.assert_not_called()
+        message.sender_chat = message.chat
+        self.assertEqual(main.recent_speaker_words(message), [])
+
     def test_agent_input_marks_persistent_memory_untrusted(self) -> None:
         main.MEMORY.save_message(
             chat_id=-1001,
