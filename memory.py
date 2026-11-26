@@ -5,6 +5,7 @@ import json
 import math
 import re
 import sqlite3
+import string
 import struct
 import threading
 from dataclasses import dataclass
@@ -1390,11 +1391,12 @@ class MemoryStore:
             rows = self._conn.execute(
                 """
                 SELECT text FROM messages WHERE chat_id = ? AND user_id = ? AND message_id < ?
-                    AND is_bot = 0 AND content_kind = 'text' AND text != ''
+                    AND is_bot = 0 AND content_kind = 'text'
+                    AND trim(text, ?) != '' AND ltrim(text, ?) NOT LIKE '/%'
                     AND forward_origin = '' AND source_text = '' AND text NOT LIKE '[message has %'
                 ORDER BY created_at DESC, id DESC LIMIT 3
                 """,
-                (chat_id, user_id, before_message_id),
+                (chat_id, user_id, before_message_id, string.whitespace, string.whitespace),
             ).fetchall()
         return [row[0] for row in reversed(rows)]
 

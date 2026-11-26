@@ -8867,7 +8867,7 @@ class PersistentMemoryTests(unittest.TestCase):
         self.assertEqual(["caption text should count", "plain text should count"], [item.text for item in items])
 
     def test_reply_uses_only_this_speakers_prior_authored_words_for_style(self) -> None:
-        message = FakeMessage("And now?", message_id=12)
+        message = FakeMessage("And now?", message_id=14)
         author = message.from_user.id
 
         def save(number, text, *, chat=-1001, actor=author, **fields):
@@ -8882,8 +8882,10 @@ class PersistentMemoryTests(unittest.TestCase):
         save(8, "quoted source", source_text="source")
         save(9, "attachment caption", content_kind="attachment")
         save(10, "bot", is_bot=True)
-        save(12, "this request")
-        save(13, "newer request")
+        save(12, " \t\n")
+        save(13, "  /status")
+        save(14, "this request")
+        save(15, "newer request")
         forwarded = FakeMessage("original channel wording", message_id=11)
         forwarded.forward_origin = SimpleNamespace(type="channel")
         main.save_memory_message(forwarded)
