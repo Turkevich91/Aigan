@@ -12,6 +12,9 @@ import re
 from urllib.parse import urljoin, urlsplit
 
 import httpx
+from yt_dlp import YoutubeDL
+from yt_dlp.extractor.tiktok import TikTokIE
+from yt_dlp.utils import YoutubeDLError
 
 from public_media_http import (
     PublicMediaTransferError as TikTokUnavailable,
@@ -69,13 +72,38 @@ def _cdn_url(raw):
     return None
 
 
+def _post_cookie(headers, canonical):
+    # The pinned response uses a numeric request URL. Apply cookie semantics to
+    # the authenticated page hostname, and accept only this public session token.
+    values = [h for h in headers.get_list("set-cookie") if h.partition("=")[0].strip() == "tt_chain_token"]
+    if len(values) != 1 or len(values[0]) > 4096:
+        return None
+    jar = httpx.Cookies()
+    jar.extract_cookies(httpx.Response(200, headers={"set-cookie": values[0]},
+                                      request=httpx.Request("GET", canonical)))
+    for cookie in jar.jar:
+        if (cookie.name == "tt_chain_token" and cookie.secure and cookie.domain_specified
+                and cookie.domain.lstrip(".") == "tiktok.com"
+                and re.fullmatch(r"[\x21\x23-\x2b\x2d-\x3a\x3c-\x5b\x5d-\x7e]{1,2048}", cookie.value or "")):
+            scoped = httpx.Cookies()
+            scoped.jar.set_cookie(cookie)
+            return scoped
+    return None
+
+
 @asynccontextmanager
-async def _open(url, normalize, *, referrer=None):
+async def _open(url, normalize, *, referrer=None, cookies=None):
     for _ in range(4):
         url = normalize(url)
         if not url:
             raise TikTokUnavailable("url")
-        async with _get(url, referrer) as response:
+        cookie_header = None
+        if cookies and _cdn_url(url) and urlsplit(url).hostname.endswith(".tiktok.com"):
+            target = httpx.Request("GET", url)
+            cookies.set_cookie_header(target)
+            cookie_header = target.headers.get("cookie")
+        request = _get(url, referrer, cookie_header=cookie_header) if cookie_header else _get(url, referrer)
+        async with request as response:
             if response.status_code in (301, 302, 303, 307, 308):
                 target = response.headers.get("location")
                 if not target:
@@ -103,10 +131,26 @@ def _download_address(page, post_id, max_bytes, max_duration):
     video = item["video"]
     if not 0 < int(video["duration"]) <= max_duration or int(video.get("size") or 0) > max_bytes:
         raise TikTokUnavailable("limits")
-    # Use one URL advertised by this post. Never retry a different source on
-    # a denial. Some public posts expose a playback URL only.
-    if (item.get("video_control") or {}).get("allow_download") is False:
-        raise TikTokUnavailable("unavailable")
+    for key in ("video_control", "videoControl"):
+        control = item.get(key, {})
+        if not isinstance(control, dict) or any(control.get(flag, True) is not True
+                                               for flag in ("allow_download", "allowDownload")):
+            raise TikTokUnavailable("unavailable")
+    if video.get("bitrateInfo"):
+        # Only parse the formats in this exact post. yt-dlp must not fetch pages,
+        # handle challenges, select an external downloader or open media URLs.
+        try:
+            with YoutubeDL({"quiet": True, "cachedir": False}, auto_init=False) as ydl:
+                formats = TikTokIE(ydl)._extract_web_formats(item)
+        except (YoutubeDLError, ValueError, TypeError, LookupError, AttributeError, ArithmeticError, RecursionError):
+            # Malformed optional renditions do not invalidate a verified post's direct URL.
+            formats = []
+        candidates = [f for f in formats if f.get("ext") == "mp4" and f.get("vcodec") in ("h264", "h265")
+                      and 0 < (f.get("filesize") or 0) <= max_bytes and _cdn_url(f.get("url"))]
+        if candidates:
+            best = max(candidates, key=lambda f: (f.get("quality", -1), -f["filesize"]))
+            return best["url"]
+    # Older pages advertise only a download or playback address.
     media = _cdn_url(video.get("downloadAddr") or video.get("playAddr"))
     if not media:
         raise TikTokUnavailable("unavailable")
@@ -129,8 +173,9 @@ async def fetch_tiktok_video(url: str, destination: Path, *, max_bytes: int, max
                 page = bytearray()
                 async for block in _chunks(response, _PAGE_LIMIT):
                     page.extend(block)
-                media = _download_address(page, post[2], limit, min(max_duration, _MAX_DURATION))
-            async with _open(media, _cdn_url, referrer=canonical) as (_, response):
+                media = await asyncio.to_thread(_download_address, page, post[2], limit, min(max_duration, _MAX_DURATION))
+                cookies = _post_cookie(response.headers, canonical)
+            async with _open(media, _cdn_url, referrer=canonical, cookies=cookies) as (_, response):
                 mime = response.headers.get("content-type", "").partition(";")[0].lower()
                 if mime not in ("video/mp4", "application/octet-stream"):
                     raise TikTokUnavailable("format")

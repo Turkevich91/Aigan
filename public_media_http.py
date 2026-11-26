@@ -14,7 +14,7 @@ class PublicMediaTransferError(Exception):
 
 
 @asynccontextmanager
-async def pinned_get(url: str, referrer: str | None = None):
+async def pinned_get(url: str, referrer: str | None = None, *, cookie_header: str | None = None):
     target = httpx.URL(url)
     if target.scheme != "https" or target.port not in (None, 443):
         raise PublicMediaTransferError("address")
@@ -30,6 +30,8 @@ async def pinned_get(url: str, referrer: str | None = None):
     headers = {"Host": hostname, "Accept-Encoding": "identity"}
     if referrer:
         headers["Referer"] = referrer
+    if cookie_header:
+        headers["Cookie"] = cookie_header
     request = httpx.Request(
         "GET", target.copy_with(host=str(addresses[0])), headers=headers,
         extensions={"sni_hostname": hostname},
