@@ -26,7 +26,18 @@ from chat_tool_policy import tool_allowed
 _POLICY = (Path(__file__).parent / "prompts" / "public_landmarks.md").read_text(encoding="utf-8")
 _WIKI_API = "https://en.wikipedia.org/w/api.php"
 _MIME = {"image/jpeg": "JPEG", "image/png": "PNG", "image/webp": "WEBP", "image/gif": "GIF"}
-_UNSAFE_OUTPUT = re.compile(r"(?:https?[:/]|www\.|[\w-]+\.[a-z]{2,}\b|@\w|[<>\[\]{}\n\r]|[\d°]\s*°|\d[.,]\d{2,}|\b\d{4}\b)", re.I)
+_UNSAFE_OUTPUT = re.compile(r"(?:https?[:/]|www\.|[\w-]+\.[a-z]{2,}\b|@\w|[<>\[\]{}°\n\r])", re.I)
+_STREET_WORD = re.compile(r"\b(?:street|st|road|rd|avenue|ave|lane|ln|drive|dr|boulevard|blvd|"
+                          r"court|ct|way|loop|place|pl|terrace|square|rue|calle|вулиця|вул|улица|ул)\b", re.I)
+_NUMBER_WORD = re.compile(r"\b(?:one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|"
+                          r"\w+teen|twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety|hundred|thousand)\b", re.I)
+_UNIT = re.compile(r"\b(?:apartment|apt|unit|suite|квартира|кв)\.?\s+(?:[a-zа-яіїєґ]\b|\w+\s*$)", re.I)
+
+
+def _address_like(value: str) -> bool:
+    # A bare number can precede or follow a street or apartment in many languages.
+    return (any(c.isnumeric() for c in value) or bool(_UNIT.search(value))
+            or bool(_NUMBER_WORD.search(value) and _STREET_WORD.search(value)))
 
 
 class LandmarkObservation(BaseModel):
@@ -71,7 +82,7 @@ def _pixels(data_url: str) -> str:
 def _title(value: str) -> bool:
     return (isinstance(value, str) and 0 < len(value) <= 90 and len(value.split()) <= 12
             and value == value.strip() and any(c.isalpha() for c in value)
-            and not _UNSAFE_OUTPUT.search(value)
+            and not _UNSAFE_OUTPUT.search(value) and not _address_like(value)
             and all(c.isalnum() or c in " '-’.,()&–—" for c in value))
 
 
@@ -170,7 +181,7 @@ def _nearby(a: LandmarkRecord, b: LandmarkRecord) -> bool:
 
 
 def _label(value: str | None, limit: int) -> str:
-    if (not value or len(value) > limit or _UNSAFE_OUTPUT.search(value)
+    if (not value or len(value) > limit or _UNSAFE_OUTPUT.search(value) or _address_like(value)
             or any(unicodedata.category(c).startswith("C") or c in "*#`" for c in value)):
         return ""
     return " ".join(value.split())

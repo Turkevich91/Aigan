@@ -82,6 +82,26 @@ class PublicLandmarksTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIn("reference service was unavailable", answer)
                 self.assertNotIn("Example Bay", answer)
 
+    async def test_address_candidates_never_reach_network_or_output_clues(self):
+        attempted = []
+        def handler(request):
+            attempted.append(str(request.url))
+            return httpx.Response(200, json=response(page()))
+
+        examples = ("42 Example Street", "Example Street 42B", "вул. Зразкова, ４２", "Apt. 4",
+                    "Example Street, Unit B", "Forty-two Example Road", "Example Lane Forty")
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            refs = landmarks._References(client)
+            for address in examples:
+                with self.subTest(address=address):
+                    await refs.read(address)
+                    self.assertIsNone(await refs.fetch(address, settlement=True))
+                    rendered = await landmarks._render(observation(clues=[address]), refs, True)
+                    self.assertNotIn(address, rendered)
+            self.assertEqual([], attempted)
+            self.assertTrue(landmarks._title("Sydney Opera House"))
+            self.assertTrue(landmarks._title("One World Trade Center"))
+
     async def test_render_corroborates_only_a_direct_colocated_pair(self):
         requests = []
 
