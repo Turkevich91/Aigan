@@ -1,0 +1,15 @@
+services:
+  aigan:
+    environment:
+      AIGAN_MEDIA_LIBRARY: /app/media-library
+    volumes:
+      - type: volume
+        source: media-library
+        target: /app/media-library
+        volume:
+          nocopy: true
+
+volumes:
+  media-library:
+    external: true
+    name: ${AIGAN_MEDIA_VOLUME:?Set the name of the private media library volume}

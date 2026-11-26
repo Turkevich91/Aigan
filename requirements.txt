@@ -131,9 +131,9 @@ brotli==1.2.0 \
     # via
     #   httpx
     #   yt-dlp
-certifi==2026.6.17 \
-    --hash=sha256:024c88eeec92ca068db80f02b8b07c9cef7b9fe261d1d535abfd5abd6f6af432 \
-    --hash=sha256:2227dcbaafe0d2f59279d1762ddddc37783ed4354594f194ffc31d20f41fc3db
+certifi==2026.11.20 \
+    --hash=sha256:7422df25243767b9877031a2248cb14d09ddac9beee846f4cef3d5c9191d488f \
+    --hash=sha256:af1cb240a8133f105aa52684a3a3258339d7f2fd0bd4e2812698ff5cf5588c4e
     # via
     #   httpcore
     #   httpx
@@ -398,13 +398,13 @@ defusedxml==0.7.1 \
     --hash=sha256:1bb3032db185915b62d7c6209c5a8792be6a32ab2fedacc84e01b52c51aa3e69 \
     --hash=sha256:a352e7e428770286cc899e2542b6cdaedb2b4953ff269a210103ec58f6198a61
     # via youtube-transcript-api
-deno==2.9.2 \
-    --hash=sha256:3b77d7689c15fb2c47d5a3927dc8cf70dbd408bc92e20c70da079c6d78980e34 \
-    --hash=sha256:8b2fd9318d452b7e44c45968916670a0c5452d72796e1af9abfaa7a389e4aa6b \
-    --hash=sha256:8e815d66b3e1314d028b2f0a05c75a331dd7025f4c825e12dd1f057207cee1f6 \
-    --hash=sha256:bf0471db7238e90810bca77a8d2c28646317b5a3fd9e5cdfdf73b251fde11b83 \
-    --hash=sha256:f6f74fd8698a8a9a31af14eed5730f1964ab50eaa0129079d11d91fa92496f60 \
-    --hash=sha256:fb4bb5362d02c193f8086668789076f366416980b79277c06ea6cff73866b668
+deno==2.9.8 \
+    --hash=sha256:338245af268724ae55ebebdb81270a0553b665affde8bdd80b01b8f1c07c7163 \
+    --hash=sha256:3e286918a36f436134336c5c6ef37dfe3a27f16ea22cd6af452ab7daa4ef1da4 \
+    --hash=sha256:60dd97e612b8bab67c8080712646a821071e3809909489f853763cea19617700 \
+    --hash=sha256:b1d1318e7deda8efd593aefa8b565a827fe71cf83aeff09d3a5ceb047444ca18 \
+    --hash=sha256:b82eac91d3e3f6fe37d94a12f833550e05029274cb9020b1e3f0f61e1678dc24 \
+    --hash=sha256:f050f14d259f1e6f39a86aa8dd85f787df2311fc8ceb0be57485a127567ae137
     # via yt-dlp
 distro==1.9.0 \
     --hash=sha256:2fa77c6fd8940f116ee1d6b94a2f90b13b5ea8d019b98bc8bafdcabcdd9bdbed \
@@ -1313,9 +1313,9 @@ youtube-transcript-api==1.2.4 \
     --hash=sha256:03878759356da5caf5edac77431780b91448fb3d8c21d4496015bdc8a7bc43ff \
     --hash=sha256:b72d0e96a335df599d67cee51d49e143cff4f45b84bcafc202ff51291603ddcd
     # via -r requirements.in
-yt-dlp==2026.7.4 \
-    --hash=sha256:b094813404f87a9dd2186f00815231df32e5fd8a5403be0f807b3bb2d21a4432 \
-    --hash=sha256:f11f2b11d5a8ac4059f9bdf29fa4407dc7c6bb00c5097e95ca22a7a9db518266
+yt-dlp==2026.11.23 \
+    --hash=sha256:1db83772a8de7855a2dab551a94d7f617c88629dfdf506531c06b369b47f88a4 \
+    --hash=sha256:e9188e0c559905f7ee05acc1ba0b6fb3f310e7565bf6dea5f62b5300e0775e35
     # via -r requirements.in
 yt-dlp-ejs==0.8.0 \
     --hash=sha256:79300e5fca7f937a1eeede11f0456862c1b41107ce1d726871e0207424f4bdb4 \
