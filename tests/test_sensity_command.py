@@ -68,7 +68,9 @@ class SensityCommandTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(self.provider.await_args.args[1], expected)
         self.source.document = self.media
         self.media.mime_type = "application/pdf"
-        self.assertIn("формат", await self.run_command("send"))
+        hint = await self.run_command("send")
+        for extension in set(command.SENSITY_MIME_TYPES.values()):
+            self.assertIn(extension.upper(), hint)
         self.assertEqual(self.media.get_file.await_count, 4)
 
     async def test_checks_declared_remote_and_actual_size_before_external_transfer(self):

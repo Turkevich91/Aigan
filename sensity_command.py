@@ -69,7 +69,8 @@ async def handle_sensity_command(
         await message.reply_text(_SELECTION)
         return
     if mime not in SENSITY_MIME_TYPES:
-        await message.reply_text("Цей формат файлу не підтримується. Спробуй JPEG, MP4 або MP3.")
+        formats = ", ".join(sorted({ext.upper() for ext in SENSITY_MIME_TYPES.values()}))
+        await message.reply_text(f"Цей формат файлу не підтримується. Доступні формати: {formats}.")
         return
     if _SLOT.locked():
         await message.reply_text("Sensity вже виконує перевірку. Спробуй ще раз трохи пізніше.")
