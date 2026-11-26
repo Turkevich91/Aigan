@@ -4672,6 +4672,11 @@ class OutboundIdentityAndProvenanceTests(unittest.TestCase):
         records = main.recent_chat_answers[message.chat_id]
         self.assertEqual(1, len(records))
         self.assertEqual("translate_reference", records[0].route)
+        followup = FakeMessage("Which part did you send?", message_id=message.message_id + 1)
+        correction = main.build_agent_input(followup, followup.text, memory_context="(none)")
+        self.assertIn(f"{main.user_label(message)}: {message.text}", correction)
+        self.assertIn(f"Aigan: {calls[0]}", correction)
+        self.assertNotIn(response, correction)
 
     def test_ambiguous_translation_delivery_does_not_mark_prompt_answered(self) -> None:
         message = FakeMessage("translate this", message_id=2815)
@@ -8860,6 +8865,42 @@ class PersistentMemoryTests(unittest.TestCase):
         items = main.MEMORY.user_stats(-1001, user_id=111)
 
         self.assertEqual(["caption text should count", "plain text should count"], [item.text for item in items])
+
+    def test_reply_uses_only_this_speakers_prior_authored_words_for_style(self) -> None:
+        message = FakeMessage("And now?", message_id=14)
+        author = message.from_user.id
+
+        def save(number, text, *, chat=-1001, actor=author, **fields):
+            main.MEMORY.save_message(chat_id=chat, user_id=actor, sender_label="Same name",
+                                     message_id=number, text=text, **fields)
+
+        for number in range(1, 5):
+            save(number, f"own {number}")
+        save(5, "room fact", actor=author + 1)
+        save(6, "another chat", chat=-2002)
+        save(7, "forwarded", forward_origin="channel")
+        save(8, "quoted source", source_text="source")
+        save(9, "attachment caption", content_kind="attachment")
+        save(10, "bot", is_bot=True)
+        save(12, " \t\n")
+        save(13, "  /status")
+        save(14, "this request")
+        save(15, "newer request")
+        forwarded = FakeMessage("original channel wording", message_id=11)
+        forwarded.forward_origin = SimpleNamespace(type="channel")
+        main.save_memory_message(forwarded)
+        self.assertEqual(main.recent_speaker_words(message), ["own 2", "own 3", "own 4"])
+        main.passive_contexts[message.chat_id].append("Another participant: room fact")
+        prompt = main.build_agent_input(message, "And now?", memory_context="(none)")
+        self.assertIn("Another participant: room fact", prompt)
+        self.assertIn('["own 2", "own 3", "own 4"]', prompt)
+        with patch.object(main, "MEMORY", None):
+            self.assertEqual(main.recent_speaker_words(message), [])
+        with patch.object(main.MEMORY, "recent_authored_texts") as read_words:
+            main.build_agent_input(message, "And now?", memory_context="(none)", route="time_sensitive")
+            read_words.assert_not_called()
+        message.sender_chat = message.chat
+        self.assertEqual(main.recent_speaker_words(message), [])
 
     def test_agent_input_marks_persistent_memory_untrusted(self) -> None:
         main.MEMORY.save_message(
