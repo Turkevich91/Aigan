@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from io import BytesIO
 import math
 import re
 import time
@@ -11,6 +12,10 @@ from requests import Session
 from youtube_transcript_api import NoTranscriptFound, TranscriptsDisabled, YouTubeTranscriptApi
 
 from youtube_caption_source import classify_cues
+
+
+MAX_RESPONSE_BYTES = 12 * 1024 * 1024
+MAX_LOOKUP_BYTES = 32 * 1024 * 1024
 
 
 class CaptionTrackUnavailable(Exception):
@@ -35,7 +40,8 @@ class _CaptionSession(Session):
         self.video_id = video_id
         self.duration_ms = None
         self.deadline = time.monotonic() + 55
-        self.hooks["response"].append(self._capture_duration)
+        self.remaining_bytes = MAX_LOOKUP_BYTES
+        self.hooks["response"].append(self._read_response)
 
     def send(self, request, **kwargs):
         url = urlsplit(request.url)
@@ -44,13 +50,32 @@ class _CaptionSession(Session):
                 not (host == "youtube.com" or host.endswith(".youtube.com") or host == "youtubei.googleapis.com")):
             raise CaptionTrackUnavailable("unsupported caption endpoint")
         remaining = self.deadline - time.monotonic()
-        if remaining <= 0:
+        if remaining <= 0 or self.remaining_bytes <= 0:
             raise CaptionTrackUnavailable("caption lookup timed out")
+        kwargs["stream"] = True
         kwargs["timeout"] = (min(4, remaining), min(12, remaining))
         return super().send(request, **kwargs)
 
+    def _read_response(self, response, **_):
+        # Bound decoded response bytes before the library parses HTML, XML or JSON.
+        try:
+            output = BytesIO()
+            for block in response.iter_content(65536):
+                self.remaining_bytes -= len(block)
+                if (self.remaining_bytes < 0 or output.tell() + len(block) > MAX_RESPONSE_BYTES
+                        or time.monotonic() >= self.deadline):
+                    raise CaptionTrackUnavailable("caption response exceeds lookup limits")
+                output.write(block)
+            # Requests reads .text/.json from this buffer once the stream is consumed.
+            response._content = output.getvalue()
+        finally:
+            response.close()
+        self._capture_duration(response)
+
     def _capture_duration(self, response, **_):
-        if response.status_code != 200 or urlsplit(response.url).path != "/youtubei/v1/player":
+        player = urlsplit(response.url)
+        if (response.status_code != 200 or player.hostname not in {"youtube.com", "www.youtube.com", "youtubei.googleapis.com"}
+                or player.path != "/youtubei/v1/player"):
             return
         try:
             details = response.json()["videoDetails"]

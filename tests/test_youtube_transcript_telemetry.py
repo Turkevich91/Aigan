@@ -281,6 +281,47 @@ class YoutubeTranscriptTelemetryTests(unittest.TestCase):
             session._capture_duration(reply)
             self.assertIsNone(session.duration_ms)
 
+    @unittest.skipUnless(os.name == "posix", "media cache uses POSIX locks")
+    def test_complete_live_platform_track_is_saved_and_reused_only_in_the_same_chat(self):
+        from youtube_media_cache import open_video
+        video_id = "abcdefghijk"
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        (root / ".aigan-media-cache").touch()
+        track = youtube_caption_tracks.OriginalCaptionTrack(
+            "ko", True, 60000, ((0, 5000, "beginning"), (54000, 59000, "stored ending")))
+        with (
+            patch.dict(os.environ, {"AIGAN_MEDIA_LIBRARY": str(root), "AIGAN_MEDIA_CHAT": "1234",
+                                    "YOUTUBE_AUDIO_FALLBACK": "false"}),
+            patch.object(youtube_transcript, "lookup_original_track", return_value=track) as lookup,
+        ):
+            first = youtube_transcript.get_youtube_transcript(video_id)
+            self.assertIn("stored ending", first)
+            self.assertIn("stored ending", youtube_transcript.get_youtube_transcript(video_id))
+            lookup.assert_called_once_with(video_id, ["uk", "en", "ru"])
+            lookup.side_effect = ConnectionError("unavailable")
+            with patch.dict(os.environ, {"AIGAN_MEDIA_CHAT":"4321"}):
+                second = youtube_transcript.get_youtube_transcript(video_id)
+                self.assertNotIn("stored ending", second)
+                self.assertIn("Caption lookup failed", second)
+                self.assertEqual(lookup.call_count, 2)
+            lookup.side_effect = None
+            with patch.dict(os.environ, {"AIGAN_MEDIA_CHAT":"7777"}), open_video(root, 7777, video_id) as held:
+                self.assertIn("stored ending", youtube_transcript.get_youtube_transcript(video_id))
+                self.assertIsNone(held.public_caption_document())
+            lookup.return_value = youtube_caption_tracks.OriginalCaptionTrack(
+                "es", False, 60000, ((0, 59000, "explicit alternative"),))
+            self.assertIn("explicit alternative", youtube_transcript.get_youtube_transcript(video_id, languages="es"))
+            lookup.assert_called_with(video_id, ["es"])
+
+    def test_caption_http_limit_counts_decoded_body_and_closes_failed_response(self):
+        with youtube_caption_tracks._CaptionSession("abcdefghijk") as session:
+            response = MagicMock()
+            response.iter_content.return_value = iter([b"1234", b"56"])
+            session.remaining_bytes = 5
+            with self.assertRaises(youtube_caption_tracks.CaptionTrackUnavailable):
+                session._read_response(response)
+            response.close.assert_called_once()
+
     def test_skill_guidance_is_confined_to_the_actual_tool_result(self):
         from tests.support import configure_test_environment
         configure_test_environment()

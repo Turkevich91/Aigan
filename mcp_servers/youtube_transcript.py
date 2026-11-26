@@ -12,6 +12,7 @@ if __package__ in {None, ""}:
 from mcp.server.fastmcp import FastMCP
 from model_telemetry import ModelTelemetryStore, StageHandle
 from provenance import canonical_source
+from youtube_caption_source import classify_cues
 from youtube_caption_tracks import lookup_original_track
 from youtube_transcript_api import NoTranscriptFound, TranscriptsDisabled
 
@@ -132,6 +133,17 @@ def _fetch_caption_transcript(video_id: str, languages: list[str]) -> list[dict]
     track = lookup_original_track(video_id, languages)
     if track is None:
         return []
+    location = _library_location()
+    status, covered = classify_cues(track.cues, track.duration_ms)
+    if location and status == "complete":
+        from youtube_media_cache import open_video
+        try:
+            with open_video(*location, video_id) as cache:
+                cache.save_public_transcript(track.cues, duration_ms=track.duration_ms,
+                    covered_ms=covered, complete=True,
+                    track_id=f"{track.language_code}:{'asr' if track.is_generated else 'manual'}")
+        except (OSError, ValueError):
+            pass  # The live caption result remains usable when storage is busy or offline.
     return [{"text": text, "start": begin / 1000, "duration": (end - begin) / 1000}
             for begin, end, text in track.cues]
 
@@ -201,22 +213,32 @@ def _transcribe_audio_fallback(video_url: str, max_chars: int) -> str:
         return text[:max_chars]
 
 
-def _library_result(video_id, max_chars, include_timestamps, *, allow_asr=False,
-                    official_text=None, official_end_ms=None):
+def _library_location():
     library = os.getenv("AIGAN_MEDIA_LIBRARY")
     chat = os.getenv("AIGAN_MEDIA_CHAT")
     if not library or not chat:
         return None
+    try:
+        return Path(library), int(chat)
+    except ValueError:
+        return None
+
+
+def _library_result(video_id, max_chars, include_timestamps, *, allow_asr=False, native_only=False,
+                    official_text=None, official_end_ms=None):
+    location = _library_location()
+    if not location:
+        return None
     from youtube_media_cache import cached_transcript_read
     try:
-        record = cached_transcript_read(Path(library), int(chat), video_id, max_chars, include_timestamps,
+        record = cached_transcript_read(*location, video_id, max_chars, include_timestamps,
                                         official_text=official_text, official_end_ms=official_end_ms)
     except (OSError, ValueError):
         return None
     if not record:
         return None
     source, text = record
-    if source == "asr" and not allow_asr:
+    if (native_only and source != "native") or (source == "asr" and not allow_asr):
         return None
     descriptions = {"native": "Saved official YouTube captions", "asr": "Saved audio transcription",
                     "mixed": "Official YouTube captions supplemented by saved audio transcription"}
@@ -233,6 +255,12 @@ def _transcript_result(video, languages, include_timestamps, max_chars):
     lang_list = [item.strip() for item in languages.split(",") if item.strip()]
     if not lang_list:
         lang_list = ["uk", "en", "ru"]
+    # A caller requesting a particular track can select it even if this chat
+    # previously cached a different language for ordinary summaries.
+    if lang_list == ["uk", "en", "ru"]:
+        native = _library_result(video_id, max_chars, include_timestamps, native_only=True)
+        if native:
+            return native
 
     try:
         entries = _fetch_caption_transcript(video_id, lang_list)
