@@ -44,10 +44,12 @@ class TikTokAcquisitionTests(IsolatedAsyncioTestCase):
         self.addCleanup(tmp.cleanup)
         self.path = Path(tmp.name) / "clip.mp4"
         self.calls = []
+        self.cookies_sent = []
 
     def route(self, responses):
         @asynccontextmanager
-        async def get(url, referrer):
+        async def get(url, referrer, *, cookie_header=None):
+            self.cookies_sent.append(cookie_header)
             self.calls.append((url, referrer))
             result = responses[url]
             try:
@@ -99,9 +101,50 @@ class TikTokAcquisitionTests(IsolatedAsyncioTestCase):
                 self.assertEqual([url for url, _ in self.calls], expected)
                 self.assertFalse(self.path.exists())
 
+    async def test_selects_one_bounded_public_video_format_from_yt_dlp(self):
+        ranked = MEDIA + "/high"
+
+        def variant(url, key, size):
+            return {"PlayAddr": {"UrlKey": key, "DataSize": size, "UrlList": [url]}}
+
+        public = page(video={"duration": 4, "height": 1280, "width": 720, "downloadAddr": MEDIA,
+                             "bitrateInfo": [
+                                 variant(MEDIA + "/low", "v0_h264_540p_150000", 700),
+                                 variant(ranked, "v0_bytevc1_720p_200000", 900),
+                                 variant(MEDIA + "/oversized", "v0_h264_1080p_420000", 1200),
+                                 variant(MEDIA + "/unplayable", "v0_bytevc2_1080p_410000", 800),
+                             ]})
+        with self.route({PAGE: response(body=public), ranked: response(body=MP4, mime="video/mp4")}):
+            await self.fetch()
+        self.assertEqual(self.calls, [(PAGE, None), (ranked, PAGE)])
+        self.assertEqual(self.path.read_bytes(), MP4)
+
+    async def test_anonymous_media_cookie_obeys_scope_and_isolated_per_request(self):
+        external = "https://v99.tiktokcdn-us.com/media"
+        scoped = "tt_chain_token=sample; Domain=.tiktok.com; Path=/; Secure"
+        headers = [("content-type", "text/html"), ("set-cookie", scoped),
+                   ("set-cookie", "sessionid=unused; Domain=.tiktok.com; Path=/; Secure")]
+        body = httpx.Response(200, headers=headers, stream=Stream(page()))
+        with self.route({PAGE: body, MEDIA: response(302, location=external),
+                         external: response(body=MP4, mime="video/mp4")}):
+            await self.fetch()
+        self.assertEqual(self.cookies_sent, [None, "tt_chain_token=sample", None])
+
+        for cookie in (None, scoped.replace("Path=/;", "Path=/private;"),
+                       scoped + "; Max-Age=0", scoped.replace("; Secure", ""),
+                       scoped.replace(".tiktok.com", ".com")):
+            with self.subTest(cookie=cookie):
+                self.path.unlink()
+                self.cookies_sent.clear()
+                headers = {"set-cookie": cookie} if cookie else {}
+                with self.route({PAGE: response(body=page(), **headers),
+                                 MEDIA: response(body=MP4, mime="video/mp4")}):
+                    await self.fetch()
+                self.assertEqual(self.cookies_sent, [None, None])
+
     async def test_page_must_establish_visibility_identity_limits_and_public_media(self):
         for body in [b"login", page(id="2" * 19), page(secret=True), page(privateItem=True),
-                     page(video_control={"allow_download": False}),
+                     page(video_control={"allow_download": False}), page(videoControl={"allowDownload": False}),
                      page(video={"duration": 11, "downloadAddr": MEDIA}),
                      page(video={"duration": 4, "size": 1025, "downloadAddr": MEDIA}),
                      page(video={"duration": 4, "downloadAddr": PAGE}),
