@@ -12,6 +12,7 @@ if __package__ in {None, ""}:
 from mcp.server.fastmcp import FastMCP
 from model_telemetry import ModelTelemetryStore, StageHandle
 from provenance import canonical_source
+from youtube_media_cache import caption_text_digest
 from youtube_caption_source import classify_cues
 from youtube_caption_tracks import lookup_original_track
 from youtube_transcript_api import NoTranscriptFound, TranscriptsDisabled
@@ -225,14 +226,14 @@ def _library_location():
 
 
 def _library_result(video_id, max_chars, include_timestamps, *, allow_asr=False, native_only=False,
-                    official_text=None, official_end_ms=None):
+                    official_digest=None, official_end_ms=None):
     location = _library_location()
     if not location:
         return None
     from youtube_media_cache import cached_transcript_read
     try:
         record = cached_transcript_read(*location, video_id, max_chars, include_timestamps,
-                                        official_text=official_text, official_end_ms=official_end_ms)
+                                        official_digest=official_digest, official_end_ms=official_end_ms)
     except (OSError, ValueError):
         return None
     if not record:
@@ -268,10 +269,10 @@ def _transcript_result(video, languages, include_timestamps, max_chars):
         if transcript:
             # Reuse a saved supplement only for the actual official track just fetched.
             # A changed track or a newly complete native transcript takes precedence.
-            words = " ".join(str(item.get("text") or "") for item in entries)
+            digest = caption_text_digest(str(item.get("text") or "") for item in entries)
             last = max((float(item["start"]) + float(item.get("duration") or 0)
                         for item in entries if item.get("text") and "start" in item), default=0)
-            saved = _library_result(video_id, max_chars, include_timestamps, official_text=words,
+            saved = _library_result(video_id, max_chars, include_timestamps, official_digest=digest,
                                     official_end_ms=round(last * 1000))
             if saved:
                 return saved

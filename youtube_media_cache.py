@@ -391,9 +391,19 @@ def open_video(root: Path, chat_id: int, video_id: str):
         yield _VideoCache(directory)
 
 
+def caption_text_digest(cues):
+    """Hash normalized caption words without building a whole-track string."""
+    digest = hashlib.sha256()
+    for text in cues:
+        for word in text.split():
+            digest.update(word.encode("utf-8"))
+            digest.update(b" ")
+    return digest.digest()
+
+
 def cached_transcript_read(root: Path, chat_id: int, video_id: str, max_chars: int,
                            include_timestamps: bool = True, *, prefer_native: bool = True,
-                           official_text: str | None = None,
+                           official_digest: bytes | None = None,
                            official_end_ms: int | None = None) -> tuple[str, str] | None:
     """Read an atomic, complete chat-scoped transcript; never create or download anything."""
     if not _integer(max_chars, 1):
@@ -405,14 +415,14 @@ def cached_transcript_read(root: Path, chat_id: int, video_id: str, max_chars: i
         public = cache._public_rows(track) if track else None
         if public is not None:
             chunks, source = public
-            if official_text is not None:
-                captured = " ".join(" ".join(cue[2].split()) for cue in track["cues"])
+            if official_digest is not None:
+                captured = caption_text_digest(cue[2] for cue in track["cues"])
                 end_ms = max(cue[1] for cue in track["cues"])
-                if (captured != " ".join(official_text.split()) or official_end_ms is None
+                if (captured != official_digest or official_end_ms is None
                         or abs(end_ms - official_end_ms) > 1500):
                     return None
         else:
-            if official_text is not None:
+            if official_digest is not None:
                 return None
             chunks = cache.segments()
             if not chunks or chunks[-1][1] != cache.state["audio"]["duration_ms"]:
