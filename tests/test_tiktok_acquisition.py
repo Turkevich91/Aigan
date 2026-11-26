@@ -119,6 +119,14 @@ class TikTokAcquisitionTests(IsolatedAsyncioTestCase):
         self.assertEqual(self.calls, [(PAGE, None), (ranked, PAGE)])
         self.assertEqual(self.path.read_bytes(), MP4)
 
+    async def test_malformed_optional_formats_still_allow_a_verified_direct_url(self):
+        public = page(video={"duration": 4, "bitrateInfo": [{"bad": True}], "playAddr": MEDIA})
+        with patch.object(acq.TikTokIE, "_extract_web_formats", side_effect=acq.YoutubeDLError("bad format")), \
+             self.route({PAGE: response(body=public), MEDIA: response(body=MP4, mime="video/mp4")}):
+            await self.fetch()
+        self.assertEqual(self.calls, [(PAGE, None), (MEDIA, PAGE)])
+        self.assertEqual(self.path.read_bytes(), MP4)
+
     async def test_anonymous_media_cookie_obeys_scope_and_isolated_per_request(self):
         external = "https://v99.tiktokcdn-us.com/media"
         scoped = "tt_chain_token=sample; Domain=.tiktok.com; Path=/; Secure"

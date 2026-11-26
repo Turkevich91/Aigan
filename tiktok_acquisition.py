@@ -14,6 +14,7 @@ from urllib.parse import urljoin, urlsplit
 import httpx
 from yt_dlp import YoutubeDL
 from yt_dlp.extractor.tiktok import TikTokIE
+from yt_dlp.utils import YoutubeDLError
 
 from public_media_http import (
     PublicMediaTransferError as TikTokUnavailable,
@@ -138,8 +139,12 @@ def _download_address(page, post_id, max_bytes, max_duration):
     if video.get("bitrateInfo"):
         # Only parse the formats in this exact post. yt-dlp must not fetch pages,
         # handle challenges, select an external downloader or open media URLs.
-        with YoutubeDL({"quiet": True, "cachedir": False}, auto_init=False) as ydl:
-            formats = TikTokIE(ydl)._extract_web_formats(item)
+        try:
+            with YoutubeDL({"quiet": True, "cachedir": False}, auto_init=False) as ydl:
+                formats = TikTokIE(ydl)._extract_web_formats(item)
+        except (YoutubeDLError, ValueError, TypeError, LookupError, AttributeError, ArithmeticError, RecursionError):
+            # Malformed optional renditions do not invalidate a verified post's direct URL.
+            formats = []
         candidates = [f for f in formats if f.get("ext") == "mp4" and f.get("vcodec") in ("h264", "h265")
                       and 0 < (f.get("filesize") or 0) <= max_bytes and _cdn_url(f.get("url"))]
         if candidates:
