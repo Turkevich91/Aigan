@@ -237,7 +237,7 @@ class TikTokRoutingTests(unittest.IsolatedAsyncioTestCase):
             else:
                 self.normal.assert_awaited_once()
 
-    async def test_local_stt_requires_spoken_request_and_current_permission(self):
+    async def test_local_stt_checks_request_scope_and_current_permission(self):
         self.select("tiktok", SPARK_MODEL)
         public_file = Path(self.enterContext(tempfile.TemporaryDirectory())) / "frame.jpg"
         public_file.write_bytes(b"frame")
@@ -258,6 +258,7 @@ class TikTokRoutingTests(unittest.IsolatedAsyncioTestCase):
             ("What color is the sign?", "speech", "spoken_words", "transcribe", False),
             ("Переклади слова диктора.", "speech", "spoken_words", "слова диктора", True),
             ("Describe the scene and translate the dialogue.", "both", "spoken_words", "translate the dialogue", True),
+            ("У чому суть ролика?", "both", "spoken_words", "суть ролика", True),
             ("Transcribe the clip.", "speech", "spoken_words", "Transcribe", False),
         ]
         for i, (request, decision, source, quote, expected_cloud) in enumerate(cases):
@@ -268,8 +269,10 @@ class TikTokRoutingTests(unittest.IsolatedAsyncioTestCase):
                 async def local(instructions, model_input, *, schema, before_call):
                     before_call()
                     if schema == main.VIDEO_INTENT_FORMAT["format"]:
+                        self.assertEqual(instructions, main.TIKTOK_INTENT_INSTRUCTIONS)
                         answer = json.dumps({"inspect": decision})
                     elif schema == main.SPEECH_SCOPE_FORMAT:
+                        self.assertEqual(instructions, main.TIKTOK_SPEECH_SCOPE_INSTRUCTIONS)
                         answer = json.dumps({"source": source, "evidence": quote})
                     else:
                         answer = "Answer from the available evidence."
@@ -296,6 +299,37 @@ class TikTokRoutingTests(unittest.IsolatedAsyncioTestCase):
                 elif i != 3:
                     self.assertIn("Answer from the available evidence.", delivered)
                 self.client.responses.create.assert_not_awaited()
+
+    async def test_tiktok_reply_about_the_topic_includes_speech_and_frames(self):
+        self.message.reply_to_message = FakeMessage(LINK, chat_type="private")
+        self.message.text = "What is the main point?"
+        self.model_outputs('{"inspect":"both"}', "A speaker explains the results.")
+        self.client.audio.transcriptions.create = AsyncMock(return_value=SimpleNamespace(text="Results."))
+
+        async def fetch(url, destination, **limits):
+            destination.write_bytes(b"clip")
+
+        @asynccontextmanager
+        async def frame_session(request):
+            frame = request.source_path.with_suffix(".jpg")
+            frame.write_bytes(b"frame")
+            yield MediaFrameResult(True, frames=(MediaFrameCandidate(frame, 0, 0),), metadata={"has_audio": True})
+
+        async def extract(source, ffmpeg, duration, transcribe):
+            return await transcribe(io.BytesIO(b"audio"))
+
+        with patch.object(main, "runtime_media_frame_adapter", return_value=SimpleNamespace(frame_session=frame_session)), \
+             patch.object(main, "fetch_tiktok_video", side_effect=fetch), \
+             patch("telegram_video.transcribe_clip", side_effect=extract):
+            await self.dispatch()
+            await asyncio.gather(*main.telegram_turn_tasks)
+        route, answer = self.client.responses.create.await_args_list
+        self.assertEqual(route.kwargs["instructions"], main.TIKTOK_INTENT_INSTRUCTIONS)
+        self.client.audio.transcriptions.create.assert_awaited_once()
+        content = answer.kwargs["input"][0]["content"]
+        self.assertEqual(json.loads(content[0]["text"])["speech_evidence"], "Results.")
+        self.assertTrue(any(part["type"] == "input_image" for part in content))
+        self.assertEqual(self.delivery.await_args.args[1], "A speaker explains the results.")
 
     async def test_passive_group_and_private_bare_link_do_not_start_tiktok(self):
         self.model_outputs()
