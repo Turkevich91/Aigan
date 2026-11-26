@@ -4672,6 +4672,11 @@ class OutboundIdentityAndProvenanceTests(unittest.TestCase):
         records = main.recent_chat_answers[message.chat_id]
         self.assertEqual(1, len(records))
         self.assertEqual("translate_reference", records[0].route)
+        followup = FakeMessage("Which part did you send?", message_id=message.message_id + 1)
+        correction = main.build_agent_input(followup, followup.text, memory_context="(none)")
+        self.assertIn(f"{main.user_label(message)}: {message.text}", correction)
+        self.assertIn(f"Aigan: {calls[0]}", correction)
+        self.assertNotIn(response, correction)
 
     def test_ambiguous_translation_delivery_does_not_mark_prompt_answered(self) -> None:
         message = FakeMessage("translate this", message_id=2815)
@@ -8879,6 +8884,9 @@ class PersistentMemoryTests(unittest.TestCase):
         save(10, "bot", is_bot=True)
         save(12, "this request")
         save(13, "newer request")
+        forwarded = FakeMessage("original channel wording", message_id=11)
+        forwarded.forward_origin = SimpleNamespace(type="channel")
+        main.save_memory_message(forwarded)
         self.assertEqual(main.recent_speaker_words(message), ["own 2", "own 3", "own 4"])
         main.passive_contexts[message.chat_id].append("Another participant: room fact")
         prompt = main.build_agent_input(message, "And now?", memory_context="(none)")
